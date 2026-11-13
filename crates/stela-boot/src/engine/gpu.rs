@@ -1296,13 +1296,21 @@ fn claim(
         .map(|(index, region)| (index, region.size))
         .collect();
     let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
-    let reset = ready.reset().is_some();
+    // A driver that resets the GPU itself has not yet: the BARs are firmware's.
+    let reset = matches!(
+        ready.reset(),
+        Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
+    );
     match ready.reset() {
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
         Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
             "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
+        )),
+        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
+            "GPU {address}: no reset at claim; {} resets it itself; {sizes}\n",
+            stack.kernel.driver
         )),
         Some(gpu::cold::Reset::Function(method)) => {
             let name = match method {

@@ -1520,11 +1520,14 @@ fn open_gpus(
                     }
                 }
             }
-            // The display adapters Stela's GPU driver does not run, and why.
-            for adapter in found
-                .iter()
-                .filter(|adapter| stela_drivers::gpu::stack::GpuStack::select(adapter).is_err())
-            {
+            // The display adapters no driver here runs, and why: the
+            // refused ones were named above.
+            for adapter in found.iter().filter(|adapter| {
+                stela_drivers::gpu::stack::GpuStack::select(adapter).is_err()
+                    && !refused
+                        .iter()
+                        .any(|gpu| gpu.address == format!("{}", adapter.address))
+            }) {
                 crate::status::info(&gpu_status::unused(adapter));
             }
             return false;
@@ -1553,8 +1556,8 @@ fn open_gpus(
     // A stop inside the start stores the USB's log from there.
     let opened = storage::in_gpu_start(|| gpu::open(machine, claimed));
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
-    // functions, starting Linux, and nouveau's probe, which boots the GSP
-    // and binds DRM.
+    // functions, starting Linux, and the drivers' probe: nouveau's boots the
+    // GSP and binds DRM.
     let ms = |ticks: u64| ticks / (tsc_hz / 1000).max(1);
     let (linux, probe) = gpu::start_times();
     output::arguments(format_args!(

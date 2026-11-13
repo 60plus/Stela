@@ -1,5 +1,6 @@
 //! GPU reset while the original configuration and DMA root stay owned: a
-//! function-local reset, else a Secondary Bus Reset of the GPU's own bus.
+//! function-local reset, else a Secondary Bus Reset of the GPU's own bus;
+//! for an AMD GPU none, as amdgpu resets the GPU itself ([`Reset::Driver`]).
 use alloc::{boxed::Box, rc::Rc};
 use core::mem::ManuallyDrop;
 use stela_driver_base::{
@@ -16,6 +17,7 @@ use stela_driver_base::{
     },
 };
 
+const AMD: u16 = 0x1002;
 const DISPLAY: u8 = 3;
 const EXPRESS: u8 = 0x10;
 
@@ -51,6 +53,16 @@ pub enum Reset {
     /// Secondary Bus Reset on the bridge above the GPU's own bus, as Linux
     /// `pci_reset_function` falls back to `pci_parent_bus_reset`.
     SecondaryBus,
+    /// None here: the driver resets the GPU itself. An AMD GPU offers no
+    /// FLR, and its bus's secondary reset would take its HDMI audio
+    /// function along. amdgpu resets the GPU on init, MODE1 through the SMU,
+    /// when the PSP's secure OS still runs from an earlier driver
+    /// (`soc24_need_reset_on_init`, `nv_need_reset_on_init`), and otherwise
+    /// takes it as the firmware left it, as Linux does at every boot. The
+    /// gated function issues no request until amdgpu sets its master bit,
+    /// and from then on the private domain bounds what anything the
+    /// firmware left running in the GPU can reach.
+    Driver,
 }
 
 /// The original CPU framebuffer/register writers and their translation owners.
@@ -97,7 +109,8 @@ pub unsafe trait Preparation: 'static {
     /// # Safety
     /// A function-local reset (FLR or D3hot soft reset) or a Secondary Bus
     /// Reset, and readiness/containment revalidation, completed with CPU
-    /// views sealed and all old owners still kept, or the function has no
+    /// views sealed and all old owners still kept, or the function's driver
+    /// resets it itself ([`Reset::Driver`]), or the function has no
     /// reset and the private domain translates its every request, so
     /// engines firmware left running reach only that domain. Nothing can
     /// rearm the function before the original root drain and private bind.
@@ -199,6 +212,9 @@ fn preflight<C: ConfigSpace>(
             return Err(Error::Identity);
         }
     }
+    if function.vendor == AMD {
+        return Ok(Some(Reset::Driver));
+    }
     // Linux `pci_reset_function` falls back from FLR to a D3hot soft reset,
     // then to a reset of the bus the function sits on alone. No GPU driver
     // of Linux resets at its probe: each starts what firmware left. Here a
@@ -284,7 +300,7 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
                     }
                 }
                 Some(Reset::SecondaryBus) => requester.reset_bus(timer).map_err(Error::Reset)?,
-                None => {}
+                Some(Reset::Driver) | None => {}
             }
             requester::validate_stopped(requester.function_mut()).map_err(Error::Claim)?;
             Ok(reset)
