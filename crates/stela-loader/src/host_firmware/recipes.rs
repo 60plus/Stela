@@ -1247,6 +1247,63 @@ pub const AMDGPU: &[Recipe] = &[
         440400,
         "9a0ab35bf157c835cbbc4a207ba819ea0111e2a65fe7f8c20910ffff3122f903",
     ),
+    // Navi 21 (Sienna Cichlid): amdgpu names these files after the chip,
+    // not its IP versions. MEC2 is byte for byte MEC.
+    amdgpu(
+        "amdgpu/sienna_cichlid_ce.bin",
+        263296,
+        "156769265ed26c8cb14902a13e14871732245daeffb793bdf394c1bd3de76f00",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_me.bin",
+        263424,
+        "fbdf0e27e1c232e5b0a69f52efd5692a1803ec2a0d77201ea678dc8bc6407116",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec2.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_pfp.bin",
+        263424,
+        "fa904ab1609ab090d90edc0d11132fc9821a05800466b04a193c62d5a5c2d5ae",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_rlc.bin",
+        132960,
+        "19d19bce396b6dc725acb87cdf419e6151a1b2961ff43d6e026e17ecf20c83d0",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sdma.bin",
+        34048,
+        "1aad9d95e1205d4a0c8da01670aa9fc6f77010ac04a321d8c644f581ada6c7ce",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_smc.bin",
+        247396,
+        "0eb99764288f764fd853d6973693ffa52419cc7ba62074aee85df4a3e8d0286d",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sos.bin",
+        227456,
+        "67706b9e1545bf68850bf9cea97660af5972574ecb0ca30041174efbb59fac37",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_ta.bin",
+        386816,
+        "dc28d6a9abc3e3a1e9e8c4f787fc179a3e02bd1d5d6a72f178f88b1ad5e61569",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_vcn.bin",
+        582800,
+        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
+    ),
 ];
 
 /// A GPU family's name, PCI device IDs and files.
@@ -1294,6 +1351,28 @@ const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
             "amdgpu/sdma_7_0_1.bin",
             "amdgpu/smu_14_0_3.bin",
             "amdgpu/vcn_5_0_0.bin",
+        ],
+    ),
+    (
+        "Radeon RX 6800, 6800 XT, 6900 XT or 6950 XT (Navi 21)",
+        // amdgpu's ID table lists these under CHIP_SIENNA_CICHLID; 1002:73bf is
+        // the RX 6800 XT checked on hardware.
+        &[
+            0x73a0, 0x73a1, 0x73a2, 0x73a3, 0x73a4, 0x73a5, 0x73a6, 0x73a7, 0x73a8, 0x73a9, 0x73aa,
+            0x73ab, 0x73ac, 0x73ad, 0x73ae, 0x73af, 0x73bf,
+        ],
+        &[
+            "amdgpu/sienna_cichlid_ce.bin",
+            "amdgpu/sienna_cichlid_me.bin",
+            "amdgpu/sienna_cichlid_mec.bin",
+            "amdgpu/sienna_cichlid_mec2.bin",
+            "amdgpu/sienna_cichlid_pfp.bin",
+            "amdgpu/sienna_cichlid_rlc.bin",
+            "amdgpu/sienna_cichlid_sdma.bin",
+            "amdgpu/sienna_cichlid_smc.bin",
+            "amdgpu/sienna_cichlid_sos.bin",
+            "amdgpu/sienna_cichlid_ta.bin",
+            "amdgpu/sienna_cichlid_vcn.bin",
         ],
     ),
 ];
