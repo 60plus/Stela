@@ -133,6 +133,7 @@ pub const DRIVER: super::native::Driver = {
         nir_options: stela_anv_nir_options,
         submit_thread: None,
         refusals: None,
+        keep_lost: false,
     }
 };
 

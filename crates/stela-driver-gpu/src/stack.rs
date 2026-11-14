@@ -41,6 +41,30 @@ pub struct Kernel {
     pub chip: fn(Control) -> Option<u32>,
     /// The bytes of device memory the driver makes available.
     pub memory_bytes: fn(Control) -> Option<u64>,
+    /// For a driver whose recovery from a hung GPU holds back every later
+    /// close of its files, how it tells whether it reset the GPU, so a GPU
+    /// it reset during its first work is left unreleased.
+    pub reset: Option<Reset>,
+}
+
+/// A kernel driver's watch for resets: a context on a file of its own,
+/// made before the GPU's first work.
+pub struct Reset {
+    /// Makes the context, answering its identifier.
+    pub watch: fn(Control) -> Option<u32>,
+    /// Whether the driver reset the GPU since the context was made.
+    pub state: fn(Control, u32) -> Option<ResetState>,
+}
+
+/// What a [`Reset`] watch saw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetState {
+    /// No reset since the watch was made.
+    Running,
+    /// The driver reset the GPU, and the reset ended.
+    Reset,
+    /// The driver is resetting the GPU now.
+    Resetting,
 }
 
 /// One vendor's stack.
@@ -103,6 +127,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         probed_integrated: None,
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
+        reset: None,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
@@ -135,6 +160,12 @@ pub static AMD: GpuStack = GpuStack {
         probed_integrated: Some(crate::amdgpu::query::integrated),
         chip: crate::amdgpu::query::family,
         memory_bytes: crate::amdgpu::query::memory_bytes,
+        // A hung GPU's recovery holds back the VM work every later close of
+        // a file waits for, which on Navi 21 has not been seen to end.
+        reset: Some(Reset {
+            watch: crate::amdgpu::query::reset_watch,
+            state: crate::amdgpu::query::reset_state,
+        }),
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
@@ -162,6 +193,7 @@ pub static INTEL: GpuStack = GpuStack {
         probed_integrated: None,
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
+        reset: None,
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
@@ -641,5 +673,36 @@ mod tests {
         assert_eq!(query(&mut fused), Some(true));
         let mut refuse = |_: u32, _: *mut c_void| -19;
         assert_eq!(query(&mut refuse), None);
+    }
+
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn amdgpu_watches_resets_on_a_context_of_its_own() {
+        let reset = AMD.kernel.reset.as_ref().unwrap();
+        assert!(NVIDIA.kernel.reset.is_none());
+        // `union drm_amdgpu_ctx`: the operation, flags, context and priority
+        // in; `alloc.ctx_id` or `state.flags` out over the first words.
+        let mut asked = alloc::vec::Vec::new();
+        let flags = core::cell::Cell::new(0u64);
+        let mut answer = |request: u32, argument: *mut c_void| {
+            // SAFETY: the query passes its own four-word record.
+            let words = unsafe { &mut *argument.cast::<[u32; 4]>() };
+            asked.push((request, words[0], words[2]));
+            match words[0] {
+                1 => words[0] = 7,
+                _ => [words[0], words[1]] = [flags.get() as u32, (flags.get() >> 32) as u32],
+            }
+            0
+        };
+        assert_eq!((reset.watch)(&mut answer), Some(7));
+        assert_eq!((reset.state)(&mut answer, 7), Some(ResetState::Running));
+        flags.set(1);
+        assert_eq!((reset.state)(&mut answer, 7), Some(ResetState::Reset));
+        flags.set(1 | 1 << 5);
+        assert_eq!((reset.state)(&mut answer, 7), Some(ResetState::Resetting));
+        assert_eq!(asked[..2], [(0xc010_6442, 1, 0), (0xc010_6442, 4, 7)]);
+        let mut refuse = |_: u32, _: *mut c_void| -22;
+        assert_eq!((reset.watch)(&mut refuse), None);
+        assert_eq!((reset.state)(&mut refuse, 7), None);
     }
 }
