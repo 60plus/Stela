@@ -4,6 +4,7 @@ use alloc::{vec, vec::Vec};
 mod outputs;
 mod power;
 mod reconnect;
+mod scaling;
 mod scanout;
 
 fn mode(width: u16, height: u16, kind: u32) -> ModeInfo {
@@ -91,6 +92,18 @@ struct Card {
     destroyed: Vec<u32>,
     removed: Vec<u32>,
     unmapped: usize,
+    /// Both connectors offer DRM's "scaling mode" as property 70, besides
+    /// property 69, "DPMS", which every connector offers.
+    scaler: bool,
+    /// Connector 50's and 51's scaling mode.
+    scaling: [u64; 2],
+    /// Scaling modes set, by connector, and the property reads.
+    scalings: Vec<(u32, u64)>,
+    property_reads: u32,
+    /// What the next scaling mode set answers instead.
+    scaling_error: Option<i64>,
+    /// Each controller lit, with its connector's scaling mode then.
+    lit_scaling: Vec<(u32, u64)>,
 }
 
 impl Card {
@@ -129,7 +142,18 @@ impl Card {
             destroyed: Vec::new(),
             removed: Vec::new(),
             unmapped: 0,
+            scaler: false,
+            scaling: [SCALE_NONE; 2],
+            scalings: Vec::new(),
+            property_reads: 0,
+            scaling_error: None,
+            lit_scaling: Vec::new(),
         }
+    }
+
+    /// Requests about connector properties: none where nothing is scaled.
+    fn property_requests(&self) -> usize {
+        self.property_reads as usize + self.scalings.len()
     }
 
     fn id(&mut self) -> u32 {
@@ -238,6 +262,54 @@ unsafe impl Drm for &mut Card {
                         assert_eq!((crtc.connectors as *const u32).read(), runs);
                         (crtc.mode, crtc.framebuffer)
                     });
+                    if crtc.connector_count != 0 {
+                        let scaling = self.scaling[(runs - 50) as usize];
+                        self.lit_scaling.push((crtc.id, scaling));
+                    }
+                }
+                OBJECT_PROPERTIES => {
+                    let object = &mut *argument.cast::<ObjectProperties>();
+                    assert_eq!(object.kind, OBJECT_CONNECTOR);
+                    assert!(matches!(object.id, 50 | 51));
+                    self.property_reads += 1;
+                    let offered: &[u32] = if self.scaler { &[69, 70] } else { &[69] };
+                    if object.count as usize >= offered.len() {
+                        let list = object.properties as *mut u32;
+                        ptr::copy_nonoverlapping(offered.as_ptr(), list, offered.len());
+                    }
+                    object.count = offered.len() as u32;
+                }
+                GET_PROPERTY => {
+                    let info = &mut *argument.cast::<PropertyInfo>();
+                    let name: &[u8] = match info.id {
+                        69 => b"DPMS",
+                        70 => SCALING_MODE,
+                        other => panic!("property {other}"),
+                    };
+                    info.name = [0; 32];
+                    info.name[..name.len()].copy_from_slice(name);
+                    let values = info.values as *mut u64;
+                    for value in 0..4u32.min(info.value_count) {
+                        values.add(value as usize).write(u64::from(value));
+                    }
+                    info.value_count = 4;
+                }
+                SET_OBJECT_PROPERTY => {
+                    let set = *argument.cast::<SetProperty>();
+                    assert_eq!((set.kind, set.id), (OBJECT_CONNECTOR, 70));
+                    assert!(self.scaler);
+                    // Only a connector that runs no controller.
+                    let runs = match set.object {
+                        50 => self.set_40.is_some(),
+                        51 => self.set.is_some(),
+                        other => panic!("connector {other}"),
+                    };
+                    assert!(!runs, "scaling set on a connector a controller runs");
+                    if let Some(error) = self.scaling_error.take() {
+                        return error;
+                    }
+                    self.scaling[(set.object - 50) as usize] = set.value;
+                    self.scalings.push((set.object, set.value));
                 }
                 PAGE_FLIP => {
                     assert!(self.immediate, "a flip requested where it must wait");
@@ -313,6 +385,9 @@ fn requests_match_linux() {
     assert_eq!(ADD_FB2, 0xc068_64b8);
     assert_eq!(REMOVE_FB, 0xc004_64af);
     assert_eq!(DESTROY_DUMB, 0xc004_64b4);
+    assert_eq!(GET_PROPERTY, 0xc040_64aa);
+    assert_eq!(OBJECT_PROPERTIES, 0xc020_64b9);
+    assert_eq!(SET_OBJECT_PROPERTY, 0xc018_64ba);
 }
 
 #[test]

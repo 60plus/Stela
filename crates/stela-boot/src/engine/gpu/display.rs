@@ -16,7 +16,8 @@
 //! connectors as the driver last detected them, which its hot-plug
 //! interrupts keep current. A display taken at start is set again when it
 //! returns after being unplugged, and shows on an output connected later
-//! when that output has its size. When the firmware's screen is gone and no
+//! when that output has its size or a larger native mode to scale it into.
+//! When the firmware's screen is gone and no
 //! display was taken, the bound GPUs are looked on until one shows a display
 //! in the guest's mode, and probed anew every [`PROBE_LOOKS`] looks, as
 //! Linux's output polling and fbdev helper take a display that appears late.
@@ -311,9 +312,10 @@ impl KmsScanout {
                     return;
                 }
                 Ok(display) => {
-                    // No scaler exists; the outputs are turned off, their
-                    // buffers and the node given back, and the GPU is
-                    // looked on no more.
+                    // No output runs the guest's size itself, which the
+                    // output that gives the picture's timing must; the
+                    // outputs are turned off, their buffers and the node
+                    // given back, and the GPU is looked on no more.
                     let (width, height) = display.size();
                     output::arguments(format_args!(
                         "GPU {name}: display detected after start has no {}x{} mode, \
@@ -345,12 +347,22 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
         (watched.restored, "display connected again"),
         (watched.joined, "display added on a new output"),
         (
+            watched.scaled,
+            "added or returned output has no mode of the display's size: picture scaled into \
+             its native mode",
+        ),
+        (
             watched.unshown,
             "new output has no free mode or controller in the display's size",
         ),
         (
             watched.modeless,
             "display connected again has no mode of the display's size: left dark",
+        ),
+        (
+            watched.smaller,
+            "dark output's native mode is smaller than the display's size, and the picture is \
+             only scaled up",
         ),
         (
             watched.refused,
@@ -368,14 +380,35 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
 }
 
 /// How many outputs show `display` and how many connected ones cannot,
-/// when that is more than the one output.
+/// when that is more than the one output, then each output that scales the
+/// picture and why others stay dark.
 fn report_outputs(name: &str, display: &Display<Node>) {
     let (shown, unshown) = (display.outputs(), display.unshown());
-    if shown > 1 || unshown != 0 {
-        let (width, height) = display.size();
+    if shown <= 1 && unshown == 0 {
+        return;
+    }
+    let (width, height) = display.size();
+    output::arguments(format_args!(
+        "GPU {name}: display on {shown} outputs, {unshown} connected without a free \
+         {width}x{height} mode or controller\n"
+    ));
+    for kms::Scaled { native, picture } in display.scaled() {
         output::arguments(format_args!(
-            "GPU {name}: display on {shown} outputs, {unshown} connected without a free \
-             {width}x{height} mode or controller\n"
+            "GPU {name}: an output has no {width}x{height} mode: it runs {}x{} and the picture \
+             fills {}x{} of it\n",
+            native.0, native.1, picture.0, picture.1
+        ));
+    }
+    let smaller = display.smaller();
+    if smaller != 0 {
+        output::arguments(format_args!(
+            "GPU {name}: {smaller} dark outputs have a native mode smaller than \
+             {width}x{height}; the picture is only scaled up\n"
+        ));
+    }
+    if let Some(error) = display.refused() {
+        output::arguments(format_args!(
+            "GPU {name}: scaling an output was refused: {error:?}; it stays dark\n"
         ));
     }
 }
