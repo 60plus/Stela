@@ -3174,6 +3174,7 @@ fn start_devices(
                 gpu::serve(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
+                    options.display_size,
                 );
                 gpu::panel_brightness(host_acpi);
             }
