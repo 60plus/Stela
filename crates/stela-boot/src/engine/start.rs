@@ -1669,6 +1669,18 @@ fn place_devices(
                     as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
             })
     };
+    // amdgpu retired the firmware's screen to claim its GPU and gave no
+    // display in its place; the Mac keeps a monitor at that screen's mode.
+    let headless_scanout = || {
+        handoff.screen.map(|screen| {
+            let (width, height) = screen.resolution();
+            output::arguments(format_args!(
+                "DISPLAY headless scanout {width}x{height}: the firmware's screen was retired for the GPU\n"
+            ));
+            alloc::boxed::Box::new(display::HeadlessScanout::new(width, height))
+                as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
+        })
+    };
     // The firmware's scanout keeps its newest frame itself; a GPU's is
     // wrapped to keep one for `--scanout-mirror`. A bound GPU with no display
     // leaves the firmware's screen on another adapter showing its frames
@@ -1686,20 +1698,10 @@ fn place_devices(
     let scanout = gpu::display::scanout()
         .map(mirrored)
         .or_else(|| firmware_scanout(gpu::display::drawn_without_display()))
-        .or_else(|| gpu::display::awaited(handoff.screen).map(mirrored));
+        .or_else(|| gpu::display::awaited(handoff.screen).map(mirrored))
+        .or_else(headless_scanout);
     #[cfg(not(feature = "nvk"))]
-    let scanout = firmware_scanout(false).or_else(|| {
-        // amdgpu retired the firmware's screen to claim its GPU headless;
-        // the Mac keeps a monitor at that screen's mode.
-        handoff.screen.map(|screen| {
-            let (width, height) = screen.resolution();
-            output::arguments(format_args!(
-                "DISPLAY headless scanout {width}x{height}: the firmware's screen was retired for the GPU\n"
-            ));
-            alloc::boxed::Box::new(display::HeadlessScanout::new(width, height))
-                as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
-        })
-    });
+    let scanout = firmware_scanout(false).or_else(headless_scanout);
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();

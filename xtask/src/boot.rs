@@ -122,10 +122,14 @@ pub enum Command {
         #[arg(long)]
         diagnostics: bool,
         /// Carry amdgpu beside nouveau and the image's Mesa drivers, for a
-        /// Radeon RX 9070 (Navi 48): amdgpu binds it in the Linux
-        /// environment.
-        #[arg(long)]
+        /// Radeon RX 9070 (Navi 48) or RX 6800-6950 XT (Navi 21): amdgpu
+        /// binds it in the Linux environment.
+        #[arg(long, conflicts_with = "radv")]
         amdgpu: bool,
+        /// Carry amdgpu and require RADV among the image's Mesa drivers:
+        /// amdgpu binds the GPU and RADV backs the Metal device over it.
+        #[arg(long)]
+        radv: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -498,10 +502,18 @@ pub fn run(command: Command) -> Result<ExitCode> {
             release,
             diagnostics,
             amdgpu,
+            radv,
         } => {
             crate::gpu::fetch::fetch(false)?;
             crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            let gpu = if amdgpu { Gpu::Amdgpu } else { Gpu::Nvk };
+            let gpu = if radv {
+                crate::gpu::require_vulkan_driver("amd")?;
+                Gpu::Radv
+            } else if amdgpu {
+                Gpu::Amdgpu
+            } else {
+                Gpu::Nvk
+            };
             println!("{}", build_for_boot(release, diagnostics, gpu)?.display());
             Ok(ExitCode::SUCCESS)
         }
@@ -524,6 +536,8 @@ enum Gpu {
     /// amdgpu beside NVK: the GPU claims run in an image with the Mesa
     /// drivers.
     Amdgpu,
+    /// amdgpu with RADV, ACO and NIR among the image's Mesa drivers.
+    Radv,
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -569,6 +583,9 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
         Gpu::Amdgpu => {
             command.args(["--features", "nvk,amdgpu"]);
+        }
+        Gpu::Radv => {
+            command.args(["--features", "radv"]);
         }
     }
     if release {
