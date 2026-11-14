@@ -31,6 +31,8 @@ mod kext {
     ));
 }
 #[cfg(feature = "nvk")]
+mod refused;
+#[cfg(feature = "nvk")]
 mod slice;
 #[cfg(feature = "nvk")]
 mod stack;
