@@ -7,14 +7,17 @@
  */
 /* Linux's device model, following Linux
  * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c, class.c and
- * devres.c. Stela's owners create and attach devices, and nothing reads
- * sysfs: adding a device only keeps its parent alive, a class is its name and
- * its attribute files do not exist. */
+ * devres.c, and lib/devres.c. Stela's owners create and attach devices, and
+ * nothing reads sysfs: adding a device only keeps its parent alive, a class
+ * is its name and no attribute file exists. */
 #include <linux/component.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/io.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/overflow.h>
 #include <linux/property.h>
 #include <linux/slab.h>
 #include <stela/device.h>
@@ -152,6 +155,73 @@ void devm_release_action(struct device *dev, void (*action)(void *), void *data)
 	WARN_ON(1);
 }
 
+/* Forgets a managed action without running it. */
+int devm_remove_action_nowarn(struct device *dev, void (*action)(void *), void *data)
+{
+	struct managed_action *managed;
+
+	list_for_each_entry(managed, &dev->devres_head, node)
+		if (managed->action == action && managed->data == data) {
+			list_del(&managed->node);
+			kfree(managed);
+			return 0;
+		}
+	return -ENOENT;
+}
+
+/* Managed memory: the action's record and the caller's bytes are one
+ * allocation, which releasing the record frees. */
+struct managed_memory {
+	struct managed_action managed;
+	u8 bytes[] __aligned(ARCH_DMA_MINALIGN);
+};
+
+static void memory_released(void *data)
+{
+	(void)data;
+}
+
+void *devm_kmalloc(struct device *dev, size_t size, gfp_t gfp)
+{
+	struct managed_memory *memory;
+	size_t total;
+
+	if (unlikely(!size))
+		return ZERO_SIZE_PTR;
+	if (check_add_overflow(sizeof(*memory), size, &total))
+		return NULL;
+	memory = kmalloc(total, gfp);
+	if (!memory)
+		return NULL;
+	memory->managed.action = memory_released;
+	memory->managed.data = memory->bytes;
+	list_add(&memory->managed.node, &dev->devres_head);
+	return memory->bytes;
+}
+
+void devm_kfree(struct device *dev, const void *p)
+{
+	if (unlikely(ZERO_OR_NULL_PTR(p)))
+		return;
+	WARN_ON(devm_remove_action_nowarn(dev, memory_released, (void *)p));
+}
+
+static void unmap_device_memory(void *mapping)
+{
+	iounmap(mapping);
+}
+
+/* A write-combining mapping that the driver's detach unmaps, following
+ * lib/devres.c. */
+void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset, resource_size_t size)
+{
+	void __iomem *mapping = ioremap_wc(offset, size);
+
+	if (mapping && devm_add_action_or_reset(dev, unmap_device_memory, (void *)mapping))
+		return NULL;
+	return mapping;
+}
+
 void stela_linux_devres_release(struct device *dev)
 {
 	struct managed_action *managed, *next;
@@ -177,6 +247,47 @@ int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
 	va_end(arguments);
 	return err;
 }
+
+/* A device's firmware node, following drivers/base/core.c. */
+void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
+{
+	dev->fwnode = fwnode;
+	dev->of_node = to_of_node(fwnode);
+}
+
+void device_set_of_node_from_dev(struct device *dev, const struct device *dev2)
+{
+	of_node_put(dev->of_node);
+	dev->of_node = of_node_get(dev2->of_node);
+	dev_set_of_node_reused(dev);
+}
+
+int device_match_of_node(struct device *dev, const void *np)
+{
+	return np && dev->of_node == np;
+}
+
+/* A bus is its type: Stela's owners match and bind the devices of the buses
+ * they own, so registering one records nothing. A Linux driver on a bus, a
+ * search of a bus's devices and a walk of a device's children need the
+ * driver core's lists, which do not exist; nothing in the image registers
+ * such a driver, and only the removal of a MIPI DSI host walks children,
+ * which no display driver here registers. */
+int bus_register(const struct bus_type *bus)
+{
+	return bus && bus->name ? 0 : -EINVAL;
+}
+
+void bus_unregister(const struct bus_type *bus)
+{
+	(void)bus;
+}
+
+STELA_UNSUPPORTED(int, driver_register, struct device_driver *)
+STELA_UNSUPPORTED(void, driver_unregister, struct device_driver *)
+STELA_UNSUPPORTED(struct device *, bus_find_device, const struct bus_type *, struct device *,
+		  const void *, device_match_t)
+STELA_UNSUPPORTED(int, device_for_each_child, struct device *, void *, device_iter_t)
 
 struct class *class_create(const char *name)
 {
@@ -210,6 +321,27 @@ void class_remove_file_ns(const struct class *class, const struct class_attribut
 	(void)ns;
 }
 
+/* A device's attribute files and groups do not exist either. */
+int device_create_file(struct device *dev, const struct device_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+	return 0;
+}
+
+void device_remove_file(struct device *dev, const struct device_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+}
+
+int devm_device_add_group(struct device *dev, const struct attribute_group *group)
+{
+	(void)dev;
+	(void)group;
+	return 0;
+}
+
 ssize_t show_class_attr_string(const struct class *class, const struct class_attribute *attr,
 			       char *buf)
 {
@@ -218,11 +350,20 @@ ssize_t show_class_attr_string(const struct class *class, const struct class_att
 }
 
 /* Components join an aggregate device when its master registers. Stela's
- * audio does not bind to GPUs' HDMI codecs through one, so none ever does. */
+ * audio does not bind to GPUs' HDMI codecs through one, and no MEI driver
+ * aggregates a GPU's content protection, so none ever does. */
 int component_add(struct device *dev, const struct component_ops *ops)
 {
 	(void)dev;
 	(void)ops;
+	return 0;
+}
+
+int component_add_typed(struct device *dev, const struct component_ops *ops, int subcomponent)
+{
+	(void)dev;
+	(void)ops;
+	(void)subcomponent;
 	return 0;
 }
 
@@ -234,6 +375,13 @@ void component_del(struct device *dev, const struct component_ops *ops)
 
 /* Runtime power dependencies, which only a bound audio component makes. */
 STELA_UNSUPPORTED(struct device_link *, device_link_add, struct device *, struct device *, u32)
+
+/* No link exists to remove: adding one is what is unsupported. */
+void device_link_remove(void *consumer, struct device *supplier)
+{
+	(void)consumer;
+	(void)supplier;
+}
 
 #ifdef STELA_LINUX_DEVICE_TEST
 #include <stela/linux.h>
@@ -272,6 +420,32 @@ static int test_property_int(const struct fwnode_handle *node, const char *name,
 	return 0;
 }
 
+static u8 window[PAGE_SIZE] __aligned(PAGE_SIZE);
+static unsigned int mapped;
+
+static void *map_device(void *context, u64 physical, size_t size, bool write_combining)
+{
+	(void)context;
+	assert(physical == 0xd0000000 && size == sizeof(window) && write_combining);
+	mapped++;
+	return window;
+}
+
+static void unmap_device(void *context, void *address)
+{
+	(void)context;
+	assert(address == window);
+	mapped--;
+}
+
+static ssize_t test_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	(void)dev;
+	(void)attr;
+	(void)buf;
+	return 0;
+}
+
 static void test_properties(void)
 {
 	static const struct fwnode_operations ops = {
@@ -291,9 +465,15 @@ static void test_properties(void)
 	assert(values[0] == 7 && values[1] == 13);
 }
 
+static const struct stela_linux_services services = {
+	.map_device = map_device,
+	.unmap_device = unmap_device,
+};
+static const struct stela_linux_owner owner = {.services = &services};
+
 int main(void)
 {
-	stela_linux_enter(&stela_linux_bare);
+	stela_linux_enter(&owner);
 	test_properties();
 	struct device dev = {.release = release};
 	device_initialize(&dev);
@@ -320,10 +500,43 @@ int main(void)
 	assert(!__devm_add_action(&child, undo, (void *)&c, "c"));
 	devm_release_action(&child, undo, (void *)&b);
 	assert(undone_count == 1 && undone[0] == 'b');
+	/* An action taken back does not run; memory is the device's until it
+	 * is freed or the device goes, and a mapping is unmapped then. */
+	static const char d = 'd';
+	assert(!__devm_add_action(&child, undo, (void *)&d, "d"));
+	assert(!devm_remove_action_nowarn(&child, undo, (void *)&d));
+	assert(devm_remove_action_nowarn(&child, undo, (void *)&d) == -ENOENT);
+	u8 *zeroed = devm_kzalloc(&child, 24, GFP_KERNEL);
+	u8 *kept = devm_kmalloc(&child, 8, GFP_KERNEL);
+	assert(zeroed && kept && !zeroed[0] && !zeroed[23]);
+	assert(IS_ALIGNED((unsigned long)zeroed, ARCH_DMA_MINALIGN));
+	assert(devm_kmalloc(&child, 0, GFP_KERNEL) == ZERO_SIZE_PTR);
+	assert(!devm_kmalloc(&child, SIZE_MAX, GFP_KERNEL));
+	devm_kfree(&child, zeroed);
+	devm_kfree(&child, NULL);
+	assert(devm_ioremap_wc(&child, 0xd0000000, PAGE_SIZE) == (void __iomem *)window);
+	assert(mapped == 1);
+	static DEVICE_ATTR_RO(test);
+	assert(!device_create_file(&child, &dev_attr_test));
+	device_remove_file(&child, &dev_attr_test);
+	assert(!component_add_typed(&child, NULL, 1));
 	device_unregister(&child);
-	assert(!memcmp(undone, "bca", 3));
+	assert(!memcmp(undone, "bca", 3) && undone_count == 3 && !mapped);
 	put_device(&child);
 	assert(released == 2);
+
+	/* A node set on a device is what a match by node compares. */
+	struct fwnode_handle node = {};
+	struct device with_node = {}, other = {};
+	device_set_node(&with_node, &node);
+	assert(with_node.fwnode == &node && !with_node.of_node);
+	device_set_of_node_from_dev(&other, &with_node);
+	assert(!other.of_node && dev_of_node_reused(&other));
+	assert(!device_match_of_node(&other, NULL));
+	static const struct bus_type test_bus = {.name = "test"};
+	static const struct bus_type unnamed = {};
+	assert(!bus_register(&test_bus) && bus_register(&unnamed) == -EINVAL);
+	bus_unregister(&test_bus);
 
 	struct class *class = class_create("test");
 	assert(!IS_ERR(class) && !strcmp(class->name, "test"));
