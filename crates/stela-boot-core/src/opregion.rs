@@ -10,6 +10,7 @@
 //! `vbt_firmware` parameter names, where `intel_bios.c` checks it again in
 //! full (`intel_bios_is_valid_vbt`). The rules here are
 //! `intel_opregion_setup`'s.
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::ops::Range;
 
 /// The configuration register holding the OpRegion's physical address
@@ -114,9 +115,185 @@ pub fn table(bytes: &[u8]) -> Option<&[u8]> {
         .then(|| &bytes[..size])
 }
 
+/// Which of its two places the OpRegion's table came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Place {
+    /// Outside the OpRegion, at `RVDA`.
+    Outside,
+    /// Mailbox 4.
+    Mailbox,
+}
+
+impl core::fmt::Display for Place {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Outside => "RVDA",
+            Self::Mailbox => "mailbox 4",
+        })
+    }
+}
+
+/// A Video BIOS Table read from an OpRegion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vbt {
+    pub bytes: Vec<u8>,
+    pub place: Place,
+    /// The OpRegion's version, major then minor.
+    pub version: (u8, u8),
+}
+
+/// Why an OpRegion gave no table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Absent<E> {
+    /// `ASLS` leads to no OpRegion.
+    OpRegion(Error),
+    /// The firmware's memory could not be read.
+    Read(E),
+    /// Neither place begins as a table that fits it.
+    NoTable,
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Absent<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OpRegion(Error::NoAddress) => f.write_str("the firmware set no address"),
+            Self::OpRegion(Error::Signature) => {
+                f.write_str("the memory at its address has no OpRegion signature")
+            }
+            Self::Read(error) => write!(f, "its memory could not be read: {error}"),
+            Self::NoTable => f.write_str("it holds no Video BIOS Table"),
+        }
+    }
+}
+
+/// The largest table: its header gives the size in 16 bits.
+const LARGEST: usize = u16::MAX as usize;
+
+/// The table of the OpRegion at physical address `asls`, as
+/// `intel_opregion_setup` chooses it: the one outside when it is a table,
+/// else mailbox 4's. `read` copies firmware memory at a physical address.
+pub fn read<E>(
+    asls: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
+) -> Result<Vbt, Absent<E>> {
+    if asls == 0 {
+        return Err(Absent::OpRegion(Error::NoAddress));
+    }
+    let mut region: Box<[u8; BYTES]> = vec![0; BYTES]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!());
+    read(asls, &mut region[..]).map_err(Absent::Read)?;
+    let location = locate(asls, &region).map_err(Absent::OpRegion)?;
+    let version = (region[MAJOR], region[MINOR]);
+    let mut unread = None;
+    if let Some((address, bytes)) = location.outside {
+        // A table is never larger than its 16-bit size, whatever RVDS says.
+        let mut outside = vec![0; (bytes as usize).min(LARGEST)];
+        match read(address, &mut outside) {
+            Ok(()) => {
+                if let Some(found) = table(&outside) {
+                    return Ok(Vbt {
+                        bytes: found.to_vec(),
+                        place: Place::Outside,
+                        version,
+                    });
+                }
+            }
+            // Mailbox 4 may still hold one; the failure is the answer if not.
+            Err(error) => unread = Some(error),
+        }
+    }
+    table(&region[location.mailbox])
+        .map(|found| Vbt {
+            bytes: found.to_vec(),
+            place: Place::Mailbox,
+            version,
+        })
+        .ok_or(unread.map_or(Absent::NoTable, Absent::Read))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Firmware memory holding an OpRegion at `asls` and one more range.
+    fn memory<'a>(
+        asls: u64,
+        region: &'a [u8; BYTES],
+        other: (u64, &'a [u8]),
+    ) -> impl FnMut(u64, &mut [u8]) -> Result<(), &'static str> + 'a {
+        move |address, into| {
+            let (base, bytes): (u64, &[u8]) = if address == asls {
+                (asls, region)
+            } else {
+                other
+            };
+            let start = address.checked_sub(base).ok_or("unmapped")? as usize;
+            let from = bytes
+                .get(start..start + into.len())
+                .ok_or("past the range")?;
+            into.copy_from_slice(from);
+            Ok(())
+        }
+    }
+
+    fn vbt(bytes: &mut [u8], size: u16) {
+        bytes[..4].copy_from_slice(b"$VBT");
+        bytes[0x18..0x1a].copy_from_slice(&size.to_le_bytes());
+    }
+
+    #[test]
+    fn the_outside_table_comes_first_and_mailbox_four_stands_in() {
+        let asls = 0x7a00_0000;
+        let mut both = region(2, 1, MAILBOX_ASLE);
+        outside(&mut both, 0x2000, 0x3000);
+        vbt(&mut both[VBT..], 0x800);
+        let mut far = [0u8; 0x3000];
+        vbt(&mut far, 0x2345);
+        let found = read(asls, memory(asls, &both, (asls + 0x2000, &far))).unwrap();
+        assert_eq!((found.place, found.bytes.len()), (Place::Outside, 0x2345));
+        assert_eq!(found.version, (2, 1));
+        // What RVDA points at is no table: mailbox 4's is used.
+        let blank = [0u8; 0x3000];
+        let found = read(asls, memory(asls, &both, (asls + 0x2000, &blank))).unwrap();
+        assert_eq!((found.place, found.bytes.len()), (Place::Mailbox, 0x800));
+        assert_eq!(&found.bytes[..4], b"$VBT");
+    }
+
+    #[test]
+    fn an_opregion_without_a_table_and_unreadable_memory_are_named() {
+        let asls = 0x7a00_0000;
+        let empty = region(2, 0, MAILBOX_ASLE);
+        assert_eq!(
+            read(asls, memory(asls, &empty, (0, &[]))),
+            Err(Absent::NoTable)
+        );
+        assert_eq!(
+            read::<&str>(0, |_, _| unreachable!()),
+            Err(Absent::OpRegion(Error::NoAddress))
+        );
+        assert_eq!(
+            read(asls, |_, _| Err("refused")),
+            Err(Absent::Read("refused"))
+        );
+        let foreign = [0u8; BYTES];
+        assert_eq!(
+            read(asls, memory(asls, &foreign, (0, &[]))),
+            Err(Absent::OpRegion(Error::Signature))
+        );
+        // An outside table that cannot be read leaves mailbox 4's, and is
+        // the reason when that holds none.
+        let mut far = region(2, 0, MAILBOX_ASLE);
+        outside(&mut far, 0x7b00_0000, 0x1000);
+        assert_eq!(
+            read(asls, memory(asls, &far, (u64::MAX, &[]))),
+            Err(Absent::Read("unmapped"))
+        );
+        vbt(&mut far[VBT..], 0x400);
+        let found = read(asls, memory(asls, &far, (u64::MAX, &[]))).unwrap();
+        assert_eq!((found.place, found.bytes.len()), (Place::Mailbox, 0x400));
+    }
 
     fn region(major: u8, minor: u8, mailboxes: u32) -> [u8; BYTES] {
         let mut region = [0; BYTES];
