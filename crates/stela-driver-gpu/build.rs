@@ -18,6 +18,9 @@ mod native;
 mod nouveau;
 #[path = "build/nouveau_firmware.rs"]
 mod nouveau_firmware;
+#[cfg(feature = "xe-port")]
+#[path = "build/xe.rs"]
+mod xe;
 
 /// The Vulkan drivers `cargo xtask gpu nvk` linked into the image's archives,
 /// as it lists them beside them: with `metal-linked`, Intel's sets
@@ -43,16 +46,8 @@ fn vulkan_drivers() {
     }
 }
 
-/// `xe-port` is the Intel stack's feature, which `metal.rs` names for the
-/// Intel branch's Vulkan driver module; this tree takes that module from the
-/// shared Mesa build before the feature itself.
-fn intel_feature() {
-    println!("cargo:rustc-check-cfg=cfg(feature, values(\"xe-port\"))");
-}
-
 fn main() {
     nouveau_firmware::validate();
-    intel_feature();
     vulkan_drivers();
     // Active ports declare their native source inputs below. Without this
     // baseline Cargo watches every vendored file even when no C port is used.
@@ -79,6 +74,8 @@ fn main() {
         let drivers = vec![
             #[cfg(feature = "nouveau-port")]
             nouveau::port(&linux),
+            #[cfg(feature = "xe-port")]
+            xe::port(&linux),
             #[cfg(feature = "amdgpu-port")]
             amdgpu::port(&linux),
         ];

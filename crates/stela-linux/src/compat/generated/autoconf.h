@@ -130,8 +130,22 @@
 #define CONFIG_MMU_NOTIFIER 1
 #define CONFIG_HMM_MIRROR 1
 
+/* xe with display. DRM_XE_DISPLAY depends on DRM_XE=m, so that a built-in
+ * i915 and xe never both define the display code they share; Stela builds no
+ * modules and links no i915, so both are built in. Selected by xe's entry and
+ * left out because nothing compiled reads them: SHMEM and TMPFS (as for TTM),
+ * RELAY, and DRM_CLIENT_SELECTION, which acts only with DRM_FBDEV_EMULATION.
+ * ACPI is not set, so its conditional selects (ACPI_VIDEO, ACPI_WMI, INPUT,
+ * BACKLIGHT_CLASS_DEVICE) do not apply. DRM_XE_GPUSVM depends on ZONE_DEVICE
+ * and DRM_XE_DP_TUNNEL on USB4, which are not set. */
+#define CONFIG_DRM_XE 1
+#define CONFIG_DRM_XE_DISPLAY 1
+/* xe's ID table marks Tiger Lake through Meteor Lake and Arc A-series as
+ * experimental and binds them only when this names them. Stela has no other
+ * driver for them, so it names every device of the table. */
+#define CONFIG_DRM_XE_FORCE_PROBE "*"
+
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
-#define CONFIG_DRM_XE_FORCE_PROBE ""
 #define CONFIG_DRM_I915_REQUEST_TIMEOUT 20000
 #define CONFIG_DRM_I915_FENCE_TIMEOUT 10000
 #define CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND 250
