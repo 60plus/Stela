@@ -1556,7 +1556,7 @@ fn open_gpus(
         ms(probe),
         ms(host::rdtsc().wrapping_sub(claiming)),
     ));
-    match opened {
+    let ok = match opened {
         Ok(()) => {
             crate::status::done("started");
             true
@@ -1568,7 +1568,9 @@ fn open_gpus(
             ));
             false
         }
-    }
+    };
+    output::flush_log();
+    ok
 }
 
 /// What the board's devices are placed from besides the board itself.

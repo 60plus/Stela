@@ -21,10 +21,10 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 2, recipes().count());
-    // The recipes' recorded lengths: 87 files, 115.8 MiB.
-    assert_eq!((count, bytes), (87, 121_468_440), "{count} {bytes}");
+    // The recipes' recorded lengths: 88 files, 177.0 MiB.
+    assert_eq!((count, bytes), (88, 185_584_904), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
-    assert_eq!(objects.last().unwrap().length, 63_571_696);
+    assert_eq!(objects.last().unwrap().length, 64_116_464);
     let manifest = manifest(&complete()).unwrap();
     let bundle = Bundle::parse(&manifest).unwrap();
     assert_eq!(bundle.objects.len(), count);
@@ -119,9 +119,9 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     expected.extend([
         "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
         "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
-        "nvidia/ga102/gsp/gsp-570.144.bin",
-        "nvidia/gb202/gsp/bootloader-570.144.bin",
-        "nvidia/gb202/gsp/fmc-570.144.bin",
+        "nvidia/gb202/gsp/bootloader-570.211.01.bin",
+        "nvidia/gb202/gsp/fmc-570.211.01.bin",
+        "nvidia/gb202/gsp/gsp-570.211.01.bin",
         "regulatory.db",
         "regulatory.db.p7s",
     ]);
@@ -135,7 +135,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     assert_eq!(
         pc.wanted
             .iter()
-            .find(|(artifact, _)| artifact.length == 63_571_696)
+            .find(|(artifact, _)| artifact.length == 64_116_464)
             .unwrap()
             .1,
         "pci 10de:2c02"

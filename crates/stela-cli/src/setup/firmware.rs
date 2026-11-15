@@ -1,5 +1,7 @@
 //! Vendor firmware provisioning for a native-driver requirement inventory.
 //! Network/cache policy stays in the CLI; the loader validates pins/packages.
+mod nvidia;
+
 use anyhow::{Context, Result, ensure};
 use reqwest::{blocking::Client, header, redirect::Policy};
 use std::{
@@ -106,18 +108,27 @@ fn mib(bytes: usize) -> String {
     format!("{:.1}", bytes as f64 / MIB as f64)
 }
 
-/// Ask `url` for `artifact`, going on from the `part` of it earlier
-/// requests brought with a Range request. On success `part` holds the
-/// checked file; after a cut it holds what arrived, for the next request.
+/// Ask `url` for `artifact` (or its bounded `slice` `(offset, total)`), going
+/// on from the `part` of it earlier requests brought with a Range request. On
+/// success `part` holds the checked file; after a cut it holds what arrived,
+/// for the next request.
 fn request(
     client: &Client,
     url: &str,
     artifact: &Artifact,
+    slice: Option<(u64, u64)>,
     part: &mut Vec<u8>,
 ) -> Result<(), Answer> {
     let had = part.len();
+    let length = artifact.length as u64;
     let mut get = client.get(url).header(header::ACCEPT_ENCODING, "identity");
-    if had > 0 {
+    if let Some((offset, _)) = slice {
+        let end = offset + length - 1;
+        get = get.header(
+            header::RANGE,
+            format!("bytes={}-{end}", offset + had as u64),
+        );
+    } else if had > 0 {
         get = get.header(header::RANGE, format!("bytes={had}-"));
     }
     let mut response = match get.send() {
@@ -128,11 +139,20 @@ fn request(
         Err(error) => return Err(Answer::Final(crate::net::explain(&error))),
     };
     let status = response.status();
-    let length = artifact.length as u64;
-    let start = match status.as_u16() {
+    let start = match (status.as_u16(), slice) {
         // The whole file: a server without ranges sends it again.
-        200 => 0,
-        206 if had > 0 => {
+        (200, None) => 0,
+        (206, Some((offset, total))) => {
+            let expected = (offset + had as u64, offset + length - 1, total);
+            if content_range(&response) != Some(expected) {
+                part.clear();
+                return Err(Answer::Transient(
+                    "sent a range other than the one asked for".into(),
+                ));
+            }
+            had
+        }
+        (206, None) if had > 0 => {
             if content_range(&response) != Some((had as u64, length - 1, length)) {
                 part.clear();
                 return Err(Answer::Transient(
@@ -141,11 +161,11 @@ fn request(
             }
             had
         }
-        416 if had > 0 => {
+        (416, _) if had > 0 => {
             part.clear();
             return Err(Answer::Transient(format!("answered {status} to a resume")));
         }
-        429 | 503 => {
+        (429 | 503, _) => {
             let after = retry_after(&response);
             let asked = match after {
                 Some(after) if after != Duration::MAX => {
@@ -203,7 +223,28 @@ fn host_of(url: &str) -> &str {
 }
 
 fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    if let Some(spec) = nvidia::spec(artifact) {
+        let wire = download_slice(
+            client,
+            &spec.wire,
+            spec.slice,
+            &artifact.urls(),
+            &mut std::thread::sleep,
+        )?;
+        let bytes = (spec.extract)(&wire)?;
+        artifact.verify(&bytes)?;
+        return Ok(bytes);
+    }
     download_from(client, artifact, &artifact.urls(), &mut std::thread::sleep)
+}
+
+fn download_from(
+    client: &Client,
+    artifact: &Artifact,
+    urls: &[String],
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Vec<u8>> {
+    download_slice(client, artifact, None, urls, sleep)
 }
 
 /// Download `artifact` from the first of `urls` that sends its pinned
@@ -212,9 +253,10 @@ fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
 /// [`WAIT_BUDGET`]; past it, or after [`ATTEMPTS`] requests that bring
 /// nothing, the next source is asked at once. The error names the file and
 /// what each source answered.
-fn download_from(
+fn download_slice(
     client: &Client,
     artifact: &Artifact,
+    slice: Option<(u64, u64)>,
     urls: &[String],
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Vec<u8>> {
@@ -227,7 +269,7 @@ fn download_from(
         let mut attempt = 1;
         let mut resumes = 0;
         let last = loop {
-            let pause = match request(client, url, artifact, &mut part) {
+            let pause = match request(client, url, artifact, slice, &mut part) {
                 Ok(()) => return Ok(part),
                 Err(Answer::Cut(what, true)) if resumes < RESUMES => {
                     eprintln!(
@@ -892,8 +934,8 @@ mod tests {
         let manifest = bundle::manifest(&files).unwrap();
         let parsed = bundle::Bundle::parse(&manifest).unwrap();
         assert!(parsed.missing().is_empty());
-        assert_eq!(parsed.objects.len(), 87);
-        assert_eq!(bundle_summary(), "for every supported device (115.8 MiB)");
+        assert_eq!(parsed.objects.len(), 88);
+        assert_eq!(bundle_summary(), "for every supported device (177.0 MiB)");
         // A volume short of room keeps the small files and leaves the large
         // GPU images out, by name.
         let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
@@ -904,6 +946,10 @@ mod tests {
         );
         let left: Vec<_> = left.iter().map(|artifact| artifact.member).collect();
         assert!(
+            left.contains(&"nvidia/gb202/gsp/gsp-570.211.01.bin"),
+            "{left:?}"
+        );
+        assert!(
             left.contains(&"nvidia/ga102/gsp/gsp-570.144.bin"),
             "{left:?}"
         );
@@ -913,7 +959,7 @@ mod tests {
         );
         assert!(!left.contains(&"regulatory.db"));
         // Files the volume already holds count as room.
-        let (_, left) = bundle_plan(Some(MARGIN), 200 * MIB);
+        let (_, left) = bundle_plan(Some(MARGIN), 260 * MIB);
         assert!(left.is_empty());
     }
 
@@ -1124,7 +1170,7 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware on the stick is incomplete: 3 of 87 files are there"
+            "the firmware on the stick is incomplete: 3 of 88 files are there"
         );
     }
 
@@ -1146,7 +1192,7 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        assert!(status.contains("lacks 86 of 87 files"), "{status}");
+        assert!(status.contains("lacks 87 of 88 files"), "{status}");
         assert!(!status.contains("nvidia/"), "{status}");
         assert!(status.contains("1 of its files are damaged"), "{status}");
     }
@@ -1439,6 +1485,23 @@ mod tests {
         let heads = server.join().unwrap();
         assert!(!heads[0].contains("range:"), "{heads:?}");
         assert!(heads[1].contains("range: bytes=2-\r\n"), "{heads:?}");
+    }
+
+    #[test]
+    fn a_bounded_slice_requests_and_resumes_exact_byte_ranges() {
+        let cut = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 100-102/500\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
+        let rest = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 102-102/500\r\nContent-Length: 1\r\nConnection: close\r\n\r\nc";
+        let (url, server) = scripted(vec![vec![cut], vec![rest]], Duration::ZERO);
+        let mut slept = Vec::new();
+        let bytes = download_slice(&client(), &ABC, Some((100, 500)), &[url], &mut |d| {
+            slept.push(d)
+        })
+        .unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(slept, [RESUME_PAUSE]);
+        let heads = server.join().unwrap();
+        assert!(heads[0].contains("range: bytes=100-102\r\n"), "{heads:?}");
+        assert!(heads[1].contains("range: bytes=102-102\r\n"), "{heads:?}");
     }
 
     #[test]
@@ -1742,5 +1805,27 @@ mod tests {
             fs::read(destination.join("manifest.json")).unwrap(),
             manifest_bytes
         );
+    }
+
+    #[test]
+    #[ignore = "oracle: STELA_NVIDIA_570_211_TEST"]
+    fn nvidia_570_211_01_live_provisioning_matches_recipe_pins() {
+        assert!(
+            std::env::var_os("STELA_NVIDIA_570_211_TEST").is_some(),
+            "set STELA_NVIDIA_570_211_TEST=1 to run live NVIDIA 570.211.01 download test"
+        );
+        let http = client();
+        let gb20x: Vec<_> = bundle::complete()
+            .into_iter()
+            .map(|(object, _)| object)
+            .filter(|a| {
+                a.source == recipes::NVIDIA_OPEN_GPU || a.source == recipes::NVIDIA_LINUX_DRIVER
+            })
+            .collect();
+        assert_eq!(gb20x.len(), 3);
+        for artifact in gb20x {
+            let bytes = download(&http, artifact).unwrap();
+            artifact.verify(&bytes).unwrap();
+        }
     }
 }

@@ -2162,12 +2162,14 @@ fn wait_for_child(
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
+            super::storage::store_usb_log_in_gpu_start();
             return Ok(());
         }
         let now = time.now_ns().map_err(environment_error)?;
         let waited_ms = output::millis_since(began);
         // The counter bounds the wait too, when Linux's clock stands still.
         if now >= deadline || waited_ms >= START_SECONDS * 1000 {
+            super::storage::store_usb_log_in_gpu_start();
             return Err(Error::Timeout);
         }
         if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {

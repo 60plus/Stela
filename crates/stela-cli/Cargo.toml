@@ -45,6 +45,9 @@ plist = "1"
 zeroize = "1"
 libc.workspace = true
 sha1 = "0.10"
+crc32fast = "1"
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+ruzstd = "0.8"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 cliclack = "0.5"
 indicatif = "0.18"
@@ -73,10 +76,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[dev-dependencies]
-miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
-
 
 [lints]
 workspace = true

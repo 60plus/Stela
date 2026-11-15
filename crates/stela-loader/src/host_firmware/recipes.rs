@@ -25,6 +25,18 @@ pub const MT7925_BLUETOOTH_REVISION: &str = "2d70539375587a68bdef08fec2e0e1a5169
 pub const GSP_REVISION: &str = "1987bb2044a6c2d68c39d01c360bdbe17f1eb60c";
 /// The GSP-RM release nouveau's newest interface takes.
 const GSP_RELEASE: &str = "570.144";
+/// The R570 LTS GSP-RM release for GeForce Blackwell (`gb20x`), which adds
+/// RTX 5060 / 5060 Ti (`GB206`) and updated signed GB202 FMC and bootloader.
+pub const GB20X_GSP_RELEASE: &str = "570.211.01";
+/// NVIDIA's open GPU kernel modules repository (`tag 570.211.01`), whose
+/// generated `bindata` sources hold the signed GB202 bootloader and GSP-FMC
+/// images before `linux-firmware` publishes them.
+pub const NVIDIA_OPEN_GPU: &str = "https://github.com/NVIDIA/open-gpu-kernel-modules";
+pub const GB20X_OPEN_GPU_REVISION: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
+/// NVIDIA's Linux x86_64 release archive, whose compressed tar stream begins
+/// with `firmware/gsp_ga10x.bin`.
+pub const NVIDIA_LINUX_DRIVER: &str = "https://download.nvidia.com/XFree86/Linux-x86_64";
+pub const NVIDIA_LINUX_DRIVER_MIRROR: &str = "https://us.download.nvidia.com/XFree86/Linux-x86_64";
 /// The files of a release, of which each chip family has some.
 const GSP_KINDS: [&str; 6] = [
     "booter_load",
@@ -53,10 +65,30 @@ pub struct Artifact {
 
 impl Artifact {
     /// The member at the pinned revision: cgit's `plain` form on
-    /// git.kernel.org, GitLab's `raw` form elsewhere.
+    /// git.kernel.org, raw GitHub / NVIDIA archive URLs for `NVIDIA_*`, and
+    /// GitLab's `raw` form elsewhere.
     pub fn url(&self) -> alloc::string::String {
         if self.source.starts_with(KERNEL_ORG_GIT) {
             format!("{}/plain/{}?h={}", self.source, self.member, self.revision)
+        } else if self.source == NVIDIA_OPEN_GPU {
+            let bindata = match self.member {
+                "nvidia/gb202/gsp/bootloader-570.211.01.bin" => {
+                    "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c"
+                }
+                "nvidia/gb202/gsp/fmc-570.211.01.bin" => {
+                    "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB202.c"
+                }
+                other => other,
+            };
+            format!(
+                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/{}/{bindata}",
+                self.revision
+            )
+        } else if self.source == NVIDIA_LINUX_DRIVER {
+            format!(
+                "{}/{}/NVIDIA-Linux-x86_64-{}.run",
+                self.source, self.revision, self.revision
+            )
         } else {
             format!("{}/-/raw/{}/{}", self.source, self.revision, self.member)
         }
@@ -64,7 +96,8 @@ impl Artifact {
     /// Every source of the member at the pinned revision, the one to try
     /// first first: linux-firmware's git.kernel.org repository, then its
     /// GitLab mirror, whose unauthenticated traffic has an hourly per-IP
-    /// limit. The pinned hash is checked whichever answers.
+    /// limit; or NVIDIA's primary and US download mirrors for release
+    /// archives. The pinned hash is checked whichever answers.
     pub fn urls(&self) -> Vec<alloc::string::String> {
         if self.source == LINUX_FIRMWARE {
             alloc::vec![
@@ -73,6 +106,14 @@ impl Artifact {
                     self.member, self.revision
                 ),
                 self.url(),
+            ]
+        } else if self.source == NVIDIA_LINUX_DRIVER {
+            alloc::vec![
+                self.url(),
+                format!(
+                    "{NVIDIA_LINUX_DRIVER_MIRROR}/{}/NVIDIA-Linux-x86_64-{}.run",
+                    self.revision, self.revision
+                ),
             ]
         } else {
             alloc::vec![self.url()]
@@ -719,11 +760,17 @@ const GSP_LICENSE: Artifact = Artifact {
     sha256: "bc5225a57f49c5249dcf238e4ae6437811677a2a8a7f579c3d839e058653ee44",
 };
 
-const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+const fn gsp_from(
+    source: &'static str,
+    revision: &'static str,
+    member: &'static str,
+    length: usize,
+    sha256: &'static str,
+) -> Recipe {
     Recipe {
         image: Artifact {
-            source: LINUX_FIRMWARE,
-            revision: GSP_REVISION,
+            source,
+            revision,
             member,
             length,
             sha256,
@@ -731,6 +778,10 @@ const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recip
         license: &GSP_LICENSE,
         consumer: Consumer::Nouveau,
     }
+}
+
+const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    gsp_from(LINUX_FIRMWARE, GSP_REVISION, member, length, sha256)
 }
 
 /// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`], and the
@@ -802,15 +853,26 @@ pub const GSP: &[Recipe] = &[
         198028,
         "bc7497c2d8116cceec2fe5638081d60b8f9c0e3dceb0b57dc93950c84909ce21",
     ),
-    gsp(
-        "nvidia/gb202/gsp/bootloader-570.144.bin",
+    gsp_from(
+        NVIDIA_OPEN_GPU,
+        GB20X_OPEN_GPU_REVISION,
+        "nvidia/gb202/gsp/bootloader-570.211.01.bin",
         200812,
-        "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071",
+        "e5e505fb453bcd618a4966464aa601e97a1ced2b1d450cab5bcb69e4043dc7f2",
     ),
-    gsp(
-        "nvidia/gb202/gsp/fmc-570.144.bin",
+    gsp_from(
+        NVIDIA_OPEN_GPU,
+        GB20X_OPEN_GPU_REVISION,
+        "nvidia/gb202/gsp/fmc-570.211.01.bin",
         199820,
-        "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece",
+        "e0950cdd16fe7045adbce11543f5b6d13146fca89e78158a9ab07d28dcbe576a",
+    ),
+    gsp_from(
+        NVIDIA_LINUX_DRIVER,
+        GB20X_GSP_RELEASE,
+        "nvidia/gb202/gsp/gsp-570.211.01.bin",
+        64116464,
+        "3ce89a251900d0238d0593e4b9eb039c4571c6c54d09661fad7399f89e37d4bc",
     ),
     gsp(
         "nvidia/gh100/gsp/bootloader-570.144.bin",
@@ -897,6 +959,13 @@ fn acr_directory(chip: &str) -> Option<&'static str> {
     matches!(gsp_directory(chip)?, "tu102" | "tu116").then_some("tu102")
 }
 
+fn gsp_release(directory: &str) -> &'static str {
+    match directory {
+        "gb202" => GB20X_GSP_RELEASE,
+        _ => GSP_RELEASE,
+    }
+}
+
 /// nouveau's request for a chip's GSP-RM file, through `WHENCE`'s links: the
 /// firmware itself runs on families of chips, and only the signed booters
 /// differ between them. The ACR bootloader follows the same links.
@@ -916,12 +985,12 @@ fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     let (chip, file) = named.split_once("/gsp/")?;
     let directory = gsp_directory(chip)?;
     let (kind, release) = file.strip_suffix(".bin")?.split_once('-')?;
-    if release != GSP_RELEASE {
+    if release != gsp_release(directory) {
         return None;
     }
     let owner = match (directory, kind) {
         ("tu116" | "ga100", "gen_bootloader" | "gsp") | ("tu116", "bootloader") => "tu102",
-        ("ad102" | "gh100" | "gb100" | "gb202", "gsp") => "ga102",
+        ("ad102" | "gh100" | "gb100", "gsp") => "ga102",
         _ => directory,
     };
     let member = format!("nvidia/{owner}/gsp/{file}");
@@ -968,9 +1037,10 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
         revision: "linux-firmware",
         board: None,
     };
+    let release = gsp_directory(chip).map_or(GSP_RELEASE, gsp_release);
     let mut found = false;
     for kind in GSP_KINDS {
-        let name = format!("nvidia/{chip}/gsp/{kind}-{GSP_RELEASE}.bin");
+        let name = format!("nvidia/{chip}/gsp/{kind}-{release}.bin");
         let request = Requirement {
             name: &name,
             target,
@@ -1695,8 +1765,12 @@ mod tests {
                 "nvidia/tu116/gsp/booter_unload-570.144.bin",
             ),
             (
-                "nvidia/gb207/gsp/fmc-570.144.bin",
-                "nvidia/gb202/gsp/fmc-570.144.bin",
+                "nvidia/gb207/gsp/fmc-570.211.01.bin",
+                "nvidia/gb202/gsp/fmc-570.211.01.bin",
+            ),
+            (
+                "nvidia/gb206/gsp/gsp-570.211.01.bin",
+                "nvidia/gb202/gsp/gsp-570.211.01.bin",
             ),
             // The ACR bootloader follows the same links, unversioned, and
             // every Turing chip shares `tu102`'s copy of it.
@@ -1743,11 +1817,15 @@ mod tests {
             let name = format!("nvidia/{chip}/acr/bl.bin");
             assert!(gsp_member(&name).is_some(), "{name}");
         }
-        for chip in [
-            "gh100", "gb100", "gb102", "gb202", "gb203", "gb205", "gb206", "gb207",
-        ] {
+        for chip in ["gh100", "gb100", "gb102"] {
             for kind in ["fmc", "bootloader", "gsp"] {
                 let name = format!("nvidia/{chip}/gsp/{kind}-570.144.bin");
+                assert!(gsp_member(&name).is_some(), "{name}");
+            }
+        }
+        for chip in ["gb202", "gb203", "gb205", "gb206", "gb207"] {
+            for kind in ["fmc", "bootloader", "gsp"] {
+                let name = format!("nvidia/{chip}/gsp/{kind}-570.211.01.bin");
                 assert!(gsp_member(&name).is_some(), "{name}");
             }
         }
@@ -1784,10 +1862,9 @@ mod tests {
         );
         assert_eq!(artifact.urls(), [artifact.url()]);
         for recipe in super::super::bundle::recipes() {
-            let sources = recipe.image.urls().len();
             assert_eq!(
-                sources,
-                if recipe.image.source == WIRELESS_REGDB {
+                recipe.image.urls().len(),
+                if matches!(recipe.image.source, WIRELESS_REGDB | NVIDIA_OPEN_GPU) {
                     1
                 } else {
                     2
@@ -1795,7 +1872,16 @@ mod tests {
                 "{}",
                 recipe.image.member
             );
-            assert_eq!(recipe.license.urls().len(), sources);
+            assert_eq!(
+                recipe.license.urls().len(),
+                if recipe.license.source == WIRELESS_REGDB {
+                    1
+                } else {
+                    2
+                },
+                "{}",
+                recipe.license.member
+            );
         }
         let value = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":"regulatory.db", "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},"minimum_bytes":8
@@ -1838,9 +1924,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                "nvidia/gb203/gsp/bootloader-570.144.bin",
-                "nvidia/gb203/gsp/fmc-570.144.bin",
-                "nvidia/gb203/gsp/gsp-570.144.bin",
+                "nvidia/gb203/gsp/bootloader-570.211.01.bin",
+                "nvidia/gb203/gsp/fmc-570.211.01.bin",
+                "nvidia/gb203/gsp/gsp-570.211.01.bin",
             ]
         );
         // An NVIDIA GPU's audio function is no GPU.
