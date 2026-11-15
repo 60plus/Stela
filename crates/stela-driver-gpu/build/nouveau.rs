@@ -48,6 +48,12 @@ const OPEN: super::image::Open = &[
         "the driver core's device lists",
         &["class_find_device", "device_find_child"],
     ),
+    // MMU_NOTIFIER gives every mm notifiers, which dropping an mm destroys;
+    // nothing subscribes one, which is what takes these locks.
+    (
+        "an address space's first notifier",
+        &["mm_drop_all_locks", "mm_take_all_locks"],
+    ),
 ];
 
 /// The unit of nouveau's own `module_init`.

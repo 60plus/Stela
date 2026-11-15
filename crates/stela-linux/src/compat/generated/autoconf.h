@@ -104,6 +104,12 @@
 #define CONFIG_HWMON 1
 #define CONFIG_BACKLIGHT_CLASS_DEVICE 1
 #define CONFIG_POWER_SUPPLY 1
+/* Every address space carries notifiers, for a driver that mirrors a client's
+ * memory: DRM_GPUSVM, which xe's entry selects, selects both, and the
+ * interval tree a ranged notifier is kept in (INTERVAL_TREE, above). Nothing
+ * subscribes one here (kernel/unsupported.c says why). */
+#define CONFIG_MMU_NOTIFIER 1
+#define CONFIG_HMM_MIRROR 1
 
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_XE_FORCE_PROBE ""

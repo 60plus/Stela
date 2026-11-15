@@ -345,6 +345,13 @@ impl Linux {
                 .iter()
                 .map(|source| PathBuf::from(format!("{LINUX}/drivers/dma-buf/{source}.c"))),
         );
+        // What MMU_NOTIFIER builds: the notifiers of an address space, over
+        // the interval tree of the ranged ones and the lock-less list their
+        // deferred removals wait in.
+        upstream.extend(
+            ["mm/mmu_notifier", "lib/interval_tree", "lib/llist"]
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
+        );
         let hosted_upstream = upstream.clone();
         println!("cargo:rerun-if-changed={LINUX}/kernel/sched");
         upstream.retain(|source| !captured_units().iter().any(|unit| unit.path() == *source));

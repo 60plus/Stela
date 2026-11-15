@@ -2,10 +2,13 @@
 /* Kernel services Stela does not provide yet. */
 #include <linux/folio_batch.h>
 #include <linux/fs.h>
+#include <linux/hmm.h>
 #include <linux/io.h>
+#include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/mm.h>
 #include <linux/seq_file.h>
 #include <linux/swap.h>
 #include <stela/linux.h>
@@ -24,6 +27,29 @@ STELA_UNSUPPORTED(bool, folio_clear_dirty_for_io, struct folio *)
 /* Transparent huge mappings of shmem-backed objects. */
 STELA_UNSUPPORTED(unsigned long, mm_get_unmapped_area, struct file *, unsigned long,
 		  unsigned long, unsigned long, unsigned long)
+/* The locks of every mapping of an address space, which subscribing its
+ * first notifier takes. Only a driver mirroring a client's memory (userptr)
+ * subscribes one, and that also needs the client's pages faulted in through
+ * Linux page tables, which Stela's clients do not have. */
+STELA_UNSUPPORTED(int, mm_take_all_locks, struct mm_struct *)
+STELA_UNSUPPORTED(void, mm_drop_all_locks, struct mm_struct *)
+/* A client's own memory as a device's buffer (userptr) and a value written
+ * into a client from a worker (a user fence). Both need the client as a
+ * Linux address space with VMAs and page tables. Stela's clients are not:
+ * the Metal device, the only caller of a GPU driver's ioctls, asks for
+ * neither. A fault of a range is refused and said once; the rest is reached
+ * only after a range faulted or a worker adopted an address space. */
+int hmm_range_fault(struct hmm_range *range)
+{
+	(void)range;
+	stela_linux_unsupported("a client's own memory as a device buffer (userptr)");
+	return -EOPNOTSUPP;
+}
+STELA_UNSUPPORTED(struct vm_area_struct *, find_vma_intersection, struct mm_struct *,
+		  unsigned long, unsigned long)
+STELA_UNSUPPORTED(void, kthread_use_mm, struct mm_struct *)
+STELA_UNSUPPORTED(void, kthread_unuse_mm, struct mm_struct *)
+STELA_UNSUPPORTED(void, mmput, struct mm_struct *)
 /* debugfs's seq_file operations, which no file opens: Stela has no debugfs. */
 STELA_UNSUPPORTED(int, single_open, struct file *, int (*)(struct seq_file *, void *), void *)
 STELA_UNSUPPORTED(int, single_release, struct inode *, struct file *)
