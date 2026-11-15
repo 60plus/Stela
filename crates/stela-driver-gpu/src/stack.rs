@@ -34,8 +34,9 @@ pub struct GpuStack {
     /// Admission of the stack's Vulkan device as a Metal device.
     #[cfg(feature = "metal")]
     pub metal: crate::metal::open::Admission,
-    /// The Vulkan driver linked into the image.
-    #[cfg(feature = "metal-linked")]
+    /// The Vulkan driver linked into the image. This crate's own test
+    /// binary links no driver archive, so it holds none.
+    #[cfg(all(feature = "metal-linked", not(test)))]
     pub vulkan: crate::metal::native::Driver,
 }
 
@@ -62,7 +63,7 @@ pub static NVIDIA: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: crate::metal::nvidia::ADMISSION,
-    #[cfg(feature = "metal-linked")]
+    #[cfg(all(feature = "metal-linked", not(test)))]
     vulkan: crate::metal::nvidia::DRIVER,
 };
 
