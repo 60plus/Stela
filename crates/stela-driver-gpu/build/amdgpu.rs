@@ -27,11 +27,7 @@ const MODULE: Module<'static> = Module {
 /// Linux service complete before the profile takes it. amdgpu compiles
 /// without them only as far as its own `IS_ENABLED` branches allow, so the
 /// port is not a valid configuration of the driver until this is empty.
-pub const PENDING: [&str; 7] = [
-    // Not a selection of amdgpu's entry but of I2C's, which every DRM driver
-    // here already depends on: `amdgpu_irq.c` routes its sources through an
-    // IRQ domain ([`BLOCKED`]).
-    "CONFIG_IRQ_DOMAIN",
+pub const PENDING: [&str; 6] = [
     "CONFIG_BACKLIGHT_CLASS_DEVICE",
     "CONFIG_DRM_CLIENT",
     "CONFIG_DRM_CLIENT_SELECTION",
@@ -39,10 +35,6 @@ pub const PENDING: [&str; 7] = [
     "CONFIG_HWMON",
     "CONFIG_POWER_SUPPLY",
 ];
-
-/// Units that cannot compile until a pending selection is set, with the
-/// selection. Each must fail to compile, and nothing else may.
-const BLOCKED: [(&str, &str); 1] = [("amdgpu_irq.o", "CONFIG_IRQ_DOMAIN")];
 
 /// The kernel services the composite imports that neither it nor Stela's
 /// Linux environment defines, one per line. Building fails when the imports
@@ -179,25 +171,18 @@ pub fn port(linux: &Linux) {
         .and_then(|jobs| jobs.parse().ok())
         .unwrap_or(1)
         .max(1);
-    let blocked = BLOCKED
-        .iter()
-        .map(|(object, _)| Path::new(AMDGPU).join(object).with_extension("c"))
-        .collect::<Vec<_>>();
     // Every unit is compiled before any failure is reported, so one build
     // names all that fail.
     let results = thread::scope(|scope| {
         units
             .chunks(units.len().div_ceil(jobs))
             .map(|chunk| {
-                let (build, blocked) = (&build, &blocked);
+                let build = &build;
                 scope.spawn(move || {
                     chunk
                         .iter()
                         .map(|unit| {
                             let mut build = build.clone();
-                            // An expected failure is checked below, not
-                            // printed with every build.
-                            build.cargo_warnings(!blocked.contains(&unit.source));
                             for flag in &unit.remove {
                                 build.remove_flag(flag);
                             }
@@ -222,9 +207,8 @@ pub fn port(linux: &Linux) {
         .filter_map(|result| result.as_ref().err())
         .collect::<Vec<_>>();
     assert!(
-        failed.iter().copied().eq(blocked.iter()),
-        "{} of amdgpu's {} units do not compile, where {BLOCKED:?} are expected to fail: \
-         {failed:?}",
+        failed.is_empty(),
+        "{} of amdgpu's {} units do not compile: {failed:?}",
         failed.len(),
         units.len()
     );
