@@ -293,17 +293,37 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the upper half since its contexts were last forgotten was
     /// non-global: the ASID selects nothing else of it, so a kernel's
     /// global text keeps one context across every process's ASID.
-    pub(super) fn half_inputs(&self, half: usize, el: u8) -> (mmu::Controls, u64) {
-        const TCR_A1: u64 = 1 << 22;
-        const TTBR_ASID: u64 = 0xffff << 48;
+    /// The regime a fetch at `el` translates in: EL2&0 at EL2, and at EL0
+    /// under HCR_EL2.TGE (XNU's EL0 on an M2, whose kernel runs at EL2);
+    /// EL1&0 otherwise.
+    fn fetch_regime(&self, el: u8) -> crate::machine::cpu::TranslationRegime {
         use crate::machine::cpu::TranslationRegime;
         let el = el & 3;
-        let regime = if el == 2 || el == 0 && self.cpu.in_host() {
+        if el == 2 || el == 0 && self.cpu.in_host() {
             TranslationRegime::El20
         } else {
             TranslationRegime::El10
-        };
-        let mut controls = self.cpu.translating_controls(regime);
+        }
+    }
+
+    /// The ASID this PE's translations are tagged with now
+    /// ([`mmu::current_asid`] of its regime, the TTBR TCR.A1 selects): the
+    /// address space of a hot sample ([`step_timing::AsidSamples`]). Under
+    /// VHE the kernel's `TTBR0_EL1` writes reach `TTBR0_EL2`, so the EL1
+    /// register alone reads 0 there.
+    pub(super) fn current_space_asid(&self) -> u16 {
+        mmu::current_asid(
+            &self
+                .cpu
+                .translating_controls(self.fetch_regime(self.cpu.pstate.el)),
+        )
+    }
+
+    pub(super) fn half_inputs(&self, half: usize, el: u8) -> (mmu::Controls, u64) {
+        const TCR_A1: u64 = 1 << 22;
+        const TTBR_ASID: u64 = 0xffff << 48;
+        let el = el & 3;
+        let mut controls = self.cpu.translating_controls(self.fetch_regime(el));
         if el == 0 {
             controls.sprr.el1 = 0;
         } else {

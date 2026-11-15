@@ -389,7 +389,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 block.pc.wrapping_sub(self.cpu.read(vbar) & !0x7ff)
             };
             // The address space it ran in: its process, or the kernel's.
-            let asid = (self.cpu.read(SystemRegister::TTBR0_EL1) >> 48) as u16;
+            let asid = self.current_space_asid();
             self.hot_samples.push((pc, level, asid));
             // Its RET, BLR or BR form's transfer, at most as many as the
             // hot samples a take would keep.

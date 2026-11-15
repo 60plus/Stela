@@ -781,7 +781,7 @@ pub struct Machine<H: Host, D: Devices> {
     /// Hot-block samples not yet taken, under step timing
     /// ([`step_timing::HotBlocks`], [`Self::take_hot_samples`]), the runs
     /// until the next sampled one and the generator of sampled budgets.
-    /// Each is a PC, its level and the ASID TTBR0_EL1 held
+    /// Each is a PC, its level and the ASID of its regime
     /// ([`step_timing::AsidSamples`]).
     hot_samples: Vec<(u64, step_timing::Level, u16)>,
     /// The sampled runs among those whose last transfer was their block's

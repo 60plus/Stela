@@ -1361,8 +1361,8 @@ pub struct HotBlocks {
     pub asids: AsidSamples,
 }
 
-/// [`HotBlocks`]' samples by the ASID TTBR0_EL1 held at each one (bits
-/// 63:48), at any level: a user thread's system calls and faults count with
+/// [`HotBlocks`]' samples by the ASID the PE's translations were tagged with
+/// at each one (`Machine::current_space_asid`), at any level: a user thread's system calls and faults count with
 /// its process, as the guest's own CPU time does, and kernel threads with
 /// the kernel's address space. Each address space's samples by [`Level`],
 /// and its EL0 blocks apart, so the PCs name the process (its frameworks)
@@ -1987,6 +1987,22 @@ mod tests {
             } else {
                 (base + 12).wrapping_sub(VBAR)
             };
+        // Each regime's TTBR0 holds an ASID of its own (8 bits: TCR.AS is
+        // clear); the sample names the one its regime tags translations
+        // with, never a constant.
+        use crate::machine::system::Register;
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL1, 0, 0x11 << 48);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL2, 0, 0x22 << 48);
+        let asid = machine.current_space_asid();
+        let in_el20 =
+            machine.cpu.pstate.el == 2 || machine.cpu.pstate.el == 0 && machine.cpu.in_host();
+        assert_eq!(asid, if in_el20 { 0x22 } else { 0x11 });
         machine.set_step_timing(true);
         run(&mut machine, 2 * HOT_SAMPLE_EVERY);
         let mut hot = HotBlocks::default();
@@ -1995,6 +2011,13 @@ mod tests {
         assert_eq!(total, 2);
         let pcs: alloc::vec::Vec<u64> = hot.counted().map(|block| block.pc).collect();
         assert_eq!(pcs, [expected]);
+        let spaces: alloc::vec::Vec<(u16, u64)> = hot
+            .asids
+            .top(8)
+            .iter()
+            .map(|space| (space.asid, space.total()))
+            .collect();
+        assert_eq!(spaces, [(asid, 2)]);
         assert!(!machine.has_hot_samples());
         // Draws stay within the span and below the run's own budget.
         for _ in 0..1000 {
@@ -2002,6 +2025,53 @@ mod tests {
             assert!((1..=HOT_SAMPLE_SPAN + 1).contains(&budget));
             assert_eq!(sampled, budget <= HOT_SAMPLE_SPAN);
         }
+    }
+
+    /// A sample's address space is the ASID its regime tags translations
+    /// with: under VHE with HCR_EL2.TGE (XNU on an M2, kernel at EL2) EL0
+    /// and EL2 take TTBR0_EL2's, where the kernel's TTBR0_EL1 writes land,
+    /// and TTBR0_EL1 stays 0; in EL1&0 TTBR0_EL1's; TCR.A1 picks TTBR1.
+    #[test]
+    fn a_samples_address_space_is_its_regimes_asid() {
+        use crate::machine::system::Register;
+        const HCR_TGE: u64 = 1 << 27;
+        const HCR_E2H: u64 = 1 << 34;
+        const TCR_A1: u64 = 1 << 22;
+        const TCR_AS: u64 = 1 << 36;
+        let mut machine = super::super::tests::machine(&[0x9100_0400]);
+        machine.cpu.registers.set(Register::TTBR0_EL1, 0, 0);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL2, 0, 0x1234 << 48);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR1_EL2, 0, 0x5678 << 48);
+        machine.cpu.registers.set(Register::TCR_EL2, 0, TCR_AS);
+        machine
+            .cpu
+            .registers
+            .set(Register::HCR_EL2, 0, HCR_TGE | HCR_E2H);
+        for el in [0, 2] {
+            machine.cpu.pstate.el = el;
+            assert_eq!(machine.current_space_asid(), 0x1234, "EL{el} under TGE");
+        }
+        machine
+            .cpu
+            .registers
+            .set(Register::TCR_EL2, 0, TCR_AS | TCR_A1);
+        assert_eq!(machine.current_space_asid(), 0x5678, "TCR.A1");
+        // EL1&0: TTBR0_EL1's, 8 bits without TCR_EL1.AS.
+        machine.cpu.registers.set(Register::HCR_EL2, 0, 0);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL1, 0, 0x1abc << 48);
+        machine.cpu.pstate.el = 1;
+        assert_eq!(machine.current_space_asid(), 0xbc);
+        machine.cpu.pstate.el = 0;
+        assert_eq!(machine.current_space_asid(), 0xbc);
     }
 
     /// Sites sampled once are not judged; a site whose samples all named
