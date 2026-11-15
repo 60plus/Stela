@@ -5011,5 +5011,13 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of one native entry into a device site's stub and the return; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "paired_and_looked_up_return_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/paired.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a guest call and return pair, through the return's lookup tail and paired; run on request"
   }
 ]

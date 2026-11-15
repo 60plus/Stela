@@ -598,6 +598,8 @@ pub struct Counts {
     /// the PAC branch exits it gave a predicted tail and its probe
     /// transfers ([`super::Statistics::lookup_hits`]).
     pub stamped: [u64; chain::STAMP_COUNTS + 4],
+    /// What its paired frames did since boot ([`chain::PairCount`]'s order).
+    pub pairs: [u64; chain::PAIR_COUNTS],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
     /// Its PAC census under step timing ([`step_timing::PAC_CENSUS_WORDS`]).
@@ -2661,6 +2663,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 stamped[chain::STAMP_COUNTS + 3] = statistics.lookup_hits;
                 stamped
             },
+            pairs: self.chain.pairs(),
             pac_fills: self.pointer.fills,
             pac_census: self
                 .pointer

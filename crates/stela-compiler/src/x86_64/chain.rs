@@ -65,6 +65,14 @@
 //! or BLR) also requires the entry to accept that BTYPE
 //! (`LookupEntry::targets`), as a Branch Target check of the entered
 //! block's first instruction would.
+//!
+//! Every return to the engine reloads RSP from the state's saved entry
+//! stack pointer first ([`EXIT_RETURN`]), so native code may leave words
+//! on the host stack between blocks: a guest call pushes a paired frame
+//! and calls its own exit ([`paired_call`]), and the return whose target
+//! and contexts are the frame's takes a host `ret` into the call's
+//! continuation ([`paired_return`], [`paired_tail`]), which the CPU's
+//! return predictor serves, instead of a probe and an indirect jump.
 use crate::x86_64::asm::{
     Alu, BitTest, Code, Cond,
     Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdx},
@@ -321,13 +329,69 @@ pub struct ChainControl {
     /// skipped): the engine's counts, which only those exits write.
     pub loop_entries: u64,
     pub loop_iterated: u64,
+    /// The most bytes of paired frames ([`paired_call`]) one native run
+    /// keeps on the host stack below the entry's: 0 pushes none, and a call
+    /// that would go past it takes the plain exit.
+    pub frame_room: u32,
+    /// Native code neither reads nor writes it.
+    pub reserved: u32,
+    /// The host address of the board's retire epoch, which every step that
+    /// retires blocks advances, or 0 with `frame_room` 0. A frame holds
+    /// the epoch of its push; a return takes it only while the epoch is
+    /// unchanged, as its continuation may lie in a block retired since.
+    pub retire_epoch: u64,
+    /// What paired frames did ([`PairCount`]): native code's counts, which
+    /// only grow.
+    pub pairs: [u64; PAIR_COUNTS],
 }
+
+/// The counts of [`ChainControl::pairs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairCount {
+    /// Returns that took their frame's continuation.
+    Matched,
+    /// Returns with frames on the stack that took the exit's lookup.
+    Missed,
+    /// Calls past the frame bound, which took the plain exit.
+    Refused,
+}
+
+/// Entries of [`ChainControl::pairs`].
+pub const PAIR_COUNTS: usize = 3;
+
+impl PairCount {
+    const fn offset(self) -> i32 {
+        PAIRS + 8 * self as i32
+    }
+}
+
+/// The paired frames the engine lets one native run keep by default
+/// ([`ChainControl::frame_room`]).
+pub const DEFAULT_FRAME_BOUND: u32 = 64;
+/// Bytes of one paired frame on the host stack, from the top of the stack
+/// down: the host return address, the guest return address, the calling
+/// block's word, the retire epoch and the lower and upper half's contexts
+/// ([`FrameWord`]). A multiple of 16, so code between blocks keeps its
+/// stack alignment.
+pub const FRAME_BYTES: usize = 48;
+
+/// The words of a paired frame above its host return address, by their
+/// offset from RSP while the return address is on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameWord {
+    Address = 8,
+    Block = 16,
+    Epoch = 24,
+    LowerContext = 32,
+    UpperContext = 40,
+}
+const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
 
 // Epoch and observed state are naturally aligned atomic-width words. Capture
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 144);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 184);
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -1812,6 +1876,9 @@ const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
+const FRAME_ROOM: i32 = core::mem::offset_of!(ChainControl, frame_room) as i32;
+const RETIRE_EPOCH: i32 = core::mem::offset_of!(ChainControl, retire_epoch) as i32;
+const PAIRS: i32 = core::mem::offset_of!(ChainControl, pairs) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interruption {
@@ -2310,6 +2377,132 @@ fn link_body(
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
+}
+
+/// The start of a call whose guest return address is `return_address`,
+/// in code that RCX, R8 and flags are free in (RAX may hold the call's
+/// target, RDX its word), before its exit: unless the frames already below
+/// the entry's stack fill the control's room, a paired frame
+/// ([`FRAME_BYTES`]) and a host `call` of the exit that follows, whose
+/// return comes back to a jump to the call's continuation. The frame holds
+/// `return_address`, the calling block's word, the board's retire epoch
+/// and both halves' contexts, under the call's own return address, so a
+/// guest return to `return_address` in this native run, in the same
+/// contexts, can `ret` into the continuation ([`paired_return`]). The
+/// continuation is the caller's own exit to `return_address`, which runs
+/// none of the block's instructions: the call's exit counted them. A call
+/// past the room counts its refusal and takes the exit as a plain one;
+/// code run without a control pushes none.
+///
+/// Between blocks the host stack holds paired frames and nothing else, from
+/// the state's saved entry stack pointer down ([`EXIT_RETURN`]): every
+/// block, thunk and tail leaves RSP as it found it but for these. A run
+/// that leaves native code at any exit leaves every frame with it, as the
+/// exit reloads RSP: an exit the called code takes before its return, or
+/// the call's own exit while unlinked, discards the frames whole. The jump
+/// to the continuation is the patch this returns, which the caller binds
+/// after the call's exit.
+pub(crate) fn paired_call(
+    asm: &mut crate::x86_64::asm::Asm,
+    return_address: GuestAddress,
+) -> crate::x86_64::asm::Patch {
+    asm.place(Rcx, CONTROL);
+    asm.test(Qword, Rcx, Rcx);
+    let uncontrolled = asm.jcc(Cond::E);
+    // R8 = the bytes of frames below the entry's stack now.
+    asm.mov_load(Qword, R8, Mem::base(Gpr::Rdi, EXIT_RSP_OFFSET));
+    asm.alu(Alu::Sub, Qword, R8, Gpr::Rsp);
+    asm.alu_load(Alu::Cmp, Dword, R8, Mem::base(Rcx, FRAME_ROOM));
+    let refused = asm.jcc(Cond::Ae);
+    asm.push_rm(Mem::base(Rcx, CONTEXTS + 8));
+    asm.push_rm(Mem::base(Rcx, CONTEXTS));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.push_rm(Mem::base(R8, 0));
+    asm.push_rm(Mem::base(Rcx, BLOCK));
+    asm.guest_imm64(R8, return_address);
+    asm.push(R8);
+    let call = asm.call();
+    let continuation = asm.jmp();
+    asm.bind(refused);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Refused.offset()),
+        1,
+    );
+    asm.bind(call);
+    asm.bind(uncontrolled);
+    continuation
+}
+
+/// The start of a return to the target in RAX, from a block that ran `ran`
+/// instructions, in code that RCX, R8 and flags are free in, before its
+/// lookup: when the host stack holds a frame ([`paired_call`]), which it
+/// does below the entry's stack pointer, and that frame holds the target,
+/// the board's retire epoch has not moved since its push, both halves'
+/// contexts are the frame's, no interruption is pending and budget is
+/// left, the return counts `ran`, names the calling block again and
+/// `ret`s into the frame's continuation, taking the frame. Anything else
+/// goes on to the lookup, its frames left in place.
+///
+/// A frame's continuation is an exit to its address from a block that ran
+/// in the frame's contexts, so any return to that address in those
+/// contexts in the same native run may take it, whichever call pushed it:
+/// in one run the PE's ITLB changes only by contexts (a native SVC, ERET
+/// or exception entry loads another state's), and a TLBI, a TTBR or
+/// translation control write and every fill leave native code, which
+/// discards the frames. A block retired meanwhile, by any PE, advances
+/// the epoch, which every frame of the run then fails, so a return never
+/// enters a retired block's continuation through its frame.
+pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
+    let ran = i32::try_from(ran).ok()?;
+    let frame = |word: FrameWord| Mem::base(Gpr::Rsp, word as i32);
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Gpr::Rsp,
+        Mem::base(Gpr::Rdi, EXIT_RSP_OFFSET),
+    );
+    let empty = asm.jcc8(Cond::E);
+    asm.place(Rcx, CONTROL);
+    let mut misses = Vec::new();
+    asm.alu_load(Alu::Cmp, Qword, Rax, frame(FrameWord::Address));
+    misses.push(asm.jcc8(Cond::Ne));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.mov_load(Qword, R8, Mem::base(R8, 0));
+    asm.alu_load(Alu::Cmp, Qword, R8, frame(FrameWord::Epoch));
+    misses.push(asm.jcc8(Cond::Ne));
+    for (half, word) in [(0, FrameWord::LowerContext), (1, FrameWord::UpperContext)] {
+        asm.mov_load(Qword, R8, Mem::base(Rcx, CONTEXTS + 8 * half));
+        asm.alu_load(Alu::Cmp, Qword, R8, frame(word));
+        misses.push(asm.jcc8(Cond::Ne));
+    }
+    misses.extend(interruption_gate(asm, Interruption::Epoch, R8));
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc8(Cond::E));
+    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran);
+    // The block's index, entered with BTYPE 0 as a continuation is.
+    asm.mov_load(Dword, R8, frame(FrameWord::Block));
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Matched.offset()),
+        1,
+    );
+    // ret 40: into the continuation, the rest of the frame taken.
+    asm.fixed(&[0xc2, (FRAME_BYTES - 8) as u8, 0]);
+    for miss in misses {
+        asm.bind(miss);
+    }
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Missed.offset()),
+        1,
+    );
+    asm.bind(empty);
+    Some(())
 }
 
 /// Bytes of the cell probe of a [`lookup_dispatcher`], which comes first.
@@ -2910,11 +3103,71 @@ fn lookup_tail_with_policy(
     btype: u8,
     policy: Interruption,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
+    let mut code = Code::new();
+    lookup_tail_code(&mut code, at, word, ran, probe, btype, policy)?;
+    let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// Bytes in a [`paired_tail`], padded.
+pub const PAIRED_TAIL_BYTES: usize = 256;
+/// Bytes of the largest tail the engine installs where a lookup tail or a
+/// stamped one may go.
+pub const TAIL_ROOM: usize = if STAMPED_TAIL_BYTES > PAIRED_TAIL_BYTES {
+    STAMPED_TAIL_BYTES
+} else {
+    PAIRED_TAIL_BYTES
+};
+
+/// The tail at host address `at` of a return's exit: a [`lookup_tail`]
+/// whose return first takes the frame of its call when that frame holds
+/// the target in the contexts it was pushed in ([`paired_return`]), where
+/// the block of `ran` instructions it leaves is counted as the lookup
+/// would. Every RET form's exit is one, RETA*'s after its thunk
+/// authenticated the target, so a forged or stale-key address, which the
+/// thunk leaves poisoned, never equals a frame's. `None` as for a
+/// [`lookup_tail`].
+pub fn paired_tail(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<[u8; PAIRED_TAIL_BYTES]> {
+    let mut code = Code::new();
+    paired_return(&mut code.asm(), ran)?;
+    lookup_tail_code(
+        &mut code,
+        at,
+        word.into(),
+        ran,
+        probe,
+        0,
+        Interruption::Epoch,
+    )?;
+    let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// [`lookup_tail`]'s code, appended to `code`, which runs from `at`.
+fn lookup_tail_code(
+    code: &mut Code,
+    at: u64,
+    word: ExitWord,
+    ran: u32,
+    probe: u64,
+    btype: u8,
+    policy: Interruption,
+) -> Option<()> {
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
     let entry = |field: i32| Mem::indexed(R10, R9, 8, JUMP_CACHE + field);
-    let mut code = Code::new();
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
     let mut misses: Vec<_> = gate(&mut asm, policy, R8, false).into_iter().collect();
@@ -2947,12 +3200,7 @@ fn lookup_tail_with_policy(
         asm.bind(miss);
     }
     // The plain tail's jump is relative to its own end in `code`.
-    tail(&mut code, at, word, ran, probe)?;
-    let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
-    for _ in 0..padding {
-        code.asm().int3();
-    }
-    code.try_into().ok()
+    tail(code, at, word, ran, probe)
 }
 
 /// Count a table probe transfer ([`StampCount::Filled`]) and fill this
@@ -4290,6 +4538,8 @@ mod tests {
     mod differential;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod jump_cache;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod paired;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod patching;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

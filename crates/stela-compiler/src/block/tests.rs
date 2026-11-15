@@ -602,11 +602,12 @@ fn system_mode_blocks_report_their_direct_successor_exits() {
             0x3700_0040,
             vec![fallthrough, (BASE + 12, ExitKind::Direct)],
         ), // tbnz w0, #0, +8
-        (0x9400_0002, vec![(BASE + 12, ExitKind::Call)]),       // bl +8
+        // A call's continuation exit follows its own (`paired_exit`).
+        (0x9400_0002, vec![(BASE + 12, ExitKind::Call), fallthrough]), // bl +8
         (ADD, vec![fallthrough]),
-        (0xd65f_03c0, vec![]), // ret
-        (0xd63f_0000, vec![]), // blr x0
-        (0xd518_1000, vec![]), // msr sctlr_el1, x0
+        (0xd65f_03c0, vec![]),            // ret
+        (0xd63f_0000, vec![fallthrough]), // blr x0
+        (0xd518_1000, vec![]),            // msr sctlr_el1, x0
     ] {
         let source: Vec<u8> = [ADD, word].into_iter().flat_map(u32::to_le_bytes).collect();
         let compiled = crate::testing::block_for(
@@ -624,8 +625,12 @@ fn system_mode_blocks_report_their_direct_successor_exits() {
                 // Padded for its offset: patchable where it lies.
                 assert_eq!(
                     code[exit.offset..exit.offset + DIRECT_EXIT_BYTES],
-                    direct_exit_at(exit.offset as u64, exit.target, exit.kind)
+                    direct_exit_at(exit.offset as u64, exit.target, exit.word())
                 );
+                // A continuation leaves every instruction of the block unrun.
+                let continuation =
+                    exit.kind == ExitKind::Fallthrough && matches!(word, 0x9400_0002 | 0xd63f_0000);
+                assert_eq!(exit.skipped, if continuation { 2 } else { 0 });
                 (exit.target.0, exit.kind)
             })
             .collect();

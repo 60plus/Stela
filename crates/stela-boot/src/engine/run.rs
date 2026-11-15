@@ -1986,6 +1986,9 @@ impl Heartbeat {
             ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            // All PEs: paired returns matched and missed, and calls past
+            // the frame bound (`chain::PairCount`).
+            let mut pairs = [0u64; stela_compiler::x86_64::chain::PAIR_COUNTS];
             let mut pac_fills = 0;
             let mut pac_census = [0u64; step_timing::PAC_CENSUS_WORDS];
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
@@ -2149,6 +2152,11 @@ impl Heartbeat {
                 ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                for (total, (now, before)) in
+                    pairs.iter_mut().zip(now.pairs.iter().zip(&before.pairs))
+                {
+                    *total += now.saturating_sub(*before);
+                }
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
                 for (sum, (now, before)) in pac_census
                     .iter_mut()
@@ -2348,6 +2356,8 @@ impl Heartbeat {
                 output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
             }
             stamped.push_str(&format!(" in_use={stamped_in_use}"));
+            let [matched, missed, refused] = pairs;
+            stamped.push_str(&format!(" pairs={matched}/{missed}/{refused}"));
             stamped_line = Some((stamped, predicted, pac_fills));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{phases}\n"));
