@@ -21,6 +21,13 @@ const EVICT_STEP: usize = 32;
 /// per PE (run 20261111-100711: 2.1 M a beat over 8 PEs); an eighth of the
 /// first keeps a step under that gap.
 pub(super) const STEP_VISITS: u64 = 128;
+/// The units a retirement step takes while another PE waits for the lock
+/// ([`board::Code::wanted`]): a fetch, link or install waits for a few
+/// microseconds of a step at most, not for all of it. Steps were 16.6 us
+/// each in run 20261115-112116 (66 K a beat, 38% of the lock's holds), so
+/// a holder found the lock held by one a tenth of the time and waited
+/// about half a step: most of the 2.3 s waited a beat.
+pub(super) const YIELD_VISITS: u64 = 16;
 
 /// Cells one step of an eviction releases under the board's lock.
 const CELL_STEP: usize = 256;
@@ -1150,8 +1157,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let mut cache = code.cache_at(board::LockSite::Evict);
         let mut visits = 0;
         if job.next < job.slots.len() || job.page.is_some() {
-            while visits < code.step_visits {
-                let left = code.step_visits - visits;
+            loop {
+                let budget = match code.wanted() {
+                    true => YIELD_VISITS.min(code.step_visits),
+                    false => code.step_visits,
+                };
+                if visits >= budget {
+                    break;
+                }
+                let left = budget - visits;
                 if job.page.is_none() {
                     if job.next >= job.slots.len() {
                         break;
@@ -1196,7 +1210,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         };
                     }
                     board::PagePhase::Retire(from) => {
-                        let to = page.end.min(from + EVICT_STEP);
+                        let to = page.end.min(from + EVICT_STEP.min(left as usize));
                         self.retire_blocks(&mut cache, &job.slots[from..to]);
                         visits += (to - from) as u64;
                         if to == page.end {
@@ -1211,7 +1225,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else if let Some(from) = job.cells {
             // The exits in the range go, and with them their cells: no
             // block in it is live now, so none links through a cell again.
-            let most = CELL_STEP.min(code.step_visits as usize);
+            let most = match code.wanted() {
+                true => CELL_STEP.min(YIELD_VISITS as usize),
+                false => CELL_STEP,
+            }
+            .min(code.step_visits as usize);
             job.cells = cache
                 .targets
                 .release_some_cells(from..=job.range.end as u64 - 1, most);
