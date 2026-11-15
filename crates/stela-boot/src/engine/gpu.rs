@@ -13,6 +13,7 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
+mod before;
 #[cfg(feature = "nvk")]
 pub(super) mod client;
 #[cfg(feature = "nvk")]
@@ -69,7 +70,7 @@ use stela_drivers::{
             owned::{ConfigRetention, OwnedConfig},
         },
     },
-    firmware::{Catalog, ErrorKind as FirmwareError, Provider},
+    firmware::Catalog,
     gpu::{self, stack::GpuStack},
     platform::work::{
         WorkError,
@@ -79,7 +80,7 @@ use stela_drivers::{
 };
 use stela_engine::machine::engine::Hub;
 use stela_linux::{
-    catalogue::{FirmwareTarget, FunctionCustody, PciAuthority, PciFirmware},
+    catalogue::{FunctionCustody, PciAuthority, PciFirmware},
     function::{self, Attached, Msi, Placement, Region},
     kernel::KernelOwner,
     owner::{Errno, Platform, RealtimeOrigin, RealtimeRead},
@@ -924,7 +925,9 @@ struct GpuViews {
     config: ConfigRetention,
     pci_words: [u32; 8],
     registers: Mapping,
-    boot0: u32,
+    /// Register 0 as it read before the reset, where it identifies the chip
+    /// and so reads the same after it. None: it is read and not compared.
+    identity: Option<u32>,
 }
 
 fn gpu_pci_words(function: &mut Function<OwnedConfig>) -> Result<[u32; 8], ConfigError> {
@@ -967,109 +970,16 @@ impl GpuViews {
             & 2
             == 0
             || gpu_pci_words(function).map_err(|_| ViewError::RegisterReadback)? != self.pci_words
-            || self.registers.read32(0) != Ok(self.boot0)
         {
+            return Err(ViewError::RegisterReadback);
+        }
+        // The read is what orders the CPU's posted writes before the reset.
+        let read = self.registers.read32(0);
+        if read.is_err() || self.identity.is_some_and(|identity| read != Ok(identity)) {
             return Err(ViewError::RegisterReadback);
         }
         Ok(())
     }
-}
-
-fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
-    use stela_loader::host_firmware::{bundle, recipes, requirements::Inventory};
-    let chip = gpu::nouveau_chip::Chip::from_boot0(boot0).ok_or(ServiceError::Refused(
-        "the GPU's PMC chipset is unsupported",
-    ))?;
-    let name = chip.name.to_ascii_lowercase();
-    let mut inventory = Inventory::default();
-    recipes::require_gsp(&mut inventory, &name)
-        .map_err(|_| ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
-    let mut names = Vec::new();
-    let request = inventory
-        .requests()
-        .first()
-        .ok_or(ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
-    let target = FirmwareTarget::new(
-        request.target.driver.clone(),
-        request.target.hardware.clone(),
-        request.target.revision.clone(),
-        request.target.board.clone(),
-    )
-    .map_err(|_| ServiceError::Refused("the GPU firmware target is invalid"))?;
-    let plan = recipes::Plan::select(&inventory)
-        .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
-    // SAFETY: the reference count is never given back, so the catalog
-    // stays allocated for every image borrowed from it for the boot.
-    let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
-    let mut bindings = Vec::new();
-    // nouveau needs every file of the chip's recipe: one missing fails its
-    // start later with a generic error.
-    let mut missing = Vec::new();
-    for selection in plan.selections() {
-        let request = &selection.request;
-        // An exact binding, else the bundle's file by its pinned digest.
-        let found = match stored.load(request.view()) {
-            Err(error) if error.kind == FirmwareError::Missing => {
-                let name = bundle::name(selection.recipe.image.sha256);
-                match stored.load(stela_drivers::firmware::Requirement {
-                    name: &name,
-                    target: bundle::TARGET,
-                    minimum_bytes: request.minimum_bytes,
-                }) {
-                    Err(stored_error) if stored_error.kind == FirmwareError::Missing => Err(error),
-                    other => other,
-                }
-            }
-            other => other,
-        };
-        if let Ok(image) = found {
-            bindings.push((image, request));
-        }
-        match found {
-            Ok(image) => {
-                selection
-                    .recipe
-                    .image
-                    .verify_digest(image.bytes().len(), image.sha256())
-                    .map_err(|_| {
-                        ServiceError::Refused(
-                            "the GPU firmware digest does not match its pinned recipe",
-                        )
-                    })?;
-            }
-            Err(error) if error.kind == FirmwareError::Missing => {
-                missing.push(request.name.clone());
-            }
-            Err(error) => {
-                output::arguments(format_args!(
-                    "GPU {name}: firmware {} refused: {error:?}\n",
-                    request.name
-                ));
-                return Err(ServiceError::Refused(
-                    "the GPU firmware does not match its exact catalogue target",
-                ));
-            }
-        }
-        names.push(request.name.clone());
-    }
-    if !missing.is_empty() {
-        output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks {} of this chip's {} files ({}); \
-             `stela repair` completes it\n",
-            missing.len(),
-            names.len(),
-            missing.join(", ")
-        ));
-        return Err(ServiceError::Refused(NO_FIRMWARE));
-    }
-    // Each file under the exact name and target nouveau asks for.
-    let catalog = Catalog::rebind_all(bindings.iter().map(|(image, request)| {
-        let view = request.view();
-        (*image, view.name, view.target)
-    }))
-    .map_err(|_| ServiceError::Refused("the GPU firmware cannot be bound to its requests"))?;
-    PciFirmware::new(target, Arc::new(catalog), names.into_boxed_slice())
-        .map_err(|_| ServiceError::Refused("the GPU firmware image names are invalid"))
 }
 
 /// A function claimed from probe, before Linux sees it.
@@ -1240,16 +1150,12 @@ fn claim(
             Protection::ReadOnly,
         )
         .map_err(ServiceError::Mapping)?;
-    let endian = registers.read32(4).map_err(ServiceError::Mapping)?;
-    if endian == u32::MAX || endian == 0x01000001 {
-        return Err(ServiceError::Refused(
-            "the GPU register byte order is unavailable",
-        ));
-    }
-    let boot0 = registers.read32(0).map_err(ServiceError::Mapping)?;
-    let firmware = select_firmware(boot0, catalog)?;
-    if let Some(chip) = gpu::nouveau_chip::Chip::from_boot0(boot0) {
-        crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip.name);
+    let before = before::of(stack).ok_or(ServiceError::Refused(
+        "the boot has no preparation for this GPU's kernel driver",
+    ))?;
+    let identified = (before.identify)(&registers, adapter, catalog)?;
+    if let Some(chip) = identified.chip {
+        crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip);
     }
     crate::host_inventory::text(
         alloc::format!("GPU{line}PCIID"),
@@ -1261,7 +1167,7 @@ fn claim(
             config,
             pci_words,
             registers,
-            boot0,
+            identity: identified.identity,
         },
         timer,
     });
@@ -1315,11 +1221,7 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
-    if let Some(chip) =
-        gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
-    {
-        wait_for_firmware_boot(services, &resources[0], chip)?;
-    }
+    (before.settle)(services, &resources[0], &identified)?;
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
     let capabilities = function
@@ -1367,7 +1269,7 @@ fn claim(
             _views: views,
             _resources: resources,
         },
-        firmware,
+        firmware: identified.firmware,
         placement,
         bars,
         name: format!("{address}"),
@@ -1436,118 +1338,6 @@ fn resized_bars<C: ConfigSpace>(
 
 /// Read one BAR0 register through a scoped read-only page of `registers`,
 /// or `None` when it cannot be mapped or read.
-fn read_register(
-    services: &dyn NativeServices,
-    registers: &owned::Resource,
-    offset: usize,
-) -> Option<u32> {
-    let page = offset & !(PAGE as usize - 1);
-    let mut window = services
-        .authority()
-        .ok()?
-        .map(
-            registers.clone(),
-            page,
-            PAGE as usize,
-            CacheAttribute::Uncached,
-            Protection::ReadOnly,
-        )
-        .ok()?;
-    let value = window.read32(offset - page).ok();
-    // SAFETY: the read above was this scoped mapping's only use.
-    unsafe { window.retire() }.ok()?;
-    value
-}
-
-/// After the claim's function-level reset a Turing-to-Ada GPU's own firmware
-/// runs devinit again. nouveau reads the VBIOS before it waits for that
-/// (`firmware_boot`), so wait here first, by nouveau's bound, and print what
-/// the start of the old boot flow depends on: the firmware boot, WPR2 (which
-/// FWSEC-FRTS sets) and the VBIOS window the PRAMIN shadow reads.
-/// `GPU AD107: firmware boot completed after N polls: gfw=… plm=… wpr2=…-…
-/// display_fuse=… vbios_window=…`, or `did not complete` and a refusal.
-fn wait_for_firmware_boot(
-    services: &dyn NativeServices,
-    registers: &owned::Resource,
-    chip: &gpu::nouveau_chip::Chip,
-) -> Result<(), ServiceError> {
-    use gpu::nouveau_chip::firmware_boot::{self, Error as BootError};
-    let page = firmware_boot::PRIV_LEVEL_MASK & !(PAGE as usize - 1);
-    let mut window = services
-        .authority()?
-        .map(
-            registers.clone(),
-            page,
-            PAGE as usize,
-            CacheAttribute::Uncached,
-            Protection::ReadOnly,
-        )
-        .map_err(ServiceError::Mapping)?;
-    let timer = services.minimum_delay()?;
-    let result = firmware_boot::wait(
-        |offset| {
-            window
-                .read32(offset - page)
-                .map_err(|_| "a register read failed")
-        },
-        |micros| timer.wait_us(micros).map_err(|_| "the timer failed"),
-    );
-    // SAFETY: the polls above were this scoped mapping's only use.
-    unsafe { window.retire() }.map_err(ServiceError::Mapping)?;
-    let read = |offset| read_register(services, registers, offset);
-    let hex =
-        |value: Option<u32>| value.map_or_else(|| String::from("unread"), |v| format!("{v:#010x}"));
-    // nouveau's PRAMIN shadow reads the window only with the display fused
-    // on (`shadowramin.c` `pramin_init`: 0x820c04 from GA100, else 0x021c04).
-    let fuse = read(match chip.architecture {
-        gpu::nouveau_chip::Architecture::Turing => 0x02_1c04,
-        _ => 0x82_0c04,
-    });
-    let window = fuse
-        .filter(|fuse| fuse & 1 == 0)
-        .and_then(|_| read(0x62_5f04));
-    let state = format!(
-        "wpr2={}-{} display_fuse={} vbios_window={}",
-        hex(read(0x1f_a824)),
-        hex(read(0x1f_a828)),
-        hex(fuse),
-        hex(window),
-    );
-    match result {
-        Ok(reading) => {
-            output::arguments(format_args!(
-                "GPU {}: firmware boot completed after {} polls: gfw={:#010x} plm={:#010x} {state}\n",
-                chip.name, reading.polls, reading.progress, reading.priv_level_mask
-            ));
-            Ok(())
-        }
-        Err(BootError::Timeout(reading)) => {
-            output::arguments(format_args!(
-                "GPU {}: firmware boot did not complete after its reset in {} polls of {} us: \
-                 gfw={:#010x} (expected low byte {:#04x}) plm={:#010x} (expected bit 0) {state}\n",
-                chip.name,
-                reading.polls,
-                firmware_boot::POLL_MICROS,
-                reading.progress,
-                firmware_boot::COMPLETED,
-                reading.priv_level_mask
-            ));
-            Err(ServiceError::Refused(
-                "the GPU's firmware boot did not complete after its reset",
-            ))
-        }
-        Err(BootError::Access(error)) => {
-            output::arguments(format_args!(
-                "GPU {}: firmware boot wait stopped: {error}\n",
-                chip.name
-            ));
-            Err(ServiceError::Refused(
-                "the GPU's firmware boot registers could not be read",
-            ))
-        }
-    }
-}
-
 fn cold_refusal(
     address: stela_drivers::bus::pci::Address,
     error: gpu::cold::Error,
@@ -1555,9 +1345,6 @@ fn cold_refusal(
     output::arguments(format_args!("GPU {address} cold preparation: {error:?}\n"));
     ServiceError::Refused("the GPU's original cold handoff was refused")
 }
-
-/// Why a GPU was refused when the USB lacks any of its chip's firmware files.
-const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
 /// An adapter with a driver stack that [`claim_all`] did not claim, for the boot screen
 /// (`stela_boot_core::gpu_status`).
@@ -1640,7 +1427,7 @@ pub(super) fn claim_all(
             Err(error) => {
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
                 let reason = match error {
-                    ServiceError::Refused(NO_FIRMWARE) => Reason::MissingFirmware,
+                    ServiceError::Refused(before::NO_FIRMWARE) => Reason::MissingFirmware,
                     _ => Reason::Other,
                 };
                 refused.push(refused_as(adapter, reason, &error));
