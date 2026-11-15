@@ -16,7 +16,6 @@ use stela_driver_base::{
     },
 };
 
-const NVIDIA: u16 = 0x10de;
 const DISPLAY: u8 = 3;
 const EXPRESS: u8 = 0x10;
 
@@ -187,7 +186,9 @@ fn preflight<C: ConfigSpace>(
     bus_reset: bool,
 ) -> Result<Option<Reset>, Error> {
     timer.check().map_err(Error::Clock)?;
-    if function.vendor != NVIDIA || function.class[0] != DISPLAY {
+    // Which vendor's display function it is, is its stack's selection
+    // (`GpuStack::select`), which the caller compared with this function.
+    if function.class[0] != DISPLAY {
         return Err(Error::Identity);
     }
     requester::validate_stopped(function).map_err(Error::Claim)?;
@@ -199,10 +200,14 @@ fn preflight<C: ConfigSpace>(
         }
     }
     // Linux `pci_reset_function` falls back from FLR to a D3hot soft reset,
-    // then to a reset of the bus the function sits on alone. nouveau itself
-    // never resets: it starts what firmware left. A GPU an earlier run left
-    // with its secure region (WPR2) standing fails nouveau's FWSEC-FRTS
-    // until it is reset, and translation does not clear that, so every
+    // then to a reset of the bus the function sits on alone. No GPU driver
+    // of Linux resets at its probe: each starts what firmware left. Here a
+    // reset comes first for every stack, for two reasons. An NVIDIA GPU an
+    // earlier run left with its secure region (WPR2) standing fails
+    // nouveau's FWSEC-FRTS until it is reset, and translation does not
+    // clear that. And a function that keeps what firmware started (an
+    // integrated GPU scans out the firmware's picture) keeps doing DMA no
+    // domain of Stela's confines while its unit is untranslated. So every
     // reset that is available comes first. Only a GPU with none starts as
     // firmware left it, and only with translation: otherwise an engine
     // firmware left running could write recycled RAM once bus mastering is
