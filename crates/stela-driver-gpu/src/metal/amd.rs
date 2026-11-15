@@ -107,11 +107,12 @@ fn admit(
 /// RADV as linked into the image, under its own loader entry
 /// (`xtask/src/gpu/nvk.rs`), with its driver-internal calls
 /// (`compat/mesa/radv_nir_options.c`, `compat/mesa/radv_submit.c`). A
-/// commit's submission runs on its PE, whose ioctls wait for the boot CPU.
-/// A submission amdgpu refuses short of losing the context fails its command
-/// buffer, not the device (Mesa patch 0038); a lost context loses the
-/// device, which the service reopens. An image whose build host lacked the
-/// tools RADV's build runs holds no RADV, and then no driver here.
+/// commit's submission runs on Mesa's submit thread, where Linux runs, not
+/// on its PE. A submission amdgpu refuses short of losing the context fails
+/// its command buffer, not the device (Mesa patch 0038); a lost context
+/// loses the device, which the service reopens. An image whose build host
+/// lacked the tools RADV's build runs holds no RADV, and then no driver
+/// here.
 #[cfg(all(feature = "metal-linked", not(test), stela_vulkan_amd))]
 pub const DRIVER: super::native::Driver = {
     use super::native::{Driver, Refusals, vk};
@@ -124,6 +125,7 @@ pub const DRIVER: super::native::Driver = {
     }
     unsafe extern "C" {
         fn stela_radv_nir_options(physical: vk::PhysicalDevice, stage: u32) -> *const c_void;
+        fn stela_radv_submit_thread(queue: vk::Queue) -> vk::Result;
         fn stela_radv_submit_failure(
             queue: vk::Queue,
             semaphore: vk::Semaphore,
@@ -135,7 +137,8 @@ pub const DRIVER: super::native::Driver = {
     Driver {
         get_instance_proc_addr: radv_icdGetInstanceProcAddr,
         nir_options: stela_radv_nir_options,
-        submit_thread: None,
+        // A commit's submission runs where Linux does, not on its PE.
+        submit_thread: Some(stela_radv_submit_thread),
         // A refused submission fails its command buffer, not the device.
         refusals: Some(Refusals {
             take: stela_radv_submit_failure,
