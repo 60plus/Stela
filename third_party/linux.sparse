@@ -378,3 +378,4 @@
 /mm/mempool.c
 /kernel/time/timeconv.c
 /kernel/locking/semaphore.c
+/drivers/gpu/buddy.c

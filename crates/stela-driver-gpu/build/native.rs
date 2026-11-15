@@ -83,6 +83,8 @@ const DRM_SOURCES: &[&str] = &[
     "drm_writeback",
     "drm_exec",
     "drm_gpuvm",
+    "drm_buddy",
+    "drm_suballoc",
     "drm_gem_ttm_helper",
     "drm_atomic_helper",
     "drm_atomic_state_helper",
@@ -120,6 +122,8 @@ const DRM_SOURCES: &[&str] = &[
     "display/drm_dp_dual_mode_helper",
     "display/drm_dp_helper",
     "display/drm_dp_mst_topology",
+    "display/drm_dsc_helper",
+    "display/drm_hdcp_helper",
     "display/drm_hdmi_helper",
     "display/drm_scdc_helper",
 ];
@@ -162,6 +166,20 @@ const DRM_UNITS: &[UnitSpec] = &[
         source: "drivers/gpu/drm/display/drm_display_helper_mod",
         module: "drm_display_helper",
         file: "drivers/gpu/drm/display/drm_display_helper",
+    },
+    // The buddy allocator under drm_buddy, whose initcall makes its block
+    // cache: a unit of DRM's level, before any driver's.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "gpubuddy",
+            group_ordinal: 8,
+            unit_ordinal: 1,
+            global_ordinal: 8,
+        },
+        source: "drivers/gpu/buddy",
+        module: "buddy",
+        file: "drivers/gpu/buddy",
     },
 ];
 
