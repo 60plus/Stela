@@ -4220,9 +4220,45 @@ fn extended_range_blends(plan: &mut Plan, library: &str) {
 /// clamps at the codes' ends; a tile function reads the fragment outputs
 /// unclamped from the imageblock, as half floats.
 fn extended_range_two_plane(plan: &mut Plan, library: &str) {
+    let values = extended_range_two_plane_reads(plan, library, [W, H], "");
+    // A surface past `PlaneStaging::MIN_TEXELS` (64K texels): its encodes
+    // go through device memory and the copy engine.
+    extended_range_two_plane_reads(plan, library, [512, 256], ".large");
+
+    // The fragment outputs as a tile function reads them in the pass: half
+    // floats, past the codes' range too.
+    let unclamped: Vec<f64> = values.iter().flatten().map(|&v| f16r(v)).collect();
+    let tiles = json!([{"function": "tile_store_colors", "threads": [16, 16]}]);
+    plan.add(
+        full(
+            "render.rgb10a8_2p_xr10.tile_read",
+            library,
+            "frag_color",
+            &values.concat(),
+            json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}], "tiles": tiles,
+                   "tile_size": [16, 16]}),
+        )
+        .buffer(Buffer::zeroed("out", 0, (W * H * 16) as usize).stage("tile"))
+        .buffer(Buffer::data("out_width", 1, u32s(&[W])).stage("tile"))
+        .texture(target("c", "rgb10a8_2p_xr10"))
+        .output(Output::new("out", Dtype::F32, Tolerance::exact()).expect_same(f32s(&unclamped))),
+    );
+}
+
+/// The two-plane extended-range reads of a `size` surface: written values
+/// and a blend over a clear, read back by a kernel through the planes, as
+/// `render.rgb10a8_2p_xr10.read{suffix}` and `.blend.over.read{suffix}`.
+/// Answers the written values.
+fn extended_range_two_plane_reads(
+    plan: &mut Plan,
+    library: &str,
+    size: [u32; 2],
+    suffix: &str,
+) -> Vec<[f64; 4]> {
     const FORMAT: &str = "rgb10a8_2p_xr10";
+    let [w, h] = size;
     let mut rng = Random::new(913);
-    let n = (W * H) as usize;
+    let n = (w * h) as usize;
     let alpha8 = |a: f64| (a.clamp(0.0, 1.0) * 255.0).round() / 255.0;
     let held = |t: [f64; 4]| -> [f64; 4] {
         std::array::from_fn(|lane| {
@@ -4257,15 +4293,15 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
                 Step::render("vert_full", "frag_color", state)
                     .bind_stage("fragment", &[("colors", 0), ("width", 1)])
                     .bind_stage("vertex", &[("depth", 2)]),
-                Step::compute("read_texels", [W, H, 1], [8, 8, 1])
+                Step::compute("read_texels", [w, h, 1], [8, 8, 1])
                     .bind_textures(&[("c", 0)])
                     .bind(&[("texels", 0)]),
             ],
         )
-        .buffer(Buffer::data("width", 0, u32s(&[W])).unbound())
+        .buffer(Buffer::data("width", 0, u32s(&[w])).unbound())
         .buffer(Buffer::data("depth", 0, f32s(&[0.5])).unbound())
-        .buffer(Buffer::zeroed("texels", 0, (W * H * 16) as usize).unbound())
-        .texture(Texture::d2("c", FORMAT, W, H).usage(&["render", "read"]))
+        .buffer(Buffer::zeroed("texels", 0, (w * h * 16) as usize).unbound())
+        .texture(Texture::d2("c", FORMAT, w, h).usage(&["render", "read"]))
         .output(
             Output::new("texels", Dtype::F32, tolerance.clone()).expect(f32s(&expected), tolerance),
         )
@@ -4275,7 +4311,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
     let expected: Vec<f64> = values.iter().flat_map(|t| held(*t)).collect();
     plan.add(
         read(
-            &format!("render.{FORMAT}.read"),
+            &format!("render.{FORMAT}.read{suffix}"),
             json!({"vertex_count": 3, "colors": [{"texture": "c", "clear": [0, 0, 0, 0]}]}),
             expected,
             Tolerance::abs(1e-4),
@@ -4301,7 +4337,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
         .collect();
     plan.add(
         read(
-            &format!("render.{FORMAT}.blend.over.read"),
+            &format!("render.{FORMAT}.blend.over.read{suffix}"),
             json!({"vertex_count": 3,
                    "colors": [{"texture": "c", "clear": clear, "blend": blend.json()}]}),
             blended,
@@ -4309,24 +4345,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
         )
         .buffer(Buffer::data("colors", 0, f32s(&sources.concat())).unbound()),
     );
-    // The fragment outputs as a tile function reads them in the pass: half
-    // floats, past the codes' range too.
-    let unclamped: Vec<f64> = values.iter().flatten().map(|&v| f16r(v)).collect();
-    let tiles = json!([{"function": "tile_store_colors", "threads": [16, 16]}]);
-    plan.add(
-        full(
-            &format!("render.{FORMAT}.tile_read"),
-            library,
-            "frag_color",
-            &values.concat(),
-            json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}], "tiles": tiles,
-                   "tile_size": [16, 16]}),
-        )
-        .buffer(Buffer::zeroed("out", 0, (W * H * 16) as usize).stage("tile"))
-        .buffer(Buffer::data("out_width", 1, u32s(&[W])).stage("tile"))
-        .texture(target("c", FORMAT))
-        .output(Output::new("out", Dtype::F32, Tolerance::exact()).expect_same(f32s(&unclamped))),
-    );
+    values
 }
 
 pub fn build(plan: &mut Plan) {
