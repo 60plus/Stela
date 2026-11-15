@@ -871,6 +871,46 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
    return true;
 }
 
+/* Thread memory of at most this many 32-bit words lives in registers. */
+#define REGISTER_THREAD_WORDS 16
+
+/* Moves small thread memory out of scratch into registers. The front end
+ * lays a function's thread memory out as scratch; when it fits in
+ * REGISTER_THREAD_WORDS words, scratch becomes one array of words and each
+ * word an SSA value. Loops that index the array by their induction
+ * variable unroll first (NIR forces that for a function-temporary array no
+ * longer than the trip count), so their indices become constants; an index
+ * still dynamic after that becomes a select tree over the words. Larger
+ * thread memory stays in scratch: more registers per thread would cost
+ * occupancy. Thread memory is private to its thread, so only its storage
+ * changes, never a value. */
+static void
+thread_memory_to_registers(nir_shader *shader)
+{
+   if (!shader->scratch_size || shader->scratch_size > REGISTER_THREAD_WORDS * 4)
+      return;
+   nir_lower_scratch_to_var(shader);
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, shader, nir_opt_loop_unroll);
+      NIR_PASS(progress, shader, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, shader, nir_opt_constant_folding);
+      NIR_PASS(progress, shader, nir_opt_algebraic);
+      NIR_PASS(progress, shader, nir_opt_copy_prop);
+      NIR_PASS(progress, shader, nir_opt_dead_cf);
+      NIR_PASS(progress, shader, nir_opt_dce);
+   } while (progress);
+   nir_lower_indirect_derefs_to_if_else_trees(shader, nir_var_function_temp,
+                                              REGISTER_THREAD_WORDS);
+   nir_lower_vars_to_ssa(shader);
+   nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
+   /* Words read before any store become undefined values carried through
+    * loops; zero is one of their values, and what NAK picks for them too. */
+   nir_lower_undef_to_zero(shader, NULL);
+   nir_opt_dce(shader);
+}
+
 nir_shader *
 stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
                               const struct stela_metal_target *target,
@@ -1069,6 +1109,8 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    };
    shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
 done:
+   if (shader)
+      thread_memory_to_registers(shader);
    free(owned_reflection);
    return shader;
 }
