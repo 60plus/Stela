@@ -104,6 +104,30 @@ fn compute(plan: &mut Plan, library: &str, rng: &mut Random) {
                 .output(Output::exact("again", Dtype::U32, u32s(&again))),
         );
     }
+    // Two buffers in turn, each dispatch reading a neighbour's word of what
+    // the one before wrote: a processor that read a word two dispatches ago
+    // must not see it again once it has changed.
+    let (mut a, mut b) = (v.clone(), vec![0u32; N as usize]);
+    let mut steps = vec![];
+    for k in 0..6 {
+        let (src, dst) = if k % 2 == 0 { ("a", "b") } else { ("b", "a") };
+        let step =
+            Step::compute("neighbours", grid(N), [64, 1, 1]).bind(&[(src, 0), (dst, 1), ("n", 2)]);
+        steps.push(if k == 0 { step } else { step.continues() });
+        if k % 2 == 0 {
+            b = neighbours(&a);
+        } else {
+            a = neighbours(&b);
+        }
+    }
+    plan.add(
+        Case::sequence("sequence.compute.ping_pong", library, steps)
+            .buffer(Buffer::data("a", 0, u32s(&v)).unbound())
+            .buffer(Buffer::zeroed("b", 0, N as usize * 4).unbound())
+            .buffer(Buffer::data("n", 0, u32s(&[N])).unbound())
+            .output(Output::exact("a", Dtype::U32, u32s(&a)))
+            .output(Output::exact("b", Dtype::U32, u32s(&b))),
+    );
     // Blits before and after compute: a fill the dispatch reads, and a copy
     // of what it wrote.
     let filled = vec![0x0707_0707u32; N as usize];

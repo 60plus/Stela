@@ -143,8 +143,9 @@ count_order(const char *listing, const char *op, const char *order)
 }
 
 /* The order NAK gives global memory accesses and barriers in a shader whose
- * accesses have no derefs, as the Metal translation's have: every store
- * and load is strong at GPU scope; a workgroup barrier on global memory is bar.sync and
+ * accesses have no derefs, as the Metal translation's have: a plain store
+ * is weak and a coherent, volatile or atomic one stays strong at GPU scope,
+ * as every load does; a workgroup barrier on global memory is bar.sync and
  * a CTA membar; a device-scope fence on global memory keeps its modes, so
  * it stays a GPU membar that writes L1 back before it and invalidates L1
  * after it. */
@@ -200,10 +201,10 @@ check_global_order(unsigned sm)
    /* CCTL.WBALL exists from Volta on; CCTL.IVALL on every target. */
    unsigned expected_controls = sm >= 70 ? 2 : 1;
    int result = 0;
-   if (!listing || weak_stores != 0 || strong_stores != 6 || weak_loads != 0 || strong_loads != 4 ||
+   if (!listing || weak_stores != 3 || strong_stores != 3 || weak_loads != 0 || strong_loads != 4 ||
        syncs != 1 || cta != 1 || gpu != 1 || controls != expected_controls) {
       fprintf(stderr,
-              "SM%u: stores weak %u strong %u (expected 0, 6), loads weak %u strong %u "
+              "SM%u: stores weak %u strong %u (expected 3, 3), loads weak %u strong %u "
               "(expected 0, 4), bar.sync %u membar.cta %u membar.gpu %u (expected 1 each), "
               "cache controls %u (expected %u)\n",
               sm, weak_stores, strong_stores, weak_loads, strong_loads, syncs, cta, gpu, controls,
