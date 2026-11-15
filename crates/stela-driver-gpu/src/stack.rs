@@ -70,6 +70,8 @@ pub static STACKS: &[&GpuStack] = &[
     &NVIDIA,
     #[cfg(feature = "amdgpu-port")]
     &AMD,
+    #[cfg(feature = "xe-port")]
+    &INTEL,
 ];
 
 /// nouveau with GSP firmware, NVK and NAK.
@@ -125,6 +127,30 @@ pub static AMD: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
+    #[cfg(all(feature = "metal-linked", not(test)))]
+    vulkan: None,
+};
+
+/// xe with the display code it shares with i915. No Vulkan driver yet: its
+/// GPU shows the frames another GPU draws, on the displays wired to it.
+#[cfg(feature = "xe-port")]
+pub static INTEL: GpuStack = GpuStack {
+    vendor: Vendor::Intel,
+    kernel: Kernel {
+        driver: "xe",
+        admits: crate::xe::admits,
+        // GTTMMADR (`regs/xe_bars.h`): the registers, then the GTT.
+        registers: 0,
+        // The platform's `dma_mask_size` (`xe_pci.c`), which
+        // `xe_set_dma_info` sets as the mask.
+        dma_bits: crate::xe::dma_bits,
+        integrated: |_| false,
+        probed_integrated: None,
+        chip: crate::xe::query::chip,
+        memory_bytes: crate::xe::query::memory_bytes,
+    },
+    #[cfg(feature = "metal")]
+    metal: None,
     #[cfg(all(feature = "metal-linked", not(test)))]
     vulkan: None,
 };
@@ -342,7 +368,10 @@ mod tests {
         for vendor in [
             #[cfg(not(feature = "amdgpu-port"))]
             0x1002,
+            #[cfg(not(feature = "xe-port"))]
             0x8086,
+            // ASPEED's BMC display and a vendor no stack names.
+            0x1a03,
             0x1234,
         ] {
             let adapter = adapter(vendor);
@@ -373,6 +402,25 @@ mod tests {
             GpuStack::select(&audio).err(),
             Some("amdgpu's PCI ID table does not hold this device")
         );
+    }
+
+    #[cfg(feature = "xe-port")]
+    #[test]
+    fn intel_is_selected_only_for_a_device_of_xes_table_and_draws_nothing() {
+        // Tiger Lake's UHD Graphics, then an ID no table holds.
+        let mut tiger_lake = adapter(0x8086);
+        tiger_lake.device = 0x9a49;
+        let intel = GpuStack::select(&tiger_lake).unwrap();
+        assert!(core::ptr::eq(intel, &INTEL));
+        assert_eq!(intel.kernel.driver, "xe");
+        assert_eq!(intel.kernel.dma_limit(&tiger_lake), (1 << 39) - 1);
+        assert!(!intel.draws());
+        let unknown = adapter(0x8086);
+        assert_eq!(
+            GpuStack::select(&unknown).err(),
+            crate::xe::admits(&unknown).err()
+        );
+        assert!(crate::xe::admits(&unknown).is_err());
     }
 
     #[test]

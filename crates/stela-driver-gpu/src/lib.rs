@@ -13,6 +13,9 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(feature = "xe-port")]
+pub mod xe;
+
 pub mod cold;
 pub mod gsp_perf;
 pub mod nouveau_chip;

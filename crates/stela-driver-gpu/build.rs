@@ -54,6 +54,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(feature = "amdgpu-port")]
     amdgpu::tables();
+    #[cfg(feature = "xe-port")]
+    xe::tables();
     // Clippy reads Rust and links nothing, so it needs no C objects.
     println!("cargo:rerun-if-env-changed=CLIPPY_ARGS");
     #[cfg(feature = "linux-kernel")]

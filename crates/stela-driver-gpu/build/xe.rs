@@ -4,6 +4,7 @@
 use super::kbuild::{Config, Kbuild, Rule};
 use super::native::{self, Linux};
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -371,4 +372,124 @@ fn generate(output: &Path) {
                 .arg(generated.join(name).with_extension("h")),
         );
     }
+}
+
+/// Linux's Intel PCI device ID lists, which xe's table is written with.
+const PCI_IDS: &str = "../../third_party/linux/include/drm/intel/pciids.h";
+
+/// Write xe's PCI ID table for the Rust side (`src/xe.rs`): each device ID
+/// with the DMA mask bits of its platform's descriptor, read from the
+/// driver's own `pciidlist` and Linux's ID lists. A clippy build reads it
+/// too, so it is written before any C is compiled.
+pub fn tables() {
+    let table = Path::new(XE).join("xe_pci.c");
+    for watched in [table.as_path(), Path::new(PCI_IDS)] {
+        println!("cargo:rerun-if-changed={}", watched.display());
+    }
+    let devices = devices(
+        &fs::read_to_string(&table).expect("read xe's PCI table"),
+        &fs::read_to_string(PCI_IDS).expect("read Linux's Intel PCI IDs"),
+    )
+    .unwrap_or_else(|error| panic!("xe's PCI ID table: {error}"));
+    let mut text = String::from(
+        "/// xe's `pciidlist`: each PCI device ID with its platform's `dma_mask_size`.\n\
+         pub(crate) const DEVICES: &[(u16, u8)] = &[\n",
+    );
+    for (device, bits) in devices {
+        text.push_str(&format!("    ({device:#06x}, {bits}),\n"));
+    }
+    text.push_str("];\n");
+    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    fs::write(output.join("xe_devices.rs"), text).expect("write xe's device table");
+}
+
+/// Each device ID of `pciidlist` in `table` with the mask bits of the
+/// descriptor its entry names, the ID lists expanded from `ids`.
+fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, u8>, String> {
+    // Each list macro's own IDs and the list macros it includes.
+    let mut lists = BTreeMap::new();
+    for definition in ids.replace("\\\n", " ").lines() {
+        let Some(rest) = definition.strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((name, body)) = rest.split_once("(MACRO__, ...)") else {
+            continue;
+        };
+        let (mut own, mut included) = (Vec::new(), Vec::new());
+        // Each call in the body: `MACRO__(0x1234, ...)` is an ID of this
+        // list, `OTHER_IDS(MACRO__, ...)` includes another list.
+        let pieces = body.split('(').collect::<Vec<_>>();
+        for call in pieces.windows(2) {
+            let callee = call[0]
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("");
+            let argument = call[1].split([',', ')']).next().unwrap_or("").trim();
+            if callee == "MACRO__" {
+                let id = argument
+                    .strip_prefix("0x")
+                    .or_else(|| argument.strip_prefix("0X"))
+                    .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+                    .ok_or_else(|| format!("{name} lists {argument:?}"))?;
+                own.push(id);
+            } else if argument == "MACRO__" {
+                included.push(callee.to_owned());
+            }
+        }
+        lists.insert(name.trim().to_owned(), (own, included));
+    }
+    // Each descriptor's mask.
+    let mut masks = BTreeMap::new();
+    for descriptor in table.split("struct xe_device_desc ").skip(1) {
+        let Some((name, body)) = descriptor.split_once(" = {") else {
+            continue;
+        };
+        // A descriptor's definition, not a pointer to one in a signature.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let body = body.split("};").next().unwrap_or("");
+        if let Some(bits) = body.split(".dma_mask_size = ").nth(1) {
+            let bits = bits.split(',').next().unwrap_or("").trim();
+            masks.insert(
+                name.trim().to_owned(),
+                bits.parse::<u8>()
+                    .map_err(|_| format!("{name} has mask {bits:?}"))?,
+            );
+        }
+    }
+    let entries = table
+        .split("pciidlist[] = {")
+        .nth(1)
+        .and_then(|rest| rest.split("{ }").next())
+        .ok_or("no pciidlist")?;
+    let mut devices = BTreeMap::new();
+    for entry in entries
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let (list, descriptor) = entry
+            .split_once('(')
+            .and_then(|(list, rest)| Some((list, rest.split_once('&')?.1)))
+            .ok_or_else(|| format!("entry {entry:?}"))?;
+        let descriptor = descriptor.trim_end_matches("),");
+        let bits = *masks
+            .get(descriptor)
+            .ok_or_else(|| format!("{descriptor} has no dma_mask_size"))?;
+        let mut pending = vec![list.to_owned()];
+        while let Some(list) = pending.pop() {
+            let (own, included) = lists.get(&list).ok_or_else(|| format!("no list {list}"))?;
+            pending.extend(included.iter().cloned());
+            for id in own {
+                if devices.insert(*id, bits).is_some_and(|other| other != bits) {
+                    return Err(format!("{id:#06x} has two masks"));
+                }
+            }
+        }
+    }
+    if devices.is_empty() {
+        return Err("pciidlist is empty".into());
+    }
+    Ok(devices)
 }
