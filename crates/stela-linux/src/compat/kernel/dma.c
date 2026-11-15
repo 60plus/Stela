@@ -43,6 +43,20 @@ void dma_unmap_page_attrs(struct device *dev, dma_addr_t addr, size_t size,
 	dma_unmap_phys(dev, addr, size, dir, attrs);
 }
 
+/* Device memory, such as another device's BAR: the owner's mapping is told
+ * it is MMIO, as kernel/dma/mapping.c tells it. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys, size_t size,
+			    enum dma_data_direction dir, unsigned long attrs)
+{
+	return dma_map_phys(dev, phys, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+			enum dma_data_direction dir, unsigned long attrs)
+{
+	dma_unmap_phys(dev, addr, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
 static int map_sg(struct device *dev, struct scatterlist *sg, int nents,
 		  enum dma_data_direction dir, unsigned long attrs)
 {
