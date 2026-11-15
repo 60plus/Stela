@@ -391,7 +391,8 @@ const RETURN_SECONDS: u64 = 8;
 /// The pause between two detections in that time.
 const RETURN_STEP_MILLIS: u64 = 100;
 
-/// Moves the display to the first bound GPU with an output, in the
+/// Moves the display to the first bound GPU with an output, the GPUs that
+/// draw first and then those that only show (`claim_all`'s order), in the
 /// monitor's own mode that macOS can be told of, else in the mode of
 /// `wanted` pixels, the firmware's, if it has it: the guest's mode is not
 /// set yet and follows the display taken. The GPU that showed the firmware's
@@ -452,6 +453,19 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                // A GPU that draws nothing shows what another draws: the
+                // display is wired to it (a laptop's panel on its integrated
+                // GPU), and each frame is copied into its buffer.
+                if !bound_gpu.stack.draws()
+                    && let Some(drawing) = bound.iter().find(|other| other.stack.draws())
+                {
+                    output::arguments(format_args!(
+                        "GPU {name}: the connected display is on this GPU, so it shows the \
+                         frames GPU {} draws, each copied into its buffer and flipped on its \
+                         own vblank\n",
+                        drawing.name
+                    ));
+                }
                 report_outputs(name, &display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {
