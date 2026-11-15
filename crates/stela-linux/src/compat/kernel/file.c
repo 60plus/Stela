@@ -317,6 +317,23 @@ int stela_linux_open(dev_t device, unsigned int flags)
 	return fd;
 }
 
+/* A new anonymous file under a new descriptor, as fs/anon_inodes.c. */
+int anon_inode_getfd(const char *name, const struct file_operations *fops, void *priv, int flags)
+{
+	int fd = get_unused_fd_flags((unsigned int)flags);
+
+	if (fd < 0)
+		return fd;
+	struct file *file = anon_inode_getfile(name, fops, priv, flags);
+
+	if (IS_ERR(file)) {
+		put_unused_fd((unsigned int)fd);
+		return (int)PTR_ERR(file);
+	}
+	fd_install((unsigned int)fd, file);
+	return fd;
+}
+
 /* A raw compatibility file has no VFS path through which to reopen it. */
 struct file *stela_linux_reopen_unowned_path(void)
 {
