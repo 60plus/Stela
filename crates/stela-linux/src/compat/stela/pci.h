@@ -67,4 +67,8 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 /* Cumulative final releases quarantined outside the original process owner.
  * Atomic observation only; no reset or deferred reclamation is implied. */
 u64 stela_linux_pci_quarantined_functions(void);
+/* Cache what Linux's probe reads from a PCI Express function's capability:
+ * its flags, device capabilities and supported link speeds. A PCIBIOS error
+ * when the function does not answer. */
+int stela_linux_pci_express_probe(struct pci_dev *dev);
 #endif

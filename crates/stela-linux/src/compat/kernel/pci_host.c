@@ -192,6 +192,18 @@ void pci_disable_msi(struct pci_dev *dev)
 	dev->msi_enabled = 0;
 }
 
+/* drivers/pci/msi/msi.c writes a function's message back after a reset
+ * cleared it. The owner holds the message, so the owner routes it again. */
+void pci_restore_msi_state(struct pci_dev *dev)
+{
+	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+
+	if (dev->msi_enabled && function->enable_msi(function->context)) {
+		pci_err(dev, "the owner could not route the message again after a reset\n");
+		dev->msi_enabled = 0;
+	}
+}
+
 /* Interrupt vectors, following drivers/pci/msi/api.c: MSI-X, MSI and INTx
  * in that order, each only where the caller allows it. A function's owner
  * routes one message and no MSI-X table, so one vector is what there is, and
@@ -289,6 +301,8 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
         error = pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_revision);
     if (!error)
         error = stela_linux_pci_find_capability(dev, PCI_CAP_ID_EXP, &dev->pcie_cap);
+    if (!error)
+        error = stela_linux_pci_express_probe(dev);
     if (error) {
         /* No original device_initialize/publication or context transfer has
          * occurred. Rust retains exact State/Host/authority on this refusal. */
