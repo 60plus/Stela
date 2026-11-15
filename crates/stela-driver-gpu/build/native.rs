@@ -133,11 +133,12 @@ const DRM_SOURCES: &[&str] = &[
     "display/drm_scdc_helper",
 ];
 
-/// What the profile selects besides, for a driver's Kconfig entry: panels,
-/// the MIPI DSI bus and the driver core's auxiliary bus. Paths are below
-/// Linux's tree.
+/// What the profile selects besides, for a driver's Kconfig entry: GPU SVM,
+/// panels, the MIPI DSI bus and the driver core's auxiliary bus. Paths are
+/// below Linux's tree.
 #[cfg(feature = "linux-drm")]
 const SELECTED_SOURCES: &[&str] = &[
+    "drivers/gpu/drm/drm_gpusvm",
     "drivers/gpu/drm/drm_panel",
     "drivers/gpu/drm/drm_mipi_dsi",
     "drivers/base/auxiliary",

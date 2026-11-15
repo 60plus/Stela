@@ -107,6 +107,16 @@
 #define CONFIG_HWMON 1
 #define CONFIG_BACKLIGHT_CLASS_DEVICE 1
 #define CONFIG_POWER_SUPPLY 1
+/* Helper objects xe's entry selects besides those above: GPU SVM. VMAP_PFN
+ * and REGMAP (which xe selects because I2C is set) build nothing here: a
+ * register map is refused (kernel/unsupported.c). DEV_COREDUMP follows
+ * WANT_DEV_COREDUMP only with ALLOW_DEV_COREDUMP, which is for systems where a
+ * dump can be read; nothing reads sysfs here, so it is not set and a dump's
+ * data is freed where it would be published. */
+#define CONFIG_DRM_GPUSVM 1
+#define CONFIG_VMAP_PFN 1
+#define CONFIG_REGMAP 1
+#define CONFIG_WANT_DEV_COREDUMP 1
 /* Buses and helpers a driver's entry selects: xe's selects panels, the MIPI
  * DSI bus and the auxiliary bus. No driver of the image registers on either
  * bus. */

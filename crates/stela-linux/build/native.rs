@@ -345,6 +345,12 @@ impl Linux {
                 .iter()
                 .map(|source| PathBuf::from(format!("{LINUX}/drivers/dma-buf/{source}.c"))),
         );
+        // Library code the drivers' selected helpers call: a binary search,
+        // an integer square root and bounded text buffers.
+        upstream.extend(
+            ["lib/bsearch", "lib/math/int_sqrt", "lib/seq_buf"]
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
+        );
         // What MMU_NOTIFIER builds: the notifiers of an address space, over
         // the interval tree of the ranged ones and the lock-less list their
         // deferred removals wait in.
