@@ -18,6 +18,9 @@ pub type Control<'a> = &'a mut dyn FnMut(u32, *mut c_void) -> i32;
 pub struct Kernel {
     /// The name its `pci_driver` registers under.
     pub driver: &'static str,
+    /// Whether the driver's ID table holds the adapter, or why it does not.
+    /// One it does not hold is left as firmware set it.
+    pub admits: fn(&Adapter) -> Result<(), &'static str>,
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
@@ -50,13 +53,16 @@ impl Kernel {
 }
 
 /// Every stack this build holds.
-pub static STACKS: [&GpuStack; 1] = [&NVIDIA];
+pub static STACKS: &[&GpuStack] = &[&NVIDIA];
 
 /// nouveau with GSP firmware, NVK and NAK.
 pub static NVIDIA: GpuStack = GpuStack {
     vendor: Vendor::Nvidia,
     kernel: Kernel {
         driver: "nouveau",
+        // nouveau's table holds every NVIDIA display function; what it does
+        // with a chip it does not know is its probe's answer.
+        admits: |_| Ok(()),
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,
@@ -104,13 +110,16 @@ impl GpuStack {
         false
     }
 
-    /// The stack for `adapter`'s vendor, or why Stela has none.
+    /// The stack for `adapter`: its vendor's, when that stack's kernel
+    /// driver holds the device. Otherwise why Stela drives it with none.
     pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
-        STACKS
+        let stack = STACKS
             .iter()
             .copied()
             .find(|stack| stack.vendor == adapter.vendor)
-            .ok_or_else(|| adapter.unavailable_reason())
+            .ok_or_else(|| adapter.unavailable_reason())?;
+        (stack.kernel.admits)(adapter)?;
+        Ok(stack)
     }
 }
 
