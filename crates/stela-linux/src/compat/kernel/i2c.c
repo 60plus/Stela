@@ -98,6 +98,23 @@ int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
 	return devm_add_action_or_reset(dev, managed_del_adapter, adapter);
 }
 
+/* An adapter by its bus number, which a panel's power sequence in the VBT
+ * uses for a platform I2C controller that firmware tables number. Stela
+ * drives no such controller and numbers no adapter, so there is none, and
+ * that is said once; nothing can then be put. */
+struct i2c_adapter *i2c_get_adapter(int nr)
+{
+	(void)nr;
+	stela_linux_unsupported("a platform I2C controller by bus number");
+	return NULL;
+}
+
+void i2c_put_adapter(struct i2c_adapter *adapter)
+{
+	if (adapter)
+		stela_linux_fatal("an I2C adapter put that no lookup gave");
+}
+
 /* Arbitration loss retries, within the adapter's limits. */
 int __i2c_transfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
 {
