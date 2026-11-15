@@ -247,8 +247,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Add the hot-block samples since the last call to `hot`
     /// ([`step_timing::HotBlocks`]).
     pub fn take_hot_samples(&mut self, hot: &mut step_timing::HotBlocks) {
-        for (pc, level) in self.hot_samples.drain(..) {
+        for (pc, level, asid) in self.hot_samples.drain(..) {
             hot.add(pc, level, 1);
+            hot.asids.add(asid, pc, level, 1);
         }
         hot.add_dynamic(&self.dynamic_samples);
         self.dynamic_samples.clear();

@@ -559,6 +559,9 @@ fn hot_blocks_report<H: Host>(
     total.merge(&hot);
     if whole {
         hot_total_report(total);
+        // Address spaces are reused by later processes: the total by
+        // address space covers the beats since the last total report.
+        total.asids = Default::default();
     }
     if hot.is_empty() {
         return;
@@ -575,6 +578,50 @@ fn hot_blocks_report<H: Host>(
         let mut line = format!("PES HOT {name} samples={samples} other={}", hot.other);
         for block in hot.top(level, SHOWN) {
             push_hot_block(&mut line, level, &block);
+        }
+        output::arguments(format_args!("{line}\n"));
+    }
+    hot_asids_report("PES HOT", &hot.asids, 10, 3, 8);
+}
+
+/// `{prefix} ASIDS samples=N other=M asid:user/kernel/guarded ...`: the
+/// samples by the guest address space they ran in (`step_timing::AsidSamples`;
+/// per beat, and under `PES HOT TOTAL` over the [`HOT_TOTAL_BEATS`] beats
+/// since the last total),
+/// the `spaces` with most first, then for the `named` first of them a
+/// `{prefix} ASID asid pc:count ...` line of its `blocks` most sampled EL0
+/// blocks, whose frameworks name the process: how much of the guest's time
+/// one process takes, in user code and in the kernel on its behalf, where
+/// the per-level lines mix every process.
+fn hot_asids_report(
+    prefix: &str,
+    asids: &step_timing::AsidSamples,
+    spaces: usize,
+    named: usize,
+    blocks: usize,
+) {
+    let top = asids.top(spaces);
+    if top.is_empty() {
+        return;
+    }
+    let samples: u64 = asids.spaces.iter().map(|space| space.total()).sum();
+    let mut line = format!(
+        "{prefix} ASIDS samples={samples} other={} asid:user/kernel/guarded",
+        asids.other
+    );
+    for space in &top {
+        let [user, kernel, guarded] = space.samples;
+        line.push_str(&format!(" {:#x}:{user}/{kernel}/{guarded}", space.asid));
+    }
+    output::arguments(format_args!("{line}\n"));
+    for space in top.iter().take(named) {
+        let shown = asids.top_blocks(space.asid, blocks);
+        if shown.is_empty() {
+            continue;
+        }
+        let mut line = format!("{prefix} ASID {:#x}", space.asid);
+        for block in shown {
+            line.push_str(&format!(" {:#x}:{}", block.pc, block.count));
         }
         output::arguments(format_args!("{line}\n"));
     }
@@ -632,6 +679,7 @@ fn hot_total_report(total: &step_timing::HotBlocks) {
         }
         output::arguments(format_args!("{line}\n"));
     }
+    hot_asids_report("PES HOT TOTAL", &total.asids, 16, 6, 24);
 }
 
 /// The end of the `PES STAMPED` line under step timing: for RET, BLR, BR
