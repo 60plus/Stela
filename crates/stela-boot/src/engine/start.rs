@@ -2563,6 +2563,70 @@ fn start_platform(
         Ok(()) => output::arguments(format_args!("NATIVE IRQ device vectors attached\n")),
         Err(error) => output::arguments(format_args!("NATIVE IRQ unavailable: {error:?}\n")),
     }
+    crate::status::progress("clocks");
+    let clock = if options.boots_macos() {
+        // SAFETY: this BSP owns the existing timer/IDT before any driver,
+        // and the HPET only after its whole-controller handoff above.
+        unsafe { service_clock(handoff, host_owner, native_mmio) }
+            .inspect_err(|error| {
+                output::arguments(format_args!(
+                    "NATIVE SERVICE CLOCK unavailable: {error:?}\n"
+                ));
+            })
+            .ok()
+            .map(|clock| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(clock)))
+    } else {
+        None
+    };
+    // SAFETY: validated BSP handoff, before AP/driver producers.
+    let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
+        Ok(work) => {
+            // SAFETY: the BSP in the engine's root, before the APs start and
+            // before any producer uses its counters or its APIC's entry.
+            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
+            #[cfg(feature = "diagnostics")]
+            output::arguments(format_args!(
+                "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
+            ));
+            Ok(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
+        }
+        // The record keeps this line until the USB log opens again, which
+        // the devices' start on the boot stack (`start_devices`) reaches.
+        Err(error) => {
+            output::arguments(format_args!("NATIVE WORK unavailable: {error}\n"));
+            Err(error.reason())
+        }
+    };
+    crate::status::progress("ACPI tables");
+    // The step watchdog's stop names this step: its AML calls are bounded
+    // (`aml::bounded`), but an access that never completes is not.
+    static ACPI_TABLES: &str = "the firmware's ACPI tables";
+    super::step_watchdog::stage(&ACPI_TABLES);
+    // Loaded before the PCI census, so PCI ports whose slot power firmware
+    // left off are powered on before it (`pci_power`) and the census sees
+    // what lies below them; hardware mode follows the census.
+    let host_acpi = aml::HostAcpi::start(
+        handoff.rsdp,
+        handoff.root,
+        handoff
+            .storage
+            .handoff()
+            .map(|storage| storage.ecam)
+            .unwrap_or_default(),
+        native_mmio,
+        handoff.tsc_hz,
+        work.as_ref().ok().copied(),
+    );
+    crate::native_idle::install(
+        host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
+    );
+    if let (Some(acpi), Some(mmio)) = (host_acpi, native_mmio) {
+        crate::status::progress("PCI ports");
+        static PCI_PORTS: &str = "powering on PCI ports through ACPI";
+        super::step_watchdog::stage(&PCI_PORTS);
+        super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
+    }
+    super::step_watchdog::clear_stage();
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
     crate::status::progress("PCI functions");
@@ -2688,62 +2752,9 @@ fn start_platform(
         }
         _ => None,
     };
-    crate::status::progress("clocks");
-    let clock = if options.boots_macos() {
-        // SAFETY: this BSP owns the existing timer/IDT before any driver,
-        // and the HPET only after its whole-controller handoff above.
-        unsafe { service_clock(handoff, host_owner, native_mmio) }
-            .inspect_err(|error| {
-                output::arguments(format_args!(
-                    "NATIVE SERVICE CLOCK unavailable: {error:?}\n"
-                ));
-            })
-            .ok()
-            .map(|clock| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(clock)))
-    } else {
-        None
-    };
-    // SAFETY: validated BSP handoff, before AP/driver producers.
-    let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
-        Ok(work) => {
-            // SAFETY: the BSP in the engine's root, before the APs start and
-            // before any producer uses its counters or its APIC's entry.
-            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
-            #[cfg(feature = "diagnostics")]
-            output::arguments(format_args!(
-                "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
-            ));
-            Ok(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
-        }
-        // The record keeps this line until the USB log opens again, which
-        // the devices' start on the boot stack (`start_devices`) reaches.
-        Err(error) => {
-            output::arguments(format_args!("NATIVE WORK unavailable: {error}\n"));
-            Err(error.reason())
-        }
-    };
-    crate::status::progress("ACPI tables");
-    // The step watchdog's stop names this step: its AML calls are bounded
-    // (`aml::bounded`), but an access that never completes is not.
-    static ACPI_TABLES: &str = "the firmware's ACPI tables";
-    super::step_watchdog::stage(&ACPI_TABLES);
-    let host_acpi = aml::HostAcpi::start(
-        handoff.rsdp,
-        handoff.root,
-        handoff
-            .storage
-            .handoff()
-            .map(|storage| storage.ecam)
-            .unwrap_or_default(),
-        native_mmio,
-        handoff.tsc_hz,
-        prepared_sci,
-        work.as_ref().ok().copied(),
-    );
-    crate::native_idle::install(
-        host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
-    );
-    super::step_watchdog::clear_stage();
+    if let Some(acpi) = host_acpi {
+        acpi.activate(prepared_sci);
+    }
     crate::status::done("");
     Platform {
         acpi: host_acpi,
