@@ -6,7 +6,9 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/log2.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <stela/device.h>
 #include <stela/linux.h>
@@ -32,8 +34,7 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids, struct
 	return NULL;
 }
 
-/* Managed enabling and wake configuration, which no selected driver uses. */
-STELA_UNSUPPORTED(int, pcim_enable_device, struct pci_dev *)
+/* Wake configuration, which no selected driver uses. */
 STELA_UNSUPPORTED(int, pci_wait_for_pending_transaction, struct pci_dev *)
 STELA_UNSUPPORTED(int, pci_wake_from_d3, struct pci_dev *, bool)
 
@@ -135,6 +136,99 @@ u8 pci_find_capability(struct pci_dev *dev, int cap)
         stela_linux_fatal("PCI capability access failed without a result");
     return found;
 }
+
+/* The extended capability list's entry for cap, or 0, as drivers/pci/pci.c
+ * finds it. A function whose owner reaches only the first 256 bytes fails
+ * the first read and has none. */
+u16 pci_find_ext_capability(struct pci_dev *dev, int cap)
+{
+	u16 pos = PCI_CFG_SPACE_SIZE;
+	u32 header;
+
+	if (pci_read_config_dword(dev, pos, &header) || !header || header == ~0U)
+		return 0;
+	for (int bound = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8; bound > 0; bound--) {
+		if (PCI_EXT_CAP_ID(header) == (u32)cap)
+			return pos;
+		pos = PCI_EXT_CAP_NEXT(header);
+		if (pos < PCI_CFG_SPACE_SIZE || pci_read_config_dword(dev, pos, &header))
+			break;
+	}
+	return 0;
+}
+
+/* Resizable BARs, following drivers/pci/rebar.c. What a function offers is
+ * read from it. A resize moves bridge windows, which belong to the firmware
+ * here: a bus lists none, so a driver that looks for room above 4 GiB finds
+ * none and keeps the size the firmware gave, and that is said once. */
+#define PCI_REBAR_MIN_SIZE ((resource_size_t)SZ_1M)
+
+int pci_rebar_bytes_to_size(u64 bytes)
+{
+	int minimum = ilog2(PCI_REBAR_MIN_SIZE);
+
+	bytes = roundup_pow_of_two(bytes);
+	return max(ilog2(bytes), minimum) - minimum;
+}
+
+resource_size_t pci_rebar_size_to_bytes(int size)
+{
+	return 1ULL << (size + ilog2(PCI_REBAR_MIN_SIZE));
+}
+
+u64 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar)
+{
+	unsigned int pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_REBAR);
+	unsigned int count;
+	u32 control, sizes;
+
+	if (!pos || bar < 0 || bar >= PCI_STD_NUM_BARS ||
+	    pci_read_config_dword(pdev, (int)pos + PCI_REBAR_CTRL, &control))
+		return 0;
+	count = (control & PCI_REBAR_CTRL_NBAR_MASK) >> PCI_REBAR_CTRL_NBAR_SHIFT;
+	for (unsigned int i = 0; i < count; i++, pos += 8) {
+		if (pci_read_config_dword(pdev, (int)pos + PCI_REBAR_CTRL, &control))
+			return 0;
+		if ((control & PCI_REBAR_CTRL_BAR_IDX) != (u32)bar)
+			continue;
+		if (pci_read_config_dword(pdev, (int)pos + PCI_REBAR_CAP, &sizes))
+			return 0;
+		sizes = (sizes & PCI_REBAR_CAP_SIZES) >> 4;
+		/* Linux's correction of one card's invalid capability. */
+		if (pdev->vendor == PCI_VENDOR_ID_ATI && pdev->device == 0x731f && bar == 0 &&
+		    sizes == 0x700)
+			return 0x3f00;
+		return sizes;
+	}
+	return 0;
+}
+
+bool pci_rebar_size_supported(struct pci_dev *pdev, int bar, int size)
+{
+	u64 sizes = pci_rebar_get_possible_sizes(pdev, bar);
+
+	if (size < 0 || size > ilog2(SZ_128T) - ilog2(PCI_REBAR_MIN_SIZE))
+		return false;
+	return BIT_ULL(size) & sizes;
+}
+
+int pci_rebar_get_max_size(struct pci_dev *pdev, int bar)
+{
+	u64 sizes = pci_rebar_get_possible_sizes(pdev, bar);
+
+	return sizes ? (int)__fls(sizes) : -ENOENT;
+}
+
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
+{
+	(void)bus;
+	(void)n;
+	stela_linux_unsupported("a PCI bus's windows: BARs keep the sizes the firmware gave");
+	return NULL;
+}
+
+STELA_UNSUPPORTED(int, pci_resize_resource, struct pci_dev *, int, int, int)
+STELA_UNSUPPORTED(void, pci_assign_unassigned_bus_resources, struct pci_bus *)
 
 const struct bus_type pci_bus_type = {.name = "pci"};
 
@@ -339,6 +433,114 @@ struct pci_dev *pci_get_domain_bus_and_slot(int domain, unsigned int bus, unsign
 	return NULL;
 }
 
+/* Other functions, following drivers/pci/search.c, among those their owners
+ * registered: the next of a class after from, whose reference the call
+ * takes over, and whether any matches a table. */
+struct pci_dev *pci_get_class(unsigned int class, struct pci_dev *from)
+{
+	struct pci_dev *dev = list_prepare_entry(from, &devices, bus_list);
+
+	list_for_each_entry_continue(dev, &devices, bus_list)
+		if (dev->class == class) {
+			pci_dev_get(dev);
+			pci_dev_put(from);
+			return dev;
+		}
+	pci_dev_put(from);
+	return NULL;
+}
+
+int pci_dev_present(const struct pci_device_id *ids)
+{
+	struct pci_dev *dev;
+
+	list_for_each_entry(dev, &devices, bus_list)
+		if (pci_match_id(ids, dev))
+			return 1;
+	return 0;
+}
+
+/* Whether the function can signal PME# from state, as its power management
+ * capability says (PCI PM 1.2, 3.2.3), which drivers/pci/pci.c caches. */
+bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
+{
+	u8 capability = pci_find_capability(dev, PCI_CAP_ID_PM);
+	u16 capabilities;
+
+	if (!capability || state < PCI_D0 || state > PCI_D3cold ||
+	    pci_read_config_word(dev, capability + PCI_PM_PMC, &capabilities))
+		return false;
+	return (capabilities & PCI_PM_CAP_PME_MASK) >> PCI_PM_CAP_PME_SHIFT & 1U << state;
+}
+
+/* The entries of the function's MSI-X table, following
+ * drivers/pci/msi/api.c. */
+int pci_msix_vec_count(struct pci_dev *dev)
+{
+	u8 capability = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+	u16 control;
+
+	if (!capability || pci_read_config_word(dev, capability + PCI_MSIX_FLAGS, &control))
+		return -EINVAL;
+	return (control & PCI_MSIX_FLAGS_QSIZE) + 1;
+}
+
+/* BAR mappings, following drivers/pci/iomap.c. A port range has no mapping
+ * here: Stela's arch reaches ports by instruction, never as memory. */
+static void __iomem *map_bar(struct pci_dev *dev, int bar, unsigned long offset,
+			     unsigned long maxlen, bool write_combining)
+{
+	if (bar < 0 || bar >= PCI_STD_NUM_BARS)
+		return NULL;
+
+	resource_size_t start = pci_resource_start(dev, bar);
+	resource_size_t len = pci_resource_len(dev, bar);
+	unsigned long flags = pci_resource_flags(dev, bar);
+
+	if (len <= offset || !start)
+		return NULL;
+	len -= offset;
+	start += offset;
+	if (maxlen && len > maxlen)
+		len = maxlen;
+	if (flags & IORESOURCE_IO) {
+		if (!write_combining)
+			stela_linux_unsupported("a mapping of a PCI I/O port BAR");
+		return NULL;
+	}
+	if (!(flags & IORESOURCE_MEM))
+		return NULL;
+	return write_combining ? ioremap_wc(start, len) : ioremap(start, len);
+}
+
+void __iomem *pci_iomap_range(struct pci_dev *dev, int bar, unsigned long offset,
+			      unsigned long maxlen)
+{
+	return map_bar(dev, bar, offset, maxlen, false);
+}
+
+void __iomem *pci_iomap_wc_range(struct pci_dev *dev, int bar, unsigned long offset,
+				 unsigned long maxlen)
+{
+	return map_bar(dev, bar, offset, maxlen, true);
+}
+
+void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long maxlen)
+{
+	return map_bar(dev, bar, 0, maxlen, false);
+}
+
+void __iomem *pci_iomap_wc(struct pci_dev *dev, int bar, unsigned long maxlen)
+{
+	return map_bar(dev, bar, 0, maxlen, true);
+}
+
+void pci_iounmap(struct pci_dev *dev, void __iomem *address)
+{
+	(void)dev;
+	iounmap(address);
+}
+
 /* Enabling, following drivers/pci/pci.c. The owner has powered the function
  * and assigned its resources; this turns on their decoding. */
 int pci_enable_device(struct pci_dev *dev)
@@ -383,6 +585,24 @@ void pci_disable_device(struct pci_dev *dev)
             stela_linux_fatal("PCI disable failed without completion");
         dev->is_busmaster = 0;
     }
+}
+
+static void managed_disable(void *data)
+{
+	pci_disable_device(data);
+}
+
+/* Enabling that the driver's detach undoes, following drivers/pci/devres.c. */
+int pcim_enable_device(struct pci_dev *dev)
+{
+	int error = pci_enable_device(dev);
+
+	if (error)
+		return error;
+	error = devm_add_action_or_reset(&dev->dev, managed_disable, dev);
+	if (!error)
+		dev->is_managed = true;
+	return error;
 }
 
 /* Linux's __pci_set_master reads Command only to compare the old and new
@@ -498,7 +718,7 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
 #include <stela/linux.h>
 #include <stela/test.h>
 
-static u8 config[256];
+static u8 config[4096];
 static int config_error;
 static bool ignore_bus_master_write;
 static unsigned int warnings;
@@ -551,10 +771,24 @@ static void log_line(void *context, int level, const char *message)
 		warnings++;
 }
 
+static unsigned int port_mappings, bus_windows;
+
+static void unsupported(void *context, const char *operation)
+{
+	(void)context;
+	if (!strcmp(operation, "a mapping of a PCI I/O port BAR"))
+		port_mappings++;
+	else if (!strcmp(operation, "a PCI bus's windows: BARs keep the sizes the firmware gave"))
+		bus_windows++;
+	else
+		assert(false);
+}
+
 static const struct stela_linux_services services = {
 	.map_device = map_device,
 	.unmap_device = unmap_device,
 	.log = log_line,
+	.unsupported = unsupported,
 };
 static const struct stela_linux_owner owner = {.services = &services};
 
@@ -629,7 +863,84 @@ int main(void)
 	assert(pci_get_domain_bus_and_slot(0, 3, PCI_DEVFN(1, 0)) == &dev);
 	pci_dev_put(&dev);
 	assert(!pci_get_domain_bus_and_slot(0, 4, PCI_DEVFN(1, 0)));
+
+	/* A function is found by class and by table, and a search past the
+	 * last one drops the reference it was given. */
+	const u32 any = (u32)PCI_ANY_ID;
+	const struct pci_device_id present[] = {{0x10de, any, any, any, 0, 0, 0, 0}, {}};
+	const struct pci_device_id missing[] = {{0x8086, any, any, any, 0, 0, 0, 0}, {}};
+	unsigned int references = kref_read(&dev.dev.kobj.kref);
+
+	dev.vendor = 0x10de;
+	dev.class = PCI_CLASS_BRIDGE_ISA << 8;
+	assert(pci_dev_present(present) && !pci_dev_present(missing));
+	assert(pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL) == &dev);
+	assert(kref_read(&dev.dev.kobj.kref) == references + 1);
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, &dev));
+	assert(kref_read(&dev.dev.kobj.kref) == references);
+	assert(!pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, NULL));
 	list_del(&dev.bus_list);
+
+	/* A detach undoes a managed enable. */
+	assert(!pcim_enable_device(&dev) && dev.is_managed);
+	assert(config[PCI_COMMAND] == PCI_COMMAND_MEMORY && atomic_read(&dev.enable_cnt) == 1);
+	stela_linux_devres_release(&dev.dev);
+	assert(!atomic_read(&dev.enable_cnt));
+
+	/* PME# from D3hot and D3cold only; an MSI-X table of eight entries. */
+	*(u16 *)&config[0x50 + PCI_PM_PMC] = 0x18 << PCI_PM_CAP_PME_SHIFT;
+	assert(pci_pme_capable(&dev, PCI_D3hot) && pci_pme_capable(&dev, PCI_D3cold));
+	assert(!pci_pme_capable(&dev, PCI_D0) && !pci_pme_capable(&dev, PCI_D2));
+	assert(pci_msix_vec_count(&dev) == -EINVAL);
+	config[0x60] = PCI_CAP_ID_MSIX;
+	config[0x61] = 0;
+	*(u16 *)&config[0x60 + PCI_MSIX_FLAGS] = 7;
+	assert(pci_msix_vec_count(&dev) == 8);
+
+	/* No extended list, then a resizable BAR capability behind another:
+	 * BAR 2 offers 256 MiB to 8 GiB. No bus lists a window to grow into. */
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR));
+	assert(!pci_rebar_get_possible_sizes(&dev, 2) && pci_rebar_get_max_size(&dev, 2) == -ENOENT);
+	*(u32 *)&config[0x100] = PCI_EXT_CAP_ID_ERR | 1 << 16 | 0x200 << 20;
+	*(u32 *)&config[0x200] = PCI_EXT_CAP_ID_REBAR | 1 << 16;
+	*(u32 *)&config[0x200 + PCI_REBAR_CAP] = 0x3f << 12;
+	*(u32 *)&config[0x200 + PCI_REBAR_CTRL] = 2 | 2 << PCI_REBAR_CTRL_NBAR_SHIFT;
+	*(u32 *)&config[0x208 + PCI_REBAR_CAP] = 0x10;
+	*(u32 *)&config[0x208 + PCI_REBAR_CTRL] = 0;
+	assert(pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR) == 0x200);
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_SRIOV));
+	assert(pci_rebar_get_possible_sizes(&dev, 2) == 0x3f00);
+	assert(pci_rebar_get_possible_sizes(&dev, 0) == 1 && !pci_rebar_get_possible_sizes(&dev, 1));
+	assert(pci_rebar_get_max_size(&dev, 2) == 13 && pci_rebar_size_to_bytes(13) == 8ULL << 30);
+	assert(pci_rebar_size_supported(&dev, 2, 8) && !pci_rebar_size_supported(&dev, 2, 7));
+	assert(!pci_rebar_size_supported(&dev, 2, -1) && !pci_rebar_size_supported(&dev, 2, 64));
+	assert(pci_rebar_bytes_to_size(1) == 0 && pci_rebar_bytes_to_size(SZ_1M) == 0);
+	assert(pci_rebar_bytes_to_size(SZ_256M) == 8 && pci_rebar_bytes_to_size(SZ_256M + 1) == 9);
+	assert(!pci_bus_resource_n(&bus, 0) && bus_windows == 1);
+	*(u32 *)&config[0x100] = PCI_EXT_CAP_ID_ERR | 1 << 16 | 0x100 << 20;
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR));
+	memset(&config[0x100], 0, sizeof(config) - 0x100);
+
+	/* A memory BAR maps from an offset, bounded by the caller's length and
+	 * the BAR's end; a port BAR, an empty one and one past the last do not. */
+	dev.resource[0].start = 0xc0000000 - 0x2000;
+	dev.resource[0].end = 0xc0000000 + sizeof(rom_window) - 1;
+	assert(pci_iomap_range(&dev, 0, 0x2000, 0) == (void __iomem *)rom_window);
+	assert(pci_iomap_range(&dev, 0, 0x2000, 2 * sizeof(rom_window)) ==
+	       (void __iomem *)rom_window);
+	pci_iounmap(&dev, rom_window);
+	assert(!pci_iomap_range(&dev, 0, 0x2000 + sizeof(rom_window), 0));
+	dev.resource[0].start = 0xc0000000;
+	assert(pci_iomap(&dev, 0, 0) == (void __iomem *)rom_window);
+	assert(pci_iomap_wc(&dev, 0, sizeof(rom_window)) == (void __iomem *)rom_window);
+	assert(!pci_iomap(&dev, 1, 0) && !pci_iomap(&dev, PCI_STD_NUM_BARS, 0));
+	dev.resource[1] = dev.resource[0];
+	dev.resource[1].flags = IORESOURCE_IO;
+	assert(!pci_iomap(&dev, 1, 0) && port_mappings == 1);
+	assert(!pci_iomap_wc(&dev, 1, 0) && port_mappings == 1);
+	dev.resource[1] = (struct resource){};
+	dev.resource[0].end = 0;
+	dev.resource[0].start = 0;
 
 	/* Two images of a block each in a window of eight: the size is theirs. */
 	dev.resource[PCI_ROM_RESOURCE].start = 0xc0000000;
@@ -648,7 +959,7 @@ int main(void)
 	rom_window[0] = 0;
 	assert(!pci_map_rom(&dev, &size) && *(u32 *)&config[PCI_ROM_ADDRESS] == 0xc0000000);
 	stela_linux_exit();
-	printf("Linux PCI configuration, enabling and option ROMs passed\n");
+	printf("Linux PCI configuration, enabling, searches, resizable BARs, BAR mappings and option ROMs passed\n");
 	return 0;
 }
 #endif
