@@ -223,14 +223,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// The block key the ITLB holds for the page of `pc` in the current
-    /// context of its half ([`Self::translate_page`]).
+    /// context of its half ([`Self::translate_page`]), or for a lower-half
+    /// page in the upper half's current context, which holds the pages
+    /// whose walk ended in a global leaf ([`Self::itlb_context`]): what a
+    /// lookup dispatcher's translation finds (`chain::translate`).
     pub(super) fn current_key(&self, pc: u64) -> Option<u64> {
-        let context = self.chain.contexts()[chain::half(pc)];
+        let half = chain::half(pc);
+        let contexts = self.chain.contexts();
         let page = pc & !(FETCH_PAGE - 1);
-        let held = self
-            .itlb
-            .find(self.itlb.page_slot(pc, context), page, context);
-        (held.pc == page && held.key == context).then_some(held.entry)
+        let held = |context: u64| {
+            let held = self
+                .itlb
+                .find(self.itlb.page_slot(pc, context), page, context);
+            (held.pc == page && held.key == context).then_some(held.entry)
+        };
+        held(contexts[half]).or_else(|| if half == 0 { held(contexts[1]) } else { None })
+    }
+
+    /// The context an ITLB entry of the page of `pc` takes: its half's
+    /// current one, but for a lower-half page whose walk ended in a global
+    /// leaf (`shared`) the upper half's. A global entry matches every ASID
+    /// (Arm `TLBIMatch`), so a TLB serves it to every address space of the
+    /// regime: the upper half's context is keyed by the same translation
+    /// inputs, EL and variant as the lower half's but TTBR0
+    /// ([`Self::half_inputs`]), so every process of a PE shares one entry
+    /// of each shared-cache page instead of taking its own. Every TLBI by
+    /// VA reaches the entry by its PC, with or without an ASID
+    /// ([`Self::forget_lookups`], whose global mark it carries); an ASID or
+    /// non-global TLBI leaves it, as it leaves global entries; a TLBI of
+    /// everything forgets both halves' contexts.
+    fn itlb_context(&self, pc: u64, shared: bool) -> u64 {
+        let half = chain::half(pc);
+        let contexts = self.chain.contexts();
+        if half == 0 && shared {
+            contexts[1]
+        } else {
+            contexts[half]
+        }
     }
 
     /// Record that the page of `pc`, which a fetch just translated for
@@ -242,17 +271,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// and keeps its neighbour. Counts the pages the ITLB lacked in the
     /// context apart from the new keys of pages it held.
     pub(super) fn translate_page(&mut self, pc: u64, key: u64) {
-        let global = self.fetched_global(pc);
-        self.take_page(pc, key, true, global);
+        // A page the fetch cache no longer holds is marked global, which
+        // only makes more TLBIs reach it, and kept in its own context.
+        let walk = self.cached_fetch(pc);
+        let global = walk.is_none_or(|walk| walk.global);
+        let shared = walk.is_some_and(|walk| walk.global);
+        self.take_page(pc, key, true, global, shared);
     }
 
     /// [`Self::translate_page`], counting a page the ITLB lacked as a miss
     /// when `missed` (a fetch's) and as a refill when not
     /// ([`Self::refill_pages`]). `global` marks a page whose walk ended in
-    /// a global leaf ([`chain::LookupEntry::global_page`]).
-    fn take_page(&mut self, pc: u64, key: u64, missed: bool, global: bool) {
+    /// a global leaf ([`chain::LookupEntry::global_page`]), or may have;
+    /// `shared` puts a lower-half page whose walk did in the context every
+    /// address space shares ([`Self::itlb_context`]).
+    fn take_page(&mut self, pc: u64, key: u64, missed: bool, global: bool, shared: bool) {
+        debug_assert!(global || !shared, "only a global page is shared");
         let half = chain::half(pc);
-        let context = self.chain.contexts()[half];
+        let context = self.itlb_context(pc, shared);
         let page = pc & !(FETCH_PAGE - 1);
         let slot = self.itlb.page_slot(pc, context);
         let entry = match global {
@@ -266,6 +302,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let held_page = held.pc == page && held.key == context;
         if !held_page {
             self.log_fill(page, context);
+            if shared && half == 0 {
+                self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
+            }
         }
         if !missed {
             if !held_page {
@@ -275,7 +314,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.statistics.itlb[1] += 1;
         } else {
             self.statistics.itlb[0] += 1;
-            let miss = self.itlb_miss(half, slot, page, context);
+            let miss = self.itlb_miss(slot, page, context);
             self.statistics.itlb_misses[miss as usize] += 1;
             self.statistics.itlb_sources[ItlbSource::FillsLower as usize + half] += 1;
             if self.note_itlb_seen(half, page, context) && miss == ItlbMiss::Cold {
@@ -283,8 +322,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         let resident = self.itlb.entry(slot);
-        if resident.pc == page && resident.key != context && !self.live_context(half, resident.key)
-        {
+        if resident.pc == page && resident.key != context && !self.live_context(resident.key) {
             self.itlb.set(slot, entry);
         } else {
             // What the resident's move takes the place of, unless it is the
@@ -294,8 +332,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 && (resident.pc, resident.key) != (page, context)
                 && lost.key != 0
                 && (lost.pc, lost.key) != (page, context)
-                && (self.chain.contexts().contains(&lost.key)
-                    || self.live_context(chain::half(lost.pc), lost.key))
+                && (self.chain.contexts().contains(&lost.key) || self.live_context(lost.key))
             {
                 self.statistics.itlb_drops[0] += 1;
                 note_itlb_ghost(&mut self.itlb_ghosts, &lost, ItlbMiss::Evicted);
@@ -304,16 +341,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Why the ITLB lacked the page `page` of `half` in `context`, whose
+    /// Why the ITLB lacked the page `page` in `context`, whose
     /// slot is `slot` ([`ItlbMiss`]): what [`note_itlb_ghost`] noted of
     /// the page in the context, or of it in a forgotten context of the
     /// same salt, or an entry of such a context in the page's set.
-    fn itlb_miss(&self, half: usize, slot: usize, page: u64, context: u64) -> ItlbMiss {
+    fn itlb_miss(&self, slot: usize, page: u64, context: u64) -> ItlbMiss {
         let salt = context % chain::LOOKUP_SALTS as u64;
         let forgotten = |number: u64| {
             number != context
                 && number % chain::LOOKUP_SALTS as u64 == salt
-                && !self.live_context(half, number)
+                && !self.live_context(number)
         };
         if let Some(&(noted, number)) = self.itlb_ghosts.get(itlb_ghost_slot(page, context))
             && noted & !ITLB_GHOST_CAUSE == page
@@ -413,10 +450,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         (self.code.table.find(slot, pc, key) != target).then_some((slot, target))
     }
 
-    /// Whether lookups of `half` may still run in context `number`: one no
-    /// TLBI or control change forgot.
-    fn live_context(&self, half: usize, number: u64) -> bool {
-        self.spaces[half].live(number).is_some()
+    /// Whether lookups may still run in context `number`, of either half:
+    /// one no TLBI or control change forgot. Context numbers are never
+    /// reused, in either half, and a lower-half page's entry may be in an
+    /// upper-half context ([`Self::itlb_context`]).
+    fn live_context(&self, number: u64) -> bool {
+        self.spaces
+            .iter()
+            .any(|spaces| spaces.live(number).is_some())
     }
 
     /// Remember that the ITLB took `page` in `context` ([`Self::fill_log`]).
@@ -436,18 +477,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn refill_after(&mut self, half: usize) {
         self.pending_refills.retain(|&(held, _), _| held != half);
         let spaces = &self.spaces[half];
+        let other = &self.spaces[1 - half];
         let pending = &mut self.pending_refills;
+        // A context's fills are of its half's pages, and for the upper half
+        // also of the lower half's global ones (`itlb_context`).
         self.fill_log.retain(|&(page, context)| {
-            if chain::half(page) != half {
-                return true;
-            }
             if let Some(space) = spaces.live(context) {
                 let pages = pending.entry((half, space.key)).or_default();
                 if pages.len() < REFILLS_PER_CONTEXT {
                     pages.push(page);
                 }
+                return false;
             }
-            false
+            other.live(context).is_some() || chain::half(page) != half
         });
         self.fill_next = self.fill_log.len() % FILL_LOG;
         for pages in self.pending_refills.values_mut() {
@@ -485,10 +527,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the translation that dropped it, now changed or not. Context numbers
     /// are never reused, so a list of a context that went matches no fetch.
     fn refill_dropped(&mut self, contexts: [u64; 2]) {
-        for (half, context) in contexts.into_iter().enumerate() {
+        for context in contexts {
             if let Some(pages) = self.dropped_refills.remove(&context) {
-                self.refills
-                    .extend(pages.into_iter().filter(|&page| chain::half(page) == half));
+                self.refills.extend(pages);
             }
         }
     }
@@ -520,7 +561,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let variant = self.page_variant(current, physical);
             if let Some(id) = self.known_variant(variant) {
                 let key = self.block_key(physical, id);
-                self.take_page(pc, key, false, global);
+                self.take_page(pc, key, false, global, global);
             }
         }
     }

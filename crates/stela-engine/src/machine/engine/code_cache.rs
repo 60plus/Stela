@@ -267,13 +267,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// [`Self::forget_spaces`] for a caller that advances the generation.
     fn forget_contexts(&mut self, halves: core::ops::RangeInclusive<usize>, cause: usize) {
+        let upper_stays = !halves.contains(&1);
         for half in halves {
             self.refill_after(half);
             self.statistics.lookup_forgets[cause] += 1;
             self.spaces[half].clear();
             self.recent[half] = [None; RECENT];
+            // The upper half's live contexts may hold lower-half global
+            // pages (`itlb_context`), which TLBIs by VA must still reach
+            // through what the lower half's fetches recorded.
+            let keep_filter = half == 0 && upper_stays && self.spaces[1].len() != 0;
             // Bits are inserted with a fetched size and only cleared here.
-            if core::mem::take(&mut self.fetched_sizes[half]) != 0 {
+            if !keep_filter && core::mem::take(&mut self.fetched_sizes[half]) != 0 {
                 let filter = &mut self.fetched_leaves[half];
                 match &mut self.fetched_words[half] {
                     Some(words) => {
@@ -446,7 +451,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     statistics.itlb_sources[every as usize] += 1;
                 }
                 super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
-                if spaces.live(entry.key).is_some() {
+                // A lower-half global page's entry is in an upper-half
+                // context (`itlb_context`).
+                if every.iter().any(|spaces| spaces.live(entry.key).is_some()) {
                     Self::keep_dropped(
                         dropped,
                         |number| every.iter().any(|spaces| spaces.live(number).is_some()),
