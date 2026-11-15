@@ -162,6 +162,14 @@ int dma_set_coherent_mask(struct device *dev, u64 mask)
 	return 0;
 }
 
+/* kernel/dma/mapping.c: whether the device's mask keeps it below addresses
+ * its mappings may get. The owner hands out bus addresses up to its limit
+ * and says whether a mask reaches it. */
+bool dma_addressing_limited(struct device *dev)
+{
+	return !supported(dev, min_not_zero(dma_get_mask(dev), dev->bus_dma_limit));
+}
+
 #ifdef STELA_LINUX_DMA_TEST
 #include <stela/linux.h>
 #include <stela/test.h>
@@ -268,6 +276,10 @@ int main(void)
 	assert(dma_set_mask(&dev, DMA_BIT_MASK(31)) == -EIO && !mask);
 	assert(!dma_set_mask_and_coherent(&dev, DMA_BIT_MASK(47)));
 	assert(mask == DMA_BIT_MASK(47) && dev.coherent_dma_mask == mask);
+	/* The mask reaches what the owner hands out; a bus limit below it does not. */
+	assert(!dma_addressing_limited(&dev));
+	dev.bus_dma_limit = DMA_BIT_MASK(31);
+	assert(dma_addressing_limited(&dev));
 	stela_linux_exit();
 	printf("Linux DMA mapping through the owner's dma_map_ops passed\n");
 	return 0;
