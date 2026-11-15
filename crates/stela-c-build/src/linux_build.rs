@@ -50,8 +50,10 @@ pub fn upstream_warnings(build: &mut cc::Build) {
         // Linux's top-level Makefile builds every file with -Wno-pointer-sign:
         // mutex.c passes its unsigned owner word to the long atomic helpers.
         .flag("-Wno-pointer-sign");
-    // The rest of scripts/Makefile.warn's default (no W=) clang profile.
+    // The rest of scripts/Makefile.warn's default (no W=) clang profile, and
+    // the top-level Makefile's `-Wno-gnu` for clang: Linux is written in GNU C.
     for warning in [
+        "gnu",
         "format-security",
         "trigraphs",
         "frame-address",
