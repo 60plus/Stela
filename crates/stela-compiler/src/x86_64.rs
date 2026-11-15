@@ -131,6 +131,8 @@ pub mod modeled {
 }
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod executed_paths;
+#[cfg(target_arch = "x86_64")]
+pub mod block_entry;
 pub(crate) mod memory_store;
 #[cfg(all(
     test,
