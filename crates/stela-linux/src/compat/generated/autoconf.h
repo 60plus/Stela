@@ -60,6 +60,8 @@
  * original native root has four. This is an ABI shape, not LA57 admission. */
 #define CONFIG_PGTABLE_LEVELS 5
 #define CONFIG_ILLEGAL_POINTER_VALUE 0xdead000000000000
+/* asm/fpu.h: floating-point units run inside kernel_fpu_begin/end sections. */
+#define CONFIG_ARCH_HAS_KERNEL_FPU_SUPPORT 1
 /* nouveau selects the I2C core for its buses and encoders. */
 #define CONFIG_I2C 1
 #define CONFIG_I2C_ALGOBIT 1

@@ -507,6 +507,7 @@ impl Linux {
             ("linux_thread_initializers", "thread_initializers_test.c"),
             ("linux_acpi_client", "acpi_client_test.c"),
             ("linux_acpi_dsm", "acpi_dsm_test.c"),
+            ("linux_fpu", "fpu_test.c"),
             ("linux_random", "random_test.c"),
             ("linux_resources", "resources_test.c"),
             ("linux_seq_output", "seq_output_test.c"),
