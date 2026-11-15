@@ -18,9 +18,9 @@ pub type Control<'a> = &'a mut dyn FnMut(u32, *mut c_void) -> i32;
 pub struct Kernel {
     /// The name its `pci_driver` registers under.
     pub driver: &'static str,
-    /// The address bits of the widest DMA mask the driver sets on the devices
-    /// Stela drives; a mapping past it is refused, not truncated.
-    pub dma_bits: u8,
+    /// The address bits of the DMA mask the driver sets on this device; a
+    /// mapping past it is refused, not truncated.
+    pub dma_bits: fn(&Adapter) -> u8,
     /// The driver's own identifier of the bound chip, by its query ioctl.
     pub chip: fn(Control) -> Option<u32>,
     /// The bytes of device memory the driver makes available.
@@ -41,9 +41,9 @@ pub struct GpuStack {
 }
 
 impl Kernel {
-    /// The widest DMA address the driver's mask allows.
-    pub const fn dma_limit(&self) -> u64 {
-        u64::MAX >> (64 - self.dma_bits)
+    /// The widest DMA address the driver's mask allows `adapter`.
+    pub fn dma_limit(&self, adapter: &Adapter) -> u64 {
+        u64::MAX >> (64 - (self.dma_bits)(adapter))
     }
 }
 
@@ -57,7 +57,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         driver: "nouveau",
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
-        dma_bits: 47,
+        dma_bits: |_| 47,
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
     },
@@ -133,10 +133,12 @@ mod tests {
                     .iter()
                     .all(|other| other.vendor != stack.vendor)
             );
-            assert!((32..=64).contains(&stack.kernel.dma_bits));
+            let adapter = adapter(stack.vendor.pci_id());
+            let bits = (stack.kernel.dma_bits)(&adapter);
+            assert!((32..=64).contains(&bits));
             assert_eq!(
-                stack.kernel.dma_limit().count_ones(),
-                stack.kernel.dma_bits.into()
+                stack.kernel.dma_limit(&adapter).count_ones(),
+                u32::from(bits)
             );
             assert!(!stack.kernel.driver.is_empty());
         }

@@ -1163,7 +1163,7 @@ fn claim(
         irq: line,
         // A mapping past the driver's mask is refused
         // (`function::Mappings`), not truncated.
-        dma_limit: stack.kernel.dma_limit(),
+        dma_limit: stack.kernel.dma_limit(adapter),
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
