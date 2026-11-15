@@ -4260,6 +4260,7 @@ fn a_tlbi_drops_the_cached_fetches_of_the_pages_it_reaches_alone() {
             physical: page,
             guarded: false,
             global: true,
+            size: 0x4000,
             el: 0,
             epoch,
         });
