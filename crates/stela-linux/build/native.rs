@@ -318,6 +318,14 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/fs/seq_lifetime.c")),
             PathBuf::from(format!("{LINUX}/fs/task_comm.c")),
             PathBuf::from(format!("{LINUX}/lib/maple_tree.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/irqdesc.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/handle.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/chip.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/dummychip.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/irqdomain.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/msi.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/resend.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/spurious.c")),
         ];
         let mut upstream = upstream;
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("uefi") {

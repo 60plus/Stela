@@ -359,3 +359,16 @@
 /security/Makefile
 /security/commoncap.c
 /security/commoncap_ptrace.c
+/kernel/irq/irqdesc.c
+/kernel/irq/handle.c
+/kernel/irq/chip.c
+/kernel/irq/dummychip.c
+/kernel/irq/irqdomain.c
+/kernel/irq/msi.c
+/kernel/irq/resend.c
+/kernel/irq/spurious.c
+/kernel/irq/internals.h
+/kernel/irq/debug.h
+/kernel/irq/settings.h
+/kernel/irq/debugfs.h
+/kernel/irq/proc.h

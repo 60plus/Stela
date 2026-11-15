@@ -160,6 +160,14 @@ int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
 	return err;
 }
 
+/* drivers/base/swnode.c: nothing here creates a software node, so no
+ * firmware node is one. */
+bool is_software_node(const struct fwnode_handle *fwnode)
+{
+	(void)fwnode;
+	return false;
+}
+
 /* A device's firmware node, following drivers/base/core.c. */
 void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
 {

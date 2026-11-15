@@ -3,6 +3,8 @@
 #include <linux/backing-dev.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/kthread.h>
@@ -278,6 +280,135 @@ static irqreturn_t sharer_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* A driver's own lines, as amdgpu makes them for the sources of its one
+ * interrupt: a linear domain whose map callback gives each line the driver's
+ * chip and Linux's simple flow handler, raised from the driver's handler. */
+static struct irq_domain *sources;
+static unsigned int source_runs, source_thread_runs, chip_enables, chip_disables, parent_runs;
+static int raised = -1, raise_result;
+
+static void source_enable(struct irq_data *data)
+{
+	assert(data->hwirq == 5);
+	chip_enables++;
+}
+
+static void source_disable(struct irq_data *data)
+{
+	assert(data->hwirq == 5);
+	chip_disables++;
+}
+
+static struct irq_chip source_chip = {
+	.name = "test-sources",
+	.irq_enable = source_enable,
+	.irq_disable = source_disable,
+};
+
+static int source_map(struct irq_domain *domain, unsigned int irq, irq_hw_number_t hwirq)
+{
+	assert(domain == sources && hwirq < 16);
+	irq_set_chip_and_handler(irq, &source_chip, handle_simple_irq);
+	return 0;
+}
+
+static const struct irq_domain_ops source_ops = {
+	.map = source_map,
+};
+
+static irqreturn_t parent_handler(int irq, void *dev_id)
+{
+	assert(irq == 7 && dev_id == &parent_runs && in_hardirq());
+	parent_runs++;
+	if (raised >= 0)
+		raise_result = generic_handle_domain_irq(sources, (irq_hw_number_t)raised);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t source_handler(int irq, void *dev_id)
+{
+	assert(dev_id == &source_runs && in_hardirq() && irq_find_mapping(sources, 5) == (unsigned int)irq);
+	source_runs++;
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t source_thread(int irq, void *dev_id)
+{
+	(void)irq;
+	assert(dev_id == &source_runs && !in_interrupt());
+	source_thread_runs++;
+	return IRQ_HANDLED;
+}
+
+static void raise_source(int hwirq)
+{
+	raised = hwirq;
+	stela_linux_irq_run(7);
+	flush_workqueue(system_highpri_wq);
+	raised = -1;
+}
+
+static void mapped_lines_reach_requests_through_their_domain(void)
+{
+	line_enables = line_disables = 0;
+	assert(!request_irq(7, parent_handler, 0, "parent", &parent_runs) && line_enables == 1);
+	sources = irq_domain_create_linear(NULL, 16, &source_ops, NULL);
+	assert(sources);
+	/* A source nothing mapped has no line: the driver's handler is told. */
+	raise_source(5);
+	assert(parent_runs == 1 && raise_result == -EINVAL);
+
+	unsigned int virq = irq_create_mapping(sources, 5);
+	/* Mapped lines are numbered above the owners'. One nothing mapped is no
+	 * line at all. */
+	assert(virq >= STELA_LINUX_OWNER_LINES && irq_find_mapping(sources, 5) == virq);
+	assert(request_irq(virq + 1, source_handler, 0, "none", &source_runs) == -EINVAL);
+	assert(irq_get_irq_data(virq)->hwirq == 5 && irq_get_chip(virq) == &source_chip);
+	/* Mapped and not requested: the flow handler has no action to run. */
+	raise_source(5);
+	assert(!raise_result && !source_runs);
+
+	assert(!request_threaded_irq(virq, source_handler, source_thread, 0, "source", &source_runs));
+	assert(chip_enables == 1 && line_enables == 1);
+	raise_source(5);
+	assert(!raise_result && source_runs == 1 && source_thread_runs == 1 && parent_runs == 3);
+	/* Another source of the domain stays unmapped. */
+	raise_source(6);
+	assert(raise_result == -EINVAL && source_runs == 1);
+
+	/* disable_irq holds the line at its chip until the matching enable_irq. */
+	disable_irq(virq);
+	disable_irq(virq);
+	assert(chip_disables == 1);
+	raise_source(5);
+	assert(source_runs == 1);
+	enable_irq(virq);
+	raise_source(5);
+	assert(source_runs == 1 && chip_enables == 1);
+	enable_irq(virq);
+	assert(chip_enables == 2);
+	raise_source(5);
+	assert(source_runs == 2 && source_thread_runs == 2);
+	synchronize_irq(virq);
+
+	assert(!strcmp(free_irq(virq, &source_runs), "source"));
+	raise_source(5);
+	assert(!raise_result && source_runs == 2);
+	irq_dispose_mapping(virq);
+	assert(!irq_find_mapping(sources, 5) && !irq_to_desc(virq));
+	irq_domain_remove(sources);
+
+	/* The same depth on an owner's line goes to its owner. */
+	assert(line_disables == 0);
+	disable_irq(7);
+	assert(line_disables == 1 && line_masked);
+	enable_irq(7);
+	assert(line_enables == 2 && !line_masked);
+	/* An owner's line has no descriptor for Linux code to raise it by. */
+	assert(!irq_to_desc(7) && parent_runs == 8);
+	free_irq(7, &parent_runs);
+}
+
 static void oneshot_sharers_hold_the_line_masked(void)
 {
 	unsigned long flags = IRQF_SHARED | IRQF_ONESHOT;
@@ -393,6 +524,7 @@ void stela_linux_workqueue_test_main(void)
 	assert(!strcmp(free_irq(7, &hard_runs), "threaded") && line_disables == 1);
 	assert(!strcmp(free_irq(7, &forced), "other") && line_disables == 2);
 	oneshot_sharers_hold_the_line_masked();
+	mapped_lines_reach_requests_through_their_domain();
 	stela_linux_i2c_test();
 	dedicated_identity_and_join();
 	stela_linux_sync_test();

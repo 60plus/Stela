@@ -35,6 +35,14 @@
 #define CONFIG_RT_MUTEXES 1
 /* DMA fence array/chain callbacks use the deferred hard-IRQ worker service. */
 #define CONFIG_IRQ_WORK 1
+/* Linux's interrupt descriptors, chips, flow handlers and domains over the
+ * lines owners route (kernel/irq.c). Descriptors are sparse, as on x86, so a
+ * line's number has no bound. PCI_MSI selects GENERIC_MSI_IRQ, which selects
+ * hierarchical domains, in every Linux configuration. */
+#define CONFIG_SPARSE_IRQ 1
+#define CONFIG_IRQ_DOMAIN 1
+#define CONFIG_IRQ_DOMAIN_HIERARCHY 1
+#define CONFIG_GENERIC_MSI_IRQ 1
 /* Original task_struct embeds each retained continuation's thread_info. */
 #define CONFIG_THREAD_INFO_IN_TASK 1
 #define CONFIG_ARCH_DMA_ADDR_T_64BIT 1
