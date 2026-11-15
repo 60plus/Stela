@@ -86,6 +86,14 @@
   },
   {
     "package": "stela-compiler",
+    "test": "executed_paths_of_real_blocks",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host instruction trace of real blocks named by DENSITY_IN; run on request"
+  },
+  {
+    "package": "stela-compiler",
     "test": "region_census_of_real_code",
     "source": "crates/stela-compiler/src/x86_64/block/tests.rs",
     "kind": "manual",
