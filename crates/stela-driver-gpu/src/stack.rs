@@ -79,21 +79,35 @@ pub static NVIDIA: GpuStack = GpuStack {
 /// stopping at the first stage that fails. Linux then matches each presented
 /// function against the registered drivers' own ID tables, so one image
 /// serves every vendor's devices and registration is not per stack.
+/// `command_line` is Linux's: space-separated `module.parameter=value` words
+/// that set the built-in drivers' parameters before any of them registers.
 ///
 /// # Safety
 /// On the canonical Linux owner's original managed task after Initial and
 /// SRCU startup have completed, once per environment. Initcalls may sleep.
 #[cfg(feature = "linux-drm")]
-pub unsafe fn start_kernel() -> Result<(), stela_linux::owner::Errno> {
+pub unsafe fn start_kernel(command_line: &str) -> Result<(), stela_linux::owner::Errno> {
     unsafe extern "C" {
         /// The build's one registration image (`build/image.rs`).
         static stela_linux_gpu_image: c_void;
-        fn stela_linux_start(image: *const c_void, registry: *mut *mut c_void) -> core::ffi::c_int;
+        fn stela_linux_start(
+            image: *const c_void,
+            command_line: *const u8,
+            length: usize,
+            registry: *mut *mut c_void,
+        ) -> core::ffi::c_int;
     }
     let mut registry = core::ptr::null_mut();
-    // SAFETY: the caller's contract; the image is the build's, and the
-    // registry's state lasts as long as what it started.
-    match unsafe { stela_linux_start(&raw const stela_linux_gpu_image, &raw mut registry) } {
+    // SAFETY: the caller's contract; the image is the build's, the registry
+    // copies the command line, and its state lasts as long as what it started.
+    match unsafe {
+        stela_linux_start(
+            &raw const stela_linux_gpu_image,
+            command_line.as_ptr(),
+            command_line.len(),
+            &raw mut registry,
+        )
+    } {
         0 => Ok(()),
         error => Err(error),
     }

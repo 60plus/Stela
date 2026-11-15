@@ -989,6 +989,8 @@ pub(super) struct Claimed {
     shows_screen: bool,
     device: Device,
     firmware: PciFirmware,
+    /// The words of Linux's command line its driver needs for it.
+    parameters: Option<String>,
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
@@ -1270,6 +1272,7 @@ fn claim(
             _resources: resources,
         },
         firmware: identified.firmware,
+        parameters: identified.parameters,
         placement,
         bars,
         name: format!("{address}"),
@@ -1483,8 +1486,18 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         bound: Vec::new(),
         result: Ok(()),
     };
+    // Linux's command line: the words each claimed GPU's driver needs set
+    // before it registers.
+    let command_line = claimed
+        .iter()
+        .filter_map(|claimed| claimed.parameters.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !command_line.is_empty() {
+        output::arguments(format_args!("GPU: Linux starts with \"{command_line}\"\n"));
+    }
     // SAFETY: entered, on a task.
-    job.result = unsafe { gpu::stack::start_kernel() };
+    job.result = unsafe { gpu::stack::start_kernel(&command_line) };
     if job.result.is_err() {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);

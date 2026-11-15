@@ -23,6 +23,9 @@ pub(super) struct Identified {
     pub(super) identity: Option<u32>,
     /// The chip or platform as people know it.
     pub(super) chip: Option<&'static str>,
+    /// Words of Linux's command line (`module.parameter=value`) the driver
+    /// needs set for this device before it registers.
+    pub(super) parameters: Option<String>,
 }
 
 /// One stack's part of the claim.
@@ -67,6 +70,7 @@ static NOUVEAU: Before = Before {
             firmware: select_firmware(&inventory, &name, catalog)?,
             identity: Some(boot0),
             chip: Some(chip.name),
+            parameters: None,
         })
     },
     settle: |services, registers, identified| match identified
