@@ -192,6 +192,44 @@ void pci_disable_msi(struct pci_dev *dev)
 	dev->msi_enabled = 0;
 }
 
+/* Interrupt vectors, following drivers/pci/msi/api.c: MSI-X, MSI and INTx
+ * in that order, each only where the caller allows it. A function's owner
+ * routes one message and no MSI-X table, so one vector is what there is, and
+ * MSI-X alone is refused. */
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs,
+			  unsigned int flags)
+{
+	int error = -ENOSPC;
+
+	if (!min_vecs || max_vecs < min_vecs)
+		return -ERANGE;
+	if (min_vecs > 1) {
+		stela_linux_unsupported("more than one PCI interrupt vector");
+		return -ENOSPC;
+	}
+	if (flags & PCI_IRQ_MSI) {
+		error = pci_enable_msi(dev);
+		if (!error)
+			return 1;
+	}
+	if ((flags & PCI_IRQ_INTX) && dev->irq)
+		return 1;
+	if (!(flags & (PCI_IRQ_MSI | PCI_IRQ_INTX)))
+		stela_linux_unsupported("PCI MSI-X vectors");
+	return error;
+}
+
+void pci_free_irq_vectors(struct pci_dev *dev)
+{
+	pci_disable_msi(dev);
+}
+
+/* The Linux interrupt of vector nr: the function's one line or message. */
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	return nr ? -EINVAL : (int)dev->irq;
+}
+
 static void release(struct device *dev)
 {
 	struct host_function *host = container_of(to_pci_dev(dev), struct host_function, dev);
@@ -370,9 +408,21 @@ static void test_disable_msi(void *context)
 	on_message = false;
 }
 
+static unsigned int refusals;
+
+static void test_unsupported(void *context, const char *operation)
+{
+	(void)context;
+	assert(strstr(operation, "PCI"));
+	refusals++;
+}
+
+static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
+static const struct stela_linux_owner test_owner = {.services = &test_services};
+
 int main(void)
 {
-	stela_linux_enter(&stela_linux_bare);
+	stela_linux_enter(&test_owner);
 	stela_test_register_pages();
 	memcpy(&config[PCI_VENDOR_ID], "\xde\x10\x07\x2d", 4);
 	memcpy(&config[PCI_CLASS_REVISION], "\xa1\x00\x00\x03", 4);
@@ -461,6 +511,23 @@ int main(void)
 	assert(!pci_enable_msi(dev) && on_message && dev->msi_enabled && dev->irq == 9);
 	pci_disable_msi(dev);
 	assert(!on_message && !dev->msi_enabled);
+
+	/* One vector: the message where MSI is allowed and granted, else the
+	 * line where INTx is allowed. MSI-X alone and two vectors are refused. */
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) == 1 && on_message);
+	assert(pci_irq_vector(dev, 0) == 9 && pci_irq_vector(dev, 1) == -EINVAL);
+	pci_free_irq_vectors(dev);
+	assert(!on_message && !dev->msi_enabled);
+	msi_error = -ENOSPC;
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) == -ENOSPC);
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_MSI | PCI_IRQ_INTX) == 1 && !on_message);
+	msi_error = 0;
+	assert(!refusals);
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSIX) == -ENOSPC && !on_message);
+	assert(pci_alloc_irq_vectors(dev, 2, 2, PCI_IRQ_ALL_TYPES) == -ENOSPC && !on_message);
+	assert(refusals == 2);
+	assert(pci_alloc_irq_vectors(dev, 0, 1, PCI_IRQ_MSI) == -ERANGE);
+	assert(pci_alloc_irq_vectors(dev, 2, 1, PCI_IRQ_MSI) == -ERANGE);
 
 	/* Removal owns only registration's reference. An escaped pci_dev keeps
 	 * the copied callback table and its original context until its last put. */
