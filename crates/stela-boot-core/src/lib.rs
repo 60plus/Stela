@@ -72,6 +72,7 @@ pub mod native_profile;
 pub mod native_resources;
 #[cfg(target_arch = "x86_64")]
 pub mod nofault_read;
+pub mod opregion;
 pub mod options;
 pub mod page_window;
 pub mod paging_controls;
