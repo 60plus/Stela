@@ -399,35 +399,31 @@ fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
     );
 }
 
-/// A mode whose width is not a multiple of the row pitch the GPU's linear
-/// images need can never be presented: the guest's display surface has a
-/// plane one byte an element wide, the Metal device refuses the surface's
-/// texture, and the guest's `WindowServer` stops. Such a mode is passed
-/// over for one the GPU can present.
+/// A mode's width is no reason to pass it over: the screen surface's
+/// one-byte alpha plane, whose row is the width, is sampled through an
+/// aligned copy where the GPU's linear images cannot take it. A panel's
+/// own mode wins whatever its width, as 2560x1600, a 3440x1440 ultrawide
+/// or a 1366x768 laptop panel, and without a preferred mode the
+/// firmware's size wins, as 1680x1050.
 #[test]
-fn a_mode_the_gpu_cannot_present_is_passed_over() {
-    let modes = [
-        mode(2560, 1600, PREFERRED),
-        mode(1680, 1050, 0),
-        mode(1920, 1200, 0),
-    ];
+fn a_mode_of_any_width_is_taken() {
     let any: Fits<'_> = &|_, _, _| true;
-    // The panel's own mode is one the GPU can present, and it wins.
+    for native in [(2560, 1600), (3440, 1440), (1366, 768)] {
+        let modes = [
+            mode(native.0, native.1, PREFERRED),
+            mode(1920, 1080, 0),
+            mode(1280, 720, 0),
+        ];
+        assert_eq!(
+            choose(&modes, Wanted::Native((1920, 1080)), any),
+            Some(modes[0]),
+            "{native:?}"
+        );
+    }
+    let modes = [mode(1680, 1050, 0), mode(1920, 1200, 0)];
     assert_eq!(
-        choose(&modes, Wanted::Native((2560, 1600)), any),
+        choose(&modes, Wanted::Native((1680, 1050)), any),
         Some(modes[0])
-    );
-    // Without a preferred mode, the mode the GPU cannot present is passed
-    // over for the one it can.
-    assert_eq!(
-        choose(&modes[1..], Wanted::Native((1680, 1050)), any),
-        Some(modes[2])
-    );
-    // With no mode the GPU can present, one is taken as before.
-    let only = [mode(1366, 768, PREFERRED)];
-    assert_eq!(
-        choose(&only, Wanted::Native((1366, 768)), any),
-        Some(only[0])
     );
 }
 
