@@ -70,6 +70,10 @@ pub struct Rendering {
     pub color: Vec<Option<Attachment>>,
     pub depth: Option<Attachment>,
     pub stencil: Option<Attachment>,
+    /// The profile's note of the Metal pass this instance draws for
+    /// ([`PassNote`](crate::metal::device::pass_times::PassNote)), zero
+    /// for none; recording ignores it.
+    pub note: u32,
 }
 
 /// `VkViewport`.

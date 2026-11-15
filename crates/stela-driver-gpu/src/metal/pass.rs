@@ -297,6 +297,10 @@ pub struct RenderPassPlan<T> {
     /// Custom sample positions in Vulkan's [0, 1) pixel space.
     pub sample_locations: Vec<[f32; 2]>,
     pub inputs: AttachmentInputs,
+    /// The profile's note of the pass
+    /// ([`Rendering::note`](crate::metal::vulkan::command::Rendering::note)),
+    /// zero for none.
+    pub note: u32,
 }
 
 /// `tileWidth`, `tileHeight`, `threadgroupMemoryLength` and
@@ -704,6 +708,7 @@ pub fn render_pass<T: Copy + Eq>(
         visibility_results: descriptor.visibility_results,
         sample_locations,
         inputs: AttachmentInputs::default(),
+        note: 0,
     })
 }
 

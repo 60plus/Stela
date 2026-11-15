@@ -1439,6 +1439,7 @@ fn rendering(pass: &RenderPassPlan<ImageView>, first: bool, last: bool) -> Rende
             .stencil
             .as_ref()
             .map(|stencil| attachment(stencil, true)),
+        note: pass.note,
     }
 }
 

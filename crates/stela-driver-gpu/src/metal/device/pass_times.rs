@@ -13,8 +13,12 @@
 //! points of the pipelines they bound, and for a render pass the first
 //! attachment's size, format and memory. [`PassTimes`] makes the
 //! `GPU PASSES` line of the most expensive ones, with per command buffer
-//! counts of submissions, passes and copies.
-use crate::metal::{pixel_format::PixelFormat, vulkan::command::Command};
+//! counts of submissions, passes and copies, and the `GPU SAMPLED` line of
+//! what the longest render pass of each samples ([`PassNote`]).
+use crate::metal::{
+    pixel_format::PixelFormat,
+    vulkan::{AttachmentLoadOp, AttachmentStoreOp, command::Command},
+};
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
     fmt,
@@ -29,6 +33,9 @@ const MAX_ENTRIES: usize = 512;
 
 /// Entries the line shows.
 const SHOWN: usize = 8;
+
+/// Textures a pass note keeps; it counts those past them.
+pub(super) const NOTED_TEXTURES: usize = 6;
 
 static PROFILE: AtomicBool = AtomicBool::new(false);
 
@@ -180,6 +187,103 @@ pub struct TargetInfo {
     pub memory: TargetMemory,
 }
 
+/// A texture a render pass binds for its functions, as the `GPU SAMPLED`
+/// line names it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampledTexture {
+    pub extent: [u32; 2],
+    pub format: PixelFormat,
+    pub memory: TargetMemory,
+    pub levels: u32,
+    pub samples: u32,
+}
+
+impl fmt::Display for SampledTexture {
+    /// `WxH/format/memory`, then `/mips=N` and `/xN` past one.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}x{}/{:?}/{}",
+            self.extent[0],
+            self.extent[1],
+            self.format,
+            self.memory.name()
+        )?;
+        if self.levels > 1 {
+            write!(formatter, "/mips={}", self.levels)?;
+        }
+        if self.samples > 1 {
+            write!(formatter, "/x{}", self.samples)?;
+        }
+        Ok(())
+    }
+}
+
+/// What one profiled render pass samples and how it begins and ends: the
+/// textures bound for its functions by `set*Texture:atIndex:` (not those an
+/// argument buffer reaches), its sample count and layers, and its first
+/// attachment's load and store operations and whether it resolves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassNote {
+    pub textures: Vec<SampledTexture>,
+    /// Distinct textures bound past [`NOTED_TEXTURES`].
+    pub more: u32,
+    pub samples: u32,
+    pub layers: u32,
+    pub load: AttachmentLoadOp,
+    pub store: AttachmentStoreOp,
+    pub resolves: bool,
+}
+
+impl PassNote {
+    /// Notes `texture` bound, once.
+    pub fn bind(&mut self, texture: SampledTexture) {
+        if self.textures.contains(&texture) {
+            return;
+        }
+        if self.textures.len() < NOTED_TEXTURES {
+            self.textures.push(texture);
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+    }
+}
+
+impl fmt::Display for PassNote {
+    /// `xS/layers=L/load/store[/resolve]/textures=a,b,…[+N]`, `-` for none.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let load = match self.load {
+            AttachmentLoadOp::Load => "load",
+            AttachmentLoadOp::Clear => "clear",
+            AttachmentLoadOp::DontCare => "dontcare",
+        };
+        let store = match self.store {
+            AttachmentStoreOp::Store => "store",
+            AttachmentStoreOp::DontCare => "dontcare",
+        };
+        write!(
+            formatter,
+            "x{}/layers={}/{load}/{store}{}/textures=",
+            self.samples,
+            self.layers,
+            if self.resolves { "/resolve" } else { "" }
+        )?;
+        if self.textures.is_empty() {
+            formatter.write_str("-")?;
+        }
+        for (index, texture) in self.textures.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{texture}")?;
+        }
+        if self.more != 0 {
+            write!(formatter, "+{}", self.more)?;
+        }
+        Ok(())
+    }
+}
+
 /// One kind of span's times in a beat.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Entry {
@@ -281,6 +385,9 @@ pub struct PassTimes {
     pub copies: Tally,
     pub copied_texels: Tally,
     pub planes: PlaneCounts,
+    /// By key, the note of its longest span that had one, and that span's
+    /// time.
+    pub notes: BTreeMap<String, (u64, String)>,
 }
 
 impl PassTimes {
@@ -299,6 +406,22 @@ impl PassTimes {
         entry.draws += work.draws;
         entry.dispatches += work.dispatches;
         entry.texels += work.texels;
+    }
+
+    /// Keeps `note` as what `key`'s span of `ns` sampled when it is the
+    /// longest of the key's spans noted so far.
+    pub fn note(&mut self, key: &str, ns: u64, note: &PassNote) {
+        if !self.entries.contains_key(key) {
+            return;
+        }
+        match self.notes.get_mut(key) {
+            Some(kept) if kept.0 >= ns => {}
+            Some(kept) => *kept = (ns, alloc::format!("{note}")),
+            None => {
+                self.notes
+                    .insert(String::from(key), (ns, alloc::format!("{note}")));
+            }
+        }
     }
 
     /// Adds a timed command buffer's counts.
@@ -352,7 +475,9 @@ pub fn span_key(
 /// `GPU PASSES command_buffers=… spans=… busy_us=… out_of_marks=…
 /// per_cb=submits:avg/max segments:… passes:… copies:… copied_ktexels:…
 /// planes=direct:count/ktexels copied:count/ktexels stamped:count/tiles
-/// decoded:count/ktexels top=key:count/total_us/longest_us/draws/dispatches/ktexels …`.
+/// decoded:count/ktexels top=key:count/total_us/longest_us/draws/dispatches/ktexels …`,
+/// then on a line of its own `GPU SAMPLED longest key:us:note …` of the
+/// keys' longest noted spans, longest first.
 impl fmt::Display for PassTimes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let average = |tally: Tally| {
@@ -399,6 +524,15 @@ impl fmt::Display for PassTimes {
                 entry.dispatches,
                 entry.texels / 1000,
             )?;
+        }
+        // The longest noted passes, longest first.
+        let mut notes: Vec<_> = self.notes.iter().collect();
+        notes.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+        if !notes.is_empty() {
+            formatter.write_str("\nGPU SAMPLED longest")?;
+        }
+        for (key, (ns, note)) in notes.into_iter().take(SHOWN) {
+            write!(formatter, " {key}:{}:{note}", ns / 1000)?;
         }
         Ok(())
     }
@@ -474,6 +608,75 @@ mod tests {
         );
         assert_eq!(times.take().spans, 3);
         assert_eq!(times, PassTimes::default());
+    }
+
+    #[test]
+    fn notes_what_the_longest_pass_of_a_key_samples() {
+        let texture = |width, memory, levels| SampledTexture {
+            extent: [width, 1440],
+            format: PixelFormat::Bgra8Unorm,
+            memory,
+            levels,
+            samples: 1,
+        };
+        let mut note = PassNote {
+            textures: Vec::new(),
+            more: 0,
+            samples: 4,
+            layers: 3,
+            load: AttachmentLoadOp::Load,
+            store: AttachmentStoreOp::DontCare,
+            resolves: true,
+        };
+        assert_eq!(
+            alloc::format!("{note}"),
+            "x4/layers=3/load/dontcare/resolve/textures=-"
+        );
+        note.bind(texture(2560, TargetMemory::LinearShared, 1));
+        note.bind(texture(2560, TargetMemory::LinearShared, 1));
+        note.bind(texture(1280, TargetMemory::Optimal, 5));
+        for width in 0..NOTED_TEXTURES as u32 {
+            note.bind(texture(width, TargetMemory::Optimal, 1));
+        }
+        assert_eq!(note.textures.len(), NOTED_TEXTURES);
+        assert_eq!(note.more, 2);
+        let line = alloc::format!("{note}");
+        assert!(
+            line.starts_with(
+                "x4/layers=3/load/dontcare/resolve/textures=2560x1440/Bgra8Unorm/linear-sys,\
+                 1280x1440/Bgra8Unorm/optimal/mips=5,"
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with("+2"), "{line}");
+
+        let mut times = PassTimes::default();
+        let key = "render:a@2560x1440/Bgra8Unorm/planes";
+        let work = |ns| SpanWork {
+            ns,
+            ..SpanWork::default()
+        };
+        // A key the beat does not keep notes nothing.
+        times.note(key, 5, &note);
+        assert!(times.notes.is_empty());
+        let short = PassNote {
+            textures: Vec::new(),
+            more: 0,
+            ..note.clone()
+        };
+        times.span(String::from(key), work(2_000_000));
+        times.note(key, 2_000_000, &short);
+        times.span(String::from(key), work(9_000_000));
+        times.note(key, 9_000_000, &note);
+        times.span(String::from(key), work(1_000_000));
+        times.note(key, 1_000_000, &short);
+        assert_eq!(times.notes[key], (9_000_000, line.clone()));
+        let report = alloc::format!("{times}");
+        let sampled = report.lines().nth(1).unwrap();
+        assert_eq!(
+            sampled,
+            alloc::format!("GPU SAMPLED longest {key}:9000:{line}")
+        );
     }
 
     #[test]

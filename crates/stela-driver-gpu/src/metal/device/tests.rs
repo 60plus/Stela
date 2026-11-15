@@ -3267,7 +3267,13 @@ fn render_passes_resolve_cached_attachment_views() {
         .fill_buffer(&mut device.resolver(), buffer, 0, 4096, 7)
         .unwrap();
     commands.end_encoding(&mut device.resolver()).unwrap();
+    // The pass notes the textures bound for it, each once.
+    let sampled = device
+        .new_texture(&texture(PixelFormat::Bgra8Unorm, TextureUsage::SHADER_READ))
+        .unwrap();
     device.begin_render(&mut commands, &request).unwrap();
+    device.note_sampled(sampled);
+    device.note_sampled(sampled);
     commands.end_encoding(&mut device.resolver()).unwrap();
     let serial = device.commit(commands).unwrap();
     let segment = &device.backend().submissions.last().unwrap()[0];
@@ -3303,6 +3309,18 @@ fn render_passes_resolve_cached_attachment_views() {
             "render:-@128x128/Rgba8Unorm/optimal",
             "transfer:-"
         ]
+    );
+    let notes: Vec<_> = passes
+        .notes
+        .iter()
+        .map(|(key, (_, note))| (key.as_str(), note.as_str()))
+        .collect();
+    assert_eq!(
+        notes,
+        [(
+            "render:-@128x128/Rgba8Unorm/optimal",
+            "x1/layers=1/clear/store/textures=128x128/Bgra8Unorm/optimal"
+        )]
     );
     device.set_pass_profile(false);
     assert_eq!(device.take_pass_times(), None);
