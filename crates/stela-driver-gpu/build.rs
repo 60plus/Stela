@@ -1,4 +1,7 @@
 #[cfg(feature = "nouveau-port")]
+#[path = "build/imports.rs"]
+mod imports;
+#[cfg(feature = "nouveau-port")]
 #[path = "build/kbuild.rs"]
 mod kbuild;
 #[cfg(feature = "linux-kernel")]
