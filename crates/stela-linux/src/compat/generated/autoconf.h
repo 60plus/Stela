@@ -52,6 +52,9 @@
 #define CONFIG_ARCH_HAS_DMA_OPS 1
 #define CONFIG_NEED_DMA_MAP_STATE 1
 #define CONFIG_HAS_IOMEM 1
+/* Port I/O, which Stela's arch has as x86 does (asm/io.h): the display code
+ * xe shares with i915 depends on it for the VGA registers. */
+#define CONFIG_HAS_IOPORT 1
 #define CONFIG_PHYS_ADDR_T_64BIT 1
 #define CONFIG_NR_CPUS 1
 #define CONFIG_HZ 1000
