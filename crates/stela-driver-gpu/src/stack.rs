@@ -31,13 +31,15 @@ pub struct Kernel {
 pub struct GpuStack {
     pub vendor: Vendor,
     pub kernel: Kernel,
-    /// Admission of the stack's Vulkan device as a Metal device.
+    /// Admission of the stack's Vulkan device as a Metal device. A stack
+    /// without one drives displays only.
     #[cfg(feature = "metal")]
-    pub metal: crate::metal::open::Admission,
-    /// The Vulkan driver linked into the image. This crate's own test
-    /// binary links no driver archive, so it holds none.
+    pub metal: Option<crate::metal::open::Admission>,
+    /// The Vulkan driver linked into the image. A stack without one drives
+    /// displays only. This crate's own test binary links no driver archive,
+    /// so its descriptors hold none.
     #[cfg(all(feature = "metal-linked", not(test)))]
-    pub vulkan: crate::metal::native::Driver,
+    pub vulkan: Option<crate::metal::native::Driver>,
 }
 
 impl Kernel {
@@ -62,9 +64,9 @@ pub static NVIDIA: GpuStack = GpuStack {
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
     },
     #[cfg(feature = "metal")]
-    metal: crate::metal::nvidia::ADMISSION,
+    metal: Some(crate::metal::nvidia::ADMISSION),
     #[cfg(all(feature = "metal-linked", not(test)))]
-    vulkan: crate::metal::nvidia::DRIVER,
+    vulkan: Some(crate::metal::nvidia::DRIVER),
 };
 
 /// Brings Linux up and registers every kernel driver built into the image,
@@ -82,6 +84,16 @@ pub unsafe fn start_kernel() -> Result<(), stela_linux::owner::Errno> {
 }
 
 impl GpuStack {
+    /// Whether this image holds the stack's Vulkan driver, so its GPU draws
+    /// the Metal device's frames. Otherwise its kernel driver only shows
+    /// frames another GPU drew, on the displays wired to it.
+    pub fn draws(&self) -> bool {
+        #[cfg(all(feature = "metal-linked", not(test)))]
+        return self.vulkan.is_some();
+        #[cfg(not(all(feature = "metal-linked", not(test))))]
+        false
+    }
+
     /// The stack for `adapter`'s vendor, or why Stela has none.
     pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
         STACKS
@@ -142,6 +154,14 @@ mod tests {
             );
             assert!(!stack.kernel.driver.is_empty());
         }
+    }
+
+    #[test]
+    fn a_stack_draws_only_with_a_vulkan_driver_in_the_image() {
+        // This test binary links no Vulkan driver, whatever the features.
+        assert!(!NVIDIA.draws());
+        #[cfg(feature = "metal")]
+        assert!(NVIDIA.metal.is_some());
     }
 
     #[test]

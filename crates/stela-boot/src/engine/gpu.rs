@@ -1595,6 +1595,9 @@ pub(super) fn claim_all(
             )),
         }
     }
+    // The GPUs that draw come first, in the firmware's order, so their DRM
+    // minors and Metal services are numbered as without a display-only GPU.
+    driven.sort_by_key(|(stack, _)| !stack.draws());
     if !cfg!(feature = "nvk") {
         let mut refused = Vec::new();
         for (_, adapter) in driven {

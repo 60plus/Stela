@@ -1109,7 +1109,9 @@ impl MemoryExporter for Exporter {
 }
 
 fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
-    let driver = &gpu.stack.vulkan;
+    let driver = gpu.stack.vulkan.as_ref().ok_or(Error::Invalid(
+        "the GPU's stack drives displays only: it has no Vulkan driver",
+    ))?;
     let compiler = |physical| {
         // SAFETY: the driver's own physical device, whose options last as long.
         let options = unsafe { (driver.nir_options)(physical) };
@@ -1191,6 +1193,10 @@ fn open_gpu(
         crate::output::arguments(format_args!("GPU {}: {reason}\n", bound.name));
         None
     };
+    if !bound.stack.draws() {
+        // Its kernel driver shows frames; `display` takes its outputs.
+        return None;
+    }
     let Some(link) = bound.link else {
         return refuse("no PCIe link");
     };

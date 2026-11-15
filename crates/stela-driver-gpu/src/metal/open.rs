@@ -132,8 +132,11 @@ fn device<B: Backend, C: Compiler>(
     if identity.pci_bus != Some(gpu.pci) {
         return Err(Error::Invalid("the backend drives another GPU").into());
     }
+    let admission = gpu.stack.metal.as_ref().ok_or(Error::Invalid(
+        "the GPU's stack drives displays only: it has no Metal admission",
+    ))?;
     let platform =
-        (gpu.stack.metal.admit)(identity, gpu.chip, gpu.attachment).map_err(OpenError::Refused)?;
+        (admission.admit)(identity, gpu.chip, gpu.attachment).map_err(OpenError::Refused)?;
     Ok(Device::new(backend, compiler, &platform)?)
 }
 
