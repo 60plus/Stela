@@ -127,6 +127,13 @@ pub struct Config {
     /// followed by a GETID. An ordinary ID0 mouse stays three-byte.
     /// The separate Explorer4.0 horizontal-mode sequence is not enabled.
     pub wheel: bool,
+    /// Reset the controller and keyboard before negotiation. Native x86
+    /// firmware handoff leaves this off, as Linux's i8042/atkbd defaults do;
+    /// some embedded laptop keyboards do not complete these reset commands.
+    pub reset_on_start: bool,
+    /// Query F0 00 after acknowledged Set 2 selection. Some laptop embedded
+    /// keyboards ignore this optional query; native startup leaves it off.
+    pub query_scan_set: bool,
     pub io_timeout_us: u64,
     pub command_timeout_us: u64,
     pub reset_timeout_us: u64,
@@ -140,6 +147,8 @@ impl Default for Config {
             keyboard: true,
             mouse: true,
             wheel: true,
+            reset_on_start: true,
+            query_scan_set: true,
             io_timeout_us: 500_000,
             command_timeout_us: 200_000,
             reset_timeout_us: 1_000_000,
@@ -206,6 +215,8 @@ pub enum Recovery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error {
     pub kind: ErrorKind,
+    /// Last wire command before failure, preserved across containment.
+    pub command: Option<Command>,
     pub recovery: Recovery,
     /// Reply or framed-error byte consumed before failure, including a
     /// late ACK. This is an observation, not proof of accepted acknowledgement.
@@ -217,19 +228,29 @@ pub struct Error {
     pub recovery_response: Option<ObservedResponse>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Controller(u8),
+    Device { port: Port, byte: u8 },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedResponse {
     pub port: Port,
     pub data: u8,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "PS/2 {:?} (recovery {:?})", self.kind, self.recovery)
+        write!(
+            f,
+            "PS/2 {:?} at {:?} (recovery {:?})",
+            self.kind, self.command, self.recovery
+        )
     }
 }
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self {
             kind,
+            command: None,
             recovery: Recovery::NotAttempted,
             response: None,
             recovery_error: None,
@@ -304,6 +325,7 @@ pub struct Controller<R = PortIo, T = Clock> {
     /// dropped, as `psmouse_smbus_process_byte` drops them.
     companion: bool,
     observed_response: Option<ObservedResponse>,
+    last_command: Option<Command>,
 }
 
 /// The psmouse protocol probe the first initialization runs on the mouse port.
@@ -353,6 +375,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             probe: None,
             companion: false,
             observed_response: None,
+            last_command: None,
         })
     }
     /// Select the mouse port's protocol as Linux `psmouse_extensions` does
@@ -446,6 +469,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
     }
     fn command(&mut self, command: u8) -> Result<(), ErrorKind> {
+        self.last_command = Some(Command::Controller(command));
         self.write_ready()?;
         self.registers.write_command(command);
         Ok(())
@@ -572,6 +596,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             if port == Port::Mouse {
                 self.command(SEND_MOUSE)?;
             }
+            self.last_command = Some(Command::Device { port, byte: value });
             self.write_data(value)?;
             loop {
                 let received = self.response(port, start, timeout)?;
@@ -728,9 +753,13 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let config = self.controller_response(READ_CONFIG)?;
         self.controller_config = Some(config);
         self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
-        self.expect_controller(SELF_TEST, 0x55)?;
-        // Self-test can reset CTR on real controllers; reapply/read it back.
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
+        if self.config.reset_on_start {
+            self.expect_controller(SELF_TEST, 0x55)?;
+            // Self-test can reset CTR on real controllers; reapply/read it back.
+            self.set_config(
+                (config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED,
+            )?;
+        }
         if self.config.keyboard {
             self.expect_controller(TEST_KEYBOARD, 0)?;
         }
@@ -749,17 +778,21 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             // Firmware may have left this keyboard reporting an unknown scan
             // set. Quiesce it before RESET, and never interpret those bytes.
             self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
-            self.reset_device(Port::Keyboard)?;
-            self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
+            if self.config.reset_on_start {
+                self.reset_device(Port::Keyboard)?;
+                self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
+            }
             self.device_command(Port::Keyboard, SET_SCAN, &[2])?;
-            self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
-            let scan = self.response(
-                Port::Keyboard,
-                self.timer.start(),
-                self.config.command_timeout_us,
-            )?;
-            if scan != 2 {
-                return Err(ErrorKind::UnsupportedScanSet(scan));
+            if self.config.query_scan_set {
+                self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
+                let scan = self.response(
+                    Port::Keyboard,
+                    self.timer.start(),
+                    self.config.command_timeout_us,
+                )?;
+                if scan != 2 {
+                    return Err(ErrorKind::UnsupportedScanSet(scan));
+                }
             }
             self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
         }
@@ -944,6 +977,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.capture_keyboard_observation();
         self.stop_keyboard_observation(StopCause::TransportFailed);
         let response = self.observed_response;
+        let command = self.last_command;
         self.observed_response = None;
         let containment = self.disable_ports();
         let recovery = if containment.is_ok() {
@@ -953,6 +987,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         };
         Error {
             kind,
+            command,
             recovery,
             response,
             recovery_error: containment.err(),

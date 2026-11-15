@@ -195,6 +195,7 @@ struct Hardware {
     resend: Option<(Port, u8, usize)>,
     resend_inject: Vec<(Port, u8)>,
     no_ack: Option<(Port, u8)>,
+    ignore_scan_query: bool,
     inject_led: Vec<(Port, u8)>,
     writes: Vec<(bool, u8)>,
     consumed: usize,
@@ -232,6 +233,7 @@ impl Hardware {
             resend: None,
             resend_inject: Vec::new(),
             no_ack: None,
+            ignore_scan_query: false,
             inject_led: Vec::new(),
             writes: Vec::new(),
             consumed: 0,
@@ -331,6 +333,14 @@ impl Hardware {
             return;
         }
         let index = Self::index(port);
+        if port == Port::Keyboard
+            && data == 0
+            && self.argument[index] == Some(SET_SCAN)
+            && self.ignore_scan_query
+        {
+            self.argument[index] = None;
+            return;
+        }
         if !(data == GET_ID && port == Port::Mouse && self.no_id_ack)
             && self.no_ack != Some((port, data))
         {
@@ -636,6 +646,120 @@ fn controller(config: Config) -> (Controller<Model, Time>, Rc<RefCell<Hardware>>
         Controller::new(Model(h.clone()), Time(time), config).unwrap(),
         h,
     )
+}
+#[test]
+fn native_handoff_negotiates_input_without_controller_or_keyboard_reset() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    // A keyboard that will not acknowledge RESET must still negotiate and
+    // produce real set-2 input through the normal native-handoff path.
+    h.borrow_mut().no_ack = Some((Port::Keyboard, RESET));
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+    assert!(!h.borrow().writes.contains(&(true, SELF_TEST)));
+    assert!(!h.borrow().writes.contains(&(false, RESET)));
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn embedded_keyboard_without_scan_query_works_after_acknowledged_set_selection() {
+    for query in [true, false] {
+        let (mut c, h) = controller(Config {
+            mouse: false,
+            reset_on_start: false,
+            query_scan_set: query,
+            ..Config::default()
+        });
+        h.borrow_mut().ignore_scan_query = true;
+        if query {
+            let error = c.initialize().unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
+            assert_eq!(
+                error.command,
+                Some(Command::Device {
+                    port: Port::Keyboard,
+                    byte: 0
+                })
+            );
+            assert_eq!(error.recovery, Recovery::PortsDisabled);
+        } else {
+            c.initialize().unwrap();
+            assert_eq!(h.borrow().scan, 2);
+            h.borrow_mut().emit(Port::Keyboard, 0x1c);
+            assert_eq!(
+                c.poll().unwrap(),
+                vec![Input::Key {
+                    usage: 4,
+                    pressed: true
+                }]
+            );
+            h.borrow_mut().emit(Port::Keyboard, 0xf0);
+            h.borrow_mut().emit(Port::Keyboard, 0x1c);
+            assert_eq!(
+                c.poll().unwrap(),
+                vec![Input::Key {
+                    usage: 4,
+                    pressed: false
+                }]
+            );
+            c.set_leds(2).unwrap();
+            assert_eq!(h.borrow().leds, 2);
+            c.stop().unwrap();
+        }
+    }
+}
+
+#[test]
+fn omitting_scan_query_still_requires_acknowledged_set_two_selection() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, 2));
+    let error = c.initialize().unwrap_err();
+    assert_eq!(
+        error.command,
+        Some(Command::Device {
+            port: Port::Keyboard,
+            byte: 2
+        })
+    );
+    assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
+    assert_eq!(error.recovery, Recovery::PortsDisabled);
+    assert!(!c.is_ready());
+}
+
+#[test]
+fn command_timeout_identifies_original_keyboard_command_after_containment() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, DISABLE_REPORTING));
+    let error = c.initialize().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
+    assert_eq!(
+        error.command,
+        Some(Command::Device {
+            port: Port::Keyboard,
+            byte: DISABLE_REPORTING
+        })
+    );
+    assert_eq!(error.recovery, Recovery::PortsDisabled);
+    assert!(c.needs_reset());
 }
 #[test]
 fn a_probed_mouse_that_is_no_touchpad_is_reset_and_probed_for_its_wheel() {

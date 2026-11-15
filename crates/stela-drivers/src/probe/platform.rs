@@ -33,6 +33,8 @@ pub(crate) fn i8042(
     Ok(Some(ps2::Config {
         keyboard,
         mouse,
+        reset_on_start: false,
+        query_scan_set: false,
         ..ps2::Config::default()
     }))
 }
@@ -204,6 +206,8 @@ mod tests {
     fn standard_ports_attach_the_listed_ports() {
         let config = i8042(true, false, &I8042_PORTS).unwrap().unwrap();
         assert!(config.keyboard && !config.mouse);
+        assert!(!config.reset_on_start);
+        assert!(!config.query_scan_set);
         let config = i8042(false, true, &[]).unwrap().unwrap();
         assert!(!config.keyboard && config.mouse);
     }
