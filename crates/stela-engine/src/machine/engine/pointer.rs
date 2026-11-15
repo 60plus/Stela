@@ -106,6 +106,8 @@ fn key_of(key: PointerAuthenticationKey) -> stela_contracts::pauth::Key {
 pub(super) struct PointerService {
     /// The keys, version and layout, while open.
     context: Option<pauth::Context>,
+    /// The layouts of the most recent regime, kept across key changes.
+    layouts: Option<pauth::Layouts>,
     /// Results, each tagged with the generation of its key's inputs when it
     /// was computed; `generations[index]` is that of each key in `inputs`.
     /// Allocated before the first usable native tag and kept at that
@@ -168,6 +170,7 @@ impl PointerService {
     pub(super) fn new() -> Self {
         Self {
             context: None,
+            layouts: None,
             memo: None,
             inputs: None,
             key_generations: [0; pointer::TAG_WORDS],
@@ -319,9 +322,13 @@ impl PointerService {
         if let Some(generic) = generic {
             keys = keys.with_generic_words(generic);
         }
+        let layouts = match self.layouts {
+            Some(layouts) if layouts.tcr() == inputs.tcr => layouts,
+            _ => *self.layouts.insert(pauth::Layouts::new(inputs.tcr)),
+        };
         self.context = Some(
             pauth::Context::new_with_version(0, keys, inputs.version)
-                .with_translation_regime(inputs.tcr)
+                .with_layouts(layouts)
                 .with_implementation_defined_cipher(),
         );
     }
@@ -402,18 +409,29 @@ impl PointerService {
         if let Some(result) = self.remembered(operation, key, pointer, modifier) {
             return Some(result);
         }
+        self.computed(operation, key, pointer, modifier)
+    }
+
+    /// [`Self::result`] past its memo lookup, which a thunk's miss has
+    /// already made: the cipher's result, remembered. `None` when the
+    /// service is closed.
+    fn computed(
+        &mut self,
+        operation: PointerOperation,
+        key: stela_contracts::pauth::Key,
+        pointer: u64,
+        modifier: u64,
+    ) -> Option<PointerResult> {
+        let index = memo_key(key);
         let context = self.context.as_ref()?;
+        let words = context.words(key)?;
         self.fills += 1;
         let result = match operation {
-            PointerOperation::Sign => Ok((context.sign(key, pointer, modifier).ok()?, true)),
+            PointerOperation::Sign => Ok((context.sign_with(key, words, pointer, modifier), true)),
             PointerOperation::Authenticate { combined } => {
-                match context.authenticate_operation(key, pointer, modifier, combined) {
+                match context.authenticate_with(key, words, pointer, modifier, combined) {
                     Ok(result) => Ok((result.pointer, result.authenticated)),
-                    Err(pauth::AuthenticationError::Failure { code }) => Err(code),
-                    Err(
-                        pauth::AuthenticationError::KeyUnavailable { .. }
-                        | pauth::AuthenticationError::GenericKeyUnavailable,
-                    ) => return None,
+                    Err(failure) => Err(failure.code),
                 }
             }
         };
@@ -441,10 +459,28 @@ impl PointerService {
                 strips_back,
             );
         }
-        self.remember(operation, key, pointer, modifier, result);
+        let tag = pointer::tag(self.key_generations[usize::from(index)], index, 0);
+        let memo = self.memo.as_mut()?;
+        let (kind, value) = memo_result(operation, result);
+        pointer::insert(
+            memo,
+            pointer::MemoEntry {
+                pointer,
+                modifier,
+                tag: tag | kind,
+                value,
+            },
+        );
         if let Some(signed) = strips_back {
-            let authenticate = PointerOperation::Authenticate { combined: false };
-            self.remember(authenticate, key, signed, modifier, Ok((pointer, true)));
+            pointer::insert(
+                memo,
+                pointer::MemoEntry {
+                    pointer: signed,
+                    modifier,
+                    tag: tag | pointer::AUTHENTICATED,
+                    value: pointer,
+                },
+            );
         }
         Some(result)
     }
@@ -533,31 +569,6 @@ impl PointerService {
             },
         }
     }
-
-    fn remember(
-        &mut self,
-        operation: PointerOperation,
-        key: stela_contracts::pauth::Key,
-        pointer: u64,
-        modifier: u64,
-        result: PointerResult,
-    ) {
-        let (kind, value) = memo_result(operation, result);
-        let memo = self.memo.as_mut().expect("memo for open tag");
-        pointer::insert(
-            memo,
-            pointer::MemoEntry {
-                pointer,
-                modifier,
-                tag: pointer::tag(
-                    self.key_generations[usize::from(memo_key(key))],
-                    memo_key(key),
-                    kind,
-                ),
-                value,
-            },
-        );
-    }
 }
 
 translated_callee! {
@@ -622,7 +633,10 @@ fn complete_with(
     } else {
         PointerOperation::Sign
     };
-    match service.result(operation, key, pointer, modifier) {
+    // The thunk missed the memo, and its open tag word says the context
+    // holds the key, so the result is computed at once. A failed
+    // authentication the memo held is computed and remembered again.
+    match service.computed(operation, key, pointer, modifier) {
         Some(Ok((value, true))) => pointer::Completion {
             completed: 1,
             value,
