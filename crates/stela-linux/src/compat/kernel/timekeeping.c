@@ -17,6 +17,13 @@ ktime_t ktime_get(void)
 	return owner->services->now_ns(owner->context);
 }
 
+/* The owner's monotonic clock runs at the hardware's rate and nothing slews
+ * it, so the raw clock is the same one. */
+ktime_t ktime_get_raw(void)
+{
+	return ktime_get();
+}
+
 notrace u64 sched_clock(void)
 {
 	ktime_t now = ktime_get();
