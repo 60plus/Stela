@@ -1,6 +1,7 @@
-# nouveau, shared DRM helpers, ACPICA and kernel headers; not a
-# buildable kernel tree. netfilter's headers differ only in case, which a
-# case-insensitive file system cannot check out.
+# nouveau, xe with the i915 tree it shares display code and headers with,
+# shared DRM helpers, ACPICA and kernel headers; not a buildable kernel tree.
+# netfilter's headers differ only in case, which a case-insensitive file
+# system cannot check out.
 /drivers/acpi/acpica/
 /drivers/base/map.c
 /drivers/base/property.c
@@ -8,6 +9,18 @@
 /drivers/base/base.h
 /drivers/base/trace.h
 /drivers/gpu/drm/nouveau/
+/drivers/gpu/drm/xe/
+/drivers/gpu/drm/i915/
+/drivers/gpu/buddy.c
+/drivers/base/auxiliary.c
+/drivers/base/base.h
+/lib/bsearch.c
+/lib/interval_tree.c
+/lib/llist.c
+/lib/math/int_sqrt.c
+/lib/seq_buf.c
+/mm/mempool.c
+/mm/mmu_notifier.c
 /drivers/gpu/drm/display/
 /drivers/gpu/drm/ttm/
 /drivers/gpu/drm/scheduler/
