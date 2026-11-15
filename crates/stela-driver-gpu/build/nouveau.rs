@@ -61,7 +61,7 @@ fn initcalls_unit() -> Unit {
     INITCALLS.into()
 }
 
-pub fn port(linux: &mut Linux) {
+pub fn port(linux: &Linux) {
     let config = Config::parse(&fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header"))
         .unwrap_or_else(|error| panic!("{AUTOCONF}: {error}"));
     let kbuild =
@@ -121,7 +121,7 @@ pub fn port(linux: &mut Linux) {
             .flat_map(|compiling| compiling.join().expect("a compiling thread"))
             .collect::<Vec<_>>()
     });
-    let mut captured = linux.take_captured();
+    let mut captured = linux.captured.clone();
     let environment_count = captured.len();
     let compiler = initcalls::compiler(&build);
     let placement = initcalls::Placement::new(

@@ -1,7 +1,7 @@
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 #[path = "build/imports.rs"]
 mod imports;
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 #[path = "build/kbuild.rs"]
 mod kbuild;
 #[cfg(feature = "linux-kernel")]
@@ -34,9 +34,7 @@ fn main() {
     #[cfg(feature = "linux-kernel")]
     linux.tests(&mut tests);
     #[cfg(feature = "nouveau-port")]
-    let mut linux = linux;
-    #[cfg(feature = "nouveau-port")]
-    nouveau::port(&mut linux);
+    nouveau::port(&linux);
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }
