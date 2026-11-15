@@ -1144,6 +1144,14 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
     let service = service.with_reopen(Box::new(move || unsafe {
         reopen(loader, Box::new(Exporter), compiler, &gpu)
     }));
+    // A driver that loses its device only with a GPU its kernel driver
+    // reset, whose release would wait for that reset's end, keeps the lost
+    // device unreleased, as an open whose first submission hung leaves it.
+    let service = if driver.keep_lost {
+        service.keep_lost_devices()
+    } else {
+        service
+    };
     Ok(Arc::new(SharedService::new(
         service,
         ServiceHost {
