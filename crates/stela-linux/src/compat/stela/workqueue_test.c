@@ -294,7 +294,19 @@ static void oneshot_sharers_hold_the_line_masked(void)
 	free_irq(7, &sharer_a);
 	free_irq(7, &sharer_b);
 
+	/* synchronize_irq returns once the line's threads have run: A's count
+	 * shows without a wait of the caller's own. A line nobody requested has
+	 * nothing to wait for. */
 	wake_b = false;
+	assert(!request_threaded_irq(7, sharer_primary, sharer_thread, flags, "A", &sharer_a));
+	stela_linux_irq_run(7);
+	synchronize_irq(7);
+	assert(sharer_a_runs == 2 && !line_masked);
+	free_irq(7, &sharer_a);
+	synchronize_irq(7);
+	synchronize_irq(9);
+	sharer_a_runs = 1;
+
 	assert(!request_threaded_irq(7, sharer_primary, sharer_thread, flags, "A", &sharer_a));
 	assert(!request_threaded_irq(7, sharer_primary, sharer_thread, flags, "B", &sharer_b));
 	stela_linux_irq_run(7);

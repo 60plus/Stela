@@ -6,12 +6,15 @@
  * hard-IRQ scope there. Threaded handlers run as work, which may sleep as an
  * IRQ thread does. The owner routes each line (irq_enable, irq_disable). */
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <stela/atomic_callback.h>
 #include <stela/irq.h>
 #include <stela/linux.h>
+#include <unsupported.h>
 
 struct irq_line;
 struct requested {
@@ -275,6 +278,54 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	const void *name = free_irq_locked(irq, dev_id);
 	mutex_unlock(&line->request_mutex);
 	return name;
+}
+
+/* A line's primary handlers run to completion in the one context Linux code
+ * runs in, so none is in progress in a caller that may sleep. What may still
+ * run is an action's thread, which is work: wait for each, as Linux waits
+ * for the line's active threads. */
+/* Interrupt lines a driver makes for a child device and raises itself, as a
+ * discrete Intel GPU does for its management engine function. Stela's lines
+ * are those owners register; none can be made, which is said once, and the
+ * driver's probe ends with the error. A line never made is never set up,
+ * raised or freed. */
+int __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
+		      struct module *owner, const struct irq_affinity_desc *affinity)
+{
+	(void)irq;
+	(void)from;
+	(void)cnt;
+	(void)node;
+	(void)owner;
+	(void)affinity;
+	stela_linux_unsupported("an interrupt line made by a driver for its child device");
+	return -ENOSPC;
+}
+STELA_UNSUPPORTED(void, irq_free_descs, unsigned int, unsigned int)
+STELA_UNSUPPORTED(void, irq_set_chip_and_handler_name, unsigned int, const struct irq_chip *,
+		  irq_flow_handler_t, const char *)
+STELA_UNSUPPORTED(int, irq_set_chip_data, unsigned int, void *)
+STELA_UNSUPPORTED(void, handle_simple_irq, struct irq_desc *)
+STELA_UNSUPPORTED(int, generic_handle_irq_safe, unsigned int)
+
+void synchronize_irq(unsigned int irq)
+{
+	struct irq_line *line = line_owner(irq, false);
+	struct requested *request;
+
+	if (in_interrupt())
+		stela_linux_fatal("synchronize_irq in interrupt context");
+	if (!line)
+		return;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node) {
+		if (request->action.irq != irq)
+			continue;
+		if (current_work() == &request->thread)
+			stela_linux_fatal("synchronize_irq from the line's own IRQ thread");
+		flush_work(&request->thread);
+	}
+	mutex_unlock(&line->request_mutex);
 }
 
 void stela_linux_irq_run(unsigned int irq)
