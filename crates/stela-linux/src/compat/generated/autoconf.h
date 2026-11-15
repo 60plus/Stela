@@ -107,6 +107,12 @@
 #define CONFIG_HWMON 1
 #define CONFIG_BACKLIGHT_CLASS_DEVICE 1
 #define CONFIG_POWER_SUPPLY 1
+/* Buses and helpers a driver's entry selects: xe's selects panels, the MIPI
+ * DSI bus and the auxiliary bus. No driver of the image registers on either
+ * bus. */
+#define CONFIG_DRM_PANEL 1
+#define CONFIG_DRM_MIPI_DSI 1
+#define CONFIG_AUXILIARY_BUS 1
 /* Every address space carries notifiers, for a driver that mirrors a client's
  * memory: DRM_GPUSVM, which xe's entry selects, selects both, and the
  * interval tree a ranged notifier is kept in (INTERVAL_TREE, above). Nothing

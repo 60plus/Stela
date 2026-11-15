@@ -48,6 +48,18 @@ const OPEN: super::image::Open = &[
         "the driver core's device lists",
         &["class_find_device", "device_find_child"],
     ),
+    // The MIPI DSI and auxiliary buses of the DRM archive: no driver of the
+    // image registers on either, and only a DSI host's removal walks a
+    // device's children.
+    (
+        "Linux drivers on a bus, bus searches and child walks",
+        &[
+            "bus_find_device",
+            "device_for_each_child",
+            "driver_register",
+            "driver_unregister",
+        ],
+    ),
     // MMU_NOTIFIER gives every mm notifiers, which dropping an mm destroys;
     // nothing subscribes one, which is what takes these locks.
     (

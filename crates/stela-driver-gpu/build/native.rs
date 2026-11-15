@@ -133,6 +133,16 @@ const DRM_SOURCES: &[&str] = &[
     "display/drm_scdc_helper",
 ];
 
+/// What the profile selects besides, for a driver's Kconfig entry: panels,
+/// the MIPI DSI bus and the driver core's auxiliary bus. Paths are below
+/// Linux's tree.
+#[cfg(feature = "linux-drm")]
+const SELECTED_SOURCES: &[&str] = &[
+    "drivers/gpu/drm/drm_panel",
+    "drivers/gpu/drm/drm_mipi_dsi",
+    "drivers/base/auxiliary",
+];
+
 /// Class-owned registration prefix after the shared common cohort.
 #[cfg(feature = "linux-drm")]
 const DRM_UNITS: &[UnitSpec] = &[
@@ -185,6 +195,18 @@ const DRM_UNITS: &[UnitSpec] = &[
         source: "drivers/gpu/buddy",
         module: "buddy",
         file: "drivers/gpu/buddy",
+    },
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "drmmipidsi",
+            group_ordinal: 9,
+            unit_ordinal: 1,
+            global_ordinal: 9,
+        },
+        source: "drivers/gpu/drm/drm_mipi_dsi",
+        module: "drm_mipi_dsi",
+        file: "drivers/gpu/drm/drm_mipi_dsi",
     },
     // The hwmon and backlight classes, which a driver's sensors and panel
     // brightness register devices of: each unit's initcall registers its
@@ -254,6 +276,12 @@ impl Linux {
             DRM_SOURCES
                 .iter()
                 .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
+        );
+        #[cfg(feature = "linux-drm")]
+        upstream.extend(
+            SELECTED_SOURCES
+                .iter()
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
         );
         let hosted_upstream = upstream[..4].to_vec();
         let mut build = stela_c_build::native::configure();
