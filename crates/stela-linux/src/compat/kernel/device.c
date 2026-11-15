@@ -6,8 +6,8 @@
  * Copyright (c) 2006 Novell, Inc.
  */
 /* Linux's device model, following Linux
- * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c, class.c and
- * devres.c, and lib/devres.c. Stela's owners create and attach devices, and
+ * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c and class.c,
+ * and lib/devres.c. Stela's owners create and attach devices, and
  * nothing reads sysfs: adding a device only keeps its parent alive, a class
  * is its name and no attribute file exists. */
 #include <linux/component.h>
@@ -121,91 +121,6 @@ void device_unregister(struct device *dev)
 	put_device(dev);
 }
 
-/* A driver's managed actions, undone last first when it detaches. */
-struct managed_action {
-	struct list_head node;
-	void (*action)(void *);
-	void *data;
-};
-
-int __devm_add_action(struct device *dev, void (*action)(void *), void *data, const char *name)
-{
-	(void)name;
-	struct managed_action *managed = kmalloc_obj(*managed);
-
-	if (!managed)
-		return -ENOMEM;
-	managed->action = action;
-	managed->data = data;
-	list_add(&managed->node, &dev->devres_head);
-	return 0;
-}
-
-void devm_release_action(struct device *dev, void (*action)(void *), void *data)
-{
-	struct managed_action *managed;
-
-	list_for_each_entry(managed, &dev->devres_head, node)
-		if (managed->action == action && managed->data == data) {
-			list_del(&managed->node);
-			action(data);
-			kfree(managed);
-			return;
-		}
-	WARN_ON(1);
-}
-
-/* Forgets a managed action without running it. */
-int devm_remove_action_nowarn(struct device *dev, void (*action)(void *), void *data)
-{
-	struct managed_action *managed;
-
-	list_for_each_entry(managed, &dev->devres_head, node)
-		if (managed->action == action && managed->data == data) {
-			list_del(&managed->node);
-			kfree(managed);
-			return 0;
-		}
-	return -ENOENT;
-}
-
-/* Managed memory: the action's record and the caller's bytes are one
- * allocation, which releasing the record frees. */
-struct managed_memory {
-	struct managed_action managed;
-	u8 bytes[] __aligned(ARCH_DMA_MINALIGN);
-};
-
-static void memory_released(void *data)
-{
-	(void)data;
-}
-
-void *devm_kmalloc(struct device *dev, size_t size, gfp_t gfp)
-{
-	struct managed_memory *memory;
-	size_t total;
-
-	if (unlikely(!size))
-		return ZERO_SIZE_PTR;
-	if (check_add_overflow(sizeof(*memory), size, &total))
-		return NULL;
-	memory = kmalloc(total, gfp);
-	if (!memory)
-		return NULL;
-	memory->managed.action = memory_released;
-	memory->managed.data = memory->bytes;
-	list_add(&memory->managed.node, &dev->devres_head);
-	return memory->bytes;
-}
-
-void devm_kfree(struct device *dev, const void *p)
-{
-	if (unlikely(ZERO_OR_NULL_PTR(p)))
-		return;
-	WARN_ON(devm_remove_action_nowarn(dev, memory_released, (void *)p));
-}
-
 static void unmap_device_memory(void *mapping)
 {
 	iounmap(mapping);
@@ -222,15 +137,12 @@ void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset, resour
 	return mapping;
 }
 
+/* A driver's managed resources are Linux's own drivers/base/devres.c. They
+ * are released last first when the driver detaches, as really_probe and
+ * device_unbind_cleanup do. */
 void stela_linux_devres_release(struct device *dev)
 {
-	struct managed_action *managed, *next;
-
-	list_for_each_entry_safe(managed, next, &dev->devres_head, node) {
-		list_del(&managed->node);
-		managed->action(managed->data);
-		kfree(managed);
-	}
+	devres_release_all(dev);
 }
 
 int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)

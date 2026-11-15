@@ -4,6 +4,9 @@
 /drivers/acpi/acpica/
 /drivers/base/map.c
 /drivers/base/property.c
+/drivers/base/devres.c
+/drivers/base/base.h
+/drivers/base/trace.h
 /drivers/gpu/drm/nouveau/
 /drivers/gpu/drm/display/
 /drivers/gpu/drm/ttm/
