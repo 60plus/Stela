@@ -40,8 +40,11 @@ STELA_UNSUPPORTED(void, mm_drop_all_locks, struct mm_struct *)
  * into a client from a worker (a user fence). Both need the client as a
  * Linux address space with VMAs and page tables. Stela's clients are not:
  * the Metal device, the only caller of a GPU driver's ioctls, asks for
- * neither. A fault of a range is refused and said once; the rest is reached
- * only after a range faulted or a worker adopted an address space. */
+ * neither. A fault of a range is refused and said once. A user fence is
+ * refused by xe where it is asked for, with one warning: no Stela task has an
+ * address space, and xe refuses a caller without one (third_party/patches/
+ * linux, "refuse a user fence"). The rest is reached only after a range
+ * faulted or a worker adopted an address space, so by nothing. */
 int hmm_range_fault(struct hmm_range *range)
 {
 	(void)range;

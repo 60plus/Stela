@@ -149,8 +149,9 @@ const OPEN: super::image::Open = &[
             "platform_device_unregister",
         ],
     ),
-    // Traps behind a refusal: no range of a client's memory faults in, and
-    // no worker adopts a client's address space.
+    // Traps behind two refusals: no range of a client's memory faults in,
+    // and xe refuses a user fence from a caller without an address space
+    // (every Stela task), so no worker adopts one.
     (
         "userptr and user fences: a client's address space",
         &[
