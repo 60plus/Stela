@@ -417,6 +417,11 @@ bool stela_linux_refault(struct stela_linux_mapping *mapping, unsigned long addr
 	return (result & VM_FAULT_NOPAGE) && !(result & (VM_FAULT_ERROR | VM_FAULT_RETRY));
 }
 
+vm_fault_t vmf_insert_pfn(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn)
+{
+	return vmf_insert_pfn_prot(vma, addr, pfn, vma->vm_page_prot);
+}
+
 vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn,
 			       pgprot_t pgprot)
 {
