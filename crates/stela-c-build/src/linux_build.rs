@@ -51,9 +51,12 @@ pub fn upstream_warnings(build: &mut cc::Build) {
         // mutex.c passes its unsigned owner word to the long atomic helpers.
         .flag("-Wno-pointer-sign");
     // The rest of scripts/Makefile.warn's default (no W=) clang profile, and
-    // the top-level Makefile's `-Wno-gnu` for clang: Linux is written in GNU C.
+    // the top-level Makefile's `-Wno-gnu` for clang: Linux is written in GNU C,
+    // and its `-Wno-microsoft-anon-tag` for the tagged anonymous members
+    // `-fms-extensions` gives it (mm/slab.h).
     for warning in [
         "gnu",
+        "microsoft-anon-tag",
         "format-security",
         "trigraphs",
         "frame-address",
