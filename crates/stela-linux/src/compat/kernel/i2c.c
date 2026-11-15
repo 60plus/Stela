@@ -8,6 +8,7 @@
  * I2C drivers run here, so a client stays unbound, which is what a Linux
  * caller sees when no driver claims a device. */
 #include <linux/completion.h>
+#include <linux/device.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/jiffies.h>
@@ -80,6 +81,21 @@ void i2c_del_adapter(struct i2c_adapter *adapter)
 {
 	put_device(&adapter->dev);
 	wait_for_completion(&adapter->dev_released);
+}
+
+static void managed_del_adapter(void *adapter)
+{
+	i2c_del_adapter(adapter);
+}
+
+/* An adapter that goes when dev's driver detaches, as in i2c-core-base.c. */
+int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
+{
+	int error = i2c_add_adapter(adapter);
+
+	if (error)
+		return error;
+	return devm_add_action_or_reset(dev, managed_del_adapter, adapter);
 }
 
 /* Arbitration loss retries, within the adapter's limits. */

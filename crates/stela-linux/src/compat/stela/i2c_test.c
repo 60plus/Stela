@@ -3,6 +3,7 @@
  * needs: adapters, transfers with Linux's retries, and unbound clients. */
 #include <linux/err.h>
 #include <linux/i2c.h>
+#include <stela/device.h>
 #include <linux/jiffies.h>
 #include <linux/string.h>
 #include <stela/test.h>
@@ -60,4 +61,16 @@ void stela_linux_i2c_test(void)
 	assert(IS_ERR(i2c_new_client_device(&adapter, &info)));
 
 	i2c_del_adapter(&adapter);
+
+	/* A managed adapter goes when its device's driver detaches. */
+	static struct device parent;
+	static struct i2c_adapter managed;
+
+	managed.algo = adapter.algo;
+	strscpy(managed.name, "managed", sizeof(managed.name));
+	device_initialize(&parent);
+	assert(!devm_i2c_add_adapter(&parent, &managed));
+	assert(kref_read(&managed.dev.kobj.kref) == 1);
+	stela_linux_devres_release(&parent);
+	assert(!kref_read(&managed.dev.kobj.kref));
 }
