@@ -1515,7 +1515,7 @@ fn open_gpus(
             // The display adapters Stela's GPU driver does not run, and why.
             for adapter in found
                 .iter()
-                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
+                .filter(|adapter| stela_drivers::gpu::stack::GpuStack::select(adapter).is_err())
             {
                 crate::status::info(&gpu_status::unused(adapter));
             }
