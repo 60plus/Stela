@@ -167,6 +167,10 @@ struct TextureObject {
     cpu_copy: Option<BufferAllocation>,
     /// A two-plane texture's second plane's image; `image` is its first's.
     second_plane: Option<Image>,
+    /// An extended-range IOSurface texture's staging memory, which large
+    /// encodes write before copying it into the planes
+    /// ([`PlaneStaging`](crate::metal::pass::PlaneStaging)).
+    plane_staging: Option<BufferAllocation>,
 }
 
 /// A depth or stencil subresource's storage copy ([`TestedCopy`]): what it
@@ -633,6 +637,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy,
             second_plane: None,
+            plane_staging: None,
         };
         Ok(TextureId(self.resources.textures.insert(texture)))
     }
@@ -669,6 +674,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok(allocation)
     }
 
+    /// Frees a texture's buffer of its own: a CPU copy, decoded blocks or
+    /// plane staging memory.
     fn destroy_cpu_copy(&mut self, copy: BufferAllocation) {
         self.defer(Object::Buffer(copy.buffer));
         self.release_memory(copy.memory, copy.allocated);
@@ -865,6 +872,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: None,
+            plane_staging: None,
         };
         Ok(TextureId(self.resources.textures.insert(view)))
     }
@@ -925,6 +933,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
+                plane_staging: None,
             }
         } else {
             let plan = resource::linear_texture(
@@ -970,6 +979,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
+                plane_staging: None,
             }
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
@@ -1156,6 +1166,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: Some(images[1]),
+            plane_staging: None,
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
@@ -2149,6 +2160,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
                 if let Some(copy) = texture.cpu_copy {
                     self.destroy_cpu_copy(copy);
+                }
+                if let Some(staging) = texture.plane_staging {
+                    self.destroy_cpu_copy(staging);
                 }
                 self.release_backing(texture.backing, texture.memory)?;
             }
