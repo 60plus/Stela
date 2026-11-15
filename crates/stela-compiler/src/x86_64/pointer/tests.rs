@@ -70,6 +70,23 @@ fn forms_name_their_key_kind_operands_and_completion() {
     );
 }
 
+/// A thunk's service call ends as `--profile`'s host samples look for it
+/// before a return address; a block's call through the cell is checked in
+/// `inline`'s tests.
+#[test]
+fn thunk_service_calls_end_as_host_samples_look_for_them() {
+    const SERVICE: u64 = 0xffff_8000_1234_5678;
+    let [cell, address] = service_call_ends(0x48, SERVICE);
+    let form = Form::of(Operation::SignIbSp).unwrap();
+    let code = thunk(form, GuestAddress(0x1000), TAGS, SERVICE).code;
+    let contains = |code: &[u8], end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
+    assert!(contains(&code, &address));
+    assert!(!contains(&code, &cell));
+    // Each ends with its call: `call rax`, `call [rdi + 0x48]`.
+    assert!(address.ends_with(&[0xff, 0xd0]));
+    assert!(cell.ends_with(&[0xff, 0x57, 0x48]));
+}
+
 #[test]
 fn tags_keep_generation_key_and_kind_apart() {
     assert_eq!(tag(1, 3, AUTHENTICATED), 0x132);

@@ -748,6 +748,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         self.patch_native(thunk, &bytes);
+        self.profile_code(thunk, bytes.len(), step_timing::CodeRegion::Link);
         self.patch_point(NativeCode(point as usize), jump);
         record.set_linked(position, true, false);
         self.statistics.links += 1;
@@ -881,6 +882,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Nothing reaches the tail before the point's jump: its direct exit
         // is linked first, so no predicted transfer returns to the engine.
         self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
         if !self.link_through_cell(cache, exit, target, retired, word, btype) {
             return false;
@@ -925,6 +927,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.lookups += 1;
         true
@@ -1028,6 +1031,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.statistics.stamped_tails += 1;
         }
         self.patch_native(tail, &code);
+        let region = match stamped_cell {
+            Some(_) => step_timing::CodeRegion::Stamped,
+            None => step_timing::CodeRegion::Lookup,
+        };
+        self.profile_code(tail, code.len(), region);
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.links += 1;
         true
@@ -1109,9 +1117,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Some((probe, tail));
         }
         self.install_stream = stream;
-        let probe = self
-            .install_native(&chain::lookup_dispatcher(btype)?, false)
-            .ok()?;
+        let dispatcher = chain::lookup_dispatcher(btype)?;
+        let probe = self.install_native(&dispatcher, false).ok()?;
+        self.profile_code(probe, dispatcher.len(), step_timing::CodeRegion::Probe);
         // The part filled between the two: the tail waits for the next.
         if part_of(probe.0) != part {
             return None;
@@ -1131,6 +1139,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let code = chain::lookup_dispatcher(btype)?;
         let installed = self.host.install(&code).ok()?;
+        self.profile_code(installed, code.len(), step_timing::CodeRegion::Probe);
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
     }

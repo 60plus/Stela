@@ -2027,6 +2027,11 @@ pub fn is_dynamic_exit(bytes: &[u8], kind: ExitKind) -> bool {
     exit_word_of(bytes) == Some(ExitWord::from(kind).encoded())
 }
 
+/// Whether `bytes` are a dynamic exit of any kind and padding.
+pub fn is_dynamic_exit_of_any_kind(bytes: &[u8]) -> bool {
+    exit_word_of(bytes).is_some()
+}
+
 /// Pad the direct exit at `offset` of `code`, which runs at host address
 /// `at + offset`, for its patch point there. Whether it is one.
 pub fn align_direct_exit(code: &mut [u8], offset: usize, at: u64) -> bool {

@@ -3,6 +3,9 @@
 //! The host supplies the clock ([`super::Host::profile_ticks`]); while off,
 //! each phase boundary costs one branch.
 
+mod regions;
+pub use regions::{CodeRegion, block_regions, pointer_service_calls};
+
 /// A phase of the step loop ([`super::Machine::run_blocks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

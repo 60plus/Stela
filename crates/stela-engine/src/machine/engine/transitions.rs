@@ -702,6 +702,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
+        self.profile_code(installed, thunk.code.len(), step_timing::CodeRegion::Other);
         let site = code.0 as u64 + site as u64;
         let jump = chain::jump(site, installed.0 as u64)?;
         // Its part was chosen meanwhile: the instruction stays an exit.

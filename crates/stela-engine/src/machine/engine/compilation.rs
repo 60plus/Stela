@@ -1127,6 +1127,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let installed_bytes = code_bytes.len();
         let terminal_pc = pc + last as u64;
         let direct_exits = compiled.direct_exits();
+        if self.step_timing.is_some() {
+            self.profile_block(code, pc, code_bytes, compiled.cold(), direct_exits);
+        }
         // Built in the machine's own list; the block's box comes from
         // those evicted blocks left ([`Self::successor_box`]).
         let mut successors = core::mem::take(&mut self.successor_scratch);
@@ -1296,6 +1299,41 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Ok(Some(Fetched::Block(slot)))
     }
 
+    /// Describe block `code` at `pc`, `bytes` long, to the host under step
+    /// timing ([`super::Host::profile_code`]): its cold code, its direct
+    /// exits with their link slots, the dynamic exit ending its terminal and
+    /// the check failures after its exits; the rest is inline.
+    fn profile_block(
+        &mut self,
+        code: NativeCode,
+        pc: u64,
+        bytes: &[u8],
+        cold: (u32, u32),
+        direct_exits: &[chain::DirectExit],
+    ) {
+        use step_timing::CodeRegion::{Cold, Exit, Link};
+        let mut spans = Vec::with_capacity(2 * direct_exits.len() + 3);
+        spans.push((cold.0, cold.1, Cold));
+        let mut terminal_end = chain::without_failures(bytes).len();
+        spans.push((terminal_end as u32, bytes.len() as u32, Exit));
+        for exit in direct_exits {
+            let slot = chain::link_slot(Some(pc), exit.target, exit.kind);
+            let start = exit.offset - slot;
+            spans.push((start as u32, exit.offset as u32, Link));
+            let end = exit.offset + chain::DIRECT_EXIT_BYTES;
+            spans.push((exit.offset as u32, end as u32, Exit));
+            terminal_end = terminal_end.min(start);
+        }
+        // RET, BR and BLR end their terminal with an exit to RAX.
+        if let Some(start) = terminal_end.checked_sub(chain::DYNAMIC_EXIT_BYTES)
+            && chain::is_dynamic_exit_of_any_kind(&bytes[start..terminal_end])
+        {
+            spans.push((start as u32, terminal_end as u32, Exit));
+        }
+        let regions = step_timing::block_regions(bytes.len() as u32, &mut spans);
+        self.host.profile_code(code, bytes.len(), &regions);
+    }
+
     /// Install `bytes` of a block, reclaiming the arena's oldest part
     /// when it is full.
     fn install_code(&mut self, bytes: &[u8]) -> Result<NativeCode, Stop> {
@@ -1455,6 +1493,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
+        self.profile_code(
+            installed,
+            thunk.code.len(),
+            step_timing::CodeRegion::Pointer,
+        );
         let site = code.0 as u64 + site as u64;
         // The block is not reachable yet: any bytes may change.
         let jump = chain::jump(site, installed.0 as u64)?;
@@ -1666,6 +1709,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) -> Option<Successor> {
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
+        self.profile_code(installed, thunk.code.len(), step_timing::CodeRegion::Other);
         let site = code.0 as u64 + site as u64;
         let jump = chain::jump(site, installed.0 as u64)?;
         // Its part was chosen meanwhile: the instruction stays an exit.

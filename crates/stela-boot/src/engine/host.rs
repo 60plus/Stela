@@ -63,6 +63,7 @@ mod faults;
 pub(crate) mod pmu;
 #[cfg(feature = "nvk")]
 mod process_fault;
+pub(crate) mod sampling;
 mod signals;
 pub use bare_host::BareHost;
 use faults::*;

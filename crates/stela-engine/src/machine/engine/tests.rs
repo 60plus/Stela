@@ -173,7 +173,12 @@ pub(super) struct FakeHost {
     /// The count at which a host interrupt brings host work
     /// ([`Host::host_work_due`]): it ends a wait it falls in.
     pub(super) host_work_at: Option<u64>,
+    /// The code installs described ([`Host::profile_code`]).
+    pub(super) described: Vec<Described>,
 }
+
+/// A described install: its code, length and regions.
+pub(super) type Described = (usize, usize, Vec<(u32, step_timing::CodeRegion)>);
 
 impl Host for FakeHost {
     fn memory_barrier(&mut self) {
@@ -369,6 +374,14 @@ impl Host for FakeHost {
     }
     fn profile_ticks(&mut self) -> u64 {
         self.counter()
+    }
+    fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        regions: &[(u32, step_timing::CodeRegion)],
+    ) {
+        self.described.push((code.0, bytes, regions.to_vec()));
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
@@ -595,6 +608,7 @@ pub(super) fn board_on<D: Devices>(
         code_partitions: None,
         parts: Vec::new(),
         host_work_at: None,
+        described: Vec::new(),
     };
     let profile = CpuProfile {
         name: "test",
@@ -6777,6 +6791,41 @@ fn implicit_pac_forms_repeat_their_results_until_the_keys_change() {
         .set(SystemRegister::APIBKeyLo_EL1, 0, 0x0bad_cafe);
     machine.derived_changed();
     assert_ne!(sign(&mut machine), signed);
+}
+
+/// Under step timing a block's install describes its code to the host
+/// (`Host::profile_code`): inline from its start, its direct exit apart,
+/// regions in ascending offsets within its code; without it nothing is
+/// described.
+#[test]
+fn block_installs_describe_their_code_under_step_timing() {
+    use step_timing::CodeRegion::{Exit, Inline};
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    for timing in [false, true] {
+        let mut machine = machine(&[ADD, ADD]);
+        machine.set_step_timing(timing);
+        let base = machine.cpu.pc;
+        machine.host.exits = vec![NativeExit::Exit {
+            next_pc: base + 8,
+            kind: ExitKind::Fallthrough as u64,
+        }];
+        machine.step().unwrap();
+        if !timing {
+            assert!(machine.host.described.is_empty());
+            continue;
+        }
+        let block = &machine.code.blocks[0];
+        let (code, bytes, regions) = &machine.host.described[0];
+        assert_eq!(*code, block.code.0);
+        assert_eq!(regions[0], (0, Inline));
+        assert!(regions.iter().any(|&(_, region)| region == Exit));
+        assert!(regions.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(
+            regions
+                .iter()
+                .all(|&(offset, _)| (offset as usize) < *bytes)
+        );
+    }
 }
 
 /// A system-mode block completes a PAC instruction that writes a register

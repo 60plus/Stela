@@ -437,6 +437,24 @@ fn call_service(asm: &mut Asm, form: Form, routine: Routine, modifier: Gpr) -> P
     failed
 }
 
+/// The bytes a service call ends with, up to its return address: through
+/// the service's cell `routine` in a block ([`inline::Cells`]), and through
+/// the address `service` in a [`thunk`]. `--profile`'s host samples look for
+/// them before a return address into native code, to tell a sample taken
+/// in the service from one in another routine native code calls.
+pub fn service_call_ends(routine: u32, service: u64) -> [Vec<u8>; 2] {
+    let mut cell = Code::pinned();
+    let mut asm = cell.asm();
+    asm.place(Gpr::Rdi, Place::new(Anchor::Pointer, 0));
+    let routine = i32::try_from(routine).expect("a field of the service");
+    asm.call_rm(Mem::base(Gpr::Rdi, routine));
+    let mut address = Code::pinned();
+    let mut asm = address.asm();
+    asm.mov_imm64(Gpr::Rax, service);
+    asm.call_rm(Gpr::Rax);
+    [cell.into_bytes(), address.into_bytes()]
+}
+
 /// The thunk completing the PAC instruction of `form` at `pc` from the memo
 /// ([`Anchor::Memo`]) under the tag words at `tags`, or through `service`, a
 /// [`ServiceRoutine`], else exiting at `pc` for the engine.

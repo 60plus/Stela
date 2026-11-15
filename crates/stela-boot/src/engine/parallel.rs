@@ -227,6 +227,9 @@ impl Pe {
         let mut screen = Share::new(super::display::BUSY_SHARE);
         loop {
             let limit = machine.statistics.blocks + SLICE;
+            if step_timing {
+                host::sampling::host_service();
+            }
             let stop = machine.run_with_budget(RunBudget {
                 blocks: limit,
                 host_ticks: Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND),
