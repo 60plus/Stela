@@ -1,3 +1,6 @@
+#[cfg(feature = "amdgpu-port")]
+#[path = "build/amdgpu.rs"]
+mod amdgpu;
 #[cfg(feature = "linux-drm")]
 #[path = "build/image.rs"]
 mod image;
@@ -71,6 +74,8 @@ fn main() {
         ];
         image::link(&linux, drivers);
     }
+    #[cfg(feature = "amdgpu-port")]
+    amdgpu::port(&linux);
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }

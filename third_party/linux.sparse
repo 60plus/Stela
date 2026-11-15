@@ -372,3 +372,4 @@
 /kernel/irq/settings.h
 /kernel/irq/debugfs.h
 /kernel/irq/proc.h
+/drivers/gpu/drm/amd/

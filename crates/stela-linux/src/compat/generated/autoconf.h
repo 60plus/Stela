@@ -79,6 +79,21 @@
 #define CONFIG_DRM_DISPLAY_HDMI_HELPER 1
 #define CONFIG_DMA_SHARED_BUFFER 1
 #define CONFIG_SYNC_FILE 1
+/* amdgpu with its display core, and what its Kconfig entry selects that only
+ * adds helper objects. Its selections that also change nouveau and the DRM
+ * core (hwmon, power supply, backlight, DRM clients) are not set yet; the
+ * amdgpu build lists them as pending. DRM_AMD_DC under clang depends on
+ * X86_64 for the stack its bandwidth calculation takes there; Stela's arch
+ * compiles for x86-64, so the dependency's reason holds. */
+#define CONFIG_DRM_AMDGPU 1
+#define CONFIG_DRM_AMD_DC 1
+#define CONFIG_DRM_AMD_DC_FP 1
+#define CONFIG_DRM_DISPLAY_DSC_HELPER 1
+#define CONFIG_DRM_DISPLAY_HDCP_HELPER 1
+#define CONFIG_DRM_BUDDY 1
+#define CONFIG_DRM_SUBALLOC_HELPER 1
+#define CONFIG_CRC16 1
+#define CONFIG_INTERVAL_TREE 1
 
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_XE_FORCE_PROBE ""
