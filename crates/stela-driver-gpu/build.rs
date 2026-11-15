@@ -1,4 +1,7 @@
 #[cfg(feature = "linux-drm")]
+#[path = "build/image.rs"]
+mod image;
+#[cfg(feature = "linux-drm")]
 #[path = "build/imports.rs"]
 mod imports;
 #[cfg(feature = "linux-drm")]
@@ -33,8 +36,14 @@ fn main() {
     );
     #[cfg(feature = "linux-kernel")]
     linux.tests(&mut tests);
-    #[cfg(feature = "nouveau-port")]
-    nouveau::port(&linux);
+    #[cfg(feature = "linux-drm")]
+    {
+        let drivers = vec![
+            #[cfg(feature = "nouveau-port")]
+            nouveau::port(&linux),
+        ];
+        image::link(&linux, drivers);
+    }
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }

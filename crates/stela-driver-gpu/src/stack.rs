@@ -77,10 +77,20 @@ pub static NVIDIA: GpuStack = GpuStack {
 /// # Safety
 /// On the canonical Linux owner's original managed task after Initial and
 /// SRCU startup have completed, once per environment. Initcalls may sleep.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 pub unsafe fn start_kernel() -> Result<(), stela_linux::owner::Errno> {
-    // SAFETY: the caller's contract.
-    unsafe { crate::nouveau::start() }
+    unsafe extern "C" {
+        /// The build's one registration image (`build/image.rs`).
+        static stela_linux_gpu_image: c_void;
+        fn stela_linux_start(image: *const c_void, registry: *mut *mut c_void) -> core::ffi::c_int;
+    }
+    let mut registry = core::ptr::null_mut();
+    // SAFETY: the caller's contract; the image is the build's, and the
+    // registry's state lasts as long as what it started.
+    match unsafe { stela_linux_start(&raw const stela_linux_gpu_image, &raw mut registry) } {
+        0 => Ok(()),
+        error => Err(error),
+    }
 }
 
 impl GpuStack {

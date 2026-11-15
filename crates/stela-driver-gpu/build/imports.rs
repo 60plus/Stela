@@ -21,8 +21,17 @@ const HARNESS: &str = "stela_test_";
 
 /// The services `port`'s members reach that the `environment` archives lack
 /// or define only as a trap.
+#[allow(dead_code, reason = "for a port whose unit is not in the image yet")]
 pub fn open(port: &Path, environment: &[&Path]) -> BTreeSet<String> {
-    let port = members(port);
+    open_all(&[port], environment)
+}
+
+/// As [`open`], for a port of several archives linked together.
+pub fn open_all(ports: &[&Path], environment: &[&Path]) -> BTreeSet<String> {
+    let port = ports
+        .iter()
+        .flat_map(|archive| members(archive))
+        .collect::<Vec<_>>();
     let environment = environment
         .iter()
         .flat_map(|archive| members(archive))

@@ -11,8 +11,6 @@ use crate::bus::pci::{Address, ConfigSpace, Function};
 #[cfg(feature = "metal")]
 pub mod metal;
 
-#[cfg(feature = "nouveau-port")]
-pub mod nouveau;
 
 pub mod cold;
 pub mod gsp_perf;

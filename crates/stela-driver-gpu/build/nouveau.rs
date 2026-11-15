@@ -5,7 +5,7 @@ use super::kbuild::{Config, Kbuild};
 use super::native::{self, Linux};
 use std::{env, fs, path::Path, thread};
 use stela_c_build::linux::Module;
-use stela_c_build::linux_capture::{self as initcalls, Projection, Unit, UnitSpec};
+use stela_c_build::linux_capture::{self as initcalls, Unit, UnitSpec};
 
 const NOUVEAU: &str = "../../third_party/linux/drivers/gpu/drm/nouveau";
 const AUTOCONF: &str = "../stela-linux/src/compat/generated/autoconf.h";
@@ -19,7 +19,7 @@ const COMPOSITES: [&str; 1] = ["nouveau"];
 /// The kernel services the composites import that Stela's Linux environment
 /// lacks, or defines only as a trap, by service. Building fails when the
 /// imports change, so each supplied service leaves this list with its change.
-const OPEN: &[(&str, &[&str])] = &[
+const OPEN: super::image::Open = &[
     // Traps nothing nouveau runs reaches. Shmem-backed pages: TTM allocates
     // from its own pool and Stela never swaps it out.
     (
@@ -61,7 +61,7 @@ fn initcalls_unit() -> Unit {
     INITCALLS.into()
 }
 
-pub fn port(linux: &Linux) {
+pub fn port(linux: &Linux) -> super::image::Driver {
     let config = Config::parse(&fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header"))
         .unwrap_or_else(|error| panic!("{AUTOCONF}: {error}"));
     let kbuild =
@@ -121,8 +121,6 @@ pub fn port(linux: &Linux) {
             .flat_map(|compiling| compiling.join().expect("a compiling thread"))
             .collect::<Vec<_>>()
     });
-    let mut captured = linux.captured.clone();
-    let environment_count = captured.len();
     let compiler = initcalls::compiler(&build);
     let placement = initcalls::Placement::new(
         &initcalls_unit().path(),
@@ -133,60 +131,25 @@ pub fn port(linux: &Linux) {
         ],
     )
     .expect("Nouveau source placement");
-    captured.push(initcalls::compile(
+    let captured = initcalls::compile(
         &build,
         Path::new("../stela-linux/src/compat/stela/registration.h"),
         INITCALLS,
         &placement,
-    ));
-    let mut expected = native::environment_units();
-    expected.push(INITCALLS);
-    let image = initcalls::source(
-        &captured,
-        Projection {
-            symbol: "stela_linux_nouveau_image",
-            expected: &expected,
-            imported_units: environment_count,
-            descriptors_only: false,
-        },
     );
     build
         .objects(objects)
-        .objects(
-            captured
-                .iter()
-                .skip(environment_count)
-                .map(|unit| unit.object()),
-        )
-        .file(image)
+        .object(captured.object())
         .compile("stela-nouveau-nvkm");
-    let archive = stela_c_build::linux_build::out_dir().join("libstela-nouveau-nvkm.a");
-    check_imports(&archive, &[&linux.archive, &linux.common_archive]);
-    let output = stela_c_build::linux_build::out_dir();
-    let digest = initcalls::write(
-        &output.join("captured-units.bin"),
-        &captured[initcalls::COMMON.len()..],
-    );
-    println!("cargo:output={}", output.display());
-    println!("cargo:cohort_sha256={digest}");
     // Hosted programs test the environment and link no driver.
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
         println!("cargo:rustc-link-lib=static=stela-nouveau-nvkm");
     }
-}
-
-/// Compare the services the composites reach when linked, directly or through
-/// the environment's objects, and that nothing supplies, with [`OPEN`].
-fn check_imports(port: &Path, environment: &[&Path]) {
-    let mut open = super::imports::open(port, environment);
-    let mut stale = Vec::new();
-    for symbol in OPEN.iter().flat_map(|(_, symbols)| symbols.iter()) {
-        if !open.remove(*symbol) {
-            stale.push(*symbol);
-        }
+    super::image::Driver {
+        name: MODULE.name,
+        spec: INITCALLS,
+        captured,
+        archive: stela_c_build::linux_build::out_dir().join("libstela-nouveau-nvkm.a"),
+        open: OPEN,
     }
-    assert!(
-        open.is_empty() && stale.is_empty(),
-        "nouveau's imports changed: newly open {open:?}; now supplied {stale:?}"
-    );
 }
