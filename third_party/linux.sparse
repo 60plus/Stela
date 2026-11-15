@@ -373,3 +373,8 @@
 /kernel/irq/debugfs.h
 /kernel/irq/proc.h
 /drivers/gpu/drm/amd/
+/lib/kfifo.c
+/lib/math/gcd.c
+/mm/mempool.c
+/kernel/time/timeconv.c
+/kernel/locking/semaphore.c
