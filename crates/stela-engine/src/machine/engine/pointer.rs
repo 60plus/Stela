@@ -19,6 +19,8 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use core::mem::offset_of;
 use stela_compiler::{Anchor, Place, block::PointerAuthenticationKey, x86_64::pointer};
 
+pub(super) mod census;
+
 /// The memo native code reads while its service has none: no entry's tag
 /// matches a tag word, so every lookup misses ([`pointer::DISABLED`]).
 /// Only read, through its address.
@@ -137,6 +139,8 @@ pub(super) struct PointerService {
     /// Results computed since boot (the cipher ran): each is a memo miss,
     /// of a block, a thunk or an engine exit.
     pub(super) fills: u64,
+    /// Under `--profile`, what the memo missed and why ([`census`]).
+    pub(super) census: Option<Box<census::Census>>,
 }
 
 /// The routine a thunk calls on a memo miss.
@@ -175,6 +179,7 @@ impl PointerService {
             strips: [pointer::strip::Cell::default(); 2],
             routine: SERVICE as usize as u64,
             fills: 0,
+            census: None,
         }
     }
 
@@ -418,6 +423,24 @@ impl PointerService {
             }
             _ => None,
         };
+        if let Some(census) = &mut self.census
+            && let Some(inputs) = self.inputs
+            && let Some(words) = inputs.keys[usize::from(index)]
+        {
+            let kind = match operation {
+                PointerOperation::Sign => census::SIGN,
+                PointerOperation::Authenticate { .. } => census::AUTHENTICATE,
+            };
+            census.fill(
+                index,
+                words,
+                inputs.tcr,
+                kind,
+                pointer,
+                modifier,
+                strips_back,
+            );
+        }
         self.remember(operation, key, pointer, modifier, result);
         if let Some(signed) = strips_back {
             let authenticate = PointerOperation::Authenticate { combined: false };
@@ -432,6 +455,20 @@ impl PointerService {
         let key = pointer::GENERIC_KEY;
         let code = self.context.as_ref()?.generic_code(data, modifier).ok()?;
         self.fills += 1;
+        if let Some(census) = &mut self.census
+            && let Some(inputs) = self.inputs
+            && let Some(words) = inputs.keys[usize::from(key)]
+        {
+            census.fill(
+                key,
+                words,
+                inputs.tcr,
+                census::GENERIC,
+                data,
+                modifier,
+                None,
+            );
+        }
         let tag = self.native_tag(key);
         let memo = self.memo.as_mut().expect("memo for open tag");
         pointer::insert(
@@ -456,6 +493,9 @@ impl PointerService {
             Some(index) => self.seen.remove(index).1,
             None => {
                 self.generations += 1;
+                if let Some(census) = &mut self.census {
+                    census.generations += 1;
+                }
                 self.generations
             }
         };
@@ -536,6 +576,23 @@ pub(super) fn complete(
     // outlives every installed thunk; the engine does not touch it while
     // native code runs.
     let service = unsafe { &mut *(service as *mut PointerService) };
+    let fills = service.fills;
+    let completion = complete_with(service, request, pointer, modifier);
+    if let Some(census) = &mut service.census {
+        census.native += service.fills - fills;
+        census.calls += 1;
+    }
+    completion
+}
+}
+
+/// [`complete`] of the service.
+fn complete_with(
+    service: &mut PointerService,
+    request: u32,
+    pointer: u64,
+    modifier: u64,
+) -> pointer::Completion {
     if pointer::requests_generic_code(request) {
         if service.tags[usize::from(pointer::GENERIC_KEY)] == 0 {
             return pointer::Completion::default();
@@ -572,7 +629,6 @@ pub(super) fn complete(
         },
         _ => pointer::Completion::default(),
     }
-}
 }
 
 #[cfg(test)]
@@ -1037,6 +1093,142 @@ mod tests {
                 service.fills as f64 / operations as f64
             );
         }
+    }
+
+    /// What a memo miss costs, run by hand in a release build: a native
+    /// signing miss through the service routine, the cipher alone, and a
+    /// miss of the authentication form. Prints nanoseconds per call.
+    #[test]
+    #[ignore = "manual: opt-in"]
+    fn miss_path_timing() {
+        extern crate std;
+        use PointerAuthenticationKey as Key;
+        use std::time::Instant;
+        const CALLS: u64 = 1 << 20;
+        let tcr = 25 | 25 << 16 | 1 << 37;
+        let mut service = Box::new(PointerService::new());
+        service.open(inputs(pauth::Version::Classic, tcr));
+        let state = service.anchors().0;
+        service.reopen(stela_contracts::pauth::Key::Ib, true, false);
+        // Canonical upper pointers, which strip back from their signings.
+        let operand = |call: u64| {
+            (
+                0xffff_ff80_0800_0000 + call * 4,
+                0xffff_fe10_0000_0000 - call * 16,
+            )
+        };
+        let sign = request(Key::Ib, PointerOperation::Sign);
+        let started = Instant::now();
+        let mut sum = 0u64;
+        for call in 0..CALLS {
+            let (pointer, modifier) = operand(call);
+            sum = sum.wrapping_add(complete(state, sign, pointer, modifier).value);
+        }
+        let native = started.elapsed().as_nanos() as f64 / CALLS as f64;
+        let cipher = {
+            let context = service.context.as_ref().unwrap();
+            let started = Instant::now();
+            for call in 0..CALLS {
+                let (pointer, modifier) = operand(call + CALLS);
+                let signed = context.sign(stela_contracts::pauth::Key::Ib, pointer, modifier);
+                sum = sum.wrapping_add(signed.unwrap_or(0));
+            }
+            started.elapsed().as_nanos() as f64 / CALLS as f64
+        };
+        let authenticate = request(Key::Ib, PointerOperation::Authenticate { combined: true });
+        let started = Instant::now();
+        for call in 0..CALLS {
+            let (pointer, modifier) = operand(call + 2 * CALLS);
+            sum = sum.wrapping_add(complete(state, authenticate, pointer, modifier).value);
+        }
+        let failed = started.elapsed().as_nanos() as f64 / CALLS as f64;
+        std::println!(
+            "MISS sign_through_service={native:.1}ns sign_alone={cipher:.1}ns auth_miss={failed:.1}ns fills={} ({sum:x})",
+            service.fills
+        );
+        // Host instructions of one call, single-stepped under the trap flag.
+        #[cfg(target_os = "linux")]
+        {
+            let (pointer, modifier) = operand(3 * CALLS);
+            let miss = steps(|| {
+                core::hint::black_box(complete(state, sign, pointer, modifier));
+            });
+            let context = service.context.as_ref().unwrap();
+            let (pointer, modifier) = operand(3 * CALLS + 1);
+            let alone = steps(|| {
+                let key = stela_contracts::pauth::Key::Ib;
+                core::hint::black_box(context.sign(key, pointer, modifier).ok());
+            });
+            let key = stela_contracts::pauth::Key::Ib;
+            let strip = steps(|| {
+                core::hint::black_box(context.strip(key, pointer));
+            });
+            let (pointer, modifier) = operand(3 * CALLS + 2);
+            let lookup = steps(|| {
+                core::hint::black_box(service.remembered(
+                    PointerOperation::Sign,
+                    key,
+                    pointer,
+                    modifier,
+                ));
+            });
+            let memo = service.memo.as_mut().unwrap();
+            let insert = steps(|| {
+                pointer::insert(
+                    memo,
+                    pointer::MemoEntry {
+                        pointer,
+                        modifier,
+                        tag: 7,
+                        value: 7,
+                    },
+                );
+            });
+            let tag = steps(|| {
+                core::hint::black_box(service.native_tag(1));
+            });
+            std::println!(
+                "MISS instructions sign_through_service={miss} sign_alone={alone} strip={strip} lookup={lookup} insert={insert} tag={tag}"
+            );
+        }
+    }
+
+    /// The instructions `run` executes, counted under the trap flag.
+    #[cfg(target_os = "linux")]
+    fn steps(run: impl FnOnce()) -> usize {
+        use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        #[repr(C)]
+        struct SigAction {
+            handler: usize,
+            mask: [u64; 16],
+            flags: i32,
+            restorer: usize,
+        }
+        unsafe extern "C" {
+            fn sigaction(signal: i32, action: *const SigAction, old: *mut SigAction) -> i32;
+        }
+        static STEPS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn step(_: i32, _: *mut core::ffi::c_void, _: *mut core::ffi::c_void) {
+            STEPS.fetch_add(1, Relaxed);
+        }
+        STEPS.store(0, Relaxed);
+        let action = SigAction {
+            handler: step as extern "C" fn(i32, *mut core::ffi::c_void, *mut core::ffi::c_void)
+                as usize,
+            mask: [0; 16],
+            flags: 4,
+            restorer: 0,
+        };
+        // SAFETY: a SIGTRAP handler that only counts; the trap flag is set
+        // around `run` alone.
+        unsafe {
+            sigaction(5, &action, core::ptr::null_mut());
+            core::arch::asm!("pushfq", "or qword ptr [rsp], 0x100", "popfq");
+        }
+        run();
+        // SAFETY: as above.
+        unsafe { core::arch::asm!("pushfq", "and qword ptr [rsp], -257", "popfq") };
+        STEPS.load(Relaxed)
     }
 
     /// A key's entries outlive changes of the other keys: a process's keys

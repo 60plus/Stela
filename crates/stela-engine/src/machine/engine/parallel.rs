@@ -600,6 +600,8 @@ pub struct Counts {
     pub stamped: [u64; chain::STAMP_COUNTS + 4],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
+    /// Its PAC census under step timing ([`step_timing::PAC_CENSUS_WORDS`]).
+    pub pac_census: [u64; step_timing::PAC_CENSUS_WORDS],
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -2660,6 +2662,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 stamped
             },
             pac_fills: self.pointer.fills,
+            pac_census: self
+                .pointer
+                .census
+                .as_ref()
+                .map_or([0; step_timing::PAC_CENSUS_WORDS], |census| census.words()),
             phases: self
                 .step_timing
                 .as_ref()
