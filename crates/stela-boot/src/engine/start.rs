@@ -2724,6 +2724,9 @@ fn start_platform(
         },
         _ => remapping::Remappers::none(),
     };
+    // SAFETY: before any GPU claim, with the loader root that maps the
+    // ACPI tables, as the remapping units' were read above.
+    unsafe { super::gpu::keep_video_bios_table(handoff.rsdp, handoff.root) };
     // The IOAPICs are the operating system's after ExitBootServices, as
     // every OS takes them: firmware and SMM program no routes at runtime.
     if let Some(pci) = &contained_pci {

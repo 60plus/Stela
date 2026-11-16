@@ -148,6 +148,77 @@ static TURN: Turn = Turn::new();
 /// One wake of a sleeping PE for each episode of held-back work.
 static WAKES: Wakes = Wakes::new();
 
+/// The firmware's ACPI VFCT table, copied while the loader root mapped it:
+/// the video BIOS images firmware publishes for GPUs without an option ROM
+/// of their own (integrated AMD GPUs).
+static VIDEO_BIOS_TABLE: AtomicPtr<Vec<u8>> = AtomicPtr::new(ptr::null_mut());
+
+/// Keeps the ACPI VFCT table for the claims, which give each function its
+/// image in it as the platform ROM Linux's drivers read.
+///
+/// # Safety
+/// `root` is the loader root that maps the ACPI tables at `rsdp`. Called
+/// once, before any claim.
+pub(super) unsafe fn keep_video_bios_table(rsdp: u64, root: u64) {
+    if rsdp == 0 {
+        return;
+    }
+    let table = {
+        // SAFETY: the caller's; the loader root maps every table.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        // SAFETY: the firmware's RSDP, whose tables the loader root maps.
+        unsafe { stela_runtime::pc::acpi::find(rsdp, &stela_boot_core::vfct::SIGNATURE) }
+            .ok()
+            .map(<[u8]>::to_vec)
+    };
+    if let Some(table) = table {
+        output::arguments(format_args!(
+            "GPU: the ACPI VFCT table holds {} bytes of video BIOS images\n",
+            table.len()
+        ));
+        VIDEO_BIOS_TABLE.store(Box::into_raw(Box::new(table)), Ordering::Release);
+    }
+}
+
+/// The function's image in the kept VFCT table, as Linux takes it
+/// (`amdgpu_acpi_vfct_bios`), or nothing; a refused image is said once.
+fn platform_rom(adapter: &gpu::Adapter) -> &'static [u8] {
+    use stela_boot_core::vfct;
+    // SAFETY: stored once before any claim and never freed.
+    let Some(table) = (unsafe { VIDEO_BIOS_TABLE.load(Ordering::Acquire).as_ref() }) else {
+        return &[];
+    };
+    let address = adapter.address;
+    let function = vfct::Function {
+        bus: address.bus,
+        device: address.device,
+        function: address.function,
+        vendor: adapter.vendor.pci_id(),
+        device_id: adapter.device,
+    };
+    match vfct::image(table, function) {
+        Ok(image) => {
+            if let Some(bus) = image.renumbered_from {
+                output::arguments(format_args!(
+                    "GPU {address}: its VFCT image names bus {bus:#x}; taken, as Linux takes it\n"
+                ));
+            }
+            output::arguments(format_args!(
+                "GPU {address}: video BIOS of {} bytes from the ACPI VFCT table, given to Linux as its platform ROM\n",
+                image.bytes.len()
+            ));
+            &table[image.bytes]
+        }
+        Err(vfct::Error::NoImage) => &[],
+        Err(error) => {
+            output::arguments(format_args!(
+                "GPU {address}: the ACPI VFCT table's image is refused ({error:?}); the driver looks for its video BIOS elsewhere\n"
+            ));
+            &[]
+        }
+    }
+}
+
 /// Who runs PE work on the boot CPU, once the PEs run.
 static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
 static BOOT_PE: AtomicUsize = AtomicUsize::new(0);
@@ -1079,6 +1150,7 @@ fn claim(
         // A mapping past the driver's mask is refused
         // (`function::Mappings`), not truncated.
         dma_limit: stack.kernel.dma_limit(adapter),
+        rom: platform_rom(adapter),
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
