@@ -190,9 +190,11 @@ pub enum CpuAccess {
     None,
     /// `vkCopyMemoryToImage` and `vkCopyImageToMemory`.
     HostImageCopy,
-    /// Metal's CPU copy of a managed texture, in a host-visible buffer:
-    /// CPU writes reach the image at the next commit, and
-    /// `synchronizeTexture` copies the image back.
+    /// A CPU copy in a host-visible buffer, which CPU writes reach the
+    /// image from at the next commit. A managed texture's is Metal's CPU
+    /// copy, which `synchronizeTexture` copies the image back into; a
+    /// shared texture's CPU reads copy the image out on the GPU
+    /// ([`Device::begin_read_back`](crate::metal::device::Device::begin_read_back)).
     Staged,
     /// The texture aliases a buffer's mapped rows.
     Linear,
@@ -298,12 +300,23 @@ pub fn texture(capabilities: &Capabilities, descriptor: &TextureDescriptor) -> R
             ));
         }
         StorageMode::Managed => CpuAccess::Staged,
-        // A staged copy only meets the GPU's writes at a synchronize.
-        StorageMode::Shared => {
+        StorageMode::Shared if descriptor.sample_count > 1 => {
             return Err(super::error::Error::Unsupported(
-                "shared storage of a format without host image copy",
+                "shared storage of multisample textures",
             ));
         }
+        // No CPU call reaches a combined depth-stencil texture's texels:
+        // blits copy each aspect.
+        StorageMode::Shared if matches!(description.kind, Kind::DepthStencil) => CpuAccess::None,
+        StorageMode::Shared if !description.encoding().is_exact() => {
+            return Err(super::error::Error::Unsupported(
+                "shared storage of an extended-range format without host image copy",
+            ));
+        }
+        // Formats without host image copy, as NVK's depth and stencil
+        // formats: CPU writes reach the image at the next commit, and CPU
+        // reads copy the image out on the GPU, so each sees the GPU's.
+        StorageMode::Shared => CpuAccess::Staged,
     };
 
     let mut image = image_info(descriptor, description, realization, usage);

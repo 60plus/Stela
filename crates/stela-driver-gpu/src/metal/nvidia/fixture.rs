@@ -410,12 +410,14 @@ fn formats() -> FormatTable {
                     },
                 }
             }
+            // NVK copies depth and stencil only on the GPU: no host image
+            // copies (nvk_image.c).
             (_, Compression::None) => FormatSupport {
                 optimal: F::SAMPLED_IMAGE
                     | F::SAMPLED_IMAGE_FILTER_LINEAR
                     | F::SAMPLED_IMAGE_DEPTH_COMPARISON
                     | F::DEPTH_STENCIL_ATTACHMENT
-                    | transfer,
+                    | transfer.difference(F::HOST_IMAGE_TRANSFER),
                 sample_counts: SAMPLE_COUNTS,
                 ..FormatSupport::default()
             },

@@ -378,6 +378,47 @@ fn shared_textures_use_host_image_copies() {
     assert!(plan.image.usage.contains(ImageUsage::HOST_TRANSFER));
 }
 
+/// On Apple GPUs every storage mode is unified memory: shared textures of
+/// formats without host image copy are made, as NVK's depth and stencil
+/// formats are, and each keeps the CPU access Metal gives it.
+#[test]
+fn shared_textures_without_host_image_copy_are_made() {
+    let capabilities = capabilities();
+    let plan = |format, samples: u64| {
+        let mut shared = descriptor(TextureType::D2, format);
+        if samples > 1 {
+            shared.texture_type = TextureType::D2Multisample;
+        }
+        shared.sample_count = samples;
+        shared.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+        shared.options = options(StorageMode::Shared);
+        texture(&capabilities, &shared)
+    };
+    for format in [
+        PixelFormat::Depth16Unorm,
+        PixelFormat::Depth32Float,
+        PixelFormat::Stencil8,
+    ] {
+        let made = plan(format, 1).unwrap();
+        assert_eq!(made.cpu_access, CpuAccess::Staged, "{format:?}");
+        assert!(!made.image.usage.contains(ImageUsage::HOST_TRANSFER));
+        assert_eq!(made.memory.required, M::DEVICE_LOCAL);
+    }
+    // No CPU call reaches a combined format's texels: blits copy each
+    // aspect.
+    assert_eq!(
+        plan(PixelFormat::Depth32FloatStencil8, 1)
+            .unwrap()
+            .cpu_access,
+        CpuAccess::None
+    );
+    // Multisample textures stay private.
+    assert!(matches!(
+        plan(PixelFormat::Depth32Float, 4),
+        Err(Error::Unsupported(_))
+    ));
+}
+
 #[test]
 fn swizzles_compose_and_storage_views_stay_identity() {
     let bgra = SwizzleChannels([

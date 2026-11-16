@@ -15,7 +15,7 @@ use crate::metal::{
     hazard::FULL,
     heap::{self, HeapAllocator, HeapDescriptor, SizeAndAlign},
     pass::{AttachmentView, TestedCopy},
-    pixel_format::{Description, Encoding},
+    pixel_format::{Description, Encoding, Kind},
     resource::{
         self, CpuAccess, ShaderViews, SubresourceLayout, TextureDescriptor, TexturePlan,
         TextureViewDescriptor,
@@ -1741,8 +1741,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok((run, packed))
     }
 
-    /// The copy of a color texture's `region` and the ranges of its rows in
-    /// `length` bytes laid out by `strides`.
+    /// The copy of a texture's `region`, of its color, depth or stencil
+    /// aspect, and the ranges of its rows in `length` bytes laid out by
+    /// `strides`.
     fn cpu_region(
         &self,
         id: TextureId,
@@ -1752,7 +1753,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     ) -> Result<(BufferImageCopy, CpuRows)> {
         let descriptor = &self.resources.textures.get(id.0)?.descriptor;
         let shape = RowShape::of(descriptor, region, strides)?;
-        let (subresource, offset, extent) = region.resolve(descriptor, ImageAspects::COLOR)?;
+        let aspect = cpu_aspect(descriptor.pixel_format.describe())?;
+        let (subresource, offset, extent) = region.resolve(descriptor, aspect)?;
         let end = if shape.images == 0 || shape.rows == 0 {
             0
         } else {
@@ -1814,6 +1816,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             cpu_copy_rows(&texture.descriptor, region, bytes.len())?,
         );
         let first = rows.first;
+        // Vulkan's own rule for depth and stencil copies, which the upload is.
+        if region.subresource.aspects != ImageAspects::COLOR && !first.is_multiple_of(4) {
+            return Err(Error::Unsupported(
+                "CPU writes of depth and stencil texels at offsets that are not multiples of four",
+            ));
+        }
         for (offset, packed) in rows {
             self.backend.write_memory(memory, offset, &bytes[packed])?;
         }
@@ -1875,6 +1883,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
             };
         };
+        // A shared texture's copy holds only the CPU's writes: its reads
+        // copy the image out on the GPU ([`Self::begin_read_back`]).
+        if gpu_read(texture) && !bytes.is_empty() {
+            return Err(Error::Unsupported(
+                "CPU reads of shared textures without host image copy outside a GPU read-back",
+            ));
+        }
         let (memory, rows) = (
             copy.memory,
             cpu_copy_rows(&texture.descriptor, region, bytes.len())?,
@@ -3118,15 +3133,11 @@ struct RowShape {
 }
 
 impl RowShape {
-    /// Validates `strides` for `region` of a color texture. Every row's
-    /// start, at most the last one's, fits in `u64`.
+    /// Validates `strides` for `region` of a texture of one aspect. Every
+    /// row's start, at most the last one's, fits in `u64`.
     fn of(descriptor: &TextureDescriptor, region: &Region, strides: Strides) -> Result<Self> {
         let description = descriptor.pixel_format.describe();
-        ensure(
-            description.is_color(),
-            "the CPU reaches depth and stencil textures through blits",
-        )?;
-        region.resolve(descriptor, ImageAspects::COLOR)?;
+        region.resolve(descriptor, cpu_aspect(description)?)?;
         let block = description.block;
         let shape = Self {
             row_bytes: region.size[0].div_ceil(u64::from(block.width)) * u64::from(block.bytes),
@@ -3159,6 +3170,31 @@ impl RowShape {
             .and_then(|(image, row)| image.checked_add(row))
             .and_then(|start| start.checked_add(self.row_bytes).map(|_| start))
             .ok_or(Error::Invalid("the bytes end before the region"))
+    }
+}
+
+/// Whether the CPU reads `texture` by a GPU copy of its image into host
+/// memory: a shared texture whose image only host image copies reach, or
+/// whose CPU copy holds only the CPU's writes.
+fn gpu_read(texture: &TextureObject) -> bool {
+    match texture.cpu_access {
+        CpuAccess::HostImageCopy => texture.cpu_copy.is_none(),
+        CpuAccess::Staged => texture.descriptor.options.storage_mode == StorageMode::Shared,
+        _ => false,
+    }
+}
+
+/// The aspect CPU copies of a texture of `description`'s format reach:
+/// its one aspect. Metal lays out no CPU texels of a combined depth-stencil
+/// format; blits copy each of its aspects.
+fn cpu_aspect(description: &Description) -> Result<ImageAspects> {
+    match description.kind {
+        Kind::Color(_) => Ok(ImageAspects::COLOR),
+        Kind::Depth => Ok(ImageAspects::DEPTH),
+        Kind::Stencil => Ok(ImageAspects::STENCIL),
+        Kind::DepthStencil => Err(Error::Unsupported(
+            "CPU copies of combined depth-stencil textures, which blits reach",
+        )),
     }
 }
 

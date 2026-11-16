@@ -2009,6 +2009,57 @@ fn depth(plan: &mut Plan, library: &str) {
             );
         }
     }
+    // Shared depth targets, which Apple GPUs keep in unified memory: the
+    // CPU writes the stored depths, the pass tests and writes them, and the
+    // CPU reads the result.
+    for format in ["depth32float", "depth16unorm"] {
+        let (d, c) = (stored(&mut rng), colors(&mut rng));
+        let unorm = format == "depth16unorm";
+        // Depth16Unorm holds the 1/64 lattice and z exactly.
+        let bits = |v: f64| i128::from((v * 65535.0).round() as u16);
+        let mut color = vec![];
+        let mut depth = vec![];
+        for i in 0..n {
+            let pass = compare("less", z, d[i]);
+            color.extend(if pass {
+                [c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]
+            } else {
+                [0.0; 4]
+            });
+            depth.push(if pass { z } else { d[i] });
+        }
+        let (stored_bytes, expected, dtype) = if unorm {
+            let ints16 =
+                |v: &[f64]| ints(Dtype::U16, &v.iter().map(|&v| bits(v)).collect::<Vec<_>>());
+            (ints16(&d), ints16(&depth), Dtype::U16)
+        } else {
+            (f32s(&d), f32s(&depth), Dtype::F32)
+        };
+        let z_at = if unorm {
+            f32r(bits(z) as f64 / 65535.0)
+        } else {
+            z
+        };
+        plan.add(
+            full_at(
+                &format!("render.depth.shared.{format}"),
+                library,
+                "frag_color",
+                &c,
+                z_at,
+                json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}],
+                        "depth": {"texture": "d", "compare": "less", "write": true}}),
+            )
+            .texture(target("c", "rgba32float"))
+            .texture(
+                target("d", format)
+                    .set("storage", "shared")
+                    .data(stored_bytes),
+            )
+            .output(Output::new("c", Dtype::F32, Tolerance::exact()).expect_same(f32s(&color)))
+            .output(Output::new("d", dtype, Tolerance::exact()).expect_same(expected)),
+        );
+    }
     // Fragment depth: any value, or one the qualifier bounds by the
     // interpolated depth; written depth stays within the viewport's range.
     for (fragment, label) in [
