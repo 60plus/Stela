@@ -24,11 +24,14 @@
 //!   and then gives its input;
 //! - PACGA gives the cipher's upper half.
 //!
-//! A key whose SCTLR enable is clear has zero masks, so both give the
-//! pointer unchanged, as Arm does. Everything else, a closed key (tag word
-//! zero), a signing of a non-canonical pointer and a failed authentication,
-//! goes to the service as a memo miss does, which computes it the engine's
-//! way. The computation clobbers RAX, RCX, R8 to R11, XMM0, XMM1 and flags.
+//! A key whose tag word is [`super::DISABLED`] (its SCTLR enable clear)
+//! gives the pointer unchanged, as Arm does, from the tag word alone: native
+//! transitions switch the tag words between two exception levels of one
+//! memo generation (`transition::check_pointer`), whose enables differ while
+//! their keys, version and layouts do not, so nothing else in the cipher
+//! may depend on an enable. Everything else, a closed key (tag word zero),
+//! a signing of a non-canonical pointer and a failed authentication, goes
+//! to the service as a memo miss does, which computes it the engine's way. The computation clobbers RAX, RCX, R8 to R11, XMM0, XMM1 and flags.
 use super::{GENERIC_KEY, Lookup, TAG_WORDS, operands};
 use crate::Place;
 use crate::x86_64::asm::{Alu, Asm, BitTest, Cond, Gpr, Mem, ShiftOp, Size};
@@ -47,8 +50,7 @@ const AUTHENTICATION: usize = 1;
 pub struct Layout {
     /// The pointer bit that selects the extension, as a mask.
     pub select: u64,
-    /// The extension mask with that bit clear and set: zero for a key
-    /// whose enable is clear.
+    /// The extension mask with that bit clear and set.
     pub extension: [u64; 2],
     padding: u64,
 }
@@ -62,13 +64,6 @@ impl Layout {
             padding: 0,
         }
     }
-
-    /// A disabled key's: every pointer unchanged.
-    pub const DISABLED: Self = Self {
-        select: 0,
-        extension: [0; 2],
-        padding: 0,
-    };
 }
 
 /// What native code computes PAC results from, at a fixed host address.
@@ -159,6 +154,9 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
         asm.shift_imm(ShiftOp::Shl, Qword, Rax, 32);
         return Lookup { misses, modifier };
     }
+    // A disabled key: the pointer, in RAX already.
+    asm.alu_imm32(Alu::Cmp, Qword, Mem::base(R8, word), super::DISABLED as i32);
+    let unchanged = asm.jcc(Cond::E);
     let authenticate = form.kind == super::AUTHENTICATED;
     let layout = LAYOUTS
         + (usize::from(form.key) * 2
@@ -193,6 +191,7 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
         asm.alu(Alu::Xor, Qword, R9, R10);
         asm.alu(Alu::And, Qword, R9, Rcx);
         asm.alu(Alu::Xor, Qword, Rax, R9);
+        asm.bind(unchanged);
         return Lookup { misses, modifier };
     }
     // R9 = the input: (p & !E) | (bit 55 ? E : 0).
@@ -214,5 +213,6 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
     asm.test(Qword, R10, Rcx);
     misses.push(asm.jcc(Cond::Ne));
     asm.mov(Qword, Rax, R9);
+    asm.bind(unchanged);
     Lookup { misses, modifier }
 }

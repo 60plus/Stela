@@ -273,7 +273,8 @@ fn thunks_compute_what_the_engine_computes() {
                             }
                             // Completions the cipher gives never reach
                             // the service.
-                            let canonical = native_completes(&native, *kind, *key, operand);
+                            let canonical = enable == Enable::Disabled
+                                || native_completes(&native, *kind, *key, operand);
                             if expected.is_some() && canonical {
                                 assert_eq!(native.fills, fills, "{what}: a service call");
                                 computed += 1;
@@ -292,6 +293,116 @@ fn thunks_compute_what_the_engine_computes() {
         computed > 10_000 && serviced > 0,
         "{computed} computed, {serviced} serviced"
     );
+}
+
+/// Native transitions switch the tag words between two exception levels
+/// of one memo generation whose enables differ (`transition::check_pointer`
+/// copies the tag words the engine reopened for each), without the service.
+/// Thunks and blocks compiled once then give, at each level, what the engine
+/// gives there: the pointer unchanged where the key is disabled, its
+/// signing or authentication where it is enabled, in any order of switches.
+/// Before, a disabled key's zero layouts stayed after a switch to the level
+/// where it is enabled, and an enabled key's layouts after a switch back, so
+/// a process whose keys are disabled at EL0 got signed pointers.
+#[test]
+fn tag_words_switched_natively_keep_each_levels_enables() {
+    use stela_contracts::pauth::Key;
+    let Some(cipher) = cipher() else { return };
+    let mut thunks = Vec::new();
+    for kind in [Kind::Sign, Kind::Authenticate, Kind::Branch] {
+        for key in KEYS {
+            let form = pointer::Form::of(operation(kind, key)).unwrap();
+            let thunk = pointer::thunk(
+                form,
+                GuestAddress(PC),
+                TAGS,
+                SERVICE as usize as u64,
+                Some(cipher),
+            );
+            thunks.push((kind, key, Mapped::new(&thunk.code)));
+        }
+    }
+    for tcr in TCRS {
+        for version in VERSIONS {
+            let inputs = super::tests::inputs(version, tcr);
+            let mut native = Box::new(PointerService::new());
+            let mut engine = PointerService::new();
+            native.open(inputs);
+            engine.open(inputs);
+            // The kernel's level: every key enabled. The process's: IA and
+            // DA disabled (a process without arm64e's JOP keys), IB and DB
+            // enabled; then the reverse.
+            let level = |native: &mut PointerService, disabled: [bool; 4]| {
+                native.close_native();
+                for (key, disabled) in [Key::Ia, Key::Ib, Key::Da, Key::Db]
+                    .into_iter()
+                    .zip(disabled)
+                {
+                    native.reopen(key, !disabled, false);
+                }
+                native.tags
+            };
+            let kernel = level(&mut native, [false; 4]);
+            let process = level(&mut native, [true, false, true, false]);
+            let other = level(&mut native, [false, true, false, true]);
+            let mut state = GuestState::default();
+            state.anchors[Anchor::Pointer] = native.anchors().0;
+            state.anchors[Anchor::Memo] = native.anchors().1;
+            for (round, tags) in [kernel, process, kernel, other, process, other, kernel]
+                .into_iter()
+                .enumerate()
+            {
+                // As a native transition writes them.
+                native.tags = tags;
+                for (kind, key, code) in &thunks {
+                    let index = usize::from(pointer::key_index(*key));
+                    let enable = if tags[index] == pointer::DISABLED {
+                        Enable::Disabled
+                    } else {
+                        Enable::Enabled
+                    };
+                    let pointer = POINTERS[round % 4];
+                    let modifier = 0x0000_0001_6fd0_0000 + round as u64 * 0x40;
+                    let signed = match engine.result(
+                        PointerOperation::Sign,
+                        key_of(*key),
+                        pointer,
+                        modifier,
+                    ) {
+                        Some(Ok((signed, _))) => signed,
+                        other => panic!("{other:?}"),
+                    };
+                    let operand = if matches!(kind, Kind::Sign) {
+                        pointer
+                    } else {
+                        signed
+                    };
+                    let expected =
+                        expect(&mut engine, *kind, Some(*key), enable, operand, modifier);
+                    state.x[3] = operand;
+                    state.x[5] = modifier;
+                    let exit = code.run(&mut state);
+                    let what = format!(
+                        "{version:?} tcr={tcr:#x} round {round} {kind:?} {key:?} {enable:?}"
+                    );
+                    match (expected, kind) {
+                        (Some(value), Kind::Branch) => {
+                            assert_eq!(exit, (value, ExitKind::Indirect as u64), "{what}")
+                        }
+                        (Some(value), _) => {
+                            assert_eq!(exit, (PC + 4, ExitKind::Fallthrough as u64), "{what}");
+                            assert_eq!(state.x[3], value, "{what}");
+                        }
+                        // A pointer outside the regime's range fails its
+                        // authentication, at either level.
+                        (None, _) => {
+                            assert_eq!(exit, (PC, ExitKind::PointerAuthentication as u64), "{what}")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What the engine's exit gives for `kind` on `operand`: the completed

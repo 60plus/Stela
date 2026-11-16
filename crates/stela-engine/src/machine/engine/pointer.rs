@@ -144,12 +144,11 @@ pub(super) struct PointerService {
     /// Under `--profile`, what the memo missed and why ([`census`]).
     pub(super) census: Option<Box<census::Census>>,
     /// What native code computes PAC results from where the cipher is the
-    /// host's AES rounds ([`cells`]): the open context's key schedules and
-    /// version, and each key's layouts, zero while its enable is clear.
+    /// host's AES rounds ([`cells`]): the open context's key schedules,
+    /// version and layouts. A function of the inputs alone, never of an
+    /// enable or trap: native transitions switch the tag words between
+    /// levels of one generation without the service.
     pub(super) cipher: pointer::cipher::Cipher,
-    /// The layouts of the open context's regime by domain (instruction,
-    /// data), as an enabled key of it takes them.
-    native_layouts: [[pointer::cipher::Layout; 2]; 2],
 }
 
 /// The routine a thunk calls on a memo miss.
@@ -212,7 +211,6 @@ impl PointerService {
             fills: 0,
             census: None,
             cipher: pointer::cipher::Cipher::default(),
-            native_layouts: [[pointer::cipher::Layout::DISABLED; 2]; 2],
         }
     }
 
@@ -274,22 +272,7 @@ impl PointerService {
         } else {
             0
         };
-        self.set_tag(index, tag);
-    }
-
-    /// Open the tag word of the key at `index` (below 4) with `tag`, and
-    /// give native code's cipher that key's layouts: zero for
-    /// [`pointer::DISABLED`], so its results are their pointers, else those
-    /// of the open regime. A closed word (zero) leaves them, as no native
-    /// code computes with them then.
-    fn set_tag(&mut self, index: u8, tag: u64) {
-        let key = usize::from(index);
-        self.tags[key] = tag;
-        self.cipher.layouts[key] = match tag {
-            0 => return,
-            pointer::DISABLED => [pointer::cipher::Layout::DISABLED; 2],
-            _ => self.native_layouts[key / 2],
-        };
+        self.tags[usize::from(index)] = tag;
     }
 
     /// After [`Self::revalidate`], open the generic key's tag word as a
@@ -381,12 +364,16 @@ impl PointerService {
         let classic = inputs.version == pauth::Version::Classic;
         self.cipher.classic = if classic { u64::MAX } else { 0 };
         self.cipher.enhanced = !self.cipher.classic;
-        self.native_layouts = [false, true].map(|data| {
+        let domains = [false, true].map(|data| {
             [true, false].map(|signing| {
                 let (select, extension) = layouts.native(data, signing);
                 pointer::cipher::Layout::new(select, extension)
             })
         });
+        for (index, key) in self.cipher.layouts.iter_mut().enumerate() {
+            // IA and IB lay out instructions, DA and DB data.
+            *key = domains[index / 2];
+        }
         self.context = Some(context);
     }
 
@@ -462,8 +449,7 @@ impl PointerService {
             return None;
         }
         let index = memo_key(key);
-        let tag = self.native_tag(index);
-        self.set_tag(index, tag);
+        self.tags[usize::from(index)] = self.native_tag(index);
         if let Some(result) = self.remembered(operation, key, pointer, modifier) {
             return Some(result);
         }
