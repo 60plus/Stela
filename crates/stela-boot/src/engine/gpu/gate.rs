@@ -1198,11 +1198,22 @@ pub(super) fn metal_choice(
         .enumerate()
         .map(|(index, bound)| stela_drivers::gpu::stack::Candidate {
             draws: bound.stack.draws(),
-            integrated: bound.integrated,
+            integrated: integrated(index, bound),
             drives_display: display == Some(index),
         })
         .collect();
     stela_drivers::gpu::stack::metal_devices(&candidates)
+}
+
+/// Whether the bound GPU at `index` is integrated: its kernel driver's
+/// answer for the bound device where it gives one, else its table's.
+fn integrated(index: usize, bound: &Bound) -> bool {
+    bound
+        .stack
+        .kernel
+        .probed_integrated
+        .and_then(|query| client::query(index as u32, query))
+        .unwrap_or(bound.integrated)
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.
@@ -1228,7 +1239,7 @@ fn open_gpu(
         // Its kernel driver shows frames; `display` takes its outputs.
         return None;
     }
-    let link = match PcieLink::admitted(bound.link, bound.integrated) {
+    let link = match PcieLink::admitted(bound.link, integrated(index, bound)) {
         Ok(link) => link,
         Err(reason) => return refuse(reason),
     };

@@ -85,6 +85,8 @@ pub mod query {
     const DEV_INFO: u32 = 0x16;
     /// `AMDGPU_INFO_MEMORY`, answering `struct drm_amdgpu_memory_info`.
     const MEMORY: u32 = 0x19;
+    /// `AMDGPU_IDS_FLAGS_FUSION`.
+    const FUSION: u64 = 1;
 
     /// The first `N` words of the answer to `query`. The driver copies no
     /// more than the size asked.
@@ -103,6 +105,15 @@ pub mod query {
     /// `struct drm_amdgpu_info_device` after the device ID and revisions.
     pub fn family(control: Control) -> Option<u32> {
         get::<3>(control, DEV_INFO).map(|words| words[2] as u32)
+    }
+
+    /// Whether the device is built into the processor: amdgpu sets
+    /// `AMDGPU_IDS_FLAGS_FUSION` in `ids_flags`, the 64-bit field at byte 136
+    /// of `struct drm_amdgpu_info_device`, for a device it flags
+    /// `AMD_IS_APU`, from its ID table or, for a device its table matches by
+    /// class, from the graphics core IP discovery reports.
+    pub fn integrated(control: Control) -> Option<bool> {
+        get::<18>(control, DEV_INFO).map(|words| words[17] & FUSION != 0)
     }
 
     /// The memory the driver hands out: the usable bytes of its VRAM heap
@@ -192,6 +203,7 @@ mod tests {
     #[test]
     fn queries_ask_the_info_ioctl_and_keep_refusals() {
         let mut asked = alloc::vec::Vec::new();
+        let mut fused = false;
         let mut answer = |request: u32, argument: *mut c_void| {
             // SAFETY: the query passes its own record and answer buffer.
             let record = unsafe { &*argument.cast::<[u64; 4]>() };
@@ -205,6 +217,11 @@ mod tests {
                 // Device ID and chip revision, then the family in the low
                 // half of the third word.
                 words[2] = 0x1234_5678_0000_0091;
+                if size > 136 {
+                    // `ids_flags`: preemption, then fusion on the second ask.
+                    words[17] = if fused { 3 } else { 2 };
+                    fused = true;
+                }
             } else {
                 words[1] = 512 << 20;
                 words[9] = 16 << 30;
@@ -216,9 +233,20 @@ mod tests {
             query::memory_bytes(&mut answer),
             Some((512 << 20) + (16 << 30))
         );
-        assert_eq!(asked, [(0x4020_6445, 0x16, 24), (0x4020_6445, 0x19, 96)]);
+        assert_eq!(query::integrated(&mut answer), Some(false));
+        assert_eq!(query::integrated(&mut answer), Some(true));
+        assert_eq!(
+            asked,
+            [
+                (0x4020_6445, 0x16, 24),
+                (0x4020_6445, 0x19, 96),
+                (0x4020_6445, 0x16, 144),
+                (0x4020_6445, 0x16, 144)
+            ]
+        );
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!(query::family(&mut refuse), None);
+        assert_eq!(query::integrated(&mut refuse), None);
         assert_eq!(query::memory_bytes(&mut refuse), None);
         let mut empty = |_: u32, _: *mut c_void| 0;
         assert_eq!(query::memory_bytes(&mut empty), None);

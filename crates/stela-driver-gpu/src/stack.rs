@@ -31,6 +31,12 @@ pub struct Kernel {
     /// the processor, sharing its memory and on its fabric rather than a
     /// PCIe link. [`metal_devices`] reads it.
     pub integrated: fn(&Adapter) -> bool,
+    /// Whether the bound device is built into the processor, by the driver's
+    /// own query, for a driver that decides it during the probe (amdgpu's
+    /// IP discovery). Where there is no such query, or it does not answer,
+    /// [`Self::integrated`] stands. [`metal_devices`] reads the bound GPU's
+    /// answer.
+    pub probed_integrated: Option<fn(Control) -> Option<bool>>,
     /// The driver's own identifier of the bound chip, by its query ioctl.
     pub chip: fn(Control) -> Option<u32>,
     /// The bytes of device memory the driver makes available.
@@ -81,6 +87,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         // nouveau drives discrete GPUs only (`nvkm_device_pci_new`); Tegra's
         // built-in GPUs are platform devices, not PCI functions.
         integrated: |_| false,
+        probed_integrated: None,
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
     },
@@ -109,8 +116,10 @@ pub static AMD: GpuStack = GpuStack {
         // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
         dma_bits: crate::amdgpu::dma_bits,
         // Its table flags only the older APUs it names by ID; IP discovery
-        // flags the rest during the probe, after the claim.
+        // flags the rest during the probe, after the claim, so the bound
+        // device's answer decides.
         integrated: |_| false,
+        probed_integrated: Some(crate::amdgpu::query::integrated),
         chip: crate::amdgpu::query::family,
         memory_bytes: crate::amdgpu::query::memory_bytes,
     },
@@ -427,5 +436,26 @@ mod tests {
         assert_eq!((NVIDIA.kernel.memory_bytes)(&mut refuse), None);
         let mut empty = |_: u32, _: *mut c_void| 0;
         assert_eq!((NVIDIA.kernel.memory_bytes)(&mut empty), None);
+        // nouveau's table answers alone, without a query.
+        assert!(NVIDIA.kernel.probed_integrated.is_none());
+    }
+
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn amdgpus_bound_device_says_whether_it_is_integrated() {
+        // amdgpu's `ids_flags` with fusion: what IP discovery found.
+        let mut fused = |_: u32, argument: *mut c_void| {
+            // SAFETY: the query passes its record, whose answer buffer
+            // holds the 18 words it asks for.
+            unsafe {
+                let record = &*argument.cast::<[u64; 4]>();
+                *(record[0] as *mut u64).add(17) = 1;
+            }
+            0
+        };
+        let query = AMD.kernel.probed_integrated.unwrap();
+        assert_eq!(query(&mut fused), Some(true));
+        let mut refuse = |_: u32, _: *mut c_void| -19;
+        assert_eq!(query(&mut refuse), None);
     }
 }
