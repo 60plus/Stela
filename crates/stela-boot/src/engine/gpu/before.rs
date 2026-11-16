@@ -30,12 +30,13 @@ pub(super) struct Identified {
 
 /// One stack's part of the claim.
 pub(super) struct Before {
-    /// Reads what selects the driver's firmware, through BAR 0's first page
-    /// mapped read-only before the reset, and selects it.
+    /// Reads what selects the driver's firmware, through the first page of
+    /// the stack's register BAR mapped read-only before the reset, and
+    /// selects it.
     pub(super) identify:
         fn(&Mapping, &gpu::Adapter, Arc<Catalog>) -> Result<Identified, ServiceError>,
     /// Waits, after the reset, for what the driver's probe expects to find
-    /// done. BAR 0 is the resource.
+    /// done. The register BAR is the resource.
     pub(super) settle:
         fn(&dyn NativeServices, &owned::Resource, &Identified) -> Result<(), ServiceError>,
 }

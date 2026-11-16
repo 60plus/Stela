@@ -21,6 +21,9 @@ pub struct Kernel {
     /// Whether the driver's ID table holds the adapter, or why it does not.
     /// One it does not hold is left as firmware set it.
     pub admits: fn(&Adapter) -> Result<(), &'static str>,
+    /// The BAR of the device's register window, whose first page the boot
+    /// reads before the function's reset.
+    pub registers: usize,
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
@@ -67,6 +70,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         // nouveau's table holds every NVIDIA display function; what it does
         // with a chip it does not know is its probe's answer.
         admits: |_| Ok(()),
+        registers: 0,
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,

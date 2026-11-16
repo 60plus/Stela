@@ -1083,16 +1083,19 @@ fn claim(
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if let Err(why) = gpu::cold::register_bar(function_bars[0], PAGE) {
+    let register_bar = stack.kernel.registers;
+    if let Err(why) = gpu::cold::register_bar(function_bars[register_bar], PAGE) {
         output::arguments(format_args!(
-            "GPU {address} register BAR refused: {why:?} BAR0={:?}\n",
-            function_bars[0]
+            "GPU {address} register BAR refused: {why:?} BAR{register_bar}={:?}\n",
+            function_bars[register_bar]
         ));
         return Err(ServiceError::Refused(
-            "the GPU's BAR 0 is not an assigned register window",
+            "the GPU's register BAR is not an assigned register window",
         ));
     }
-    for (region, bar) in placement.regions.iter_mut().zip(function_bars) {
+    // The register BAR's resource, among those of the memory BARs.
+    let mut registers_at = 0;
+    for (index, (region, bar)) in placement.regions.iter_mut().zip(function_bars).enumerate() {
         let Some(
             bar @ Bar::Memory {
                 address: start,
@@ -1110,6 +1113,9 @@ fn claim(
             return Err(ServiceError::Refused(
                 "the GPU BAR is translated by the host bridge",
             ));
+        }
+        if index == register_bar {
+            registers_at = resources.len();
         }
         resources.push(resource);
         bars.push(start..start + size);
@@ -1148,7 +1154,7 @@ fn claim(
     let registers = services
         .authority()?
         .map(
-            resources[0].clone(),
+            resources[registers_at].clone(),
             0,
             PAGE as usize,
             CacheAttribute::Uncached,
@@ -1226,7 +1232,7 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
-    (before.settle)(services, &resources[0], &identified)?;
+    (before.settle)(services, &resources[registers_at], &identified)?;
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
     let capabilities = function
