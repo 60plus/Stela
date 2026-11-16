@@ -92,8 +92,8 @@ struct Imported {
 
 impl<B: Backend, C: Compiler> Device<B, C> {
     /// Imports the dma-buf `fd` of `bytes`, a display's scanout buffer.
-    /// The driver owns `fd` once this succeeds; the caller still does
-    /// after an error.
+    /// The driver owns `fd` once this succeeds, and after an error once
+    /// the memory was imported but no buffer could be placed on it.
     pub fn import_scanout(&mut self, fd: i32, bytes: u64) -> Result<ScanoutBuffer> {
         self.ensure_admission()?;
         let memory = self.backend.import_dma_buf(fd, bytes)?;
