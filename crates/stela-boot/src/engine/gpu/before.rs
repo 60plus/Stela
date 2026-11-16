@@ -347,17 +347,20 @@ fn find<'a>(
     }
 }
 
-/// Whether every file of `inventory` is in `catalog`, before anything of the
-/// GPU `name` changes: one line naming the files the USB lacks, and the
-/// refusal [`select_firmware`] would give for them later.
+/// Whether every file of `inventory` the driver needs is in `catalog`,
+/// before anything of the GPU `name` changes: one line naming the files the
+/// USB lacks, and the refusal [`select_firmware`] would give for them later.
+/// A file the driver starts without (`recipes::optional`) may be missing.
 fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), ServiceError> {
-    let plan = stela_loader::host_firmware::recipes::Plan::select(inventory)
+    use stela_loader::host_firmware::recipes;
+    let plan = recipes::Plan::select(inventory)
         .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
     let missing: Vec<_> = plan
         .selections()
         .iter()
         .filter(|selection| {
-            find(catalog, selection).is_err_and(|error| error.kind == FirmwareError::Missing)
+            !recipes::optional(&selection.request)
+                && find(catalog, selection).is_err_and(|error| error.kind == FirmwareError::Missing)
         })
         .map(|selection| selection.request.name.clone())
         .collect();
@@ -380,7 +383,10 @@ fn lacks(name: &str, missing: &[String], files: usize) {
 
 /// The firmware of every request in `inventory`, each file bound under the
 /// exact name and target its driver asks for. A driver needs every file of
-/// its recipe: one missing fails its start later with a generic error.
+/// its recipe but those it starts without (`recipes::optional`): one of the
+/// others missing fails its start later with a generic error, so the GPU is
+/// refused; an optional one missing is said once and its request answers
+/// that the file does not exist, as on Linux.
 /// `read` is an image the boot read from the PC itself and the name the
 /// driver asks for it by, bound beside the files under the same target.
 fn select_firmware(
@@ -430,6 +436,12 @@ fn select_firmware(
                             "the GPU firmware digest does not match its pinned recipe",
                         )
                     })?;
+            }
+            Err(error) if error.kind == FirmwareError::Missing && recipes::optional(request) => {
+                output::arguments(format_args!(
+                    "GPU {name}: firmware {} is not on the USB; its driver starts without it\n",
+                    request.name
+                ));
             }
             Err(error) if error.kind == FirmwareError::Missing => {
                 missing.push(request.name.clone());

@@ -1646,6 +1646,37 @@ pub fn intel_gpu_platform(device: u16) -> Option<&'static str> {
         .map(|(name, ..)| *name)
 }
 
+/// The platforms whose xe loads without their GSC image, Battlemage and
+/// later: `xe_gsc_init` goes on when it is missing, as only content
+/// protection needs it there. Before them a missing GSC fails xe's probe.
+const XE_GSC_OPTIONAL: [&str; 2] = ["Panther Lake", "Wildcat Lake"];
+
+/// Whether xe and the display code start without the file `request` names
+/// when it is missing, on every platform that names it: a display
+/// microcontroller program (`intel_dmc.c` runs the display without its
+/// power states) and the GSC image of Battlemage and later. A GuC or HuC
+/// image is always needed: `xe_uc_init` fails without either. Other drivers'
+/// files are all needed.
+pub fn optional(request: &Request) -> bool {
+    if select_xe(request).is_none() {
+        return false;
+    }
+    let mut named = false;
+    for (platform, _, files) in XE_PLATFORMS {
+        for (column, file) in files.iter().enumerate() {
+            if *file != Some(request.name.as_str()) {
+                continue;
+            }
+            named = true;
+            let tolerated = column == 3 || (column == 2 && XE_GSC_OPTIONAL.contains(platform));
+            if !tolerated {
+                return false;
+            }
+        }
+    }
+    named
+}
+
 /// Requires the files xe and the display code ask for on the Intel GPU with
 /// PCI device ID `device`.
 pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
@@ -2575,6 +2606,38 @@ mod tests {
         for device in [0x8a56, 0x0166] {
             assert_eq!(intel_gpu_platform(device), None);
             assert!(require_xe(&mut Inventory::default(), device).is_err());
+        }
+    }
+
+    #[test]
+    fn xe_starts_without_its_display_programs_and_late_gsc_images_only() {
+        let request = |name: &str| {
+            Request::from(Requirement {
+                name,
+                target: XE_TARGET,
+                minimum_bytes: 1,
+            })
+        };
+        for name in [
+            "i915/tgl_dmc_ver2_12.bin",
+            "i915/adlp_dmc.bin",
+            "i915/bmg_dmc.bin",
+            "xe/ptl_gsc_1.bin",
+        ] {
+            assert!(optional(&request(name)), "{name}");
+        }
+        // GuC and HuC images, and GSC images before Battlemage, are needed.
+        for name in [
+            "i915/tgl_guc_70.bin",
+            "i915/tgl_huc.bin",
+            "xe/bmg_huc.bin",
+            "i915/mtl_gsc_1.bin",
+            "xe/lnl_gsc_1.bin",
+        ] {
+            assert!(!optional(&request(name)), "{name}");
+        }
+        for platform in XE_GSC_OPTIONAL {
+            assert!(XE_PLATFORMS.iter().any(|(name, ..)| *name == platform));
         }
     }
 
