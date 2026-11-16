@@ -216,8 +216,12 @@ fn sequence(targets: usize) -> Vec<u64> {
 /// The path a case's tail takes.
 #[derive(Clone, Copy, Debug)]
 enum Path {
+    /// A hot exit's stamped tail, through a stamped cell.
     Stamped,
+    /// A cell tail through a cell past the stamped ones, as every exit's
+    /// is until its transfers make it hot: the census's cell probes.
     Cell,
+    /// A cell tail whose cell holds no entry.
     EmptyCell,
     /// A lookup tail of this many targets in one native run.
     Lookup(usize),
@@ -249,7 +253,10 @@ fn cost(path: Path) -> (f64, f64, f64) {
     let tail: Vec<u8> = match path {
         Path::Stamped | Path::Cell => {
             let held = world.table.find(world.table.slot(pc, KEY), pc, KEY);
-            world.table.link_cell(site, pc, Some(held));
+            match path {
+                Path::Stamped => world.table.link_hot_cell(site, pc, Some(held)).unwrap(),
+                _ => world.table.link_cell(site, pc, Some(held)),
+            };
             let number = world.table.site_cell_number(site).unwrap();
             let cell = LookupTable::cell_slot(&world.table.cells, number) as *const Slot as u64;
             match path {
@@ -263,7 +270,6 @@ fn cost(path: Path) -> (f64, f64, f64) {
                     .to_vec()
                 }
                 _ => {
-                    world.table.settle_heat(number);
                     let probe = base + (PROBES + CELL_PROBE_ENTRY) as u64;
                     cell_tail(at, cell, word, RAN, probe).unwrap().to_vec()
                 }

@@ -500,8 +500,8 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
             });
         let ra = run(&new, &mut a, target);
         let rb = run(&old, &mut b, target);
-        // Only today's cell probes count heat.
-        a.heat = 0;
+        // Only today's cell probes count and sample their transfers.
+        (a.heat, a.sampled) = (0, 0);
         if held && (ra != rb || a != b) {
             cached += 1;
             continue;

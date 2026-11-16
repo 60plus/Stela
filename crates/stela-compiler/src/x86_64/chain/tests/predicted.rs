@@ -464,7 +464,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
         let relink = |table: &mut LookupTable, key: u64| {
             let held = table.find(table.slot(predicted, key), predicted, key);
             let current = (held.pc == predicted && held.key == key).then_some(held);
-            table.link_cell(site, predicted, current);
+            table.link_hot_cell(site, predicted, current).unwrap();
             // As the engine links: a stamped tail only for a block that
             // accepts the BTYPE.
             current.filter(|entry| entry.targets & 1 << case.btype != 0)
@@ -601,6 +601,10 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 results[index] = run.run(&mut states[index], &mut controls[index]);
             }
             let [lookup, linked_way, unlinked, bare] = results;
+            // Only the cell probes count and sample their transfers.
+            for control in &mut controls {
+                (control.heat, control.sampled) = (0, 0);
+            }
             let stamped = hits_of() != stamped_hits;
             // The one difference the stamped tail may make, as in the
             // stamped tails' test: the cell probe misses a page this ITLB

@@ -3243,14 +3243,15 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
         kind: kind as u64,
     };
     machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
-    // Other exits hold the first cells, so this exit's cell number takes a
+    // Other hot exits hold the first stamped cells, so this exit's takes a
     // 32-bit displacement in its stamp's address, as a booted guest's do.
     {
         let mut cache = machine.code.cache();
         for other in 0..300 {
             cache
                 .targets
-                .link_cell(0x7_0000 + 8 * other, 0x40_0000, None);
+                .link_hot_cell(0x7_0000 + 8 * other, 0x40_0000, None)
+                .unwrap();
         }
     }
     machine.step().unwrap();
@@ -3258,34 +3259,34 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let first = &machine.code.blocks[0];
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
-    let (number, cells) = {
-        let mut cache = machine.code.cache();
-        (
-            cache.targets.site_cell_number(site).expect("a cell"),
-            cache.targets.stamped_cells(),
-        )
+    let address = {
+        let cache = machine.code.cache();
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!(number as usize >= chain::STAMPED_CELLS, "{number}");
+        cache.targets.cell_address(number)
     };
-    assert!(number > 256, "{number}");
-    // Cold: the sweep leaves it.
+    // Cold: a step without its samples, or with fewer than make it hot,
+    // leaves it.
     let patches = machine.host.patches.len();
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
+    machine.promote_hot_exits();
+    for _ in 1..scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
     }
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches);
-    // Hot, as its cell probe would count: the sweep gives it a stamped tail
-    // jumping straight to the block of `far`, and the site's jump to it.
-    let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
-        as *const core::sync::atomic::AtomicU32;
-    // SAFETY: the board's stamped cells live while it does; the word is an atomic.
-    unsafe { &*heat }.store(chain::HOT_CELL, Ordering::Relaxed);
-    // One full sweep of the stamped cells, a bounded step at a time.
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
-    }
+    // Hot, as its cell probe would name it: the step gives it a stamped
+    // cell and a stamped tail jumping straight to the block of `far`, and
+    // the site's jump to it.
+    machine.cell_samples.push(address);
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches + 2);
     let (tail, bytes) = machine.host.patches[patches].clone();
     let cache = machine.code.cache();
     let number = cache.targets.site_cell_number(site).expect("a cell");
+    assert!(
+        (257..chain::STAMPED_CELLS as u32).contains(&number),
+        "{number}"
+    );
     let held = cache.targets.site_cell(site).expect("a cell");
     assert_eq!(held.pc, far);
     assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
@@ -3304,14 +3305,14 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
         machine.host.patches[patches + 1],
         (site as usize, jump.to_vec())
     );
-    // Settled: hot no more.
-    assert!(
-        cache
-            .targets
-            .hot_links(0..chain::STAMPED_CELLS as u32)
-            .is_empty()
-    );
-    let _ = number;
+    // Its stamped cell's samples promote it no more.
+    let address = cache.targets.cell_address(number);
+    drop(cache);
+    for _ in 0..scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
+    }
+    machine.promote_hot_exits();
+    assert_eq!(machine.host.patches.len(), patches + 2);
 }
 
 /// An exit to a block another address space compiled, in a page this one
@@ -3396,25 +3397,20 @@ fn a_promotion_in_another_context_stamps_what_the_cell_holds() {
     let first = &machine.code.blocks[0];
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
-    let (number, cells, held) = {
-        let mut cache = machine.code.cache();
+    let (address, held) = {
+        let cache = machine.code.cache();
         let held = cache.targets.site_cell(site).expect("a cell");
-        (
-            cache.targets.site_cell_number(site).expect("a cell"),
-            cache.targets.stamped_cells(),
-            held,
-        )
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        (cache.targets.cell_address(number), held)
     };
     assert_eq!(held.pc, far);
     assert_ne!(held.key, 0);
-    let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
-        as *const core::sync::atomic::AtomicU32;
-    // SAFETY: the board's stamped cells live while it does; the word is an atomic.
-    let heat = unsafe { &*heat };
+    // A step after the samples that make the exit hot.
     let sweep = |machine: &mut Machine<FakeHost, NoDevices>| {
-        for _ in 0..chain::STAMPED_CELLS / 256 {
-            machine.promote_hot_exits();
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
         }
+        machine.promote_hot_exits();
     };
     // The sweeping PE now runs in contexts no fetch translated a page in.
     let contexts = machine.chain.contexts();
@@ -3422,15 +3418,14 @@ fn a_promotion_in_another_context_stamps_what_the_cell_holds() {
         .chain
         .set_contexts([contexts[0] + 1000, contexts[1] + 1000]);
     assert_eq!(machine.current_key(far), None);
-    // Its cell emptied, as a forget of its entry leaves it: still hot after
-    // a sweep, which patches nothing.
+    // Its cell emptied, as a forget of its entry leaves it: a step finds it
+    // hot and patches nothing.
     {
         let mut cache = machine.code.cache();
         let frame = chain::key_frame(held.key);
         cache.targets.forget_frames(frame..=frame, |_| true);
         assert_eq!(cache.targets.site_cell(site).map(|cell| cell.key), Some(0));
     }
-    heat.store(chain::HOT_CELL, Ordering::Relaxed);
     let patches = machine.host.patches.len();
     sweep(&mut machine);
     assert_eq!(machine.host.patches.len(), patches);
@@ -3459,25 +3454,29 @@ fn a_promotion_in_another_context_stamps_what_the_cell_holds() {
     assert_eq!(cache.targets.stamped_tails(), 1);
 }
 
-/// The cell probe counts its transfers through cells past the stamped
-/// ones in the low 32 bits of the control's `heat`: each native call
-/// starts it at 0 and the engine adds what it holds after.
+/// The cell probe counts its transfers in the low 32 bits of the
+/// control's `heat` and names a sampled one's cell in `sampled`: each
+/// native call starts both at 0 and the engine takes what they hold after.
 #[test]
-fn a_native_runs_overflow_cell_transfers_are_counted() {
+fn a_native_runs_cell_probe_transfers_and_sample_are_taken() {
     const NOP: u32 = 0xd503_201f;
     let mut machine = machine(&[NOP, NOP]);
     let control = machine.chain.address() as *mut chain::ChainControl;
     // SAFETY: the PE's control, which no native code runs with now.
-    unsafe { core::ptr::addr_of_mut!((*control).heat).write(0xffff_ffff_0000_0007) };
-    assert_eq!(machine.chain.overflow(), 7);
+    unsafe {
+        core::ptr::addr_of_mut!((*control).heat).write(0xffff_ffff_0000_0007);
+        core::ptr::addr_of_mut!((*control).sampled).write(0x1234_5000);
+    }
+    assert_eq!(machine.chain.cell_probes(), (7, 0x1234_5000));
     machine.chain.begin(0, 10);
-    assert_eq!(machine.chain.overflow(), 0);
+    assert_eq!(machine.chain.cell_probes(), (0, 0));
     machine.host.exits = vec![NativeExit::Exit {
         next_pc: machine.cpu.pc + 4,
         kind: ExitKind::Fallthrough as u64,
     }];
     machine.step().unwrap();
-    assert_eq!(machine.statistics.cell_overflow, 0);
+    assert_eq!(machine.statistics.cell_probes, 0);
+    assert!(machine.cell_samples.is_empty());
 }
 
 #[test]
@@ -7445,7 +7444,7 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
             .expect("the predicted tail")
             .0 as u64;
         let site = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
-        let (number, cells, held) = {
+        let (address, held) = {
             let mut cache = machine.code.cache();
             assert_eq!(cache.targets.site_cell(site).map(|cell| cell.pc), Some(far));
             let number = cache.targets.site_cell_number(site).expect("a cell");
@@ -7458,24 +7457,18 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
                 held.targets = 0b0101;
                 cache.targets.set(slot, held);
             }
-            (number, cache.targets.stamped_cells(), held)
+            (cache.targets.cell_address(number), held)
         };
-        let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
-            as *const core::sync::atomic::AtomicU32;
-        // SAFETY: the board's stamped cells live while it does; the word is an atomic.
-        unsafe { &*heat }.store(chain::HOT_CELL, Ordering::Relaxed);
         let patches = machine.host.patches.len();
-        for _ in 0..chain::STAMPED_CELLS / 256 {
-            machine.promote_hot_exits();
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
         }
+        machine.promote_hot_exits();
         if !accepts {
-            // Settled with its cell tail: no stamped tail could enter the
-            // block, and a relink would only install the same tail again.
+            // Its cell tail stays: no stamped tail could enter the block,
+            // and a relink would only install the same tail again.
             assert_eq!(machine.host.patches.len(), patches);
             assert_eq!(machine.statistics.stamped_tails, 0);
-            let cache = machine.code.cache();
-            assert!(cache.targets.cell_heat(number) >= chain::HOT_CELL);
-            assert!(cache.targets.hot_links(number..number + 1).is_empty());
             continue;
         }
         assert_eq!(machine.host.patches.len(), patches + 2);

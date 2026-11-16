@@ -320,10 +320,14 @@ pub struct ChainControl {
     /// The host address of the block table's first [`STAMPED_CELLS`] cells
     /// ([`LookupTable::stamped_cells`]), or 0.
     pub cells: u64,
-    /// Where cell probes count the transfers through cells past the
-    /// stamped ones, in its low 32 bits: the engine zeroes it before each
-    /// native call and adds it to its counts after.
+    /// Where cell probes count their transfers, in its low 32 bits: the
+    /// engine zeroes it before each native call and adds it to its counts
+    /// after.
     pub heat: u64,
+    /// The host address of the cell of the last transfer a cell probe
+    /// named, one in [`CELL_SAMPLE`] of those it counts in `heat`, or 0:
+    /// the engine zeroes it before each native call and reads it after.
+    pub sampled: u64,
     /// Exits of blocks that ran their iterations inside themselves
     /// (`x86_64::block`'s self-loops), one per entry, and the instructions
     /// those entries retired past their first iteration (net of what joins
@@ -392,7 +396,7 @@ const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 184);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 192);
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -737,21 +741,18 @@ const SWEEP_STEP_SETS: usize = 256;
 const CELL_CHUNK: usize = 256;
 
 /// Cells that [`stamped_tail`]s can name: the first cells of a block table,
-/// in one array ([`LookupTable::stamped_cells`]) followed by a `live` and
-/// a `heat` word per cell. Later cells come in chunks of [`CELL_CHUNK`].
+/// in one array ([`LookupTable::stamped_cells`]) followed by a `live` word
+/// per cell, which only the exits of hot cells take
+/// ([`LookupTable::link_hot_cell`]). Every other cell comes in chunks of
+/// [`CELL_CHUNK`].
 pub const STAMPED_CELLS: usize = 1 << 16;
 /// Byte offset of a stamped cell's `live` word from the array: nonzero
 /// while the cell holds what it held when its exit was linked.
 pub const CELL_LIVE: usize = STAMPED_CELLS * size_of::<LookupEntry>();
-/// Byte offset of a stamped cell's `heat` word: cell probe transfers
-/// through it since it was linked.
-pub const CELL_HEAT: usize = CELL_LIVE + STAMPED_CELLS * 4;
-/// Cell probe transfers through a cell after which its exit is worth a
-/// [`stamped_tail`] ([`LookupTable::hot_links`]).
-pub const HOT_CELL: u32 = 256;
-/// A stamped cell's `heat` once its exit has a stamped tail, or was found
-/// unable to take one: never hot again before it wraps.
-const SETTLED: u32 = 1 << 31;
+/// A cell probe names one transfer in this many of its PE's in
+/// `ChainControl::sampled` ([`cell_probe`]): the engine gives the exits
+/// whose cells it names often a stamped cell and a [`stamped_tail`].
+pub const CELL_SAMPLE: u32 = 256;
 /// Bytes of one PE's stamp of one stamped cell: the context, then the ITLB
 /// drop epoch of the target's half, in which the PE's cell probe found the
 /// cell's target ([`stamped_tail`]).
@@ -909,7 +910,7 @@ fn cell_bucket(pc: u64) -> usize {
     ((pc >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize % CELL_BUCKETS
 }
 
-/// What an exit through a stamped cell was linked with
+/// What an exit through a cell was linked with
 /// ([`LookupTable::note_link`]): its patch point, its target, the
 /// instructions its block ran, its word and the BTYPE its branch sets (0
 /// but for the exit of a [`predicted_tail`] of a BR or BLR form).
@@ -921,6 +922,18 @@ pub struct CellLink {
     pub word: ExitWord,
     pub btype: u8,
 }
+
+/// A [`CellLink`] as a table keeps it for every cell, its target in the
+/// cell: the patch point (0 for none), the instructions its block ran with
+/// the BTYPE above them, and its word.
+#[derive(Debug, Clone, Copy, Default)]
+struct CellNote {
+    site: u64,
+    ran: u32,
+    word: u32,
+}
+const _: () = assert!(size_of::<CellNote>() == 16);
+const NOTE_BTYPE_SHIFT: u32 = 24;
 
 /// A table of [`LookupEntry`]s in two-entry sets, by slot, and an index of
 /// the sets each group's entries are in. The block table
@@ -961,8 +974,13 @@ pub struct LookupTable {
     /// The cells of direct exits out of their pages ([`Self::link_cell`]),
     /// in chunks that never move, as code names their addresses.
     cells: Vec<Slots>,
-    /// Cells no exit holds.
+    /// Cells past the stamped ones no exit holds.
     free_cells: Vec<u32>,
+    /// Stamped cells no exit holds, for hot exits ([`Self::link_hot_cell`]).
+    free_stamped: Vec<u32>,
+    /// The first cell of each chunk past the stamped ones by its address,
+    /// which a cell probe's sample names ([`Self::sampled_link`]).
+    chunks: BTreeMap<u64, u32>,
     /// Each held cell by its target's PC.
     cell_pcs: BTreeSet<(u64, u32)>,
     /// Each cell holding an entry by the frame its key names, which
@@ -976,16 +994,16 @@ pub struct LookupTable {
     /// Each held cell by the host address of the exit holding it.
     cell_sites: BTreeMap<u64, u32>,
     /// How many held cells are past the stamped ones ([`STAMPED_CELLS`]),
-    /// whose exits never take a stamped tail.
+    /// whose exits keep the cell probe.
     cells_past: usize,
     /// The host address of each PE's stamps ([`Self::new_stamps`]), whose
     /// stamps of a stamped cell go when the cell changes.
     stamp_tables: Vec<u64>,
     /// The stamps those addresses name, which never move.
     stamp_store: Vec<Box<[AtomicU64]>>,
-    /// The link of each stamped cell an exit holds, for its promotion
-    /// ([`Self::hot_links`]).
-    cell_links: Vec<Option<CellLink>>,
+    /// The link of each cell an exit holds, by cell number, for its
+    /// promotion ([`Self::sampled_link`]).
+    cell_links: Vec<CellNote>,
     /// The stamped cells whose exits have a stamped tail.
     stamped: BTreeSet<u32>,
     /// The state of [`Self::insert`]'s victim choice (xorshift).
@@ -1046,6 +1064,8 @@ impl LookupTable {
             sweep_from: None,
             cells: Vec::new(),
             free_cells: Vec::new(),
+            free_stamped: Vec::new(),
+            chunks: BTreeMap::new(),
             cell_pcs: BTreeSet::new(),
             cell_frames: BTreeSet::new(),
             cell_counts: Box::default(),
@@ -1118,7 +1138,9 @@ impl LookupTable {
             + self.cells.iter().map(|cells| cells.len).sum::<usize>() * size_of::<LookupEntry>()
             + self.stamp_store.len()
                 * (64 + JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES + STAMP_TABLE_BYTES)
-            + self.free_cells.capacity() * size_of::<u32>()
+            + (self.free_cells.capacity() + self.free_stamped.capacity()) * size_of::<u32>()
+            + self.cell_links.capacity() * size_of::<CellNote>()
+            + self.chunks.len() * 2 * size_of::<(u64, u32)>()
             + self.cell_counts.len() * size_of::<u32>()
             + (self.cell_pcs.len() + self.cell_frames.len() + self.cell_sites.len())
                 * 2
@@ -1187,22 +1209,54 @@ impl LookupTable {
     /// entry, as the table's would go, and then the entry of `pc` the table
     /// takes next, of whatever key: a cell probe enters the block it names
     /// only while the target's page translates to that key. The cell stays
-    /// the exit's until [`Self::release_cells`] reaches `site`.
+    /// the exit's until [`Self::release_cells`] reaches `site`. It is past
+    /// the stamped ones: a stamped cell is for a hot exit
+    /// ([`Self::link_hot_cell`]).
     pub fn link_cell(&mut self, site: u64, pc: u64, current: Option<LookupEntry>) -> u64 {
         self.release_cells(site..=site);
+        self.stamped_cells();
         let cell = self.free_cells.pop().unwrap_or_else(|| {
-            if self.cells.is_empty() {
-                self.stamped_cells();
-                if let Some(cell) = self.free_cells.pop() {
-                    return cell;
-                }
-            }
             let cell = (STAMPED_CELLS + (self.cells.len() - 1) * CELL_CHUNK) as u32;
-            self.cells.push(Slots::zeroed(CELL_CHUNK));
+            let chunk = Slots::zeroed(CELL_CHUNK);
+            self.chunks.insert(chunk.address(), cell);
+            self.cells.push(chunk);
             self.free_cells
                 .extend((cell + 1..cell + CELL_CHUNK as u32).rev());
             cell
         });
+        self.link_numbered(site, pc, current, cell)
+    }
+
+    /// [`Self::link_cell`] with a stamped cell, which a [`stamped_tail`] can
+    /// name, for an exit whose cell probe transfers are many: `None` while
+    /// every stamped cell is held.
+    pub fn link_hot_cell(
+        &mut self,
+        site: u64,
+        pc: u64,
+        current: Option<LookupEntry>,
+    ) -> Option<u64> {
+        self.stamped_cells();
+        if self.free_stamped.is_empty() {
+            return None;
+        }
+        self.release_cells(site..=site);
+        let cell = self.free_stamped.pop()?;
+        Some(self.link_numbered(site, pc, current, cell))
+    }
+
+    /// Whether a stamped cell is free for [`Self::link_hot_cell`].
+    pub fn has_free_stamped(&self) -> bool {
+        self.cells.is_empty() || !self.free_stamped.is_empty()
+    }
+
+    fn link_numbered(
+        &mut self,
+        site: u64,
+        pc: u64,
+        current: Option<LookupEntry>,
+        cell: u32,
+    ) -> u64 {
         let entry = current
             .filter(|entry| entry.pc == pc && entry.key != 0)
             .unwrap_or(LookupEntry {
@@ -1217,13 +1271,9 @@ impl LookupTable {
             entry,
         );
         if (cell as usize) < STAMPED_CELLS {
-            let words = &self.cells[0];
-            words
-                .word(CELL_HEAT + 4 * cell as usize)
-                .store(0, Ordering::Relaxed);
             // After the entry: a probe that finds the word set read the
             // entry it was linked with.
-            words
+            self.cells[0]
                 .word(CELL_LIVE + 4 * cell as usize)
                 .store(1, Ordering::Release);
         }
@@ -1266,7 +1316,7 @@ impl LookupTable {
                 self.cells_past -= 1;
             }
             if let Some(link) = self.cell_links.get_mut(cell as usize) {
-                *link = None;
+                *link = CellNote::default();
             }
             self.stamped.remove(&cell);
             let pc = self.cell(cell).pc;
@@ -1280,7 +1330,10 @@ impl LookupTable {
                 cell,
                 LookupEntry::default(),
             );
-            self.free_cells.push(cell);
+            match (cell as usize) < STAMPED_CELLS {
+                true => self.free_stamped.push(cell),
+                false => self.free_cells.push(cell),
+            }
             match site.checked_add(1) {
                 Some(next) if next <= *sites.end() => from = next,
                 _ => return None,
@@ -1300,8 +1353,8 @@ impl LookupTable {
     }
 
     /// The cells exits hold past the stamped ones ([`STAMPED_CELLS`]):
-    /// their exits keep the cell probe, whose transfers through them each
-    /// PE counts in `ChainControl::heat`.
+    /// their exits keep the cell probe until their transfers make them hot
+    /// ([`Self::link_hot_cell`]).
     pub fn cells_past_stamped(&self) -> usize {
         self.cells_past
     }
@@ -1325,14 +1378,14 @@ impl LookupTable {
     }
 
     /// The host address of the stamped cells ([`STAMPED_CELLS`]), for
-    /// `ChainControl::cells`, made with their `live` and `heat` words on
-    /// first use.
+    /// `ChainControl::cells`, made with their `live` words on first use.
     pub fn stamped_cells(&mut self) -> u64 {
         if self.cells.is_empty() {
-            self.cells
-                .push(Slots::zeroed(STAMPED_CELLS + STAMPED_CELLS / 4));
-            // Cell 0 counts the transfers of cells past the stamped ones.
-            self.free_cells.extend((1..STAMPED_CELLS as u32).rev());
+            const _: () = assert!((STAMPED_CELLS * 4).is_multiple_of(size_of::<LookupEntry>()));
+            let live = STAMPED_CELLS * 4 / size_of::<LookupEntry>();
+            self.cells.push(Slots::zeroed(STAMPED_CELLS + live));
+            // Cell 0 is never held: no stamp is at the stamps' address.
+            self.free_stamped.extend((1..STAMPED_CELLS as u32).rev());
         }
         self.cells[0].address()
     }
@@ -1359,32 +1412,63 @@ impl LookupTable {
         self.stamp_tables.contains(&stamps)
     }
 
-    /// Note what the exit holding stamped cell `cell` ran and its word, for
-    /// a promotion of the exit ([`Self::hot_links`]).
+    /// Note what the exit holding cell `cell` ran, its word and its BTYPE,
+    /// for a promotion of the exit ([`Self::sampled_link`]); a link whose
+    /// fields do not fit is not noted.
     pub fn note_link(&mut self, cell: u32, link: CellLink) {
-        if (cell as usize) < STAMPED_CELLS {
-            if self.cell_links.len() <= cell as usize {
-                self.cell_links.resize(cell as usize + 1, None);
-            }
-            self.cell_links[cell as usize] = Some(link);
+        if link.retired >= 1 << NOTE_BTYPE_SHIFT || link.site == 0 {
+            return;
         }
+        if self.cell_links.len() <= cell as usize {
+            self.cell_links
+                .resize(cell as usize + 1, CellNote::default());
+        }
+        self.cell_links[cell as usize] = CellNote {
+            site: link.site,
+            ran: link.retired | u32::from(link.btype) << NOTE_BTYPE_SHIFT,
+            word: link.word.encoded(),
+        };
     }
 
-    /// Keep stamped cell `cell` from making its exit hot again: its exit
-    /// has a stamped tail now.
-    pub fn settle_heat(&mut self, cell: u32) {
-        if (cell as usize) < STAMPED_CELLS {
-            self.cells[0]
-                .word(CELL_HEAT + 4 * cell as usize)
-                .store(SETTLED, Ordering::Relaxed);
+    /// The number and link of the held cell at host address `address`, as
+    /// a cell probe names it (`ChainControl::sampled`), if an exit holds it
+    /// and its link was noted ([`Self::note_link`]).
+    pub fn sampled_link(&self, address: u64) -> Option<(u32, CellLink)> {
+        let stamped = self.cells.first()?.address();
+        let cell = match address.checked_sub(stamped) {
+            Some(offset) if offset < CELL_LIVE as u64 => offset / size_of::<LookupEntry>() as u64,
+            _ => {
+                let (&chunk, &first) = self.chunks.range(..=address).next_back()?;
+                let index = (address - chunk) / size_of::<LookupEntry>() as u64;
+                if index >= CELL_CHUNK as u64 {
+                    return None;
+                }
+                u64::from(first) + index
+            }
+        };
+        let cell = u32::try_from(cell).ok()?;
+        let note = *self.cell_links.get(cell as usize)?;
+        if note.site == 0 || self.cell_sites.get(&note.site) != Some(&cell) {
+            return None;
         }
+        let (kind, skipped) = ExitWord::split(u64::from(note.word));
+        let link = CellLink {
+            site: note.site,
+            pc: self.cell(cell).pc,
+            retired: note.ran & ((1 << NOTE_BTYPE_SHIFT) - 1),
+            word: ExitWord {
+                kind: ExitKind::try_from(kind).ok()?,
+                skipped,
+            },
+            btype: (note.ran >> NOTE_BTYPE_SHIFT) as u8,
+        };
+        Some((cell, link))
     }
 
     /// Note that the exit holding stamped cell `cell` has a stamped tail
-    /// now, until it releases the cell, and [`Self::settle_heat`].
+    /// now, until it releases the cell.
     pub fn note_stamped(&mut self, cell: u32) {
         if (cell as usize) < STAMPED_CELLS {
-            self.settle_heat(cell);
             self.stamped.insert(cell);
         }
     }
@@ -1394,42 +1478,14 @@ impl LookupTable {
         self.stamped.len()
     }
 
+    /// The host address of cell `cell`, as its exit's tail names it.
+    pub fn cell_address(&self, cell: u32) -> u64 {
+        Self::cell_slot(&self.cells, cell) as *const Slot as u64
+    }
+
     /// The cell number of the exit at host address `site`, if it holds one.
     pub fn site_cell_number(&self, site: u64) -> Option<u32> {
         self.cell_sites.get(&site).copied()
-    }
-
-    /// The links of the exits holding stamped cells `cells` whose cell
-    /// probe transfers made them hot ([`HOT_CELL`]) since they were linked:
-    /// each to get a stamped tail, after which [`Self::settle_heat`].
-    pub fn hot_links(&self, cells: core::ops::Range<u32>) -> Vec<CellLink> {
-        let Some(words) = self.cells.first() else {
-            return Vec::new();
-        };
-        let end = cells.end.min(STAMPED_CELLS as u32);
-        (cells.start.max(1)..end)
-            .filter(|&cell| {
-                let heat = words
-                    .word(CELL_HEAT + 4 * cell as usize)
-                    .load(Ordering::Relaxed);
-                (HOT_CELL..SETTLED).contains(&heat)
-            })
-            .filter_map(|cell| {
-                let link = (*self.cell_links.get(cell as usize)?)?;
-                (self.cell_sites.get(&link.site) == Some(&cell)).then_some(link)
-            })
-            .collect()
-    }
-
-    /// Transfers cell probes made through stamped cell `cell` since it was
-    /// linked, or [`SETTLED`] and beyond once its exit took a stamped tail.
-    pub fn cell_heat(&self, cell: u32) -> u32 {
-        if cell as usize >= STAMPED_CELLS {
-            return 0;
-        }
-        self.cells[0]
-            .word(CELL_HEAT + 4 * cell as usize)
-            .load(Ordering::Relaxed)
     }
 
     /// A drop when either slot of `slot`'s set holds `entry`'s page and
@@ -1946,6 +2002,7 @@ const HITS: i32 = core::mem::offset_of!(ChainControl, hits) as i32;
 const STAMPS: i32 = core::mem::offset_of!(ChainControl, stamps) as i32;
 const CELLS: i32 = core::mem::offset_of!(ChainControl, cells) as i32;
 const HEAT: i32 = core::mem::offset_of!(ChainControl, heat) as i32;
+const SAMPLED: i32 = core::mem::offset_of!(ChainControl, sampled) as i32;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
@@ -2717,10 +2774,9 @@ fn entered_btype(asm: &mut crate::x86_64::asm::Asm, register: Gpr, btype: u8) {
 
 /// A cell probe at the end of `code`, R9 at the cell (R10 keeps it across
 /// the translation); a `stamping` one stamps the cell when it enters its
-/// block ([`stamp`]). Every one counts the transfers through a stamped
-/// cell in its `heat` word without a branch: the host's indirect predictor
-/// tells the sites of the shared jump apart by the branches since each
-/// tail's jump, and one more costs a misprediction a transfer. The jumps to
+/// block ([`stamp`]). Every one counts its transfers in the control's
+/// `heat`, a word only its PE writes, and names the cell of one in
+/// [`CELL_SAMPLE`] in `sampled`, by a branch taken that rarely. The jumps to
 /// the table probe with the key in R8, and to its start for a torn read.
 /// A probe of a nonzero `btype` (the exits of [`predicted_tail`]s of BR and
 /// BLR forms) takes the cell's entry only when it accepts that BTYPE, and
@@ -2753,18 +2809,12 @@ fn cell_probe(
     asm.mov_load(Dword, R8, Mem::base(R10, ENTRY_BLOCK));
     asm.mov_load(Qword, R9, Mem::base(R10, ENTRY_CODE));
     let torn = seqlock_check(&mut asm, R10);
-    // R11 = the cell's `heat` word, 4 bytes a cell; a cell past the
-    // stamped ones, or none (`ChainControl::cells` 0), counts in the
-    // control's `heat`.
-    asm.mov(Qword, R11, R10);
-    asm.alu_load(Alu::Sub, Qword, R11, Mem::base(Rcx, CELLS));
-    asm.shift_imm(ShiftOp::Shr, Qword, R11, 3);
-    asm.alu_imm32(Alu::Cmp, Qword, R11, (CELL_LIVE / 8) as i32);
-    asm.mov_load(Qword, R10, Mem::base(Rcx, CELLS));
-    asm.lea(Qword, R11, Mem::indexed(R10, R11, 1, CELL_HEAT as i32));
-    asm.lea(Qword, R10, Mem::base(Rcx, HEAT));
-    asm.cmov(Cond::Ae, Qword, R11, R10);
-    asm.alu_imm8(Alu::Add, Dword, Mem::base(R11, 0), 1);
+    const _: () = assert!(CELL_SAMPLE == 256);
+    asm.alu_imm8(Alu::Add, Dword, Mem::base(Rcx, HEAT), 1);
+    asm.test_imm(Size::Byte, Mem::base(Rcx, HEAT), 0xff);
+    let unsampled = asm.jcc8(Cond::Ne);
+    asm.mov_store(Qword, Mem::base(Rcx, SAMPLED), R10);
+    asm.bind(unsampled);
     spend_budget(&mut asm, policy);
     misses.push(asm.jcc(Cond::B));
     asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
@@ -2793,25 +2843,30 @@ fn cell_probe(
     (to_table, to_probe)
 }
 
-/// A cell probe's stamp, after its transfer is counted, of the stamped cell
-/// whose words R11 points at less CELL_LIVE (R11 = 0: none): this PE's
-/// context of the target's half and its ITLB's drop epoch there, while the
-/// cell still holds the entry it was linked with ([`stamped_tail`]). The
-/// epoch goes in by a locked exchange, and the `live` word is read again
-/// after it: a writer that cleared it meanwhile also zeroes the stamp, or
-/// this does. It counts the stamps it writes and the cells it finds
-/// changed ([`StampCount`]). Clobbers RDX, R8, R10, R11.
+/// A cell probe's stamp, after its transfer is counted, of the cell at R10
+/// when it is a stamped one: this PE's context of the target's half and its
+/// ITLB's drop epoch there, while the cell still holds the entry it was
+/// linked with ([`stamped_tail`]). The epoch goes in by a locked exchange,
+/// and the `live` word is read again after it: a writer that cleared it
+/// meanwhile also zeroes the stamp, or this does. It counts the stamps it
+/// writes and the cells it finds changed ([`StampCount`]). Clobbers RDX,
+/// R8, R10, R11.
 fn stamp(asm: &mut crate::x86_64::asm::Asm) {
-    // R11 back to the cell's words less CELL_LIVE, or the control's heat.
-    asm.lea(Qword, R11, Mem::base(R11, -(CELL_HEAT as i32)));
-    asm.mov(Qword, R10, R11);
-    asm.alu_load(Alu::Sub, Qword, R10, Mem::base(Rcx, CELLS));
-    asm.alu_imm32(Alu::Cmp, Qword, R10, (CELL_LIVE / 8) as i32);
+    const _: () = assert!(size_of::<LookupEntry>() == 2 * STAMP_BYTES);
+    // R11 = 32 times the cell's number, or more for a cell past the
+    // stamped ones, whose chunks lie elsewhere.
+    asm.mov(Qword, R11, R10);
+    asm.alu_load(Alu::Sub, Qword, R11, Mem::base(Rcx, CELLS));
+    asm.alu_imm32(Alu::Cmp, Qword, R11, CELL_LIVE as i32);
     let none = asm.jcc8(Cond::Ae);
     asm.mov_load(Qword, R8, Mem::base(Rcx, STAMPS));
     asm.test(Qword, R8, R8);
     let unstamped = asm.jcc8(Cond::E);
-    asm.alu_imm8(Alu::Cmp, Dword, Mem::base(R11, CELL_LIVE as i32), 0);
+    // RDX = the cell's `live` word less CELL_LIVE, 4 bytes a cell.
+    asm.mov(Qword, Rdx, R11);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rdx, 3);
+    asm.alu_load(Alu::Add, Qword, Rdx, Mem::base(Rcx, CELLS));
+    asm.alu_imm8(Alu::Cmp, Dword, Mem::base(Rdx, CELL_LIVE as i32), 0);
     let live = asm.jcc8(Cond::Ne);
     asm.alu_imm8(
         Alu::Add,
@@ -2827,23 +2882,21 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
         Mem::base(R8, StampCount::Restamped.offset()),
         1,
     );
-    // RDX = this PE's stamp of the cell.
-    asm.mov(Qword, Rdx, R11);
-    asm.alu_load(Alu::Sub, Qword, Rdx, Mem::base(Rcx, CELLS));
-    asm.shift_imm(ShiftOp::Shl, Qword, Rdx, 2);
-    asm.alu(Alu::Add, Qword, Rdx, R8);
+    // R11 = this PE's stamp of the cell.
+    asm.shift_imm(ShiftOp::Shr, Qword, R11, 1);
+    asm.alu(Alu::Add, Qword, R11, R8);
     asm.mov(Qword, R8, Rax);
     asm.shift_imm(ShiftOp::Shr, Qword, R8, 55);
     asm.alu_imm8(Alu::And, Dword, R8, 1);
     asm.mov_load(Qword, R10, Mem::indexed(Rcx, R8, 8, CONTEXTS));
-    asm.mov_store(Qword, Mem::base(Rdx, 0), R10);
+    asm.mov_store(Qword, Mem::base(R11, 0), R10);
     asm.mov_load(Qword, R10, Mem::base(Rcx, ITLB));
     asm.mov_load(Qword, R10, Mem::indexed(R10, R8, 8, ITLB_DROPS));
-    // xchg [rdx + 8], r10
-    asm.fixed(&[0x4c, 0x87, 0x52, 0x08]);
-    asm.alu_imm8(Alu::Cmp, Dword, Mem::base(R11, CELL_LIVE as i32), 0);
+    // xchg [r11 + 8], r10
+    asm.fixed(&[0x4d, 0x87, 0x53, 0x08]);
+    asm.alu_imm8(Alu::Cmp, Dword, Mem::base(Rdx, CELL_LIVE as i32), 0);
     let kept = asm.jcc8(Cond::Ne);
-    asm.mov_rm_imm32(Qword, Mem::base(Rdx, 8), 0);
+    asm.mov_rm_imm32(Qword, Mem::base(R11, 8), 0);
     asm.bind(none);
     asm.bind(changed);
     asm.bind(unstamped);
@@ -4346,19 +4399,13 @@ mod tests {
                 table.cells_empty(),
             )
         };
-        // Every stamped cell held (cell 0 counts the cells past them).
-        for site in 1..STAMPED_CELLS as u64 {
-            table.link_cell(site, PC, Some(entry));
-        }
-        assert_eq!(census(&table), (STAMPED_CELLS - 1, 0, 0));
-        // The next two come from a chunk past them, one of them empty.
-        let past = STAMPED_CELLS as u64;
-        table.link_cell(past, PC, Some(entry));
-        table.link_cell(past + 1, PC + 4, None);
-        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 1));
+        // Plain links take cells past the stamped ones, one of them empty.
+        let address = table.link_cell(1, PC, Some(entry));
+        table.link_cell(2, PC + 4, None);
+        assert_eq!(census(&table), (2, 2, 1));
         // A relink keeps one cell for its exit.
-        table.link_cell(past + 1, PC + 4, None);
-        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 1));
+        table.link_cell(2, PC + 4, None);
+        assert_eq!(census(&table), (2, 2, 1));
         // The table's entry of its PC fills the empty one.
         table.set(
             lookup_slot(PC + 4, key),
@@ -4367,15 +4414,69 @@ mod tests {
                 ..entry
             },
         );
+        assert_eq!(census(&table), (2, 2, 0));
+        // A hot exit moves to a stamped cell, and its old cell is free.
+        let hot = table.link_hot_cell(1, PC, Some(entry)).unwrap();
+        assert_ne!(hot, address);
+        assert_eq!(census(&table), (2, 1, 0));
+        assert_eq!(table.link_cell(3, PC, Some(entry)), address);
+        // Every stamped cell held: no more hot ones.
+        for site in 4..2 + STAMPED_CELLS as u64 {
+            assert!(table.link_hot_cell(site, PC, Some(entry)).is_some());
+        }
+        assert!(!table.has_free_stamped());
+        assert_eq!(table.link_hot_cell(1 << 40, PC, Some(entry)), None);
         assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 0));
         // Forgetting the frame empties every cell of it.
         table.forget_frames(5..=5, |_| true);
         assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, STAMPED_CELLS + 1));
-        // Releases go from the counts.
-        table.release_cells(past..=past + 1);
-        assert_eq!(census(&table), (STAMPED_CELLS - 1, 0, STAMPED_CELLS - 1));
+        // Releases go from the counts, and free their stamped cells.
+        table.release_cells(1..=3);
+        assert_eq!(census(&table), (STAMPED_CELLS - 2, 0, STAMPED_CELLS - 2));
+        assert!(table.has_free_stamped());
         table.release_cells(0..=u64::MAX);
         assert_eq!(census(&table), (0, 0, 0));
+    }
+
+    /// A cell probe's sample, the cell's address, names the exit holding
+    /// the cell with what it was linked with, stamped or past the stamped
+    /// ones; a released cell names none.
+    #[test]
+    fn a_sampled_cell_names_its_exits_link() {
+        const PC: u64 = 0xffff_fe00_0123_4000;
+        let mut table = LookupTable::new();
+        let link = |site: u64| CellLink {
+            site,
+            pc: PC,
+            retired: 7,
+            word: ExitWord {
+                kind: ExitKind::Call,
+                skipped: 3,
+            },
+            btype: 2,
+        };
+        let mut cells = Vec::new();
+        for site in 1..=300u64 {
+            let address = table.link_cell(site, PC, None);
+            let number = table.site_cell_number(site).unwrap();
+            table.note_link(number, link(site));
+            cells.push((site, address, number));
+        }
+        let hot = table.link_hot_cell(1000, PC, None).unwrap();
+        let number = table.site_cell_number(1000).unwrap();
+        assert!((number as usize) < STAMPED_CELLS);
+        table.note_link(number, link(1000));
+        cells.push((1000, hot, number));
+        for &(site, address, number) in &cells {
+            assert_eq!(table.sampled_link(address), Some((number, link(site))));
+        }
+        assert_eq!(
+            table.sampled_link(cells[0].1 + 8),
+            table.sampled_link(cells[0].1)
+        );
+        assert_eq!(table.sampled_link(0x1000), None);
+        table.release_cells(1..=1);
+        assert_eq!(table.sampled_link(cells[0].1), None);
     }
 
     /// Each tail calls its probe and jumps through R9 itself: the site's own

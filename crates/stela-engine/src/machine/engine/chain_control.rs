@@ -227,6 +227,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).hits).write(0);
             core::ptr::addr_of_mut!((*control).linked).write(0);
             core::ptr::addr_of_mut!((*control).heat).write(0);
+            core::ptr::addr_of_mut!((*control).sampled).write(0);
         }
         self.budget().store(budget, Ordering::Relaxed);
         self.entered = budget;
@@ -276,14 +277,21 @@ impl Owner {
         };
         (block, retired, hits, chained.saturating_sub(hits))
     }
-    /// The transfers the last native call's cell probes made through cells
-    /// past the stamped ones ([`ChainControl::heat`], whose low 32 bits they
-    /// count in and [`Self::begin`] zeroes).
-    pub(super) fn overflow(&self) -> u64 {
+    /// The transfers the last native call's cell probes made
+    /// ([`ChainControl::heat`], whose low 32 bits they count in and
+    /// [`Self::begin`] zeroes), and the cell of the last one they named, or
+    /// 0 ([`ChainControl::sampled`]).
+    pub(super) fn cell_probes(&self) -> (u64, u64) {
+        let control = self.storage.control.get();
         // SAFETY: the synchronous native call has returned; only this
-        // owner's native code writes the field.
-        let heat = unsafe { core::ptr::addr_of!((*self.storage.control.get()).heat).read() };
-        u64::from(heat as u32)
+        // owner's native code writes the fields.
+        let (heat, sampled) = unsafe {
+            (
+                core::ptr::addr_of!((*control).heat).read(),
+                core::ptr::addr_of!((*control).sampled).read(),
+            )
+        };
+        (u64::from(heat as u32), sampled)
     }
     #[cfg(test)]
     pub(super) fn weak_storage(&self) -> alloc::sync::Weak<Storage> {
@@ -317,6 +325,8 @@ impl Owner {
             cells: unsafe { core::ptr::addr_of!((*control).cells).read() },
             // SAFETY: as for `table`; native code adds to it only within a call.
             heat: unsafe { core::ptr::addr_of!((*control).heat).read() },
+            // SAFETY: as for `heat`.
+            sampled: unsafe { core::ptr::addr_of!((*control).sampled).read() },
             loop_entries: self.loops().0,
             loop_iterated: self.loops().1,
             // SAFETY: as for `table`.

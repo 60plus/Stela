@@ -552,12 +552,17 @@ pub struct Statistics {
     /// How many exits had a stamped tail when this PE last looked (every
     /// promotion step): a level, which adding keeps the larger of.
     pub stamped_in_use: u64,
-    /// Transfers this PE's cell probes made through cells past the stamped
-    /// ones, which no promotion reaches (`ChainControl::heat`).
-    pub cell_overflow: u64,
+    /// Transfers this PE's cell probes made (`ChainControl::heat`).
+    pub cell_probes: u64,
     /// Hot exits a promotion step found whose cell held no entry yet, left
     /// for a later step.
     pub promotions_waiting: u64,
+    /// The cells this PE's cell probes named (`ChainControl::sampled`) that
+    /// its promotion steps read.
+    pub cell_samples: u64,
+    /// Hot exits a promotion step found while every stamped cell was held,
+    /// which kept their cell tails.
+    pub promotions_full: u64,
     /// The cells exits held, those past the stamped ones and those holding
     /// no entry, when this PE last looked (every promotion step): levels,
     /// as `stamped_in_use`.
@@ -783,8 +788,10 @@ impl core::ops::AddAssign for Statistics {
             stamped_tails,
             predicted_tails,
             stamped_in_use,
-            cell_overflow,
+            cell_probes,
             promotions_waiting,
+            cell_samples,
+            promotions_full,
             cells_live,
             cells_past,
             cells_empty,
@@ -962,8 +969,10 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.links, links),
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
-            (&mut self.cell_overflow, cell_overflow),
+            (&mut self.cell_probes, cell_probes),
             (&mut self.promotions_waiting, promotions_waiting),
+            (&mut self.cell_samples, cell_samples),
+            (&mut self.promotions_full, promotions_full),
             (&mut self.unlinks, unlinks),
             (&mut self.lookups, lookups),
             (&mut self.lookup_hits, lookup_hits),

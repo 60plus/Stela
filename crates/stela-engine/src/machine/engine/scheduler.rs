@@ -3,11 +3,17 @@
 
 use super::*;
 
-/// Native runs between two promotion steps, and the stamped cells each
-/// looks at: every stamped cell once in 256 steps, a lock and 256 loads
-/// in 1024 runs.
+/// Native runs between two promotion steps, each of which reads the cells
+/// the runs' cell probes named, at most one a run: a lock and a few
+/// lookups in 1024 runs.
 const PROMOTION_RUNS: u32 = 1024;
-const PROMOTION_CELLS: u32 = 256;
+/// Times promotion steps read an exit's cell before the exit is hot: with
+/// one transfer in [`chain::CELL_SAMPLE`] of its PE's named, about 512 of
+/// its transfers, while a rare one is seldom named twice.
+pub(super) const HOT_SAMPLES: u8 = 2;
+/// Exits whose cells promotion steps read once that the PE keeps before
+/// it starts over, so a count stays recent.
+const SAMPLED_EXITS: usize = 4096;
 
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Run until a stop. `budget` limits executed blocks (0 = unlimited).
@@ -353,7 +359,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let remaining = self.chain.budget().load(Ordering::Relaxed);
         let (block, retired, hits, _) = self.chain.completed();
-        self.statistics.cell_overflow += self.chain.overflow();
+        let (cell_probes, sampled_cell) = self.chain.cell_probes();
+        self.statistics.cell_probes += cell_probes;
+        if sampled_cell != 0 && self.cell_samples.len() < PROMOTION_RUNS as usize {
+            self.cell_samples.push(sampled_cell);
+        }
         self.promotion_runs = self.promotion_runs.wrapping_add(1);
         if self.promotion_runs.is_multiple_of(PROMOTION_RUNS) {
             self.promote_hot_exits();
@@ -699,7 +709,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0) {
+            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }
@@ -904,7 +914,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.patch_native(tail, &code);
         self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
-        if !self.link_through_cell(cache, exit, target, retired, word, btype) {
+        if !self.link_through_cell(cache, exit, target, retired, word, btype, false) {
             return false;
         }
         self.patch_point(NativeCode(site as usize), jump);
@@ -977,6 +987,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// a nonzero `btype` uses the probes of `btype`, whose cell probes take
     /// only entries that accept it, and gets a stamped tail only for a block
     /// that accepts it.
+    ///
+    /// A `hot` exit, whose cell probe transfers promotion found many
+    /// ([`Self::promote_hot_exits`]), takes a stamped cell and a stamped
+    /// tail ([`chain::stamped_tail`]) while one is free; every other a cell
+    /// past them and a cell tail.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn link_through_cell(
         &mut self,
         cache: &mut board::Cache,
@@ -985,16 +1001,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         retired: u32,
         word: ExitWord,
         btype: u8,
+        hot: bool,
     ) -> bool {
         if !chain::patchable(site) {
             return false;
         }
-        // An exit whose cell probe transfers made it hot gets a stamped
-        // tail ([`chain::stamped_tail`]); every other a cell tail.
-        let hot = cache
-            .targets
-            .site_cell_number(site)
-            .is_some_and(|cell| cache.targets.cell_heat(cell) >= chain::HOT_CELL);
         let bytes = if hot {
             chain::STAMPED_TAIL_BYTES
         } else {
@@ -1012,7 +1023,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .site_cell(site)
             .filter(|held| held.pc == next_pc && held.key != 0)
             .or_else(|| self.translated_entry(cache, next_pc));
-        let cell = cache.targets.link_cell(site, next_pc, current);
+        let cell = hot
+            .then(|| cache.targets.link_hot_cell(site, next_pc, current))
+            .flatten()
+            .unwrap_or_else(|| cache.targets.link_cell(site, next_pc, current));
         let number = cache.targets.site_cell_number(site);
         if let Some(number) = number {
             let link = chain::CellLink {
@@ -1080,31 +1094,36 @@ impl<H: Host, D: Devices> Machine<H, D> {
         (held.pc == pc && held.key == key).then_some(held)
     }
 
-    /// Give the exits of the next [`PROMOTION_CELLS`] stamped cells whose
-    /// cell probe transfers made them hot a stamped tail
+    /// Give the exits whose cells this PE's cell probes named
+    /// [`HOT_SAMPLES`] times a stamped cell and a stamped tail
     /// ([`chain::stamped_tail`]): a bounded step every [`PROMOTION_RUNS`]
-    /// native runs, sweeping every stamped cell in turn.
+    /// native runs, over the cells those runs named.
     ///
     /// The stamped tail enters the block the cell holds, which every
-    /// transfer that made the cell hot entered, whatever this PE's own
+    /// transfer that made the exit hot entered, whatever this PE's own
     /// context translates now: each PE's stamp still requires its own
     /// translation of the target to name the cell's key. A cell that holds
-    /// no entry yet stays hot for a later step; one whose block takes no
-    /// transfer of the exit's BTYPE settles with the exit as it is.
+    /// no entry yet waits for later samples; an exit whose block takes no
+    /// transfer of its BTYPE keeps its cell tail, as does every hot exit
+    /// while every stamped cell is held.
     pub(super) fn promote_hot_exits(&mut self) {
-        let from = self.promotion_cursor;
-        let to = from + PROMOTION_CELLS;
-        self.promotion_cursor = if to as usize >= chain::STAMPED_CELLS {
-            0
-        } else {
-            to
-        };
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(board::LockSite::Link);
-        for link in cache.targets.hot_links(from..to) {
-            let Some(cell) = cache.targets.site_cell_number(link.site) else {
+        let mut samples = core::mem::take(&mut self.cell_samples);
+        self.statistics.cell_samples += samples.len() as u64;
+        for &address in &samples {
+            let Some((cell, link)) = cache.targets.sampled_link(address) else {
                 continue;
             };
+            if (cell as usize) < chain::STAMPED_CELLS {
+                continue;
+            }
+            let count = self.sampled_exits.entry(link.site).or_insert(0);
+            *count += 1;
+            if *count < HOT_SAMPLES {
+                continue;
+            }
+            self.sampled_exits.remove(&link.site);
             let Some(held) = cache
                 .targets
                 .site_cell(link.site)
@@ -1113,9 +1132,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.statistics.promotions_waiting += 1;
                 continue;
             };
-            // Hot once: tried now whatever the link finds.
-            cache.targets.settle_heat(cell);
             if link.btype != 0 && held.targets & 1 << link.btype == 0 {
+                continue;
+            }
+            if !cache.targets.has_free_stamped() {
+                self.statistics.promotions_full += 1;
                 continue;
             }
             self.link_through_cell(
@@ -1125,8 +1146,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 link.retired,
                 link.word,
                 link.btype,
+                true,
             );
         }
+        if self.sampled_exits.len() > SAMPLED_EXITS {
+            self.sampled_exits.clear();
+        }
+        samples.clear();
+        self.cell_samples = samples;
         self.statistics.stamped_in_use = cache.targets.stamped_tails() as u64;
         self.statistics.cells_live = cache.targets.cells() as u64;
         self.statistics.cells_past = cache.targets.cells_past_stamped() as u64;

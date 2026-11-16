@@ -787,10 +787,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// The sampled runs among those whose last transfer was their block's
     /// RET, BLR or BR form's ([`step_timing::HotBlocks::dynamic`]).
     dynamic_samples: Vec<step_timing::DynamicSample>,
-    /// Native runs since the engine started, and the stamped cell the next
-    /// promotion step looks at ([`scheduler`]'s `promote_hot_exits`).
+    /// Native runs since the engine started, the cells their cell probes
+    /// named since the last promotion step ([`scheduler`]'s
+    /// `promote_hot_exits`), and how often recent steps read each exit's.
     promotion_runs: u32,
-    promotion_cursor: u32,
+    cell_samples: Vec<u64>,
+    sampled_exits: BTreeMap<u64, u8>,
     /// The paired frames a native run may keep
     /// (`chain::ChainControl::frame_bound`).
     frame_bound: u32,
@@ -1355,7 +1357,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,
-            promotion_cursor: 0,
+            cell_samples: Vec::new(),
+            sampled_exits: BTreeMap::new(),
             frame_bound: chain::DEFAULT_FRAME_BOUND,
             hot_countdown: step_timing::HOT_SAMPLE_EVERY,
             hot_seed: 0x9e37_79b9_7f4a_7c15,

@@ -2996,21 +2996,12 @@ fn transfers_leave_their_copies_to_run_outside_the_lock() {
     );
 }
 
-/// The word a cell probe counts a transfer through the cell at host
-/// address `cell` in, as [`chain::lookup_dispatcher`]'s does from the
-/// control it runs with: the cell's `heat` word among the control's
-/// stamped cells, or else the control's own `heat`, which nothing reads.
-fn probed_heat(control: &chain::ChainControl, cell: u64) -> Option<*const AtomicU32> {
-    let index = cell.wrapping_sub(control.cells) >> 3;
-    (index < (chain::CELL_LIVE / 8) as u64)
-        .then(|| (control.cells + chain::CELL_HEAT as u64 + index) as *const AtomicU32)
-}
-
-/// A PE gone parallel runs on its hub control: its cell probes count heat
-/// in the board's stamped cells, where the sweep reads it, so a hot exit
-/// out of the page gets a stamped tail, and its stamps are counted.
+/// A PE gone parallel runs on its hub control, with the board's stamped
+/// cells and stamps of the board's table: an exit out of the page whose
+/// cell its cell probes named often gets a stamped cell and a stamped tail,
+/// and its stamps are counted.
 #[test]
-fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
+fn a_parallel_pe_promotes_the_exits_its_cell_probes_named() {
     use super::super::tests::{NATIVE_CODE_STRIDE, machine};
     use stela_compiler::block::ExitKind;
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
@@ -3034,36 +3025,31 @@ fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
     let first = &machine.code.blocks[0];
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
-    let (number, cells, stamps_held) = {
+    let (address, cells, stamps_held) = {
         let mut cache = machine.code.cache();
         let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!(number as usize >= chain::STAMPED_CELLS);
         let control = machine.chain.snapshot();
         (
-            number,
+            cache.targets.cell_address(number),
             cache.targets.stamped_cells(),
             cache.targets.holds_stamps(control.stamps),
         )
     };
-    assert!((number as usize) < chain::STAMPED_CELLS);
     let control = machine.chain.snapshot();
-    // The cell probe's transfers through the exit's cell.
-    let cell = cells + (number as u64) * size_of::<chain::LookupEntry>() as u64;
     let patches = machine.host.patches.len();
-    for _ in 0..chain::HOT_CELL {
-        if let Some(heat) = probed_heat(&control, cell) {
-            // SAFETY: a heat word of the board's stamped cells, an atomic,
-            // which live while the board does.
-            unsafe { &*heat }.fetch_add(1, Ordering::Relaxed);
-        }
+    // The samples its cell probes take of the exit's cell.
+    for _ in 0..super::super::scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
     }
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
-    }
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches + 2, "a stamped tail");
     assert_eq!(
         machine.host.patches[patches].1.len(),
         chain::STAMPED_TAIL_BYTES
     );
+    let number = machine.code.cache().targets.site_cell_number(site);
+    assert!(number.is_some_and(|number| (number as usize) < chain::STAMPED_CELLS));
     assert_eq!(machine.statistics.stamped_tails, 1);
     assert_eq!(machine.statistics.stamped_in_use, 1);
     assert_eq!(control.cells, cells, "the board's stamped cells");
