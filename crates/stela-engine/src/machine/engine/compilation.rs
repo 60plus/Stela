@@ -1488,7 +1488,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             operation => {
                 let form = x86_64_pointer::Form::of(operation)?;
-                x86_64_pointer::thunk(form, GuestAddress(pc), TAGS, SERVICE as usize as u64)
+                x86_64_pointer::thunk(
+                    form,
+                    GuestAddress(pc),
+                    TAGS,
+                    SERVICE as usize as u64,
+                    pointer::native_cipher(self.target),
+                )
             }
         };
         self.install_stream = self.stream_at(code.0 as u64);

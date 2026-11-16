@@ -432,7 +432,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
         let form = pointer::Form::of(case.operation).unwrap();
         let tags = Place::new(Anchor::Pointer, core::mem::offset_of!(Service, tags));
         let routine: ServiceRoutine = service;
-        let thunk = pointer::thunk(form, GuestAddress(PC), tags, routine as usize as u64);
+        let thunk = pointer::thunk(form, GuestAddress(PC), tags, routine as usize as u64, None);
         let word = ExitWord::from(case.kind);
         // The predicted target: the first of a page in either half.
         let predicted = PCS[2 * (number % 2)];

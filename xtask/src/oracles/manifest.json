@@ -4822,6 +4822,14 @@
   },
   {
     "package": "stela-engine",
+    "test": "native_cipher_timing",
+    "source": "crates/stela-engine/src/machine/engine/pointer/native_tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "native PAC cipher, memo hit and memo miss timing and single-stepped host instruction counts; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",

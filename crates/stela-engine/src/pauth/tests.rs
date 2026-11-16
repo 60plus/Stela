@@ -801,3 +801,44 @@ fn layouts_worked_out_ahead_match_the_regime() {
         }
     }
 }
+
+/// A regime's layout of a signing or an authentication depends on one
+/// pointer bit, the one `Layouts::native` names, under every combination
+/// of TBI0, TBI1, TBID0 and TBID1 and for both domains, with the ranges'
+/// TnSZ equal or not.
+#[test]
+fn layouts_depend_on_the_one_bit_native_code_selects_by() {
+    for controls in 0..16u64 {
+        let bits = (controls & 1) << 37
+            | (controls >> 1 & 1) << 38
+            | (controls >> 2 & 1) << 51
+            | (controls >> 3 & 1) << 52;
+        for (t0sz, t1sz) in [(25, 25), (17, 25), (16, 39), (39, 16)] {
+            let layouts = Layouts::new(t0sz | t1sz << 16 | bits);
+            for data in [false, true] {
+                let domain = if data {
+                    policy::Domain::Data
+                } else {
+                    policy::Domain::Instruction
+                };
+                for signing in [false, true] {
+                    let (select, extension) = layouts.native(data, signing);
+                    assert!(select == 55 || select == 63);
+                    // Authentications always select by bit 55.
+                    assert!(signing || select == 55);
+                    for pointer in [0, 1 << 55, 1 << 63, 1 << 55 | 1 << 63] {
+                        let selected = usize::from(pointer & 1 << select != 0);
+                        assert_eq!(
+                            layouts.get(domain, pointer, signing).extension_mask(),
+                            extension[selected],
+                            "controls={controls:#x} t0sz={t0sz} t1sz={t1sz} data={data} signing={signing} pointer={pointer:#x}"
+                        );
+                        // The select bit is in the extension it selects.
+                        assert_ne!(extension[selected] & 1 << select, 0);
+                        assert_ne!(extension[selected] & 1 << 55, 0);
+                    }
+                }
+            }
+        }
+    }
+}

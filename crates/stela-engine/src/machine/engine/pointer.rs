@@ -143,6 +143,13 @@ pub(super) struct PointerService {
     pub(super) fills: u64,
     /// Under `--profile`, what the memo missed and why ([`census`]).
     pub(super) census: Option<Box<census::Census>>,
+    /// What native code computes PAC results from where the cipher is the
+    /// host's AES rounds ([`cells`]): the open context's key schedules and
+    /// version, and each key's layouts, zero while its enable is clear.
+    pub(super) cipher: pointer::cipher::Cipher,
+    /// The layouts of the open context's regime by domain (instruction,
+    /// data), as an enabled key of it takes them.
+    native_layouts: [[pointer::cipher::Layout; 2]; 2],
 }
 
 /// The routine a thunk calls on a memo miss.
@@ -153,10 +160,31 @@ pub(super) const CELLS: pointer::inline::Cells = pointer::inline::Cells {
     tags: offset_of!(PointerService, tags) as u32,
     strips: offset_of!(PointerService, strips) as u32,
     routine: offset_of!(PointerService, routine) as u32,
+    cipher: None,
 };
 
 /// Where native code finds the service's tag words.
 pub(super) const TAGS: Place = Place::new(Anchor::Pointer, offset_of!(PointerService, tags));
+
+/// Where native code finds the service's cipher.
+const CIPHER: Place = Place::new(Anchor::Pointer, offset_of!(PointerService, cipher));
+
+/// Whether native code for `target` computes PAC results itself
+/// (`x86_64::pointer::cipher`): the target has AES-NI and the engine's
+/// cipher is the AES rounds, which it is exactly where the host has AES-NI.
+/// Otherwise it looks them up in the memo and calls the service on a miss.
+pub(super) fn native_cipher(target: stela_compiler::TargetCpu) -> Option<Place> {
+    (target.supports(stela_compiler::TargetCpu::Aes) && pauth::keyed::native()).then_some(CIPHER)
+}
+
+/// [`CELLS`] for blocks compiled for `target`, with the cipher where
+/// [`native_cipher`] takes it.
+pub(super) fn cells(target: stela_compiler::TargetCpu) -> pointer::inline::Cells {
+    pointer::inline::Cells {
+        cipher: native_cipher(target).map(|place| place.offset as u32),
+        ..CELLS
+    }
+}
 
 /// Where native code finds the stripping cell of `data`.
 pub(super) const fn strip_place(data: bool) -> Place {
@@ -183,6 +211,8 @@ impl PointerService {
             routine: SERVICE as usize as u64,
             fills: 0,
             census: None,
+            cipher: pointer::cipher::Cipher::default(),
+            native_layouts: [[pointer::cipher::Layout::DISABLED; 2]; 2],
         }
     }
 
@@ -232,7 +262,7 @@ impl PointerService {
         trapped: bool,
     ) {
         let index = memo_key(key);
-        self.tags[usize::from(index)] = if !enabled {
+        let tag = if !enabled {
             pointer::DISABLED
         } else if !trapped
             && self
@@ -243,6 +273,22 @@ impl PointerService {
             self.native_tag(index)
         } else {
             0
+        };
+        self.set_tag(index, tag);
+    }
+
+    /// Open the tag word of the key at `index` (below 4) with `tag`, and
+    /// give native code's cipher that key's layouts: zero for
+    /// [`pointer::DISABLED`], so its results are their pointers, else those
+    /// of the open regime. A closed word (zero) leaves them, as no native
+    /// code computes with them then.
+    fn set_tag(&mut self, index: u8, tag: u64) {
+        let key = usize::from(index);
+        self.tags[key] = tag;
+        self.cipher.layouts[key] = match tag {
+            0 => return,
+            pointer::DISABLED => [pointer::cipher::Layout::DISABLED; 2],
+            _ => self.native_layouts[key / 2],
         };
     }
 
@@ -326,11 +372,22 @@ impl PointerService {
             Some(layouts) if layouts.tcr() == inputs.tcr => layouts,
             _ => *self.layouts.insert(pauth::Layouts::new(inputs.tcr)),
         };
-        self.context = Some(
-            pauth::Context::new_with_version(0, keys, inputs.version)
-                .with_layouts(layouts)
-                .with_implementation_defined_cipher(),
-        );
+        let context = pauth::Context::new_with_version(0, keys, inputs.version)
+            .with_layouts(layouts)
+            .with_implementation_defined_cipher();
+        for (index, schedule) in self.cipher.schedules.iter_mut().enumerate() {
+            *schedule = context.native_schedule(index).unwrap_or_default();
+        }
+        let classic = inputs.version == pauth::Version::Classic;
+        self.cipher.classic = if classic { u64::MAX } else { 0 };
+        self.cipher.enhanced = !self.cipher.classic;
+        self.native_layouts = [false, true].map(|data| {
+            [true, false].map(|signing| {
+                let (select, extension) = layouts.native(data, signing);
+                pointer::cipher::Layout::new(select, extension)
+            })
+        });
+        self.context = Some(context);
     }
 
     /// A usable tag permits a thunk to dereference the memo anchor. A
@@ -405,7 +462,8 @@ impl PointerService {
             return None;
         }
         let index = memo_key(key);
-        self.tags[usize::from(index)] = self.native_tag(index);
+        let tag = self.native_tag(index);
+        self.set_tag(index, tag);
         if let Some(result) = self.remembered(operation, key, pointer, modifier) {
             return Some(result);
         }
@@ -644,6 +702,13 @@ fn complete_with(
         _ => pointer::Completion::default(),
     }
 }
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod native_tests;
 
 #[cfg(test)]
 mod tests {
@@ -927,7 +992,7 @@ mod tests {
         }
     }
 
-    fn inputs(version: pauth::Version, tcr: u64) -> PointerInputs {
+    pub(super) fn inputs(version: pauth::Version, tcr: u64) -> PointerInputs {
         let key = |index: u64| [0x1122_3344_5566_7788 ^ index, 0x99aa_bbcc_ddee_ff00 + index];
         PointerInputs {
             keys: [key(1), key(2), key(3), key(4), key(5)].map(Some),
@@ -1209,7 +1274,7 @@ mod tests {
 
     /// The instructions `run` executes, counted under the trap flag.
     #[cfg(target_os = "linux")]
-    fn steps(run: impl FnOnce()) -> usize {
+    pub(super) fn steps(run: impl FnOnce()) -> usize {
         use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         #[repr(C)]
         struct SigAction {

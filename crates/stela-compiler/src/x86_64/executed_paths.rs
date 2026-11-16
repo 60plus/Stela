@@ -107,6 +107,7 @@ fn options() -> Options {
             tags: 0x40,
             strips: 0x80,
             routine: 0x1c0,
+            cipher: None,
         }),
         self_loops: true,
         ..NativeSystem::NONE

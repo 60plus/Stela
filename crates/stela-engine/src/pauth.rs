@@ -131,6 +131,25 @@ impl Layouts {
         self.tcr
     }
 
+    /// What native code computes `domain`'s signings or authentications
+    /// with (`x86_64::pointer::cipher::Layout`): the one pointer bit their
+    /// layout depends on, and the extension mask with it clear and set.
+    /// `regime_layout` selects TnSZ by that bit (55, or 63 for a signing
+    /// when neither range ignores the top byte) and TBI by bit 55, which it
+    /// ignores when it selects by bit 63, as neither range has TBI then.
+    pub(crate) fn native(&self, data: bool, signing: bool) -> (u32, [u64; 2]) {
+        let domain = if data {
+            policy::Domain::Data
+        } else {
+            policy::Domain::Instruction
+        };
+        let select = self.get(domain, 0, signing).select_shift;
+        (
+            select,
+            [0, 1 << select].map(|pointer| self.get(domain, pointer, signing).extension_mask()),
+        )
+    }
+
     fn get(&self, domain: policy::Domain, pointer: u64, signing: bool) -> policy::Layout {
         let index = usize::from(domain == policy::Domain::Data) << 3
             | usize::from(signing) << 2
@@ -314,6 +333,21 @@ impl Context {
         )
     }
 
+    /// The AES schedule native code computes PACs of the key at tag word
+    /// `index` with (`x86_64::pointer::cipher`): IA, IB, DA, DB, then the
+    /// generic key. `None` when the context lacks the key or its cipher is
+    /// not the AES rounds native code runs ([`keyed::native`]).
+    pub(crate) fn native_schedule(&self, index: usize) -> Option<[[u64; 2]; keyed::SCHEDULE]> {
+        if !self.keyed || !keyed::native() {
+            return None;
+        }
+        let words = match index {
+            4 => self.keys.generic.as_ref(),
+            index => self.keys.words.get(index)?.as_ref(),
+        }?;
+        Some(keyed::schedule(words))
+    }
+
     /// The words of `key`, when the context has it.
     #[inline]
     pub(crate) fn words(&self, key: Key) -> Option<&[u64; 2]> {
@@ -434,7 +468,7 @@ const PROCESS_TCR: u64 = 17 | 17 << 16 | 1 << 37 | 1 << 51;
 const MIN_TNSZ: u64 = 16;
 const MAX_TNSZ: u64 = 39;
 
-mod keyed;
+pub(crate) mod keyed;
 mod qarma;
 use qarma::compute as qarma5;
 

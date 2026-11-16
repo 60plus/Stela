@@ -78,7 +78,7 @@ fn thunk_service_calls_end_as_host_samples_look_for_them() {
     const SERVICE: u64 = 0xffff_8000_1234_5678;
     let [cell, address] = service_call_ends(0x48, SERVICE);
     let form = Form::of(Operation::SignIbSp).unwrap();
-    let code = thunk(form, GuestAddress(0x1000), TAGS, SERVICE).code;
+    let code = thunk(form, GuestAddress(0x1000), TAGS, SERVICE, None).code;
     let contains = |code: &[u8], end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
     assert!(contains(&code, &address));
     assert!(!contains(&code, &cell));
@@ -261,6 +261,7 @@ fn thunks_complete_hits_and_computed_misses_natively() {
             pc,
             TAGS,
             routine as usize as u64,
+            None,
         )
     };
     let mut state = GuestState::default();
@@ -405,7 +406,7 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
     use super::super::chain::{DIRECT_EXIT_BYTES, DYNAMIC_EXIT_BYTES};
     let pc = GuestAddress(0x4000);
     let form = Form::of(Operation::SignIbSp).unwrap();
-    let thunk = thunk(form, pc, TAGS, 0x4000);
+    let thunk = thunk(form, pc, TAGS, 0x4000, None);
     let end = thunk.code.len();
     assert_eq!(
         thunk.code[end - DIRECT_EXIT_BYTES..],
@@ -446,7 +447,7 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
     // A return completes at its exit to the target in RAX, which the
     // service path reaches too.
     let ret = Form::of(Operation::ReturnIaSp).unwrap();
-    let ret = super::thunk(ret, pc, TAGS, 0x4000);
+    let ret = super::thunk(ret, pc, TAGS, 0x4000, None);
     assert_eq!(ret.next, None);
     let returns = ret.dynamic.unwrap();
     // Padded for its patch point, wherever it lands.

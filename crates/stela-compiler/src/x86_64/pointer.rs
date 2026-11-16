@@ -30,6 +30,10 @@
 //! RCX, RDX, R8, R9 and flags; a service call every register the SysV ABI
 //! lets a call clobber, which no block keeps live across its exit. The call
 //! aligns the stack to 16 bytes itself.
+//!
+//! Where the host has AES-NI, thunks and blocks given a [`cipher::Cipher`]
+//! compute signings, successful authentications and PACGA in native code
+//! instead of looking them up; the rest still goes to the service.
 use crate::x86_64::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size, resolve};
 use crate::{
     Anchor, GuestAddress, Place,
@@ -41,6 +45,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+pub mod cipher;
 pub mod inline;
 pub mod strip;
 
@@ -315,13 +320,9 @@ struct Lookup {
     modifier: Gpr,
 }
 
-/// The memo lookup of `form`'s operands, the pointer in RAX and the modifier
-/// in its host register if it has one (SP in pinned code), else in RDX,
-/// under the tag words at `tags`; a hit leaves the result in RAX. A key that
-/// is not open misses (no entry's tag is a bare kind), and so does a
-/// disabled key's first use of each operand pair. Clobbers RCX, RDX, R8, R9
-/// and flags.
-fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
+/// `form`'s pointer into RAX, and the register holding its modifier: its
+/// host register if it has one (SP in pinned code), else RDX.
+fn operands(asm: &mut Asm, form: Form) -> Gpr {
     use Gpr::{R8, R9, Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
     let pointer = asm.guest(Register::X(form.pointer)).expect("X0..X30");
@@ -346,8 +347,21 @@ fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
     };
     debug_assert!(!matches!(
         modifier,
-        Gpr::Rsp | Gpr::R11 | Rax | Rcx | R8 | R9
+        Gpr::Rsp | Gpr::R10 | Gpr::R11 | Rax | Rcx | R8 | R9
     ));
+    modifier
+}
+
+/// The memo lookup of `form`'s operands, the pointer in RAX and the modifier
+/// in its host register if it has one (SP in pinned code), else in RDX,
+/// under the tag words at `tags`; a hit leaves the result in RAX. A key that
+/// is not open misses (no entry's tag is a bare kind), and so does a
+/// disabled key's first use of each operand pair. Clobbers RCX, RDX, R8, R9
+/// and flags.
+fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
+    use Gpr::{R8, R9, Rax, Rcx};
+    use Size::Qword;
+    let modifier = operands(asm, form);
     // The anchor, then the key's tag word through it: one load, no LEA.
     asm.place(R8, Place::new(tags.anchor, 0));
     let word = i32::try_from(tags.offset + usize::from(form.key) * 8).expect("a tag word offset");
@@ -455,15 +469,25 @@ pub fn service_call_ends(routine: u32, service: u64) -> [Vec<u8>; 2] {
     [cell.into_bytes(), address.into_bytes()]
 }
 
-/// The thunk completing the PAC instruction of `form` at `pc` from the memo
-/// ([`Anchor::Memo`]) under the tag words at `tags`, or through `service`, a
-/// [`ServiceRoutine`], else exiting at `pc` for the engine.
-pub fn thunk(form: Form, pc: GuestAddress, tags: Place, service: u64) -> Thunk {
+/// The thunk completing the PAC instruction of `form` at `pc` under the tag
+/// words at `tags`, from the [`cipher::Cipher`] at `cipher` when there is
+/// one and from the memo ([`Anchor::Memo`]) otherwise, or through `service`,
+/// a [`ServiceRoutine`], else exiting at `pc` for the engine.
+pub fn thunk(
+    form: Form,
+    pc: GuestAddress,
+    tags: Place,
+    service: u64,
+    cipher: Option<Place>,
+) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::Qword;
     let mut code = Code::pinned();
     let mut asm = code.asm();
-    let Lookup { misses, modifier } = lookup(&mut asm, form, tags);
+    let Lookup { misses, modifier } = match cipher {
+        Some(cipher) => cipher::compute(&mut asm, form, tags, cipher),
+        None => lookup(&mut asm, form, tags),
+    };
     let complete = asm.len();
     let next_pc = GuestAddress(pc.0.wrapping_add(4));
     let mut next = None;

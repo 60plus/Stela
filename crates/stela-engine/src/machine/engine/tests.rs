@@ -7071,6 +7071,7 @@ fn what_follows_a_pac_exit_keeps_its_thunk() {
             GuestAddress(last),
             TAGS,
             SERVICE as usize as u64,
+            pointer::native_cipher(machine.target),
         );
         assert!(machine.host.installed.contains(&thunk.code), "{words:x?}");
     }
@@ -7091,6 +7092,7 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         GuestAddress(base),
         TAGS,
         SERVICE as usize as u64,
+        pointer::native_cipher(machine.target),
     );
     let at = machine
         .host
@@ -7156,6 +7158,7 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         GuestAddress(base),
         TAGS,
         SERVICE as usize as u64,
+        pointer::native_cipher(machine.target),
     );
     let at = machine
         .host
