@@ -2502,13 +2502,8 @@ fn board_code(
     // generation, and parts taken away: the oldest young one, the tenured
     // one entered least, a tenured one past its age, one mostly holes.
     let outs: [u64; 4] = core::array::from_fn(|why| now.outs[why].saturating_sub(was.outs[why]));
-    // Thunks and tails in their part's late room, those that found it full
-    // and pinned the open part, and cold choices a pin turned away from the
-    // part entered least.
-    let late: [u64; 3] = core::array::from_fn(|at| now.late[at].saturating_sub(was.late[at]));
     let churn = format!(
-        "{churn} gens=young/tenured:{}/{} promoted={} out=young/cold/aged/holes:{}/{}/{}/{} \
-         late=taken/full/pinned:{}/{}/{}",
+        "{churn} gens=young/tenured:{}/{} promoted={} out=young/cold/aged/holes:{}/{}/{}/{}",
         now.generations[0],
         now.generations[1],
         now.promoted.saturating_sub(was.promoted),
@@ -2516,9 +2511,6 @@ fn board_code(
         outs[1],
         outs[2],
         outs[3],
-        late[0],
-        late[1],
-        late[2],
     );
     format!(
         " board={}M/{}/{} retired={} forced={} lost={} redone/refused={}/{} \

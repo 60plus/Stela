@@ -390,15 +390,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Err(self.fail_native(index, fault, NativeFailureReason::UnknownCode));
         }
         // A sampled run whose budget ran out was in `last` at a uniformly
-        // chosen transfer: its part's heat, and under step timing the hot
-        // blocks (`step_timing::HotBlocks`).
-        if sampled && remaining > budget {
-            let weight = u64::from(self.sample_period()) * step_timing::HOT_SAMPLE_SPAN;
-            self.heat(last, weight);
-        }
+        // chosen transfer (`step_timing::HotBlocks`).
         if sampled
             && remaining > budget
-            && self.step_timing.is_some()
             && let Some(block) = self.code.blocks.get(last)
         {
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);
@@ -770,7 +764,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         }
         self.install_stream = self.stream_at(point);
-        self.install_home = Some(point);
         let Ok(thunk) = self.install_native(&[0; chain::THUNK_BYTES], false) else {
             return false;
         };
@@ -1196,7 +1189,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // there ([`board::Ring::refer`]).
         let stream = self.stream_at(site);
         self.install_stream = stream;
-        self.install_home = Some(site);
         let tail = self
             .install_native(&[0; chain::TAIL_ROOM][..bytes], false)
             .ok()?;
@@ -1217,8 +1209,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Some((probe, tail));
         }
         self.install_stream = stream;
-        // Beside its tail: in the late room when the tail went there.
-        self.install_home = Some(site);
         let dispatcher = chain::lookup_dispatcher(btype)?;
         let probe = self.install_native(&dispatcher, false).ok()?;
         self.profile_code(probe, dispatcher.len(), step_timing::CodeRegion::Probe);
