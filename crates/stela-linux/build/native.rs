@@ -446,6 +446,7 @@ impl Linux {
                     format!("{COMPAT}/stela/timer_test.c"),
                     format!("{COMPAT}/stela/workqueue_test.c"),
                     format!("{COMPAT}/stela/i2c_test.c"),
+                    format!("{COMPAT}/stela/pci_reset_test.c"),
                     format!("{COMPAT}/stela/sync_test.c"),
                     format!("{COMPAT}/stela/srcu_test.c"),
                     format!("{COMPAT}/stela/rcu_original_test.c"),

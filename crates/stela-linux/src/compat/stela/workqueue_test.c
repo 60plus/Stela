@@ -23,6 +23,7 @@ int stela_linux_workqueue_test_irq_enable(unsigned int irq, bool *unexposed);
 int stela_linux_workqueue_test_irq_disable(unsigned int irq);
 int stela_linux_workqueue_test_irq_retire(unsigned int irq);
 void stela_linux_i2c_test(void);
+void stela_linux_pci_reset_test(void);
 void stela_linux_sync_test(void);
 
 static struct kthread_worker *dedicated;
@@ -526,6 +527,7 @@ void stela_linux_workqueue_test_main(void)
 	oneshot_sharers_hold_the_line_masked();
 	mapped_lines_reach_requests_through_their_domain();
 	stela_linux_i2c_test();
+	stela_linux_pci_reset_test();
 	dedicated_identity_and_join();
 	stela_linux_sync_test();
 }

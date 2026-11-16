@@ -1370,7 +1370,7 @@ int main(void)
 
 	/* A function with neither a function-level reset nor a D3hot that resets
 	 * it has no reset of its own, and keeps its header. (The resets
-	 * themselves sleep, which needs a Linux task this program has not.) */
+	 * themselves sleep, which needs a Linux task: stela/pci_reset_test.c.) */
 	config[PCI_COMMAND] = PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
 	dev.current_state = PCI_D0;
 	dev.devcap &= ~(u32)PCI_EXP_DEVCAP_FLR;
