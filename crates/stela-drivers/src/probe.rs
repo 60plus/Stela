@@ -699,6 +699,39 @@ fn unsupported(class: [u8; 3]) -> Option<&'static str> {
     }
 }
 
+/// A PCI-to-ISA bridge as the scan read it, without a write. Intel's display
+/// code finds the PCH by the bridge's IDs (`intel_pch.c`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IsaBridge {
+    pub identity: crate::bus::pci::Identity,
+    pub revision: u8,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+}
+
+impl IsaBridge {
+    /// `function`'s, when its class is a PCI-to-ISA bridge's and its
+    /// revision and subsystem IDs read.
+    fn read<C: crate::bus::pci::ConfigSpace>(
+        function: &mut crate::bus::pci::Function<C>,
+    ) -> Option<Self> {
+        use crate::bus::pci::regs;
+        if function.class[..2] != [0x06, 0x01] {
+            return None;
+        }
+        let identity = function.identity();
+        let config = function.config();
+        let revision = config.read8(regs::CLASS_REVISION).ok()?;
+        let subsystem = config.read32(regs::SUBSYSTEM_VENDOR_ID).ok()?;
+        Some(Self {
+            identity,
+            revision,
+            subsystem_vendor: subsystem as u16,
+            subsystem_device: (subsystem >> 16) as u16,
+        })
+    }
+}
+
 /// Every block and input device the drivers brought up, and every
 /// controller they could not.
 #[derive(Default)]
@@ -709,6 +742,9 @@ pub struct Devices {
     /// Display controllers, inventoried without changing firmware scanout.
     /// These are not initialized accelerators; each records its missing port.
     pub gpus: Vec<gpu::Adapter>,
+    /// PCI-to-ISA bridges as their configuration reads, which no driver
+    /// here takes: a GPU's kernel driver names the chipset by them.
+    pub isa_bridges: Vec<IsaBridge>,
     /// Host keyboards and pointers: virtio-input devices, USB HID devices
     /// behind xHCI controllers, and the i8042 ports the ACPI namespace
     /// lists, each polled through [`InputDevice::poll`].
@@ -1719,6 +1755,7 @@ pub unsafe fn probe_observed(
             if function.class[0] == 0x02 {
                 devices.network_functions.push(function.identity());
             }
+            devices.isa_bridges.extend(IsaBridge::read(&mut function));
             // A network adapter joins the links, or its failure is recorded.
             macro_rules! attach_link {
                 ($attached:expr, $variant:path) => {{
@@ -3630,15 +3667,18 @@ mod tests {
     }
 
     /// A GPU's HDMI/DP audio function is recorded as not driven and never
-    /// prepared, so it stays parked for the GPU's Secondary Bus Reset.
+    /// prepared, so it stays parked for the GPU's Secondary Bus Reset. A
+    /// PCI-to-ISA bridge is recorded as it reads and not prepared either.
     #[test]
     fn a_gpus_audio_function_is_never_prepared() {
         let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
         // 00:00.0 a multi-function NVIDIA display controller, 00:00.1 its
-        // HD Audio function, whose identity the HD Audio driver admits.
+        // HD Audio function, whose identity the HD Audio driver admits,
+        // 00:00.2 a PCI-to-ISA bridge.
         for (function, id, class, header) in [
             (0, 0x10de_2c02u32, 0x0300_0000u32, 0x0080_0000u32),
             (1, 0x10de_22e9, 0x0403_0000, 0x0080_0000),
+            (2, 0x8086_5182, 0x0601_0001, 0x0080_0000),
         ] {
             let start = function * 4096 / 4;
             let page = &mut ecam[start..start + 4096 / 4];
@@ -3646,6 +3686,7 @@ mod tests {
             page[0] = (id & 0xffff) << 16 | id >> 16;
             page[2] = class;
             page[3] = header;
+            page[11] = 0x22e7_17aa;
         }
         let window = EcamWindow {
             base: ecam.as_mut_ptr() as u64,
@@ -3687,6 +3728,23 @@ mod tests {
         };
         assert!(services.preparations.borrow().is_empty());
         assert!(services.requests.borrow().is_empty());
+        assert_eq!(
+            devices.isa_bridges,
+            [IsaBridge {
+                identity: crate::bus::pci::Identity {
+                    address: Address {
+                        function: 2,
+                        ..audio
+                    },
+                    vendor: 0x8086,
+                    device: 0x5182,
+                    class: [0x06, 0x01, 0x00],
+                },
+                revision: 0x01,
+                subsystem_vendor: 0x17aa,
+                subsystem_device: 0x22e7,
+            }]
+        );
         assert!(devices.failures.iter().all(|(at, _)| *at != audio));
         assert!(
             devices
