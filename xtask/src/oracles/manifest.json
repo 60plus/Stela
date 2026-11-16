@@ -4830,6 +4830,14 @@
   },
   {
     "package": "stela-engine",
+    "test": "memo_replay_of_threads_on_pes",
+    "source": "crates/stela-engine/src/machine/engine/pointer/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss measurement over a modelled desktop on eight PEs with the census; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",

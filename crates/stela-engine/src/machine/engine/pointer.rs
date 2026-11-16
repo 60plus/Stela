@@ -711,6 +711,9 @@ fn complete_with(
 mod native_tests;
 
 #[cfg(test)]
+mod replay;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
