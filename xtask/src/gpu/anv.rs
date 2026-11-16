@@ -6,8 +6,12 @@
 //! binds and submissions without running them
 //! (`intel/hosted/xe_noop_drm_shim.c`, on Mesa's DRM shim). For each
 //! platform xe binds, the program creates ANV's device, builds a compute
-//! pipeline through BRW and submits one dispatch (`intel/tests/anv_device.c`);
-//! every xe ioctl ANV made must be one Stela's xe registers.
+//! pipeline through BRW from SPIR-V and one from NIR, as the Metal device
+//! passes the AIR compiler's NIR, and submits one dispatch
+//! (`intel/tests/anv_device.c`); every xe ioctl ANV made must be one Stela's
+//! xe registers. It also counts the platforms where ANV meets the Metal
+//! device's Vulkan requirements and reads and writes Metal's tier 2
+//! read-write texture formats.
 //!
 //! Needs what ANV's image build needs (`clc.rs`: mesa_clc's LLVM, Clang,
 //! SPIRV-LLVM-Translator and SPIRV-Tools, and glslang) and the host's
@@ -114,6 +118,7 @@ pub fn test(jobs: u16) -> Result<()> {
     ensure!(!registered.is_empty(), "xe_device.c registers no ioctl");
     let mut failures = Vec::new();
     let mut metal = 0;
+    let mut read_write = 0;
     for (device, name, discrete) in PLATFORMS {
         let run = Command::new(&program)
             .args([device, if discrete { "discrete" } else { "integrated" }])
@@ -140,6 +145,7 @@ pub fn test(jobs: u16) -> Result<()> {
         ) {
             (true, false, true) => {
                 metal += usize::from(stdout.contains(METAL_MET));
+                read_write += usize::from(stdout.contains(READ_WRITE_MET));
                 println!("{name}: {}", stdout.trim());
                 println!(
                     "  xe ioctls: {}",
@@ -168,7 +174,8 @@ pub fn test(jobs: u16) -> Result<()> {
     );
     println!(
         "ANV ran on xe's ioctls for {} platforms, with no GPU; the Metal device's Vulkan \
-         requirements are met on {metal} of them",
+         requirements are met on {metal} of them, and Metal's tier 2 read-write texture \
+         formats on {read_write}",
         PLATFORMS.len()
     );
     Ok(())
@@ -176,6 +183,9 @@ pub fn test(jobs: u16) -> Result<()> {
 
 /// What the test program prints for a device the Metal device admits.
 const METAL_MET: &str = "Metal device: every requirement met";
+/// What it prints for a device that reads and writes every format of
+/// Metal's read-write texture tier 2.
+const READ_WRITE_MET: &str = "Metal read-write textures: every tier 2 format read and written";
 
 /// Builds the shim and the test program; their paths.
 fn link_test(
@@ -249,6 +259,10 @@ fn link_test(
         (
             "compat/mesa/drm.c",
             vec![libc.clone(), "-fvisibility=default".to_owned()],
+        ),
+        (
+            "intel/tests/anv_nir_shader.c",
+            vec!["-Wno-missing-prototypes".to_owned()],
         ),
         (
             "intel/tests/anv_device.c",

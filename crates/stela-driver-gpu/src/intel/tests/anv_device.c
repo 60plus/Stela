@@ -6,17 +6,22 @@
  * (intel/hosted/xe_noop_drm_shim.c) preloaded. It creates the instance and
  * the device of the one GPU the shim shows, checks what Vulkan reports of it
  * against the expected device, asks the hook for each stage's NIR options,
- * builds a compute pipeline (BRW compiles it; its statistics count the
- * instructions and code bytes), and records, submits and waits for one dispatch, which the
- * shim accepts without running it.
+ * builds a compute pipeline from SPIR-V (BRW compiles it; its statistics count
+ * the instructions and code bytes) and one from NIR built with the hook's
+ * options, as the Metal device passes the AIR compiler's NIR
+ * (intel/tests/anv_nir_shader.c: a formatless storage image read, which
+ * Metal's read-write textures need), and records, submits and waits for one
+ * dispatch, which the shim accepts without running it.
  *
  * It also says which of the Metal device's Vulkan requirements ANV does not
- * meet on the device, which is no failure of this test: the Metal device
- * refuses such a device when it opens.
+ * meet on the device, and which of Metal's tier 2 read-write texture formats
+ * ANV cannot read and write without a format, which is no failure of this
+ * test: the Metal device refuses such a device, or reports the tier absent,
+ * when it opens.
  *
  * Usage: anv_device DEVICE-ID integrated|discrete
- * Prints a "Metal device: ..." line and a line "ANV on xe: ..." and exits 0,
- * or names the failed check. */
+ * Prints a "Metal device: ..." line, a "Metal read-write textures: ..." line
+ * and a line "ANV on xe: ..." and exits 0, or names the failed check. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +48,17 @@
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance, const char *);
 const void *stela_anv_nir_options(VkPhysicalDevice physical, unsigned stage);
+void *stela_anv_test_nir(const void *options);
+void stela_anv_test_nir_free(void *shader);
+
+/* Mesa's `VkPipelineShaderStageNirCreateInfoMESA` (vk_internal_exts.h): a
+ * stage without a module takes its NIR from it. */
+#define STRUCTURE_TYPE_NIR_STAGE ((VkStructureType)1000290001)
+struct nir_stage {
+	VkStructureType sType;
+	const void *pNext;
+	const void *nir;
+};
 
 static uint16_t expected_device;
 /* How often the libdrm stand-in asked for the device: never would mean
@@ -184,6 +200,100 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 	printf(lacking ? "\n" : "Metal device: every requirement met\n");
 }
 
+/* Metal's tier 2 read-write texture formats, tier 1's first
+ * (`metal::capabilities::read_write_tier`), that the device cannot read and
+ * write as storage images without a format, printed as one line. */
+static void report_read_write_formats(VkInstance instance, VkPhysicalDevice physical)
+{
+	LOAD(instance, vkGetPhysicalDeviceFormatProperties2);
+	const struct {
+		const char *name;
+		VkFormat format;
+	} formats[] = {
+		{"R32Float", VK_FORMAT_R32_SFLOAT},
+		{"R32Uint", VK_FORMAT_R32_UINT},
+		{"R32Sint", VK_FORMAT_R32_SINT},
+		{"RGBA32Float", VK_FORMAT_R32G32B32A32_SFLOAT},
+		{"RGBA32Uint", VK_FORMAT_R32G32B32A32_UINT},
+		{"RGBA32Sint", VK_FORMAT_R32G32B32A32_SINT},
+		{"RGBA16Float", VK_FORMAT_R16G16B16A16_SFLOAT},
+		{"RGBA16Uint", VK_FORMAT_R16G16B16A16_UINT},
+		{"RGBA16Sint", VK_FORMAT_R16G16B16A16_SINT},
+		{"RGBA8Unorm", VK_FORMAT_R8G8B8A8_UNORM},
+		{"RGBA8Uint", VK_FORMAT_R8G8B8A8_UINT},
+		{"RGBA8Sint", VK_FORMAT_R8G8B8A8_SINT},
+		{"R16Float", VK_FORMAT_R16_SFLOAT},
+		{"R16Uint", VK_FORMAT_R16_UINT},
+		{"R16Sint", VK_FORMAT_R16_SINT},
+		{"R8Unorm", VK_FORMAT_R8_UNORM},
+		{"R8Uint", VK_FORMAT_R8_UINT},
+		{"R8Sint", VK_FORMAT_R8_SINT},
+	};
+	const VkFormatFeatureFlags2 needed = VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+					     VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+					     VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+	int lacking = 0;
+	for (unsigned index = 0; index < sizeof(formats) / sizeof(formats[0]); index++) {
+		VkFormatProperties3 features = {
+			.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3,
+		};
+		VkFormatProperties2 properties = {
+			.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+			.pNext = &features,
+		};
+		vkGetPhysicalDeviceFormatProperties2(physical, formats[index].format, &properties);
+		if ((features.optimalTilingFeatures & needed) == needed)
+			continue;
+		printf("%s%s", lacking ? ", " : "Metal read-write textures: ANV cannot read and write ",
+		       formats[index].name);
+		lacking = 1;
+	}
+	printf(lacking ? " without a format\n"
+		       : "Metal read-write textures: every tier 2 format read and written\n");
+}
+
+/* BRW's code for `pipeline`: its executables' instructions and code bytes. */
+static void brw_statistics(VkDevice device,
+			   PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR,
+			   PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR,
+			   VkPipeline pipeline, uint64_t *instructions, uint64_t *code_bytes)
+{
+	const VkPipelineInfoKHR pipeline_info = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR,
+		.pipeline = pipeline,
+	};
+	uint32_t executable_count = 0;
+	VK(vkGetPipelineExecutablePropertiesKHR(device, &pipeline_info, &executable_count, NULL));
+	CHECK(executable_count >= 1);
+	*instructions = 0;
+	*code_bytes = 0;
+	for (uint32_t executable = 0; executable < executable_count; executable++) {
+		const VkPipelineExecutableInfoKHR info = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
+			.pipeline = pipeline,
+			.executableIndex = executable,
+		};
+		VkPipelineExecutableStatisticKHR statistics[32];
+		uint32_t statistic_count = 32;
+		for (uint32_t i = 0; i < statistic_count; i++)
+			statistics[i] = (VkPipelineExecutableStatisticKHR){
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR,
+			};
+		VkResult result =
+			vkGetPipelineExecutableStatisticsKHR(device, &info, &statistic_count, statistics);
+		CHECK(result == VK_SUCCESS || result == VK_INCOMPLETE);
+		for (uint32_t i = 0; i < statistic_count; i++) {
+			if (statistics[i].format != VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR)
+				continue;
+			if (!strcmp(statistics[i].name, "Instructions"))
+				*instructions += statistics[i].value.u64;
+			else if (!strcmp(statistics[i].name, "Code size"))
+				*code_bytes += statistics[i].value.u64;
+		}
+	}
+	CHECK(*instructions > 0 && *code_bytes > 0);
+}
+
 int main(int argc, char **argv)
 {
 	CHECK(argc == 3);
@@ -232,6 +342,7 @@ int main(int argc, char **argv)
 	CHECK(properties.properties.deviceType == expected_type);
 	CHECK(driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
 	report_metal_requirements(instance, physical);
+	report_read_write_formats(instance, physical);
 
 	/* The hook answers one set per stage, and none past Mesa's stages. */
 	const void *options[STAGES];
@@ -364,39 +475,70 @@ int main(int argc, char **argv)
 		NULL, &pipeline));
 
 	/* BRW's code: each executable's instruction count. */
-	const VkPipelineInfoKHR pipeline_info = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR,
-		.pipeline = pipeline,
+	uint64_t instructions, code_bytes;
+	brw_statistics(device, vkGetPipelineExecutablePropertiesKHR,
+		       vkGetPipelineExecutableStatisticsKHR, pipeline, &instructions, &code_bytes);
+
+	/* The same through NIR: a formatless read of one storage image written to
+	 * another, from NIR built with the hook's compute options. */
+	VkDescriptorSetLayout image_layout;
+	VK(vkCreateDescriptorSetLayout(
+		device,
+		&(VkDescriptorSetLayoutCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+			.bindingCount = 2,
+			.pBindings =
+				(VkDescriptorSetLayoutBinding[]){
+					{
+						.binding = 0,
+						.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+						.descriptorCount = 1,
+						.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+					},
+					{
+						.binding = 1,
+						.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+						.descriptorCount = 1,
+						.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+					},
+				},
+		},
+		NULL, &image_layout));
+	VkPipelineLayout image_pipeline_layout;
+	VK(vkCreatePipelineLayout(device,
+				  &(VkPipelineLayoutCreateInfo){
+					  .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+					  .setLayoutCount = 1,
+					  .pSetLayouts = &image_layout,
+				  },
+				  NULL, &image_pipeline_layout));
+	void *nir = stela_anv_test_nir(options[STAGES - 1]);
+	CHECK(nir);
+	const struct nir_stage nir_stage = {
+		.sType = STRUCTURE_TYPE_NIR_STAGE,
+		.nir = nir,
 	};
-	uint32_t executable_count = 0;
-	VK(vkGetPipelineExecutablePropertiesKHR(device, &pipeline_info, &executable_count, NULL));
-	CHECK(executable_count >= 1);
-	uint64_t instructions = 0, code_bytes = 0;
-	for (uint32_t executable = 0; executable < executable_count; executable++) {
-		const VkPipelineExecutableInfoKHR info = {
-			.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
-			.pipeline = pipeline,
-			.executableIndex = executable,
-		};
-		VkPipelineExecutableStatisticKHR statistics[32];
-		uint32_t statistic_count = 32;
-		for (uint32_t i = 0; i < statistic_count; i++)
-			statistics[i] = (VkPipelineExecutableStatisticKHR){
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR,
-			};
-		VkResult result =
-			vkGetPipelineExecutableStatisticsKHR(device, &info, &statistic_count, statistics);
-		CHECK(result == VK_SUCCESS || result == VK_INCOMPLETE);
-		for (uint32_t i = 0; i < statistic_count; i++) {
-			if (statistics[i].format != VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR)
-				continue;
-			if (!strcmp(statistics[i].name, "Instructions"))
-				instructions += statistics[i].value.u64;
-			else if (!strcmp(statistics[i].name, "Code size"))
-				code_bytes += statistics[i].value.u64;
-		}
-	}
-	CHECK(instructions > 0 && code_bytes > 0);
+	VkPipeline nir_pipeline;
+	VK(vkCreateComputePipelines(
+		device, VK_NULL_HANDLE, 1,
+		&(VkComputePipelineCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR,
+			.stage =
+				{
+					.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+					.pNext = &nir_stage,
+					.stage = VK_SHADER_STAGE_COMPUTE_BIT,
+					.pName = "main",
+				},
+			.layout = image_pipeline_layout,
+		},
+		NULL, &nir_pipeline));
+	stela_anv_test_nir_free(nir);
+	uint64_t nir_instructions, nir_code_bytes;
+	brw_statistics(device, vkGetPipelineExecutablePropertiesKHR,
+		       vkGetPipelineExecutableStatisticsKHR, nir_pipeline, &nir_instructions,
+		       &nir_code_bytes);
 
 	/* One dispatch over a host-visible buffer, submitted and waited for. */
 	const VkDeviceSize bytes = 64 * sizeof(uint32_t);
@@ -516,6 +658,9 @@ int main(int argc, char **argv)
 	vkDestroyDescriptorPool(device, pool, NULL);
 	vkDestroyBuffer(device, buffer, NULL);
 	vkFreeMemory(device, allocation, NULL);
+	vkDestroyPipeline(device, nir_pipeline, NULL);
+	vkDestroyPipelineLayout(device, image_pipeline_layout, NULL);
+	vkDestroyDescriptorSetLayout(device, image_layout, NULL);
 	vkDestroyPipeline(device, pipeline, NULL);
 	vkDestroyPipelineLayout(device, layout, NULL);
 	vkDestroyDescriptorSetLayout(device, set_layout, NULL);
@@ -523,8 +668,10 @@ int main(int argc, char **argv)
 	vkDestroyDevice(device, NULL);
 	vkDestroyInstance(instance, NULL);
 	printf("ANV on xe: %s (0x%04x, %s), NIR options for %u stages, compute pipeline of %llu "
-	       "instructions in %llu bytes, one dispatch submitted\n",
+	       "instructions in %llu bytes from SPIR-V and of %llu instructions in %llu bytes "
+	       "from NIR, one dispatch submitted\n",
 	       properties.properties.deviceName, expected_device, argv[2], STAGES,
-	       (unsigned long long)instructions, (unsigned long long)code_bytes);
+	       (unsigned long long)instructions, (unsigned long long)code_bytes,
+	       (unsigned long long)nir_instructions, (unsigned long long)nir_code_bytes);
 	return 0;
 }
