@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod anv;
 mod clc;
 pub mod fetch;
+mod hosted;
 mod llvm;
 mod mesa;
 mod metal_suite;
