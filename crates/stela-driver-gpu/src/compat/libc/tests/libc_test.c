@@ -2,9 +2,12 @@
 /* The C library against the C standard's answers, as a static Linux program:
  * `cargo xtask gpu nvk` builds and runs it. */
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <inttypes.h>
+#include <link.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -258,6 +261,32 @@ static void test_refusals(void)
 	errno = 0;
 	CHECK(poll(&file, 1, 0) == -1);
 	CHECK(errno == ENOSYS);
+	errno = 0;
+	CHECK(mkfifoat(AT_FDCWD, "control", 0600) == -1 && errno == EACCES);
+	errno = 0;
+	CHECK(openat(AT_FDCWD, "control", O_RDONLY | O_NONBLOCK) == -1 && errno == ENOENT);
+	errno = 0;
+	CHECK(openat(3, "control", O_RDONLY) == -1 && errno == EBADF);
+	CHECK(imaxabs(-INTMAX_MAX) == INTMAX_MAX);
+}
+
+static int objects;
+
+static int count_object(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)info;
+	(void)size;
+	(void)data;
+	return ++objects;
+}
+
+static void test_loading(void)
+{
+	Dl_info info;
+	CHECK(!dlopen("libvulkan.so.1", RTLD_NOW));
+	CHECK(!dladdr((const void *)test_loading, &info));
+	/* No ELF object, so no callback. */
+	CHECK(!dl_iterate_phdr(count_object, NULL) && !objects);
 }
 
 static void test_division(void)
@@ -658,6 +687,7 @@ int main(void)
 	test_anonymous_files();
 	test_meminfo();
 	test_refusals();
+	test_loading();
 	test_division();
 	test_system();
 	test_wide();

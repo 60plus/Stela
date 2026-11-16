@@ -162,11 +162,11 @@ pub(super) const LATE_DEFINES: [&str; 3] = [
     "VK_USE_PLATFORM_DISPLAY_KHR",
     "VK_USE_PLATFORM_HEADLESS_EXT",
 ];
-/// What the image has without the probes finding it: `HAVE_DL_ITERATE_PHDR`
-/// declares the build ID that `compat/mesa/build_id.c` provides.
-pub(super) const ADDED_DEFINES: [&str; 6] = [
+/// What the image has without the probes finding it. Meson's probe finds the
+/// C library's `dl_iterate_phdr` and then declares the build ID that
+/// `compat/mesa/build_id.c` provides.
+pub(super) const ADDED_DEFINES: [&str; 5] = [
     "STELA_LIBC",
-    "HAVE_DL_ITERATE_PHDR",
     "BLAKE3_NO_SSE2",
     "BLAKE3_NO_SSE41",
     "BLAKE3_NO_AVX2",

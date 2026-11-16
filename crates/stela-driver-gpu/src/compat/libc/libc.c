@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <link.h>
 #include <locale.h>
 #include <math.h>
 #include <poll.h>
@@ -470,6 +471,11 @@ long long llabs(long long value)
 	return value < 0 ? -value : value;
 }
 
+intmax_t imaxabs(intmax_t value)
+{
+	return value < 0 ? -value : value;
+}
+
 static unsigned int random_state = 1;
 
 void srand(unsigned int seed)
@@ -866,6 +872,13 @@ int open(const char *path, int flags, ...)
 	return checked(stela_libc_drm_open((unsigned int)strtoul(path + sizeof(prefix) - 1, NULL, 10)));
 }
 
+int openat(int directory, const char *path, int flags, ...)
+{
+	if (directory != AT_FDCWD && path[0] != '/')
+		return fail(EBADF);
+	return open(path, flags);
+}
+
 int close(int fd)
 {
 	struct text_file *text = text_file(fd);
@@ -1007,6 +1020,14 @@ int lstat(const char *path, struct stat *result)
 
 int mkdir(const char *path, mode_t mode)
 {
+	(void)path;
+	(void)mode;
+	return fail(EACCES);
+}
+
+int mkfifoat(int directory, const char *path, mode_t mode)
+{
+	(void)directory;
 	(void)path;
 	(void)mode;
 	return fail(EACCES);
@@ -1167,6 +1188,14 @@ int dladdr(const void *address, Dl_info *info)
 {
 	(void)address;
 	(void)info;
+	return 0;
+}
+
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data),
+		    void *data)
+{
+	(void)callback;
+	(void)data;
 	return 0;
 }
 
