@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 use alloc::{boxed::Box, vec};
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use stela_boot_core::firmware_screen;
 use stela_boot_core::staged_frame::StagedFrame;
 use stela_contracts::refuse;
 use stela_formats::boot_bundle;
@@ -455,12 +454,10 @@ impl GopScanout {
     /// This scanout shows frames a bound GPU drew while no output of any
     /// GPU has a display: on a PC whose screen is wired to another adapter,
     /// as a laptop with no display mux wires its panel to the integrated
-    /// GPU. Every frame is copied by the CPU, so the guest's display runs at
-    /// [`firmware_screen::COPIED_REFRESH_MILLIHERTZ`] at most, which the DCP
-    /// model advertises and paces macOS by. Said once in the log and on the
-    /// boot screen.
-    pub fn copying_gpu_frames(mut self) -> Self {
-        self.refresh_millihertz = firmware_screen::copied_refresh(self.refresh_millihertz);
+    /// GPU. The CPU copies each frame's changed rows, at the panel's rate
+    /// as its EDID prefers it, which the DCP model advertises and paces
+    /// macOS by. Said once in the log and on the boot screen.
+    pub fn copying_gpu_frames(self) -> Self {
         let ScanoutMode { width, height, .. } = self.mode;
         output::arguments(format_args!(
             "DISPLAY no GPU output has a display: macOS is drawn on the GPU and copied to the \

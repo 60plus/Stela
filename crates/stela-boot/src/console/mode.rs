@@ -59,16 +59,8 @@ pub(super) fn size_mm() -> Option<(u32, u32)> {
 /// lists at.
 pub(super) fn refresh(width: usize, height: usize) -> u32 {
     let native = NATIVE.0.try_borrow().ok().and_then(|native| *native);
-    match native {
-        Some((w, h, refresh))
-            if usize::try_from(w).ok() == Some(width)
-                && usize::try_from(h).ok() == Some(height)
-                && display::guest_takes_at(w, h, refresh) =>
-        {
-            refresh
-        }
-        _ => stela_soc::scanout::DEFAULT_REFRESH_MILLIHERTZ,
-    }
+    let size = |pixels: usize| u32::try_from(pixels).unwrap_or(u32::MAX);
+    display::screen_refresh(native, size(width), size(height))
 }
 
 /// `1920x1080 Bgr`.

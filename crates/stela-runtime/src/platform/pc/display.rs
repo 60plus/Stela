@@ -238,6 +238,19 @@ pub fn guest_takes(width: u32, height: u32) -> bool {
     guest_takes_at(width, height, DEFAULT_REFRESH_MILLIHERTZ)
 }
 
+/// The refresh in millihertz a `width` by `height` screen runs at, given
+/// the EDID's preferred timing `native` as width, height and millihertz:
+/// that timing's when it is the screen's size and the guest's display can
+/// advertise it, else 60 Hz, which every monitor runs a mode it lists at.
+pub fn screen_refresh(native: Option<(u32, u32, u32)>, width: u32, height: u32) -> u32 {
+    match native {
+        Some((w, h, refresh)) if (w, h) == (width, height) && guest_takes_at(w, h, refresh) => {
+            refresh
+        }
+        _ => DEFAULT_REFRESH_MILLIHERTZ,
+    }
+}
+
 /// Whether the DCP model can advertise a `width` by `height` screen at
 /// `refresh` millihertz.
 pub fn guest_takes_at(width: u32, height: u32, refresh: u32) -> bool {
@@ -548,6 +561,26 @@ mod tests {
         assert_eq!(
             choose(&modes, 1, Some((1920, 1920))),
             Some((modes[1], Reason::OtherShape))
+        );
+    }
+
+    #[test]
+    fn a_screen_runs_at_its_edids_preferred_rate_in_its_native_size() {
+        let native = Some((1600, 900, 240_000));
+        assert_eq!(screen_refresh(native, 1600, 900), 240_000);
+        assert_eq!(
+            screen_refresh(Some((2560, 1440, 239_970)), 2560, 1440),
+            239_970
+        );
+        assert_eq!(
+            screen_refresh(native, 1280, 800),
+            DEFAULT_REFRESH_MILLIHERTZ
+        );
+        assert_eq!(screen_refresh(None, 1600, 900), DEFAULT_REFRESH_MILLIHERTZ);
+        // A timing the guest's display cannot publish is not run.
+        assert_eq!(
+            screen_refresh(Some((5120, 2880, 60_000)), 5120, 2880),
+            DEFAULT_REFRESH_MILLIHERTZ
         );
     }
 }
