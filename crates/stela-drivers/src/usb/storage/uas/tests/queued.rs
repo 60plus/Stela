@@ -654,8 +654,10 @@ fn a_stalled_or_hung_tag_resets_the_device_and_each_running_command_runs_again()
     }
 }
 
+/// Linux requeues a command a reset ended, and one that failed, while it
+/// has retries left: each read runs again after each of the two resets.
 #[test]
-fn a_command_a_second_reset_ends_after_its_one_more_run_fails() {
+fn commands_two_resets_end_run_again_within_their_retries() {
     let mut memory = vec![0u64; 512 * 1024];
     let (mut disk, device, _owner) = stack(&mut memory, 32);
     let lbas: Vec<u64> = (0..3).map(|i| 512 + i * 8).collect();
@@ -670,11 +672,9 @@ fn a_command_a_second_reset_ends_after_its_one_more_run_fails() {
         .map(|&lba| disk.start(Command::Read { lba, bytes: 4096 }).unwrap())
         .collect();
     let results = drain(&mut disk, &device, &tags);
-    assert_eq!(results[&tags[0]], Ok(Some(vec![0x5a; 4096])));
-    assert_eq!(results[&tags[1]], Err(BlockError::Device { status: STALL }));
-    // The second reset found the third read running again, its one more
-    // run spent: it ends, as Linux fails a command past its retries.
-    assert_eq!(results[&tags[2]], Err(media::RESET_ENDED));
+    for tag in &tags {
+        assert_eq!(results[tag], Ok(Some(vec![0x5a; 4096])));
+    }
     assert_eq!(device.borrow().resets, 2);
 }
 

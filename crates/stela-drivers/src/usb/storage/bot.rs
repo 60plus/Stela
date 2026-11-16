@@ -41,7 +41,8 @@ const RESET_RECOVERY_US: u64 = 6_000_000;
 const MAX_LUN: u8 = 15;
 /// xHCI completion code 22: the slot must be retired, not cancelled.
 const INCOMPATIBLE_DEVICE: u32 = 22;
-const PROTOCOL_ERROR: BlockError = BlockError::Protocol("malformed Bulk-Only wrapper or transfer");
+pub(super) const PROTOCOL_ERROR: BlockError =
+    BlockError::Protocol("malformed Bulk-Only wrapper or transfer");
 const SHORT_WRITE: BlockError = BlockError::Protocol("short Bulk-Only write");
 
 pub(super) fn supported(device: &Device) -> Result<(), &'static str> {

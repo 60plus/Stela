@@ -51,7 +51,8 @@ const WRITE_READY_IU: u8 = 7;
 const TIMEOUT_US: u64 = 30_000_000;
 const IU_BUFFER_BYTES: usize = 512;
 const MAX_CDB: usize = 260;
-const PROTOCOL_ERROR: BlockError = BlockError::Protocol("malformed UAS information unit");
+pub(super) const PROTOCOL_ERROR: BlockError =
+    BlockError::Protocol("malformed UAS information unit");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pipe {

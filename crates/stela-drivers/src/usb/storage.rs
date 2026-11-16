@@ -25,6 +25,8 @@ use stela_driver_base::stepped::block_on;
 mod media;
 pub use media::UsbStorage;
 mod bot;
+mod recovery;
+pub use recovery::{Cause, End, Recovery, Step, take_recoveries};
 mod scsi;
 pub mod uas;
 use bot::{Bot, Io, Native};

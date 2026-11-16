@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Linux sd.c::sd_check_events/media_not_present/sd_revalidate_disk and
 // scsi_lib.c::scsi_io_completion_action. See NOTICE.
+use super::recovery::{Ladder, Step};
 use super::resume::{OTHER_IDENTITY, OTHER_MEDIUM, UNCHECKED_MEDIUM};
 use super::*;
 
@@ -121,16 +122,18 @@ struct Begun<L> {
     generation: u64,
     /// A UNIT ATTENTION after a reset may still retry this attempt.
     attention: bool,
-    /// A command a port reset ended may still run once more.
-    rebound: bool,
+    /// Its runs down the recovery ladder ([`Ladder`]).
+    ladder: Ladder,
     /// The unit's first blocks once the command completes, where it
     /// writes them ([`Owner::first_blocks_after`]).
     first_blocks: Option<Option<Vec<u8>>>,
 }
 /// A command begun without waiting: running on the transport under its
-/// handle there, or ended with its result.
+/// handle there, waiting to run again until the transport's recovery has
+/// settled and it has room, or ended with its result.
 enum Queued<L> {
     Running(Begun<L>, usize),
+    Waiting(Begun<L>),
     Ended(Result<Vec<u8>, BlockError>),
 }
 /// A begun command's data, kept for its retry.
@@ -295,6 +298,11 @@ impl<T: Scsi> Owner<T> {
             .collect();
     }
 
+    /// Run `command` on a published unit down the recovery ladder: a
+    /// transport error, or any failure a port reset ended, runs it again
+    /// once the transport's recovery has settled, as Linux's SCSI midlayer
+    /// requeues a `DID_ERROR` or `DID_RESET` command within sd's retries
+    /// and runtime ([`Ladder`]). A unit not yet published runs it once.
     fn run<R>(
         &mut self,
         lun: T::Lun,
@@ -302,14 +310,47 @@ impl<T: Scsi> Owner<T> {
         mut command: impl FnMut(&mut T) -> Result<R, BlockError>,
     ) -> Result<R, BlockError> {
         self.end_first();
-        self.rebound = false;
-        let mut result = self.attempt(lun, cdb, &mut command);
-        // Linux's SCSI error handler retries the command a reset ended.
-        if result.is_err() && core::mem::take(&mut self.rebound) && self.valid(lun) {
-            result = self.attempt(lun, cdb, &mut command);
+        let published = self.units.iter().any(|unit| unit.lun == lun);
+        let mut ladder = Ladder::new(self.transport.now_us());
+        loop {
             self.rebound = false;
+            let generation = self.transport.generation();
+            let result = self.attempt(lun, cdb, &mut command);
+            let rebound = core::mem::take(&mut self.rebound);
+            let Err(error) = &result else {
+                ladder.completed();
+                return result;
+            };
+            let step = self.step(generation, rebound);
+            if !published || !ladder.again(error, step, self.transport.now_us(), self.usable(lun)) {
+                return result;
+            }
         }
-        result
+    }
+
+    /// The step of the recovery ladder that ran since a command began at
+    /// transport generation `generation`; `rebound` when a port reset
+    /// replaced the transport.
+    fn step(&self, generation: u64, rebound: bool) -> Step {
+        if rebound {
+            Step::PortReset
+        } else if generation != self.transport.generation() {
+            Step::ClassReset
+        } else {
+            Step::Again
+        }
+    }
+
+    /// Whether `lun` is published, valid, on a transport that takes commands.
+    fn usable(&self, lun: T::Lun) -> bool {
+        self.valid(lun) && !self.transport.poisoned()
+    }
+
+    /// Whether a command waits to run again ([`Queued::Waiting`]).
+    fn waiting(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|queued| matches!(queued, Some(Queued::Waiting(_))))
     }
 
     /// One run of `command` and what its end means for the units.
@@ -350,7 +391,10 @@ impl<T: Scsi> Owner<T> {
         loop {
             let mut running = false;
             for handle in 0..self.commands.len() {
-                if !matches!(self.commands[handle], Some(Queued::Running(..))) {
+                if !matches!(
+                    self.commands[handle],
+                    Some(Queued::Running(..) | Queued::Waiting(_))
+                ) {
                     continue;
                 }
                 match self.end_begun(handle) {
@@ -405,8 +449,9 @@ impl<T: Scsi> Owner<T> {
 
     /// Command `handle`'s result once it has one, after the retries
     /// [`Self::run`] makes of a waiting command: once for a UNIT ATTENTION
-    /// a reset raised, and once more after a port reset rebound the
-    /// transport. A retry begins at once; its result comes at a later look.
+    /// a reset raised, and down the recovery ladder ([`Ladder`]) after a
+    /// transport error or a port reset. A retry begins once the transport
+    /// has room; its result comes at a later look.
     fn end_begun(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
         match self.commands.get(handle)? {
             None => None,
@@ -420,6 +465,16 @@ impl<T: Scsi> Owner<T> {
                     return None;
                 };
                 self.ended_with(handle, begun, result)
+            }
+            // Its run again begins once the transport has room.
+            Some(Queued::Waiting(_)) => {
+                if !self.transport.room() {
+                    return None;
+                }
+                let Some(Queued::Waiting(begun)) = self.commands[handle].take() else {
+                    return None;
+                };
+                self.retry(handle, begun)
             }
         }
     }
@@ -451,14 +506,19 @@ impl<T: Scsi> Owner<T> {
         }
         self.settle(begun.generation, &result);
         let rebound = core::mem::take(&mut self.rebound);
-        if result.is_err()
-            && rebound
-            && core::mem::take(&mut begun.rebound)
-            && self.valid(begun.lun)
-        {
-            begun.attention = true;
-            begun.generation = self.transport.generation();
-            return self.retry(handle, begun);
+        match &result {
+            Err(error) => {
+                let step = self.step(begun.generation, rebound);
+                let usable = self.usable(begun.lun);
+                if begun
+                    .ladder
+                    .again(error, step, self.transport.now_us(), usable)
+                {
+                    begun.attention = true;
+                    return self.retry(handle, begun);
+                }
+            }
+            Ok(_) => begun.ladder.completed(),
         }
         if result.is_ok()
             && let Some(Some(first)) = begun.first_blocks
@@ -468,13 +528,25 @@ impl<T: Scsi> Owner<T> {
         Some(result)
     }
 
-    /// Begin `begun` again: `None` while it runs, its failure to begin as
-    /// its result.
+    /// Begin `begun` again: `None` while it runs or waits for the
+    /// transport's recovery to settle ([`Queued::Waiting`]), its failure to
+    /// begin as its result. A class reset that completed since it began
+    /// raises the UNIT ATTENTION its run again may meet first.
     fn retry(
         &mut self,
         handle: usize,
-        begun: Begun<T::Lun>,
+        mut begun: Begun<T::Lun>,
     ) -> Option<Result<Vec<u8>, BlockError>> {
+        if !self.transport.room() {
+            self.store(handle, Queued::Waiting(begun));
+            return None;
+        }
+        let generation = self.transport.generation();
+        if generation != begun.generation {
+            self.expecting_reset = true;
+            begun.ladder.reached(Step::ClassReset);
+        }
+        begun.generation = generation;
         match self.begin_attempt(handle, begun)? {
             Ok(()) => None,
             Err(error) => Some(Err(error)),
@@ -482,9 +554,9 @@ impl<T: Scsi> Owner<T> {
     }
 
     /// The commands still running on a transport a device reset replaced:
-    /// each that may run once more begins again on the new one, as Linux's
-    /// SCSI error handling retries the commands a uas host reset ended
-    /// (`DID_RESET`); the others end failed.
+    /// each within its retries ([`Ladder`]) begins again on the new one, as
+    /// Linux's SCSI error handling retries the commands a uas host reset
+    /// ended (`DID_RESET`); the others end failed.
     fn restart_after_reset(&mut self) {
         for handle in 0..self.commands.len() {
             if !matches!(self.commands[handle], Some(Queued::Running(..))) {
@@ -493,7 +565,13 @@ impl<T: Scsi> Owner<T> {
             let Some(Queued::Running(mut begun, _)) = self.commands[handle].take() else {
                 continue;
             };
-            if !(core::mem::take(&mut begun.rebound) && self.valid(begun.lun)) {
+            let usable = self.valid(begun.lun);
+            if !begun.ladder.again(
+                &RESET_ENDED,
+                Step::PortReset,
+                self.transport.now_us(),
+                usable,
+            ) {
                 self.commands[handle] = Some(Queued::Ended(Err(RESET_ENDED)));
                 continue;
             }
@@ -544,7 +622,8 @@ impl<T: Scsi> Owner<T> {
     /// Linux usb-storage's ladder after a failed class reset: reset the
     /// device's port, rebind a fresh transport to the same device, and keep
     /// every unit that probes as it was published, so the disks published on
-    /// it go on working; [`Owner::run`] then retries the failed command once. At most
+    /// it go on working; [`Owner::run`] then runs the failed command again
+    /// within its retries ([`Ladder`]). At most
     /// [`RESET_LIMIT`] resets run in [`RESET_WINDOW_US`]; past that, or when
     /// the reset fails, every unit fails until an explicit rescan.
     fn reset_device(&mut self) {
@@ -660,7 +739,7 @@ impl<T: Scsi> Owner<T> {
             return Err(why);
         }
         for queued in &mut self.commands {
-            if matches!(queued, Some(Queued::Running(..))) {
+            if matches!(queued, Some(Queued::Running(..) | Queued::Waiting(_))) {
                 *queued = Some(Queued::Ended(Err(BlockError::Unsupported(
                     "USB storage device left the bus during the command",
                 ))));
@@ -764,8 +843,9 @@ impl<T: Scsi> Scsi for Owner<T> {
     fn signals(&self) -> bool {
         self.transport.signals()
     }
+    /// A command waiting to run again is looked at until it begins.
     fn posted(&self) -> bool {
-        self.transport.posted()
+        self.waiting() || self.transport.posted()
     }
     fn write_protect_page(&self) -> Option<u8> {
         self.transport.write_protect_page()
@@ -827,7 +907,7 @@ impl<T: Scsi> Scsi for Owner<T> {
         cdb: &[u8],
         data: Data<'_>,
     ) -> Option<Result<usize, BlockError>> {
-        if !self.transport.room() {
+        if !self.room() {
             return Some(Err(BlockError::Protocol(
                 "every command tag of the USB storage transport is in use",
             )));
@@ -846,7 +926,7 @@ impl<T: Scsi> Scsi for Owner<T> {
             data: Retry::new(&data),
             generation: self.transport.generation(),
             attention: true,
-            rebound: true,
+            ladder: Ladder::new(self.transport.now_us()),
             first_blocks,
         };
         Some(self.begin_attempt(handle, begun)?.map(|()| handle))
@@ -857,8 +937,9 @@ impl<T: Scsi> Scsi for Owner<T> {
     fn busy(&mut self) -> bool {
         self.commands.iter().any(Option::is_some) || self.transport.busy()
     }
+    /// A command waiting to run again goes first.
     fn room(&mut self) -> bool {
-        self.transport.room()
+        !self.waiting() && self.transport.room()
     }
 }
 
@@ -1130,6 +1211,8 @@ impl UsbDisk {
     }
 }
 
+#[cfg(test)]
+mod ladder_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

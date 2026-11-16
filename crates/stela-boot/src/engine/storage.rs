@@ -697,6 +697,8 @@ impl Service {
         result: Result<T, BlockError>,
     ) -> Result<T, BlockError> {
         if let Err(error) = &result {
+            // What the USB storage recovery did for it comes first.
+            report_usb_recoveries();
             self.failures += 1;
             if self.failures <= 16 || self.failures.is_power_of_two() {
                 output::arguments(format_args!(
@@ -707,6 +709,21 @@ impl Service {
             }
         }
         result
+    }
+}
+
+/// One line per USB storage command the recovery ladder ran for since the
+/// last call (`stela_drivers::usb::storage::take_recoveries`): what failed
+/// it, the furthest step that ran, and whether it completed.
+fn report_usb_recoveries() {
+    let (recoveries, replaced) = stela_drivers::usb::storage::take_recoveries();
+    for recovery in &recoveries {
+        output::arguments(format_args!("HOST USB DISK RECOVERY {recovery}\n"));
+    }
+    if replaced != 0 {
+        output::arguments(format_args!(
+            "HOST USB DISK RECOVERY {replaced} more commands recovered or failed since the last report\n"
+        ));
     }
 }
 
@@ -1597,6 +1614,7 @@ impl HostDisks {
                 Self::report_callback(serial, callbacks, tsc_hz, "periodic");
             }
         }
+        report_usb_recoveries();
         let refused = stela_drivers::usb::storage::take_cache_refusals();
         if refused != 0 {
             output::arguments(format_args!(
