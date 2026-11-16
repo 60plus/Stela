@@ -297,12 +297,19 @@ impl SwapTimes {
         })
     }
 
-    /// `swap:surface:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync`:
-    /// milliseconds after the vblank before the submit, the latch in whole
+    /// `swap:surface:n:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync`:
+    /// n the vblank before the submit in whole refreshes after the first
+    /// sampled swap's (`first`), which places consecutive swaps on one
+    /// timeline; then milliseconds after that vblank, the latch in whole
     /// refreshes after it, completion and vsync answers in milliseconds after
     /// the latch; `-` for a time not seen (a zero word, or an event after the
     /// window closed), `far` for a word more than 100 s away.
-    fn write(&self, f: &mut core::fmt::Formatter<'_>, refresh: u64) -> core::fmt::Result {
+    fn write(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+        refresh: u64,
+        first: u64,
+    ) -> core::fmt::Result {
         let ms = |ticks: i128| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
         let since = |base: u64, at: Option<u64>| at.map(|at| i128::from(at) - i128::from(base));
         let show = |f: &mut core::fmt::Formatter<'_>, ticks: Option<i128>| match ticks {
@@ -310,7 +317,14 @@ impl SwapTimes {
             Some(ticks) if ticks.unsigned_abs() > 100 * u128::from(COUNTER_HZ) => write!(f, "far"),
             Some(ticks) => write!(f, "{:.1}", ms(ticks)),
         };
-        write!(f, " {}:{}:", self.swap_id, self.surface)?;
+        let refreshes = |ticks: u64| (ticks + refresh / 2) / refresh.max(1);
+        write!(
+            f,
+            " {}:{}:{}:",
+            self.swap_id,
+            self.surface,
+            refreshes(self.vblank.saturating_sub(first))
+        )?;
         show(f, since(self.vblank, Some(self.submitted)))?;
         f.write_str("/")?;
         show(f, since(self.vblank, self.tick))?;
@@ -322,11 +336,7 @@ impl SwapTimes {
         show(f, since(self.vblank, self.ready))?;
         f.write_str("/")?;
         match self.latched {
-            Some(latched) => write!(
-                f,
-                "{}",
-                (latched.saturating_sub(self.vblank) + refresh / 2) / refresh.max(1)
-            )?,
+            Some(latched) => write!(f, "{}", refreshes(latched.saturating_sub(self.vblank)))?,
             None => f.write_str("-")?,
         }
         let latched = self.latched.unwrap_or(0);
@@ -480,13 +490,13 @@ impl core::fmt::Display for Pacing {
         write!(
             f,
             "\nDCP SWAPS refresh_ms={:.2} words48_50={}/{} \
-             swap:surface:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync",
+             swap:surface:n:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync",
             ms(self.refresh),
             first.words[0],
             first.words[1],
         )?;
         for swap in &self.swaps {
-            swap.write(f, self.refresh)?;
+            swap.write(f, self.refresh, first.vblank)?;
         }
         Ok(())
     }

@@ -2354,16 +2354,25 @@ fn the_pacing_report_samples_each_swaps_times_and_record_words() {
     );
     assert!(
         swaps.ends_with(&alloc::format!(
-            " {id}:5:7.5/0.5/1.0/16.7/-/-/-/-/-/12.0/1/2.0/2.0"
+            " {id}:5:0:7.5/0.5/1.0/16.7/-/-/-/-/-/12.0/1/2.0/2.0"
         )),
         "{swaps}"
     );
-    // Only the first swaps of a window are sampled.
-    for _ in 0..SAMPLED_SWAPS {
+    // Only the first swaps of a window are sampled. The next ones follow the
+    // next vblank, one refresh after the first swap's.
+    let next = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(next, &[(0, 4, 2, 0x1000)]), 0xc));
+    for _ in 1..SAMPLED_SWAPS {
         let id = start_swap(&mut methods);
         returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
     }
     assert_eq!(methods.pacing.swaps.len(), SAMPLED_SWAPS);
+    let pacing = Pacing {
+        refresh: period,
+        ..methods.pacing.clone()
+    };
+    let text = pacing.to_string();
+    assert!(text.contains(&alloc::format!(" {next}:0:1:2.0/")), "{text}");
 }
 
 /// A screen whose frames another thread can push, as a compose outside the
