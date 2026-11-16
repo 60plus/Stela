@@ -85,6 +85,17 @@
     ]
   },
   {
+    "package": "stela-cli",
+    "test": "nvidia_570_211_01_live_provisioning_matches_recipe_pins",
+    "source": "crates/stela-cli/src/setup/firmware.rs",
+    "kind": "oracle",
+    "inputs": [],
+    "reason": "downloads NVIDIA's 570.211.01 GB20x sources and checks the extracted images against their pins; set STELA_NVIDIA_570_211_TEST=1",
+    "values": [
+      "STELA_NVIDIA_570_211_TEST"
+    ]
+  },
+  {
     "package": "stela-compiler",
     "test": "executed_paths_of_real_blocks",
     "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
