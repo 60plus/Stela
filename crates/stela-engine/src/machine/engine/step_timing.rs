@@ -1643,6 +1643,12 @@ pub struct HotBlock {
 pub const HOT_BLOCKS: usize = 8192;
 /// One run in this many is sampled.
 pub const HOT_SAMPLE_EVERY: u32 = 16;
+/// Without step timing, one run in this many is sampled, for the ring's
+/// heat alone (`Machine::heat`): a sample cuts its run short once, an
+/// exit and a fetch of about a microsecond, at most one in this many runs
+/// (PE4 makes about 50 K runs a second in a launch: under 0.05% of its
+/// time), and gives a part of hot chained code tens of samples a second.
+pub const HEAT_SAMPLE_EVERY: u32 = 128;
 /// A sampled run's budget is at most this many transfers.
 pub const HOT_SAMPLE_SPAN: u64 = 4096;
 

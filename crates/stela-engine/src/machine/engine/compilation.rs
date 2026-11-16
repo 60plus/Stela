@@ -1351,6 +1351,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Install `bytes` of a block, reclaiming the arena's oldest part
     /// when it is full.
     fn install_code(&mut self, bytes: &[u8]) -> Result<NativeCode, Stop> {
+        // A block's code takes its generation's open part.
+        self.install_home = None;
         match self.install_native(bytes, true) {
             Ok(code) => Ok(code),
             Err(InstallError::Full) => {
@@ -1512,6 +1514,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         };
         self.install_stream = self.stream_at(code.0 as u64);
+        self.install_home = Some(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
         self.profile_code(
             installed,
@@ -1728,6 +1731,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         thunk: x86_64_pointer::Thunk,
     ) -> Option<Successor> {
         self.install_stream = self.stream_at(code.0 as u64);
+        self.install_home = Some(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
         self.profile_code(installed, thunk.code.len(), step_timing::CodeRegion::Other);
         let site = code.0 as u64 + site as u64;
