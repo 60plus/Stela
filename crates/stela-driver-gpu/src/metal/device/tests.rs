@@ -4546,7 +4546,7 @@ fn the_memory_book_names_freed_ranges_and_their_neighbours() {
     device.new_heap_buffer(heap, 4096, shared, None).unwrap();
     assert_eq!(
         device.memory_book_report(),
-        ["lost device memory: no whole allocation with a known address was freed"]
+        ["lost device memory: no whole allocation was freed"]
     );
     let serial = submit(&mut device);
     device.destroy_texture(texture).unwrap();

@@ -532,6 +532,12 @@ pub struct NativeBackend {
     import_cache: ImportCache,
     /// The tokens of imported memory now freed.
     retired: VecDeque<NonZeroU64>,
+    /// Whole allocations dedicated to an image, which no buffer may be
+    /// bound to, by their memory's handle.
+    image_dedicated: alloc::collections::BTreeSet<u64>,
+    /// Kept imports unbound since the Metal device last asked
+    /// ([`Backend::take_unbound`]), by their memory's handle.
+    unbound: Vec<u64>,
     /// [`Loader::refusals`].
     refusals: Option<Refusals>,
     /// The count the driver raises by each refusal it keeps
@@ -789,6 +795,8 @@ impl NativeBackend {
             imports: BTreeMap::new(),
             import_cache: ImportCache::default(),
             retired: VecDeque::new(),
+            image_dedicated: alloc::collections::BTreeSet::new(),
+            unbound: Vec::new(),
             refusals: loader.refusals,
             outstanding: None,
             new_images: Vec::new(),
@@ -1322,6 +1330,9 @@ impl NativeBackend {
         let Some(allocation) = self.memories.remove(memory) else {
             return;
         };
+        if let memory::Allocation::Whole { memory, .. } = allocation {
+            self.image_dedicated.remove(&raw(memory));
+        }
         if let memory::Allocation::Whole { memory, resource } = allocation
             && let Some((exported, token, ranges)) = self.imports.remove(&raw(memory))
         {
@@ -1332,6 +1343,7 @@ impl NativeBackend {
             self.zeroing.forget(&self.device, memory);
             self.retired.push_back(token);
             for evicted in self.import_cache.keep(ranges, memory, exported) {
+                self.unbound.push(raw(evicted.memory));
                 self.free_after_turn(Freed {
                     memory: evicted.memory,
                     exported: Some(evicted.exported),
@@ -2598,6 +2610,13 @@ impl Backend for NativeBackend {
                 }
             };
         let allocated = (self.ticks)();
+        if self
+            .memories
+            .resolve(memory)
+            .is_some_and(|r| r.size.is_none())
+        {
+            self.image_dedicated.insert(raw(device_memory));
+        }
         // SAFETY: the memory, or the place at `offset` in it, was allocated
         // for this image's requirements.
         let bound =
@@ -3291,6 +3310,60 @@ impl Backend for NativeBackend {
         self.memories
             .resolve(memory)
             .is_some_and(|resolved| resolved.size.is_none())
+    }
+
+    /// The address of a byte-long buffer bound at the allocation's start,
+    /// made and destroyed at once: no driver call reaches the kernel.
+    fn memory_address(&mut self, memory: Memory) -> Option<u64> {
+        let resolved = self.memories.resolve(memory)?;
+        if resolved.size.is_some() || self.image_dedicated.contains(&raw(resolved.memory)) {
+            return None;
+        }
+        let info = BufferInfo {
+            size: 1,
+            usage: super::vulkan::BufferUsage::SHADER_DEVICE_ADDRESS,
+            flags: super::vulkan::BufferCreate::EMPTY,
+        };
+        let create = |create: &vk::BufferCreateInfo<'_>| {
+            // SAFETY: the create info outlives the call.
+            unsafe { self.device.create_buffer(create, None) }.map_err(failure)
+        };
+        let buffer = if self.imports.contains_key(&raw(resolved.memory)) {
+            objects::imported_buffer(&info, DMA_BUF, create)
+        } else {
+            objects::buffer(&info, create)
+        }
+        .ok()?;
+        let (needs, own) = self.buffer_needs(buffer);
+        let every = u32::try_from(self.snapshot.memory.types.len())
+            .ok()
+            .and_then(|count| 1u32.checked_shl(count))
+            .map_or(u32::MAX, |bit| bit - 1);
+        // Only where any memory takes the buffer, so binding it is valid
+        // whatever type the allocation has.
+        let address = (!own && needs.memory_type_bits & every == every)
+            .then(|| {
+                // SAFETY: the allocation is live and takes a buffer of one
+                // byte at offset zero.
+                unsafe { self.device.bind_buffer_memory(buffer, resolved.memory, 0) }.ok()?;
+                let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+                // SAFETY: the buffer is bound and has device-address usage.
+                Some(unsafe { self.device.get_buffer_device_address(&info) })
+            })
+            .flatten();
+        // SAFETY: nothing used the buffer.
+        unsafe { self.device.destroy_buffer(buffer, None) };
+        address
+    }
+
+    fn kept_bound(&self, memory: Memory) -> Option<u64> {
+        let resolved = self.memories.resolve(memory)?;
+        let key = raw(resolved.memory);
+        (resolved.size.is_none() && self.imports.contains_key(&key)).then_some(key)
+    }
+
+    fn take_unbound(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.unbound)
     }
 }
 

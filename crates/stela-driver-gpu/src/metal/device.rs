@@ -546,10 +546,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// Destroys `object` now that no submitted work uses it; freed memory
     /// leaves the book as of the completed serial.
     fn destroy_now(&mut self, object: Object) {
-        if let Object::Memory(memory) = object {
-            self.book.free(memory, self.completed);
+        let Object::Memory(memory) = object else {
+            self.backend.destroy(object);
+            return;
+        };
+        // Its address, while it has one, for a fault in it later.
+        if self.book.lacks_address(memory)
+            && let Some(va) = self.backend.memory_address(memory)
+        {
+            self.book.learn_address(memory, va);
         }
+        let kept = self.backend.kept_bound(memory);
+        self.book.free(memory, self.completed, kept);
         self.backend.destroy(object);
+        let unbound = self.backend.take_unbound();
+        self.book.unbound(&unbound, self.completed);
     }
 
     /// Notes `memory`, a whole allocation of `bytes` that `what` owns, in
@@ -568,7 +579,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// The newest frees of whole allocations and the live ranges either
     /// side, which name what the address of a GPU MMU fault held.
-    pub fn memory_book_report(&self) -> Vec<alloc::string::String> {
+    pub fn memory_book_report(&mut self) -> Vec<alloc::string::String> {
+        for memory in self.book.addressless() {
+            if let Some(va) = self.backend.memory_address(memory) {
+                self.book.learn_address(memory, va);
+            }
+        }
         self.book.report(self.submitted)
     }
 }

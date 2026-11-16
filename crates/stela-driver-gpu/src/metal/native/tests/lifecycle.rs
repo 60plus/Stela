@@ -180,6 +180,8 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
         imports: BTreeMap::new(),
         import_cache: crate::metal::native::ImportCache::default(),
         retired: VecDeque::new(),
+        image_dedicated: alloc::collections::BTreeSet::new(),
+        unbound: Vec::new(),
         refusals: None,
         outstanding: None,
         new_images: Vec::new(),

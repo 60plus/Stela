@@ -134,6 +134,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let (image, copy_memory, bytes) = self.backend.create_image(&info, request)?;
         self.allocated += bytes;
+        self.book_memory(copy_memory, bytes, || {
+            alloc::format!(
+                "aligned copy of a {}x{} plane",
+                info.extent[0],
+                info.extent[1]
+            )
+        });
         let [width, height, _] = info.extent;
         let region = BufferImageCopy {
             buffer_offset: layout.offset,

@@ -325,6 +325,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             None => self.backend.import_memory(ranges, token)?,
         };
         self.allocated += bytes;
+        if let Some(key) = self.backend.kept_bound(memory) {
+            self.book.retaken(key);
+        }
         self.book_memory(memory, bytes, || {
             format!("imported memory of {bytes} bytes")
         });
@@ -601,6 +604,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .add(Phase::TextureCreate, whole.saturating_sub(allocate + bind));
         self.time_texture(descriptor, bytes, false);
         self.allocated += bytes;
+        self.book_memory(memory, bytes, || {
+            format!(
+                "image memory of a {}x{} {:?} texture",
+                descriptor.width, descriptor.height, descriptor.pixel_format
+            )
+        });
         self.finish_texture(
             image,
             descriptor,
@@ -705,6 +714,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let allocation = self.backend.create_buffer(&info, request)?;
         self.allocated += allocation.allocated;
+        self.book_memory(allocation.memory, allocation.allocated, || {
+            format!(
+                "CPU copy of a {}x{} {:?} texture",
+                descriptor.width, descriptor.height, descriptor.pixel_format
+            )
+        });
         Ok(allocation)
     }
 

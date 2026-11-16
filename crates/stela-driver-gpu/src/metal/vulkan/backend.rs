@@ -433,6 +433,26 @@ pub trait Backend {
     fn whole_memory(&self, _memory: Memory) -> bool {
         true
     }
+
+    /// The GPU address of whole allocation `memory`'s first byte, for
+    /// naming what a GPU fault address held; `None` when the backend
+    /// cannot tell.
+    fn memory_address(&mut self, _memory: Memory) -> Option<u64> {
+        None
+    }
+
+    /// The allocation behind whole `memory`, as [`Self::take_unbound`]
+    /// names it, when freeing it may keep it bound (a freed import kept for
+    /// reuse): it is unbound only once that names it.
+    fn kept_bound(&self, _memory: Memory) -> Option<u64> {
+        None
+    }
+
+    /// The allocations [`Self::kept_bound`] named that were unbound since
+    /// the last call.
+    fn take_unbound(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A Vulkan feature or extension the Metal layer needs from every device.
