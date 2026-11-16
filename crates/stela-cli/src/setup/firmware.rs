@@ -545,22 +545,27 @@ fn present_bytes(directory: &Path) -> u64 {
 
 /// Write `files` and their notices to the bundle on `volume`, each fetched
 /// through `fetch` unless the volume holds it already, then its manifest,
-/// and remove files no longer listed.
-pub(super) fn publish_bundle(
+/// and remove files no longer listed. Returns the files whose image this
+/// wrote.
+pub(super) fn publish_bundle<'a>(
     volume: &Path,
-    files: &[(&Artifact, &Artifact)],
+    files: &[(&'a Artifact, &'a Artifact)],
     fetch: &mut dyn FnMut(&Artifact) -> Result<Vec<u8>>,
-) -> Result<()> {
+) -> Result<Vec<(&'a Artifact, &'a Artifact)>> {
     let directory = volume.join(bundle::DIRECTORY);
     fs::create_dir_all(directory.join("licenses"))?;
     let mut kept = vec![directory.join("bundle.json")];
-    for (object, notice) in files {
+    let mut written = Vec::new();
+    for &(object, notice) in files {
         for (artifact, path) in [
-            (*object, bundle::object_path(object.sha256)),
-            (*notice, bundle::notice_path(notice.sha256)),
+            (object, bundle::object_path(object.sha256)),
+            (notice, bundle::notice_path(notice.sha256)),
         ] {
             let path = directory.join(path);
             if !kept.contains(&path) && !holds(&path, artifact) {
+                if std::ptr::eq(artifact, object) {
+                    written.push((object, notice));
+                }
                 let bytes = fetch(artifact)?;
                 artifact.verify(&bytes)?;
                 let parent = path.parent().context("bundle path has no directory")?;
@@ -588,7 +593,38 @@ pub(super) fn publish_bundle(
             }
         }
     }
-    Ok(())
+    Ok(written)
+}
+
+/// The licence lines of a run that wrote `written` to the bundle: the
+/// licence of each image NVIDIA publishes only under its driver licence
+/// and where its text is, then where every notice is. None when nothing
+/// was written.
+fn licence_notes(written: &[(&Artifact, &Artifact)]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut named: Vec<&str> = Vec::new();
+    for (object, notice) in written {
+        if matches!(
+            recipes::nvidia_gsp(object),
+            Some((_, recipes::NvidiaPart::Gsp))
+        ) && !named.contains(&notice.sha256)
+        {
+            named.push(notice.sha256);
+            notes.push(format!(
+                "NVIDIA's GPU firmware is used under the NVIDIA Driver License Agreement; its \
+                 text is in {}/{} on the stick's data partition",
+                bundle::DIRECTORY,
+                bundle::notice_path(notice.sha256)
+            ));
+        }
+    }
+    if !written.is_empty() {
+        notes.push(format!(
+            "firmware licences are in {}/licenses on the stick's data partition",
+            bundle::DIRECTORY
+        ));
+    }
+    notes
 }
 
 /// Put the complete bundle on the stick's data volume `volume`, beside the
@@ -614,11 +650,17 @@ pub(super) fn provision_bundle(
     // Every download before the first write to the stick.
     prefetch_bundle(mount_image, Some(volume))?;
     let cache = super::cache_dir().join("firmware");
-    publish_bundle(volume, &files, &mut |artifact| {
+    let written = publish_bundle(volume, &files, &mut |artifact| {
         read_cached(&cache.join(artifact.sha256), artifact)
     })
     .context("the stick did not get the complete firmware bundle")?;
+    // Once per run, whatever calls this.
+    static LICENCES_NAMED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let mut notes = Vec::new();
+    if !written.is_empty() && !LICENCES_NAMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        notes.extend(licence_notes(&written));
+    }
     if !left.is_empty() {
         notes.push(format!(
             "{} has no room for {} firmware files, so PCs that need them lack them: {}",
@@ -1079,6 +1121,50 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_writes_firmware_names_its_licences() {
+        let complete = bundle::complete();
+        let gsp = *complete
+            .iter()
+            .find(|(object, _)| {
+                matches!(
+                    recipes::nvidia_gsp(object),
+                    Some((_, recipes::NvidiaPart::Gsp))
+                )
+            })
+            .unwrap();
+        let other = *complete
+            .iter()
+            .find(|(object, _)| recipes::nvidia_gsp(object).is_none())
+            .unwrap();
+        let summary =
+            "firmware licences are in stela/firmware/licenses on the stick's data partition";
+        let nvidia = format!(
+            "NVIDIA's GPU firmware is used under the NVIDIA Driver License Agreement; its text \
+             is in stela/firmware/licenses/{}.txt on the stick's data partition",
+            &recipes::NVIDIA_DRIVER_570_211_01_LICENSE.sha256[..32]
+        );
+        assert_eq!(
+            gsp.1.sha256,
+            recipes::NVIDIA_DRIVER_570_211_01_LICENSE.sha256
+        );
+        // Nothing written, nothing said.
+        assert!(licence_notes(&[]).is_empty());
+        // Other vendors' files: one summary line, not one per file.
+        assert_eq!(licence_notes(&[other, other]), [summary]);
+        // NVIDIA's GSP-RM image: its licence and file, then the summary.
+        assert_eq!(
+            licence_notes(&[other, gsp, gsp]),
+            [nvidia.as_str(), summary]
+        );
+        // The named file is where publish_bundle stores that notice.
+        assert!(nvidia.contains(&format!(
+            " {}/{} ",
+            bundle::DIRECTORY,
+            bundle::notice_path(gsp.1.sha256)
+        )));
+    }
+
+    #[test]
     fn the_bundle_is_the_same_on_every_computer_and_stores_a_shared_file_once() {
         use super::super::{host::Host, tests::FakeHost};
         let catalog = synthetic();
@@ -1115,11 +1201,17 @@ mod tests {
         for host in [&with as &dyn Host, &without] {
             let dir = tempfile::tempdir().unwrap();
             assert!(host.nvidia_gpus().is_ok());
-            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            let written = publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            // The alias is the first file's content, written once.
+            assert_eq!(written.len(), 2);
             snapshots.push(snapshot(dir.path()));
-            // A second publication fetches nothing.
+            // A second publication fetches and writes nothing.
             let before = fetches.get();
-            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            assert!(
+                publish_bundle(dir.path(), &files, &mut fetch)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(fetches.get(), before);
         }
         assert_eq!(snapshots[0], snapshots[1]);
