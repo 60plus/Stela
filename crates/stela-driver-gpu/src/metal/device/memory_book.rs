@@ -30,6 +30,8 @@ const FREED_KEPT: usize = 32;
 const FREED_SHOWN: usize = 12;
 /// Freed imports kept bound for reuse that the book follows.
 const KEPT_FOLLOWED: usize = 64;
+/// Live allocations a report names inside each freed range.
+const INSIDE_SHOWN: usize = 4;
 
 /// One whole allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,20 +194,41 @@ impl MemoryBook {
         (below, above)
     }
 
-    /// The newest frees, each with the live ranges either side, for a
-    /// device lost while serial `now` was the newest submitted.
+    /// The live allocations with known addresses that overlap
+    /// `start..end`, lowest first: what the GPU addresses of a freed range
+    /// map now.
+    fn inside(&self, start: u64, end: u64) -> Vec<&Entry> {
+        let mut inside: Vec<&Entry> = self
+            .live
+            .values()
+            .filter(|entry| {
+                entry
+                    .va
+                    .is_some_and(|va| va < end && va + entry.bytes > start)
+            })
+            .collect();
+        inside.sort_by_key(|entry| entry.va);
+        inside
+    }
+
+    /// The newest frees, each with the live ranges either side and those
+    /// placed inside it since, for a device lost while serial `now` was the
+    /// newest submitted.
     pub(crate) fn report(&self, now: u64) -> Vec<String> {
         let mut lines = Vec::new();
         for freed in self.freed.iter().rev().take(FREED_SHOWN) {
             let entry = &freed.entry;
-            let (below, above) = match entry.va {
-                Some(start) => self.neighbours(start, start + entry.bytes),
-                None => (None, None),
+            let ((below, above), inside) = match entry.va {
+                Some(start) => (
+                    self.neighbours(start, start + entry.bytes),
+                    self.inside(start, start + entry.bytes),
+                ),
+                None => ((None, None), Vec::new()),
             };
             let unbound = freed.unbound.map_or_else(String::new, |serial| {
                 format!(", kept bound for reuse and unbound when serial {serial} completed")
             });
-            lines.push(format!(
+            let mut line = format!(
                 "lost device memory: freed {} when serial {} completed{unbound} (device at {}); \
                  live below: {}; live above: {}",
                 describe(entry),
@@ -213,7 +236,17 @@ impl MemoryBook {
                 now,
                 below.map_or_else(|| String::from("none"), describe),
                 above.map_or_else(|| String::from("none"), describe),
-            ));
+            );
+            // A read of a page left unmapped beside one of these faults in
+            // the freed range without reaching what it held.
+            for (n, live) in inside.iter().take(INSIDE_SHOWN).enumerate() {
+                line.push_str(if n == 0 { "; live inside now: " } else { ", " });
+                line.push_str(&describe(live));
+            }
+            if inside.len() > INSIDE_SHOWN {
+                line.push_str(&format!(" and {} more", inside.len() - INSIDE_SHOWN));
+            }
+            lines.push(line);
         }
         if lines.is_empty() {
             lines.push(String::from(
@@ -287,6 +320,39 @@ mod tests {
         assert!(
             line.contains("live above: 0x3fb4200000-0x3fb4600000 (4194304 bytes) imported heap")
         );
+    }
+
+    #[test]
+    fn a_freed_range_names_what_was_placed_inside_it_since() {
+        let mut book = MemoryBook::default();
+        book.note(Memory(1), 33_177_600, String::from("buffer"), 163);
+        book.learn_address(Memory(1), 0x3f_d935_c000);
+        book.release(Memory(1), 4313);
+        book.free(Memory(1), 4313, Some(5));
+        book.unbound(&[5], 4816);
+        // A heap at the first 2 MiB boundary in the freed range.
+        book.note(Memory(2), 0x40_0000, String::from("imported heap"), 4900);
+        book.learn_address(Memory(2), 0x3f_d940_0000);
+        book.note(Memory(3), 0x8000, String::from("image memory"), 163);
+        book.learn_address(Memory(3), 0x3f_d934_0000);
+        let line = &book.report(4987)[0];
+        assert!(
+            line.contains("live below: 0x3fd9340000-0x3fd9348000"),
+            "{line}"
+        );
+        assert!(line.contains("live above: none"), "{line}");
+        assert!(
+            line.ends_with(
+                "; live inside now: 0x3fd9400000-0x3fd9800000 (4194304 bytes) imported heap of no \
+                 connection, made at serial 4900"
+            ),
+            "{line}"
+        );
+        for n in 0..6u64 {
+            book.note(Memory(10 + n), 0x1000, format!("buffer {n}"), 4950);
+            book.learn_address(Memory(10 + n), 0x3f_da00_0000 + (n << 12));
+        }
+        assert!(book.report(4987)[0].ends_with(" and 3 more"));
     }
 
     #[test]
