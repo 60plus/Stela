@@ -337,11 +337,24 @@ fn a_display_taken_at_start_runs_the_monitors_own_mode() {
     ];
     let any: Fits<'_> = &|_, _, _| true;
     let firmware = Wanted::Native((1920, 1080));
-    assert_eq!(choose(&modes, firmware, any), Some(modes[0]));
+    // The preferred timing is the monitor's 60 Hz one, listed first as
+    // Linux sorts it; its 144 Hz mode of the same size runs.
+    assert_eq!(choose(&modes, firmware, any), Some(modes[1]));
     assert_eq!(
         choose(&modes, Wanted::Size((1920, 1080)), any),
         Some(modes[2])
     );
+    // An interlaced mode is passed over, however fast; equals keep the
+    // first listed.
+    let laced = [
+        modes[0],
+        ModeInfo {
+            flags: INTERLACED,
+            ..at(3840, 2160, 0, 120)
+        },
+        at(3840, 2160, 0, 60),
+    ];
+    assert_eq!(choose(&laced, firmware, any), Some(laced[0]));
     // The native size cannot be described at all: the firmware's size.
     let small: Fits<'_> = &|width, _, _| width < 3840;
     assert_eq!(choose(&modes, firmware, small), Some(modes[2]));

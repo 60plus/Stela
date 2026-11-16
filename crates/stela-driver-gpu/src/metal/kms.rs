@@ -64,6 +64,8 @@ const DESTROY_DUMB: u32 = request::<DestroyDumb>(0xb4);
 const CONNECTED: u32 = 1;
 /// `DRM_MODE_TYPE_PREFERRED`.
 const PREFERRED: u32 = 1 << 3;
+/// `DRM_MODE_FLAG_INTERLACE`.
+const INTERLACED: u32 = 1 << 4;
 /// `DRM_FORMAT_XRGB8888`: blue in the low byte of the little-endian pixel.
 const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const BYTES_PER_PIXEL: u32 = 4;
@@ -610,15 +612,20 @@ fn size_of_mode(mode: &ModeInfo) -> (u32, u32) {
     (u32::from(mode.hdisplay), u32::from(mode.vdisplay))
 }
 
-/// `modes`' mode of `size` that `fits`, else its first of that size. Linux
-/// lists the faster of each size first, so this is the size's fastest mode
-/// the guest can be told of. A monitor's fastest mode may not fit, as
-/// 2560x1440 at 180 Hz.
+/// `modes`' fastest progressive mode of `size` that `fits`, the first of
+/// equals, else its first of that size. Linux sorts a preferred mode ahead
+/// of faster ones of its size (`drm_mode_compare`), and a monitor's
+/// preferred timing is often its 60 Hz one, with its 144 or 240 Hz modes
+/// in an extension, so the first listed is not the fastest. A monitor's
+/// fastest mode may not fit, as one past the guest's timing record's
+/// clock.
 fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
     let mut sized = modes.iter().filter(|mode| size_of_mode(mode) == size);
     let fitting = sized
         .clone()
-        .find(|mode| fits(size.0, size.1, refresh(mode)));
+        .filter(|mode| mode.flags & INTERLACED == 0 && fits(size.0, size.1, refresh(mode)))
+        .rev()
+        .max_by_key(|mode| refresh(mode));
     fitting.or_else(|| sized.next()).copied()
 }
 
