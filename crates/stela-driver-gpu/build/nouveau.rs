@@ -20,51 +20,16 @@ const COMPOSITES: [&str; 1] = ["nouveau"];
 /// lacks, or defines only as a trap, by service. Building fails when the
 /// imports change, so each supplied service leaves this list with its change.
 const OPEN: super::image::Open = &[
-    // Traps nothing nouveau runs reaches. Shmem-backed pages: TTM allocates
-    // from its own pool and Stela never swaps it out.
-    (
-        "shmem and page cache",
-        &[
-            "folio_clear_dirty_for_io",
-            "mm_get_unmapped_area",
-            "shmem_read_folio_gfp",
-            "shmem_read_mapping_page_gfp",
-            "shmem_truncate_range",
-            "shmem_writeout",
-        ],
-    ),
     // Nothing tears a pseudo filesystem's superblock down.
     (
         "reopening a file without a VFS path",
         &["stela_linux_reopen_unowned_path"],
-    ),
-    (
-        "HDMI audio",
-        &["device_link_add", "platform_device_unregister"],
     ),
     // Searches of a class's devices and of a device's children, which
     // hwmon.c and backlight.c hold for I2C sensors and panel drivers.
     (
         "the driver core's device lists",
         &["class_find_device", "device_find_child"],
-    ),
-    // The MIPI DSI and auxiliary buses of the DRM archive: no driver of the
-    // image registers on either, and only a DSI host's removal walks a
-    // device's children.
-    (
-        "Linux drivers on a bus, bus searches and child walks",
-        &[
-            "bus_find_device",
-            "device_for_each_child",
-            "driver_register",
-            "driver_unregister",
-        ],
-    ),
-    // MMU_NOTIFIER gives every mm notifiers, which dropping an mm destroys;
-    // nothing subscribes one, which is what takes these locks.
-    (
-        "an address space's first notifier",
-        &["mm_drop_all_locks", "mm_take_all_locks"],
     ),
 ];
 

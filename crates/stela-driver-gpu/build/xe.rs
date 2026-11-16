@@ -99,71 +99,7 @@ const DESCRIPTIONS: [&str; 6] = [
 /// lacks, or defines only as a trap, by service. Building fails when the
 /// imports change, so each supplied service leaves this list with its change.
 const OPEN: super::image::Open = &[
-    // Traps: no driver of the image registers on the auxiliary or MIPI DSI
-    // bus, and only a DSI host's removal walks a device's children.
-    (
-        "Linux drivers on a bus, bus searches and child walks",
-        &[
-            "bus_find_device",
-            "device_for_each_child",
-            "driver_register",
-            "driver_unregister",
-        ],
-    ),
-    // Made only when an audio driver binds the display's component.
-    ("HDMI audio's power dependency", &["device_link_add"]),
-    // Trap: no bus lists a window, so no driver gets as far as assigning a
-    // resized BAR (pci_resize_resource itself answers that the host bridge
-    // keeps the firmware's assignment).
-    (
-        "PCI: a BAR's resize",
-        &["pci_assign_unassigned_bus_resources"],
-    ),
-    // Traps behind a refusal: a discrete GPU's management controller gets
-    // no register map, so its platform device and I2C client never exist.
-    (
-        "management controller: after its register map",
-        &[
-            "bus_register_notifier",
-            "bus_unregister_notifier",
-            "fwnode_create_software_node",
-            "fwnode_remove_software_node",
-            "i2c_bus_type",
-            "i2c_transfer_buffer_flags",
-            "i2c_verify_adapter",
-            "platform_device_add",
-            "platform_device_alloc",
-            "platform_device_put",
-            "platform_device_unregister",
-        ],
-    ),
-    // Traps behind two refusals: no range of a client's memory faults in,
-    // and xe refuses a user fence from a caller without an address space
-    // (every Stela task), so no worker adopts one.
-    (
-        "userptr and user fences: a client's address space",
-        &[
-            "find_vma_intersection",
-            "kthread_unuse_mm",
-            "kthread_use_mm",
-            "mm_drop_all_locks",
-            "mm_take_all_locks",
-            "mmput",
-        ],
-    ),
-    // As for nouveau: TTM allocates from its own pool and Stela never swaps
-    // it out, and nothing tears a pseudo filesystem's superblock down.
-    (
-        "shmem and page cache",
-        &[
-            "folio_clear_dirty_for_io",
-            "mm_get_unmapped_area",
-            "shmem_read_folio_gfp",
-            "shmem_read_mapping_page_gfp",
-            "shmem_truncate_range",
-            "shmem_writeout",
-        ],
-    ),
+    // Nothing tears a pseudo filesystem's superblock down.
     (
         "reopening a file without a VFS path",
         &["stela_linux_reopen_unowned_path"],

@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <stela/device.h>
 #include <stela/catalogue.h>
+#include <stela/linux.h>
 #include <unsupported.h>
 
 static void device_release(struct kobject *kobj)
@@ -195,9 +196,12 @@ int device_match_of_node(struct device *dev, const void *np)
 /* A bus is its type: Stela's owners match and bind the devices of the buses
  * they own, so registering one records nothing. A Linux driver on a bus, a
  * search of a bus's devices and a walk of a device's children need the
- * driver core's lists, which do not exist; nothing in the image registers
- * such a driver, and only the removal of a MIPI DSI host walks children,
- * which no display driver here registers. */
+ * driver core's lists, which do not exist. Each is said once and answers as
+ * Linux does when it finds nothing to act on: a driver is refused (only MIPI
+ * DSI and DP AUX bus drivers register one, and the image holds none), a
+ * search finds no device, and a walk visits no child, so the children of a
+ * MIPI DSI host that goes away (a DSI panel's encoder torn down) stay
+ * registered and keep their host's device, as their references hold it. */
 int bus_register(const struct bus_type *bus)
 {
 	return bus && bus->name ? 0 : -EINVAL;
@@ -208,11 +212,38 @@ void bus_unregister(const struct bus_type *bus)
 	(void)bus;
 }
 
-STELA_UNSUPPORTED(int, driver_register, struct device_driver *)
-STELA_UNSUPPORTED(void, driver_unregister, struct device_driver *)
-STELA_UNSUPPORTED(struct device *, bus_find_device, const struct bus_type *, struct device *,
-		  const void *, device_match_t)
-STELA_UNSUPPORTED(int, device_for_each_child, struct device *, void *, device_iter_t)
+int driver_register(struct device_driver *driver)
+{
+	(void)driver;
+	stela_linux_unsupported("a Linux driver on a bus: it is refused");
+	return -EOPNOTSUPP;
+}
+
+/* Only a driver driver_register took is unregistered, and it takes none. */
+void driver_unregister(struct device_driver *driver)
+{
+	(void)driver;
+}
+
+struct device *bus_find_device(const struct bus_type *bus, struct device *start,
+			       const void *data, device_match_t match)
+{
+	(void)bus;
+	(void)start;
+	(void)data;
+	(void)match;
+	stela_linux_unsupported("a search of a bus's devices: it finds none");
+	return NULL;
+}
+
+int device_for_each_child(struct device *parent, void *data, device_iter_t fn)
+{
+	(void)parent;
+	(void)data;
+	(void)fn;
+	stela_linux_unsupported("a walk of a device's children: they stay registered");
+	return 0;
+}
 
 /* A class is its name: a device of one is created and attached like any
  * other, and its attribute groups are files nothing reads. Registering a
@@ -320,8 +351,19 @@ void component_del(struct device *dev, const struct component_ops *ops)
 	(void)ops;
 }
 
-/* Runtime power dependencies, which only a bound audio component makes. */
-STELA_UNSUPPORTED(struct device_link *, device_link_add, struct device *, struct device *, u32)
+/* Runtime power dependencies, which a bound HDMI audio component and an
+ * SR-IOV physical function's virtual functions make. Without the driver
+ * core's lists none is kept: the link is refused, said once, and its maker
+ * goes on as Linux's does when a link fails (audio's bind fails with
+ * -ENOMEM, a virtual function stays unlinked). */
+struct device_link *device_link_add(struct device *consumer, struct device *supplier, u32 flags)
+{
+	(void)consumer;
+	(void)supplier;
+	(void)flags;
+	stela_linux_unsupported("a runtime power dependency between devices: it is refused");
+	return NULL;
+}
 
 /* A link to delete is one device_link_add gave, and it gives none. */
 STELA_UNSUPPORTED(void, device_link_del, struct device_link *)

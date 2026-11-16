@@ -19,6 +19,12 @@
 
 static int next_adapter;
 
+/* The bus clients are on, which only names it: no I2C driver matches here. */
+const struct bus_type i2c_bus_type = {.name = "i2c"};
+
+/* What an adapter's device is, so i2c_verify_adapter tells it from others. */
+const struct device_type i2c_adapter_type = {0};
+
 static void lock_bus(struct i2c_adapter *adapter, unsigned int flags)
 {
 	(void)flags;
@@ -73,6 +79,7 @@ int i2c_add_adapter(struct i2c_adapter *adapter)
 	init_completion(&adapter->dev_released);
 	adapter->nr = next_adapter++;
 	device_initialize(&adapter->dev);
+	adapter->dev.type = &i2c_adapter_type;
 	adapter->dev.release = adapter_released;
 	return dev_set_name(&adapter->dev, "i2c-%d", adapter->nr);
 }
@@ -137,6 +144,26 @@ int i2c_transfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
 	int ret = __i2c_transfer(adapter, msgs, num);
 	i2c_unlock_bus(adapter, I2C_LOCK_SEGMENT);
 	return ret;
+}
+
+/* One message to or from a client: the bytes moved, or the error. */
+int i2c_transfer_buffer_flags(const struct i2c_client *client, char *buf, int count, u16 flags)
+{
+	struct i2c_msg msg = {
+		.addr = client->addr,
+		.flags = flags | (client->flags & I2C_M_TEN),
+		.len = (u16)count,
+		.buf = (u8 *)buf,
+	};
+	int ret = i2c_transfer(client->adapter, &msg, 1);
+
+	return ret == 1 ? count : ret;
+}
+
+/* The adapter a device is, or NULL for a device of another type. */
+struct i2c_adapter *i2c_verify_adapter(struct device *dev)
+{
+	return dev->type == &i2c_adapter_type ? to_i2c_adapter(dev) : NULL;
 }
 
 static void client_released(struct device *dev)

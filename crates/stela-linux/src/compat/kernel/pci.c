@@ -476,7 +476,13 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size, int exclude_ba
 	return -ENOTSUPP;
 }
 
-STELA_UNSUPPORTED(void, pci_assign_unassigned_bus_resources, struct pci_bus *)
+/* What a BAR's resize released, assigned again. pci_resize_resource refuses
+ * every resize, so each BAR keeps the firmware's assignment and nothing is
+ * unassigned: there is nothing to do. */
+void pci_assign_unassigned_bus_resources(struct pci_bus *bus)
+{
+	(void)bus;
+}
 
 const struct bus_type pci_bus_type = {.name = "pci"};
 

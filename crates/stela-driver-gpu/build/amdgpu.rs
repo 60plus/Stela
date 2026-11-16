@@ -69,34 +69,16 @@ fn selected(kconfig: &str, set: impl Fn(&str) -> bool) -> Result<Vec<String>, St
 /// lacks, or defines only as a trap, by service. Building fails when the
 /// imports change, so each supplied service leaves this list with its change.
 const OPEN: super::image::Open = &[
-    // As nouveau's list has them: TTM allocates from its own pool and Stela
-    // never swaps it out.
-    (
-        "shmem and page cache",
-        &[
-            "folio_clear_dirty_for_io",
-            "mm_get_unmapped_area",
-            "shmem_read_folio_gfp",
-            "shmem_read_mapping_page_gfp",
-            "shmem_truncate_range",
-            "shmem_writeout",
-        ],
-    ),
     (
         "reopening a file without a VFS path",
         &["stela_linux_reopen_unowned_path"],
     ),
-    // Only SMU 14's USB-C controller link makes a device link.
-    ("device links", &["device_link_add", "device_link_del"]),
+    // Only SMU 14's USB-C controller link makes a device link, and
+    // device_link_add refuses it, so none is deleted.
+    ("device links", &["device_link_del"]),
     // Only the partitions of a partitioned accelerator (amdxcp) are
     // platform devices.
-    (
-        "platform devices",
-        &[
-            "platform_device_register_full",
-            "platform_device_unregister",
-        ],
-    ),
+    ("platform devices", &["platform_device_register_full"]),
     // Only the NUMA placement of an accelerator's memory partitions asks.
     ("the firmware's memory map", &["page_is_ram"]),
     // As nouveau's list has them, through hwmon.c and backlight.c.
