@@ -367,7 +367,8 @@ fn generate(output: &Path) {
 const PCI_IDS: &str = "../../third_party/linux/include/drm/intel/pciids.h";
 
 /// Write xe's PCI ID table for the Rust side (`src/xe.rs`): each device ID
-/// with the DMA mask bits of its platform's descriptor, read from the
+/// with the DMA mask bits of its platform's descriptor and whether that
+/// descriptor binds only by force probe, read from the
 /// driver's own `pciidlist` and Linux's ID lists. A clippy build reads it
 /// too, so it is written before any C is compiled.
 pub fn tables() {
@@ -381,20 +382,22 @@ pub fn tables() {
     )
     .unwrap_or_else(|error| panic!("xe's PCI ID table: {error}"));
     let mut text = String::from(
-        "/// xe's `pciidlist`: each PCI device ID with its platform's `dma_mask_size`.\n\
-         pub(crate) const DEVICES: &[(u16, u8)] = &[\n",
+        "/// xe's `pciidlist`: each PCI device ID with its platform's `dma_mask_size`\n\
+         /// and `require_force_probe`.\n\
+         pub(crate) const DEVICES: &[(u16, u8, bool)] = &[\n",
     );
-    for (device, bits) in devices {
-        text.push_str(&format!("    ({device:#06x}, {bits}),\n"));
+    for (device, (bits, forced)) in devices {
+        text.push_str(&format!("    ({device:#06x}, {bits}, {forced}),\n"));
     }
     text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     fs::write(output.join("xe_devices.rs"), text).expect("write xe's device table");
 }
 
-/// Each device ID of `pciidlist` in `table` with the mask bits of the
-/// descriptor its entry names, the ID lists expanded from `ids`.
-fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, u8>, String> {
+/// Each device ID of `pciidlist` in `table` with the mask bits and the
+/// force-probe requirement of the descriptor its entry names, the ID lists
+/// expanded from `ids`.
+fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> {
     // Each list macro's own IDs and the list macros it includes.
     let mut lists = BTreeMap::new();
     for definition in ids.replace("\\\n", " ").lines() {
@@ -442,8 +445,11 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, u8>, String> {
             let bits = bits.split(',').next().unwrap_or("").trim();
             masks.insert(
                 name.trim().to_owned(),
-                bits.parse::<u8>()
-                    .map_err(|_| format!("{name} has mask {bits:?}"))?,
+                (
+                    bits.parse::<u8>()
+                        .map_err(|_| format!("{name} has mask {bits:?}"))?,
+                    body.contains(".require_force_probe = true"),
+                ),
             );
         }
     }

@@ -9,9 +9,19 @@ include!(concat!(env!("OUT_DIR"), "/xe_devices.rs"));
 /// `dma_mask_size`, if xe's table holds the device.
 fn mask_bits(device: u16) -> Option<u8> {
     DEVICES
-        .binary_search_by_key(&device, |(id, _)| *id)
+        .binary_search_by_key(&device, |(id, _, _)| *id)
         .ok()
         .map(|index| DEVICES[index].1)
+}
+
+/// Whether xe binds `device` only because the profile sets Linux's force
+/// probe for every device (`CONFIG_DRM_XE_FORCE_PROBE`): its table marks the
+/// platform `require_force_probe`, which upstream uses for the platforms
+/// where xe is experimental and i915 is the supported driver.
+pub fn force_probed(device: u16) -> bool {
+    DEVICES
+        .binary_search_by_key(&device, |(id, _, _)| *id)
+        .is_ok_and(|index| DEVICES[index].2)
 }
 
 /// Whether xe's table holds the adapter. Intel graphics before Tiger Lake
@@ -29,7 +39,7 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
 /// presented to it ([`admits`]); it gets the narrowest mask of any platform.
 pub fn dma_bits(adapter: &Adapter) -> u8 {
     mask_bits(adapter.device)
-        .or_else(|| DEVICES.iter().map(|(_, bits)| *bits).min())
+        .or_else(|| DEVICES.iter().map(|(_, bits, _)| *bits).min())
         .unwrap_or(32)
 }
 
@@ -67,6 +77,20 @@ mod tests {
         // Ice Lake and Ivy Bridge are not xe's.
         for device in [0x8a56, 0x0166] {
             assert_eq!(mask_bits(device), None, "{device:04x}");
+        }
+    }
+
+    #[test]
+    fn force_probe_is_the_tables_mark_of_each_platform() {
+        // Tiger Lake, Alder Lake P, Raptor Lake P, DG1, Arc A-series and
+        // Meteor Lake bind only by force probe.
+        for device in [0x9a49, 0x46a6, 0xa7a0, 0x4905, 0x56a0, 0x7d55] {
+            assert!(force_probed(device), "{device:04x}");
+        }
+        // Lunar Lake and Battlemage bind without it; a device outside the
+        // table is not xe's at all.
+        for device in [0x64a0, 0xe20b, 0x8a56] {
+            assert!(!force_probed(device), "{device:04x}");
         }
     }
 }
