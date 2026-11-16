@@ -5035,5 +5035,13 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of a guest call and return pair, through the return's lookup tail and paired; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "transfer_path_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of one transfer through a stamped tail, a cell tail, an empty cell and a lookup tail of one to many targets; run on request"
   }
 ]

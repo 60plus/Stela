@@ -4614,6 +4614,8 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod budget;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod costs;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod differential;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod jump_cache;
