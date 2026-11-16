@@ -462,7 +462,20 @@ struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
 	return NULL;
 }
 
-STELA_UNSUPPORTED(int, pci_resize_resource, struct pci_dev *, int, int, int)
+/* Linux's pci_resize_resource asks first whether the host bridge must keep
+ * the firmware's resource assignment (preserve_config) and answers -ENOTSUPP
+ * when it must. Every bridge here must: no bus has a window to grow into, so
+ * a BAR keeps the size the firmware gave. */
+int pci_resize_resource(struct pci_dev *dev, int resno, int size, int exclude_bars)
+{
+	(void)dev;
+	(void)resno;
+	(void)size;
+	(void)exclude_bars;
+	stela_linux_unsupported("resizing a PCI BAR: BARs keep the sizes the firmware gave");
+	return -ENOTSUPP;
+}
+
 STELA_UNSUPPORTED(void, pci_assign_unassigned_bus_resources, struct pci_bus *)
 
 const struct bus_type pci_bus_type = {.name = "pci"};
@@ -1108,7 +1121,7 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
 #include <stela/linux.h>
 #include <stela/test.h>
 
-static u8 config[4096];
+static u8 config[4096], before[4096];
 static int config_error;
 static bool ignore_bus_master_write;
 static unsigned int warnings;
@@ -1161,7 +1174,7 @@ static void log_line(void *context, int level, const char *message)
 		warnings++;
 }
 
-static unsigned int port_mappings, bus_windows;
+static unsigned int port_mappings, bus_windows, resizes;
 
 static void unsupported(void *context, const char *operation)
 {
@@ -1170,6 +1183,8 @@ static void unsupported(void *context, const char *operation)
 		port_mappings++;
 	else if (!strcmp(operation, "a PCI bus's windows: BARs keep the sizes the firmware gave"))
 		bus_windows++;
+	else if (!strcmp(operation, "resizing a PCI BAR: BARs keep the sizes the firmware gave"))
+		resizes++;
 	else
 		assert(false);
 }
@@ -1307,6 +1322,11 @@ int main(void)
 	assert(pci_rebar_bytes_to_size(1) == 0 && pci_rebar_bytes_to_size(SZ_1M) == 0);
 	assert(pci_rebar_bytes_to_size(SZ_256M) == 8 && pci_rebar_bytes_to_size(SZ_256M + 1) == 9);
 	assert(!pci_bus_resource_n(&bus, 0) && bus_windows == 1);
+	/* Growing a BAR is refused as by a bridge that keeps the firmware's
+	 * assignment, and nothing of the function is written. */
+	memcpy(before, config, sizeof(config));
+	assert(pci_resize_resource(&dev, 2, 13, 0) == -ENOTSUPP && resizes == 1);
+	assert(!memcmp(before, config, sizeof(config)));
 	*(u32 *)&config[0x100] = PCI_EXT_CAP_ID_ERR | 1 << 16 | 0x100 << 20;
 	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR));
 	memset(&config[0x100], 0, sizeof(config) - 0x100);
