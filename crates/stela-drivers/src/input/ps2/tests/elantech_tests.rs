@@ -390,7 +390,7 @@ fn real_v1_parity_rocker_and_startup_quirk_reports_keep_suppressed_packets() {
             polled
                 .inputs
                 .iter()
-                .filter(|e| **e == Input::Buttons(1))
+                .filter(|e| **e == Input::MouseButtons(1))
                 .count(),
             1
         );

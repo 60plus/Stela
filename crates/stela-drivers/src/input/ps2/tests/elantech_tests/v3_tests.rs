@@ -71,7 +71,13 @@ fn v3_tail_packets_keep_head_provenance() {
         assert_eq!(contact.primary, None);
         assert_eq!(contact.secondary, Some((500, 600)));
         assert_eq!(contact.head_sequence, None);
-        assert!(polled.inputs.contains(&Input::Move { x: 0, y: 0 }));
+        // The touch's first frame moves nothing.
+        assert!(
+            !polled
+                .inputs
+                .iter()
+                .any(|input| matches!(input, Input::Motion { .. }))
+        );
         assert_eq!(contact.buttons, if firmware & 0x1000 != 0 { 1 } else { 2 });
         emit(&h, Port::Mouse, &packet(crc, true, 2, 200, 100, 1));
         let head = c.poll_elantech().unwrap();

@@ -978,16 +978,21 @@ fn pnp_and_queried_board_select_coordinate_rules_without_replacing_raw_bounds() 
         if board.is_none() {
             assert!(!cap.queries.iter().any(|q| q.id == 1));
         }
+        // A finger from one corner of the bounds to the other moves the
+        // mouse by its travel at the queried 40 and 50 units per mm, up
+        // the screen as Synaptics y runs bottom-up.
         emit(&h, Port::Mouse, &new_packet(min.0, min.1, 50, 5, 0));
-        assert!(c.poll_synaptics().unwrap().inputs.contains(&Input::Move {
-            x: 0,
-            y: crate::input::POINTER_MAX
-        }));
+        assert!(c.poll_synaptics().unwrap().inputs.is_empty());
         emit(&h, Port::Mouse, &new_packet(max.0, max.1, 50, 5, 0));
-        assert!(c.poll_synaptics().unwrap().inputs.contains(&Input::Move {
-            x: crate::input::POINTER_MAX,
-            y: 0
-        }));
+        let counts =
+            |units: u16, per_mm: i64| (i64::from(units) * 400_000 / (per_mm * 25_400)) as i16;
+        assert_eq!(
+            c.poll_synaptics().unwrap().inputs,
+            [Input::Motion {
+                dx: counts(max.0 - min.0, 40),
+                dy: -counts(max.1 - min.1, 50)
+            }]
+        );
     }
     for id in [
         "LEN0034", "LEN0036", "LEN0037", "LEN0039", "LEN2002", "LEN2004",
@@ -1133,7 +1138,7 @@ fn child_reset_identity_negotiation_input_and_stop_remain_separate_from_parent()
             &wrapped([0x09, 2, 3, if explorer { 0x31 } else { 1 }]),
         );
         let input = c.poll_synaptics().unwrap();
-        assert!(input.inputs.contains(&Input::Buttons(1)));
+        assert!(input.inputs.contains(&Input::MouseButtons(1)));
         assert!(
             input
                 .child_inputs
@@ -1151,7 +1156,7 @@ fn child_reset_identity_negotiation_input_and_stop_remain_separate_from_parent()
             input.frames[0].native_sequence + 1,
             input.passthrough[0].native_sequence
         );
-        assert!(c.stop().unwrap().contains(&Input::Buttons(0)));
+        assert!(c.stop().unwrap().contains(&Input::MouseButtons(0)));
         assert!(
             c.drain_synaptics_child_inputs()
                 .contains(&Input::MouseButtons(0))
@@ -1902,7 +1907,7 @@ fn cleanup_acknowledges_relative_mode_and_child_stop_before_retiring_held_input(
         .before_mode_ack
         .push(record);
     let releases = c.cleanup_synaptics().unwrap();
-    assert!(releases.contains(&Input::Buttons(0)));
+    assert!(releases.contains(&Input::MouseButtons(0)));
     assert!(releases.contains(&Input::Key {
         usage: 4,
         pressed: false
@@ -1965,7 +1970,7 @@ fn cleanup_failures_keep_held_state() {
             Some(if late_mode { 0xc5 } else { 0 })
         );
         assert!(c.drain_events().is_empty());
-        assert!(c.release_inputs().contains(&Input::Buttons(0)));
+        assert!(c.release_inputs().contains(&Input::MouseButtons(0)));
         let writes = h.borrow().writes.len();
         assert_eq!(
             c.cleanup_synaptics().unwrap_err().kind,
@@ -2144,7 +2149,7 @@ fn forcepad_pressure_requires_sustained_single_finger_then_latches_until_no_cont
                 .any(|v| matches!(v, Input::Wheel(_) | Input::MouseWheel(_)))
         );
     }
-    assert!(c.stop().unwrap().contains(&Input::Buttons(0)));
+    assert!(c.stop().unwrap().contains(&Input::MouseButtons(0)));
     c.initialize().unwrap();
     emit(&h, Port::Mouse, &force_packet(50, 5, true));
     assert_eq!(c.poll_synaptics().unwrap().frames[0].buttons, 0);
@@ -2173,7 +2178,7 @@ fn forcepad_interleaved_raw_records_preserve_pressure_epoch_and_fault_release() 
     emit(&h, Port::Mouse, &[0]);
     assert!(c.poll().is_err());
     assert!(c.drain_events().is_empty());
-    assert!(c.release_inputs().contains(&Input::Buttons(0)));
+    assert!(c.release_inputs().contains(&Input::MouseButtons(0)));
     assert!(c.needs_reset());
 }
 #[test]

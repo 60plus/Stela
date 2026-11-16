@@ -11,6 +11,7 @@
 //! own input. Vendor children, guest binding and DMI policy remain separate.
 //! ForcePad timing requires a matched native firmware identifier.
 use super::*;
+use crate::input::touchpad::{Geometry, Touch, Translator};
 pub mod agm;
 pub mod board;
 pub mod buttons;
@@ -165,7 +166,8 @@ pub(super) struct Engine {
     position: usize,
     start: u64,
     relaxed: Option<bool>,
-    buttons: u8,
+    /// The pad's mouse emulation, made with its first frame.
+    pointer: Option<Translator>,
     touching: bool,
     frames: VecDeque<Frame>,
     advanced: VecDeque<agm::Record>,
@@ -188,7 +190,7 @@ impl Engine {
             position: 0,
             start: 0,
             relaxed: None,
-            buttons: 0,
+            pointer: None,
             touching: false,
             frames: VecDeque::new(),
             advanced: VecDeque::new(),
@@ -256,19 +258,8 @@ impl Engine {
         if let Some(state) = &mut self.forcepad {
             *state = forcepad::State::default();
         }
-        if self.buttons != 0 {
-            self.buttons = 0;
-            inputs.push(
-                if self
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|c| c.capabilities & 8 != 0)
-                {
-                    Input::MouseButtons(0)
-                } else {
-                    Input::Buttons(0)
-                },
-            );
+        if let Some(pointer) = &mut self.pointer {
+            pointer.release(inputs);
         }
     }
     pub(super) fn feed(
@@ -482,28 +473,29 @@ impl Engine {
             child.external_buttons(buttons)?;
         }
         let buttons = if clickpad { buttons & !2 } else { buttons };
-        if buttons != self.buttons {
-            self.buttons = buttons;
-            inputs.push(if four {
-                Input::MouseButtons(buttons)
-            } else {
-                Input::Buttons(buttons)
-            });
-        }
-        if fingers != 0 {
-            let (min, max) = c.bounds();
-            let scale = |v: i16, low: u16, high: u16| {
-                ((i32::from(v) - i32::from(low)).clamp(0, i32::from(high - low)) as u32
-                    * u32::from(crate::input::POINTER_MAX)
-                    / u32::from(high - low)) as u16
-            };
-            inputs.push(Input::Move {
-                x: scale(x, min.0, max.0),
-                y: crate::input::POINTER_MAX - scale(y, min.1, max.1),
-            });
-        }
+        // A touchpad is a mouse moved by finger travel, as libinput reads
+        // these absolute packets; Synaptics y runs bottom-up.
+        let touch = (fingers != 0).then_some(Touch {
+            x: x.into(),
+            y: -i32::from(y),
+            fingers,
+        });
+        self.pointer
+            .get_or_insert_with(|| Translator::new(geometry(c)))
+            .frame(touch, buttons, now, inputs);
         Ok(())
     }
+}
+/// The pad's scale: its queried resolution, else its bounds over libinput's
+/// assumed size.
+fn geometry(c: &Capabilities) -> Geometry {
+    let (minimum, maximum) = c.bounds();
+    let span = (
+        maximum.0.saturating_sub(minimum.0),
+        maximum.1.saturating_sub(minimum.1),
+    );
+    let (x, y) = c.resolution.unwrap_or((0, 0));
+    Geometry::resolution(span, (x.into(), y.into()))
 }
 impl<R: Registers, T: Timer> Controller<R, T> {
     /// Explicit ordinary touchpad attachment. The platform must establish the
@@ -774,7 +766,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             | u8::from(c.extended());
         c.queries = queries;
         // Keep identity/query observations even if mode's ACK fails.
-        self.synaptics.as_mut().unwrap().capabilities = Some(c);
+        let engine = self.synaptics.as_mut().unwrap();
+        engine.capabilities = Some(c);
+        engine.pointer = None;
         self.synaptics_sliced(mode)?;
         self.device_command(Port::Mouse, SET_RATE, &[0x14])?;
         let advanced = {

@@ -280,7 +280,7 @@ fn v4_late_mode_effect_backpressure_bad_signature_and_stop_are_kept() {
     assert_eq!(c.poll_elantech().unwrap().frames.len(), 8);
     let released = c.stop().unwrap();
     assert_eq!(c.elantech_multitouch().unwrap().fingers, 0);
-    assert!(released.contains(&Input::Buttons(0)));
+    assert!(released.contains(&Input::MouseButtons(0)));
     c.initialize().unwrap();
     head[0] |= 8;
     emit(&h, Port::Mouse, &head);
