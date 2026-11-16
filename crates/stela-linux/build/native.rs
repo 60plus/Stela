@@ -257,6 +257,7 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/kernel/locking/semaphore.c")),
             PathBuf::from(format!("{LINUX}/lib/kstrtox-parse.c")),
             PathBuf::from(format!("{LINUX}/lib/idr.c")),
+            PathBuf::from(format!("{LINUX}/lib/vsscanf.c")),
             PathBuf::from(format!("{LINUX}/lib/radix-tree.c")),
             PathBuf::from(format!("{LINUX}/lib/xarray.c")),
             PathBuf::from(format!("{LINUX}/lib/rbtree.c")),

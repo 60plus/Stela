@@ -379,3 +379,5 @@
 /kernel/time/timeconv.c
 /kernel/locking/semaphore.c
 /drivers/gpu/buddy.c
+/lib/vsscanf.c
+/lib/vsprintf_atoi.h
