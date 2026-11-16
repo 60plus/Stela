@@ -94,6 +94,14 @@
   },
   {
     "package": "stela-compiler",
+    "test": "allocator_bound_census",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "system-mode and process-mode code of the blocks named by DENSITY_IN, for the allocator bound; run on request"
+  },
+  {
+    "package": "stela-compiler",
     "test": "region_census_of_real_code",
     "source": "crates/stela-compiler/src/x86_64/block/tests.rs",
     "kind": "manual",
