@@ -854,7 +854,8 @@ const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recip
     }
 }
 
-/// An image of an [`NvidiaGsp`] release.
+/// An image of an [`NvidiaGsp`] release, under the notice of what it is
+/// made from.
 const fn nvidia_image(
     source: &'static str,
     revision: &'static str,
@@ -878,6 +879,30 @@ const fn nvidia_image(
 
 /// open-gpu-kernel-modules at its tag `570.211.01`.
 const OPEN_GPU_570_211_01: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
+
+/// open-gpu-kernel-modules' `COPYING` at [`OPEN_GPU_570_211_01`]: its files
+/// are MIT unless they say otherwise, and the generated `bindata` sources
+/// the bootloader and GSP-FMC are built from say `SPDX-License-Identifier:
+/// MIT`.
+const OPEN_GPU_570_211_01_LICENSE: Artifact = Artifact {
+    source: NVIDIA_OPEN_GPU,
+    revision: OPEN_GPU_570_211_01,
+    member: "COPYING",
+    length: 19391,
+    sha256: "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06",
+};
+
+/// The `LICENSE` of `NVIDIA-Linux-x86_64-570.211.01.run`, the NVIDIA Driver
+/// License Agreement its GSP-RM image is under. It lies 1.2 GB into the
+/// installer's single `zstd` frame, so the CLI carries this file's exact
+/// bytes rather than downloading the installer for it.
+pub const NVIDIA_DRIVER_570_211_01_LICENSE: Artifact = Artifact {
+    source: NVIDIA_LINUX_DRIVER,
+    revision: "570.211.01",
+    member: "LICENSE",
+    length: 22653,
+    sha256: "c692fb14ad4f499c6aee1b9e144e6905148c420e6225b17cb2937366c1e507ad",
+};
 
 /// GeForce Blackwell's GSP-RM 570.211.01 (`gb202` directory).
 pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
@@ -914,7 +939,7 @@ pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
             "nvidia/gb202/gsp/bootloader-570.211.01.bin",
             200812,
             "e5e505fb453bcd618a4966464aa601e97a1ced2b1d450cab5bcb69e4043dc7f2",
-            &GSP_LICENSE,
+            &OPEN_GPU_570_211_01_LICENSE,
         ),
         nvidia_image(
             NVIDIA_OPEN_GPU,
@@ -922,7 +947,7 @@ pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
             "nvidia/gb202/gsp/fmc-570.211.01.bin",
             199820,
             "e0950cdd16fe7045adbce11543f5b6d13146fca89e78158a9ab07d28dcbe576a",
-            &GSP_LICENSE,
+            &OPEN_GPU_570_211_01_LICENSE,
         ),
         nvidia_image(
             NVIDIA_LINUX_DRIVER,
@@ -930,7 +955,7 @@ pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
             "nvidia/gb202/gsp/gsp-570.211.01.bin",
             64116464,
             "3ce89a251900d0238d0593e4b9eb039c4571c6c54d09661fad7399f89e37d4bc",
-            &GSP_LICENSE,
+            &NVIDIA_DRIVER_570_211_01_LICENSE,
         ),
     ],
 };
@@ -2917,6 +2942,10 @@ mod tests {
             let image = nvidia_gsp(&recipe.image)
                 .map_or(&recipe.image, |(release, part)| release.source(part));
             for artifact in [image, recipe.license] {
+                if *artifact == NVIDIA_DRIVER_570_211_01_LICENSE {
+                    // The CLI carries it.
+                    continue;
+                }
                 assert_eq!(
                     artifact.urls().len(),
                     if matches!(artifact.source, WIRELESS_REGDB | NVIDIA_OPEN_GPU) {
@@ -2944,7 +2973,8 @@ mod tests {
                 "https://us.download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run"
             ]
         );
-
+        assert_eq!(bootloader.license.member, "COPYING");
+        assert_eq!(*gsp.license, NVIDIA_DRIVER_570_211_01_LICENSE);
         let value = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":"regulatory.db", "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},"minimum_bytes":8
         }]});

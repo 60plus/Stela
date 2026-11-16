@@ -5,7 +5,9 @@
 //! against its pin before it is parsed, and each image after.
 use anyhow::{Context, Result, bail, ensure};
 use std::io::Read;
-use stela_loader::host_firmware::recipes::{self, Artifact, NvidiaGsp, NvidiaPart};
+use stela_loader::host_firmware::recipes::{
+    self, Artifact, NVIDIA_DRIVER_570_211_01_LICENSE, NvidiaGsp, NvidiaPart,
+};
 
 /// How an image's pinned download maps to the image.
 pub(super) struct WireSpec {
@@ -40,6 +42,13 @@ pub(super) fn spec(artifact: &Artifact) -> Option<WireSpec> {
         release,
         part,
     })
+}
+
+/// The exact bytes of a notice the CLI carries, which no download serves
+/// cheaply ([`NVIDIA_DRIVER_570_211_01_LICENSE`]).
+pub(super) fn carried(artifact: &Artifact) -> Option<&'static [u8]> {
+    (*artifact == NVIDIA_DRIVER_570_211_01_LICENSE)
+        .then_some(include_bytes!("notices/NVIDIA-Linux-x86_64-570.211.01-LICENSE").as_slice())
 }
 
 /// Extract one named `NvU8` array from an `open-gpu-kernel-modules` `bindata` C

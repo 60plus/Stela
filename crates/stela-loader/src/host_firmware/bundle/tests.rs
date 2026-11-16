@@ -32,7 +32,11 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert!(bundle.missing().is_empty());
     assert_eq!(bundle.notices.len(), notices().len());
     for notice in &bundle.notices {
-        assert!(notice.member.contains("LICEN"), "{}", notice.member);
+        assert!(
+            notice.member.contains("LICEN") || notice.member == "COPYING",
+            "{}",
+            notice.member
+        );
     }
 }
 

@@ -223,6 +223,10 @@ fn host_of(url: &str) -> &str {
 }
 
 fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    if let Some(bytes) = nvidia::carried(artifact) {
+        artifact.verify(bytes)?;
+        return Ok(bytes.to_vec());
+    }
     if let Some(spec) = nvidia::spec(artifact) {
         let wire = download_slice(
             client,
@@ -1493,6 +1497,32 @@ mod tests {
         let heads = server.join().unwrap();
         assert!(!heads[0].contains("range:"), "{heads:?}");
         assert!(heads[1].contains("range: bytes=2-\r\n"), "{heads:?}");
+    }
+
+    #[test]
+    fn every_nvidia_release_image_has_its_download_and_every_notice_a_source() {
+        for (object, notice) in bundle::complete() {
+            match nvidia::spec(object) {
+                Some(spec) => {
+                    let (release, part) = recipes::nvidia_gsp(object).unwrap();
+                    assert_eq!(spec.wire, release.source(part));
+                    assert_eq!(spec.slice.is_some(), part == recipes::NvidiaPart::Gsp);
+                }
+                None => assert!(recipes::nvidia_gsp(object).is_none()),
+            }
+            // A notice is downloaded, or carried with its pinned bytes.
+            match nvidia::carried(notice) {
+                Some(bytes) => notice.verify(bytes).unwrap(),
+                None => assert!(!notice.urls().is_empty(), "{}", notice.member),
+            }
+        }
+        let gsp = &recipes::GB20X_570_211_01.images[2];
+        assert_eq!(*gsp.license, recipes::NVIDIA_DRIVER_570_211_01_LICENSE);
+        let carried = nvidia::carried(gsp.license).unwrap();
+        assert!(carried.starts_with(b"NVIDIA Driver License Agreement"));
+        // The CLI serves it without a network.
+        let client = super::client().unwrap();
+        assert_eq!(download(&client, gsp.license).unwrap(), carried);
     }
 
     #[test]
