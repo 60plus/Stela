@@ -172,8 +172,6 @@ impl World {
         while left > 0 {
             let now = left.min(run);
             left -= now;
-            // SAFETY: the table's stamps, which live; nothing runs.
-            unsafe { next_jump_serial(self.control.stamps) };
             // SAFETY: the region holds the loop, a tail, probes and blocks
             // with the block ABI; they touch the state, the control, the
             // tables, the stamps and the sequence, which outlive the call.

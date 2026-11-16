@@ -263,9 +263,6 @@ fn put(pages: &Pages, offset: usize, bytes: &[u8]) {
 /// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`:
 /// what it returned.
 fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    // A native entry, as the engine's: the jump cache starts over.
-    // SAFETY: the control's stamps are 0 or the live table's.
-    unsafe { next_jump_serial(control.stamps) };
     let mut frame = Box::new(GuestState::default());
     frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
     // SAFETY: the region holds the stub, a tail and probes with the block
@@ -300,7 +297,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
     let stamps = table.new_stamps();
     let mut itlb = LookupTable::itlb();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-    let (mut entered, mut exited) = (0u32, 0u32);
+    let (mut entered, mut exited, mut cached) = (0u32, 0u32, 0u32);
+    // What the page tables map each page to in each context: a key changes
+    // only after a drop of the page, as a TLBI precedes a remap.
+    let mut keys = alloc::collections::BTreeMap::new();
+    for &pc in &pcs {
+        for context in CONTEXTS {
+            keys.insert((pc & !0xfff, context), KEYS[0]);
+        }
+    }
     for (block, &pc) in pcs.iter().enumerate() {
         itlb.insert(
             itlb.page_slot(pc, CONTEXTS[half(pc)]),
@@ -332,10 +337,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                     0 => CONTEXTS[rng.below(3) as usize],
                     _ => CONTEXTS[half(pc)],
                 };
-                let key = KEYS[usize::from(rng.below(4) == 0)];
+                let page = pc & !0xfff;
+                let held = keys.get_mut(&(page, context)).unwrap();
+                if rng.below(4) == 0 {
+                    itlb.forget_range_where(page..=page, |entry| entry.key == context);
+                    *held = KEYS[usize::from(rng.below(4) == 0)];
+                }
                 itlb.insert(
                     itlb.page_slot(pc, context),
-                    LookupEntry::page(pc & !0xfff, context, key),
+                    LookupEntry::page(page, context, *held),
                 );
             }
             3..=5 => {
@@ -408,9 +418,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
             )
             .unwrap()
             .to_vec(),
-            false => lookup_tail(new.0 as u64 + 3, kind, ran, new.0 as u64 + probe as u64, 0)
-                .unwrap()
-                .to_vec(),
+            false => lookup_tail(
+                new.0 as u64 + 3,
+                kind,
+                ran,
+                new.0 as u64 + probe as u64,
+                btype,
+            )
+            .unwrap()
+            .to_vec(),
         };
         let before = legacy_tail(
             old.0 as u64 + 3,
@@ -445,14 +461,55 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         let mut base = base;
         base.salts = base.contexts.map(|context| itlb.salt(context));
         let (mut a, mut b) = (base, base);
+        // The one difference the jump cache makes, as a stamp does: its
+        // entry holds in the half's context and ITLB drop epoch while the
+        // probe misses a page this ITLB put out for another (a capacity
+        // eviction, not a drop), or finds it in another upper context than
+        // the lower-half page's entry was filled in, and the entry enters
+        // the block of the key the page tables still map the page to.
+        let page = target & !0xfff;
+        let candidates = match half(target) {
+            0 => &base.contexts[..],
+            _ => &base.contexts[1..],
+        };
+        let translated = candidates.iter().find_map(|&context| {
+            let resident = itlb.find(itlb.page_slot(target, context), page, context);
+            (resident.pc == page && resident.key == context).then_some(resident.entry)
+        });
+        let at = jump_entry(stamps, target);
+        // SAFETY: an entry of the stamps' jump cache and a drop epoch of
+        // the ITLB, which live; no native code runs meanwhile.
+        let field = |offset: i32| unsafe { ((at as i64 + i64::from(offset)) as *const u64).read() };
+        let drops = itlb.address() as i64 + i64::from(ITLB_DROPS) + 8 * half(target) as i64;
+        // SAFETY: as above.
+        let drops = unsafe { (drops as *const u64).read() };
+        let cached_block = field(JUMP_BLOCK) as u32;
+        let held = !through_cell
+            && field(JUMP_PC) == target
+            && field(JUMP_CONTEXT) == base.contexts[half(target)]
+            && field(JUMP_EPOCH) == drops
+            && KEYS.into_iter().any(|key| {
+                let entry = table.find(table.slot(target, key), target, key);
+                entry.pc == target
+                    && entry.key == key
+                    && entry.block == cached_block
+                    && translated != Some(key)
+                    && CONTEXTS
+                        .into_iter()
+                        .any(|context| keys.get(&(page, context)) == Some(&key))
+            });
         let ra = run(&new, &mut a, target);
         let rb = run(&old, &mut b, target);
+        // Only today's cell probes count heat.
+        a.heat = 0;
+        if held && (ra != rb || a != b) {
+            cached += 1;
+            continue;
+        }
         assert_eq!(
             ra, rb,
             "trial {trial}: target {target:#x} cell {through_cell} btype {btype}"
         );
-        // Only today's cell probes count heat.
-        a.heat = 0;
         assert_eq!(a, b, "trial {trial}: the controls differ");
         if ra.1 == 99 {
             entered += 1;
@@ -462,6 +519,7 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         }
     }
     assert!(entered > 8000 && exited > 8000, "{entered} {exited}");
+    assert!(cached < 1200, "{cached}");
 }
 
 /// A lower-half page the ITLB lacks in the lower half's context is
@@ -492,7 +550,11 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
     put(&region, 3, &tail);
     let [lower, upper] = [pcs()[0], pcs()[4]];
     let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
-    let stamps = table.new_stamps();
+    // Each check takes fresh stamps: one page's global and non-global
+    // entries together are a TLB conflict, which a jump cache entry filled
+    // from either serves until the TLBI that ends it drops the page.
+    let fresh: Vec<u64> = (0..8).map(|_| table.new_stamps()).collect();
+    let next = std::cell::Cell::new(0);
     for pc in [lower, upper] {
         let entry = LookupEntry {
             pc,
@@ -504,6 +566,8 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
         table.insert(table.slot(pc, KEYS[0]), entry);
     }
     let control = |itlb: &LookupTable| {
+        let stamps = fresh[next.get()];
+        next.set(next.get() + 1);
         let mut control = ChainControl {
             budget: 5,
             contexts: [CONTEXTS[0], CONTEXTS[1]],

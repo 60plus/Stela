@@ -305,9 +305,12 @@ impl Run {
 
     fn run(&mut self, state: &mut GuestState, control: &mut ChainControl) -> (u64, u64) {
         state.anchors[Anchor::Control] = control as *mut ChainControl as u64;
-        // A native entry, as the engine's: the jump cache starts over.
-        // SAFETY: the control's stamps are 0 or the live table's.
-        unsafe { next_jump_serial(control.stamps) };
+        // Each run starts with an empty jump cache, so the ways compare as
+        // the table probe serves them; the cache's own differences are the
+        // probes' and the jump cache's tests.
+        if control.stamps != 0 {
+            forget_all_jumps(&[control.stamps]);
+        }
         state.anchors[Anchor::Memo] = self.memo.as_ptr() as u64;
         state.anchors[Anchor::Pointer] = &raw mut *self.service as u64;
         // SAFETY: the region holds the entry, the thunk, its tails and the

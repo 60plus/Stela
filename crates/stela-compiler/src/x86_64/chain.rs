@@ -761,54 +761,83 @@ pub const STAMP_TABLE_BYTES: usize = STAMPED_CELLS * STAMP_BYTES;
 /// Bytes of the counts in front of one PE's stamps ([`StampCount`]).
 pub const STAMP_COUNTS_BYTES: usize = 64;
 
-/// Entries of a PE's jump cache, in front of its stamp counts: the
-/// targets its table probe found since the cache's serial last moved, by
-/// guest PC, which a [`lookup_tail`] takes without a probe. Bits 2-9 of
-/// the PC pick the entry.
+/// Entries of a PE's jump cache, in front of its stamp counts: targets its
+/// table probe entered, by guest PC, which a [`lookup_tail`] takes without
+/// a probe. Bits 2-9 of the PC pick the entry.
+///
+/// An entry holds across native runs, while the target's half has the
+/// context and ITLB drop epoch the entry names, as a stamp holds
+/// ([`stamped_tail`]), and while the block table keeps the entry it was
+/// filled from: every change of a table entry takes that PC's jump cache
+/// entries from every PE's cache ([`forget_jumps`]). The probe that fills
+/// an entry stores its PC with a locked exchange and reads the table
+/// entry's last word again after it, taking the entry back when the word
+/// moved; the table's writer stores the entry, fences and then reads the
+/// caches, so one of the two sees the other.
 pub const JUMP_CACHE_ENTRIES: usize = 256;
-/// Bytes of one jump cache entry: the PC, the block's code, its index and
-/// the BTYPEs it accepts (as [`LookupEntry`]), and the serial it holds in.
-const JUMP_ENTRY_BYTES: usize = 32;
-/// Bytes in front of a PE's stamp counts: the jump cache, then a cache
-/// line whose first word is its serial.
-pub const JUMP_CACHE_BYTES: usize = JUMP_CACHE_ENTRIES * JUMP_ENTRY_BYTES + 64;
-/// Byte offset from the stamps of the jump cache's serial, which the
-/// engine moves at every native entry ([`next_jump_serial`]) and a native
-/// transition moves when it changes the lookup contexts: an entry holds
-/// only while its serial is the cache's. Never 0, which no entry holds
-/// until it is written.
-pub const JUMP_SERIAL: i32 = -((STAMP_COUNTS_BYTES + 64) as i32);
+/// Bytes of one jump cache entry, a cache line: the PC, the block's code,
+/// its index and the table entry's last word as the probe read it, whose
+/// low byte is the BTYPEs the block accepts ([`LookupEntry`]), then the
+/// context and ITLB drop epoch of the target's half it holds in.
+const JUMP_ENTRY_BYTES: usize = 64;
+/// Bytes of a PE's jump cache, in front of its stamp counts.
+pub const JUMP_CACHE_BYTES: usize = JUMP_CACHE_ENTRIES * JUMP_ENTRY_BYTES;
 /// Byte offset from the stamps of the jump cache's first entry.
-const JUMP_CACHE: i32 = JUMP_SERIAL - (JUMP_CACHE_ENTRIES * JUMP_ENTRY_BYTES) as i32;
-/// The PC bits that pick an entry, scaled by 4: times 8 an entry's offset.
+const JUMP_CACHE: i32 = -((STAMP_COUNTS_BYTES + JUMP_CACHE_BYTES) as i32);
+/// The PC bits that pick an entry, scaled by 4: shifted left by
+/// [`JUMP_INDEX_SHIFT`], an entry's offset.
 const JUMP_INDEX: i32 = ((JUMP_CACHE_ENTRIES - 1) << 2) as i32;
+const JUMP_INDEX_SHIFT: u8 = JUMP_ENTRY_BYTES.trailing_zeros() as u8 - 2;
 const JUMP_PC: i32 = 0;
 const JUMP_CODE: i32 = 8;
 const JUMP_BLOCK: i32 = 16;
 const JUMP_TARGETS: i32 = 20;
-const JUMP_ENTRY_SERIAL: i32 = 24;
-const _: () = assert!(JUMP_ENTRY_BYTES == 4 * 8 && JUMP_CACHE_ENTRIES.is_power_of_two());
+const JUMP_CONTEXT: i32 = 24;
+const JUMP_EPOCH: i32 = 32;
+const _: () = assert!(JUMP_EPOCH as usize + 8 <= JUMP_ENTRY_BYTES);
+const _: () = assert!(JUMP_ENTRY_BYTES == 64 && JUMP_CACHE_ENTRIES.is_power_of_two());
+const _: () = assert!(STAMP_COUNTS_BYTES.is_multiple_of(64));
 
-/// Move the serial of the jump cache in front of `stamps` (0 for none):
-/// every entry it holds goes. The engine does this at every native entry,
-/// after which the ITLB, the contexts and the blocks may all be others.
-///
-/// # Safety
-///
-/// `stamps` is 0 or an address [`LookupTable::new_stamps`] returned, whose
-/// table lives, and no native code of its PE runs.
-pub unsafe fn next_jump_serial(stamps: u64) {
-    if stamps == 0 {
+/// The host address of the entry of `pc` in the jump cache in front of
+/// `stamps` ([`LookupTable::new_stamps`]).
+pub const fn jump_entry(stamps: u64, pc: u64) -> u64 {
+    stamps
+        .wrapping_add(JUMP_CACHE as i64 as u64)
+        .wrapping_add((pc & JUMP_INDEX as u64) << JUMP_INDEX_SHIFT)
+}
+
+/// Take the entries of `pc` out of the jump caches in front of `stamps`,
+/// after a change of the block table entry they may have been filled
+/// from, which the caller stored before: the fence orders that store
+/// before these reads, as the filling probe's locked exchange orders its
+/// store of the PC before its read of the table entry ([`fill_jump_cache`]).
+fn forget_jumps(stamps: &[u64], pc: u64) {
+    if stamps.is_empty() {
         return;
     }
-    let word = (stamps as i64 + i64::from(JUMP_SERIAL)) as *mut u64;
-    // SAFETY: the caller's: `new_stamps` made the serial as an atomic in
-    // front of `stamps`, and only this PE writes it.
-    let serial = unsafe { AtomicU64::from_ptr(word) };
-    serial.store(
-        serial.load(Ordering::Relaxed).wrapping_add(1).max(1),
-        Ordering::Relaxed,
-    );
+    fence(Ordering::SeqCst);
+    for &table in stamps {
+        // SAFETY: `new_stamps` made the cache in front of each of `stamps`
+        // as atomics, which live while their table does.
+        let held = unsafe { AtomicU64::from_ptr(jump_entry(table, pc) as *mut u64) };
+        if held.load(Ordering::Relaxed) == pc {
+            held.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Take every entry out of the jump caches in front of `stamps`, as
+/// [`forget_jumps`] does one PC's.
+fn forget_all_jumps(stamps: &[u64]) {
+    fence(Ordering::SeqCst);
+    for &table in stamps {
+        for entry in 0..JUMP_CACHE_ENTRIES {
+            let at =
+                (table as i64 + i64::from(JUMP_CACHE)) as u64 + (entry * JUMP_ENTRY_BYTES) as u64;
+            // SAFETY: as for `forget_jumps`.
+            unsafe { AtomicU64::from_ptr(at as *mut u64) }.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// What one PE's stamped tails and stamping cell probe count, a word each
@@ -1087,7 +1116,8 @@ impl LookupTable {
             + self.granules.len() * 2 * size_of::<(u64, u32)>()
             + self.front.len() * size_of::<(u64, u32)>()
             + self.cells.iter().map(|cells| cells.len).sum::<usize>() * size_of::<LookupEntry>()
-            + self.stamp_store.len() * (JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES + STAMP_TABLE_BYTES)
+            + self.stamp_store.len()
+                * (64 + JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES + STAMP_TABLE_BYTES)
             + self.free_cells.capacity() * size_of::<u32>()
             + self.cell_counts.len() * size_of::<u32>()
             + (self.cell_pcs.len() + self.cell_frames.len() + self.cell_sites.len())
@@ -1111,6 +1141,9 @@ impl LookupTable {
             if slot.key() != 0 {
                 slot.store(LookupEntry::default());
             }
+        }
+        if !self.stamp_tables.is_empty() {
+            forget_all_jumps(&self.stamp_tables);
         }
         self.granules.clear();
         self.front.fill((NO_GROUP, 0));
@@ -1310,11 +1343,11 @@ impl LookupTable {
     /// the table keeps while it lives and zeroes a cell's stamps in when
     /// the cell changes.
     pub fn new_stamps(&mut self) -> u64 {
-        let words = (JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES + STAMP_TABLE_BYTES) / 8;
+        // A cache line more, for the jump cache's entries to start one.
+        let words = (64 + JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES + STAMP_TABLE_BYTES) / 8;
         let stamps: Box<[AtomicU64]> = (0..words).map(|_| AtomicU64::new(0)).collect();
-        let address = stamps.as_ptr() as u64 + (JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES) as u64;
-        // The jump cache's serial starts at 1: its zeroed entries hold in none.
-        stamps[(JUMP_CACHE_BYTES - 64) / 8].store(1, Ordering::Relaxed);
+        let address = (stamps.as_ptr() as u64).next_multiple_of(64)
+            + (JUMP_CACHE_BYTES + STAMP_COUNTS_BYTES) as u64;
         self.stamp_store.push(stamps);
         self.stamp_tables.push(address);
         address
@@ -1465,10 +1498,24 @@ impl LookupTable {
             };
             if keep_resident {
                 // The same set, which the resident's group lists already.
-                self.sets.get(neighbour(slot)).store(resident);
+                self.put(neighbour(slot), resident);
             }
         }
         self.set(slot, entry);
+    }
+
+    /// Store `entry` in `slot`; the entry it puts out of a block table
+    /// goes from every PE's jump cache ([`forget_jumps`]).
+    fn put(&self, slot: usize, entry: LookupEntry) {
+        let held = self.sets.get(slot);
+        let old = (!self.stamp_tables.is_empty()).then(|| held.load());
+        held.store(entry);
+        if let Some(old) = old
+            && old.key != 0
+            && old != entry
+        {
+            forget_jumps(&self.stamp_tables, old.pc);
+        }
     }
 
     /// Put `entry` in `slot` alone, and in every cell of its PC.
@@ -1482,7 +1529,7 @@ impl LookupTable {
             }
             self.note_rekey(slot, &entry);
         }
-        self.sets.get(slot).store(entry);
+        self.put(slot, entry);
         if entry.key == 0 {
             return;
         }
@@ -1707,6 +1754,7 @@ impl LookupTable {
             let held = self.sets.get(at);
             if held.key() == key && named(&held.load()) {
                 held.store(LookupEntry::default());
+                forget_jumps(&self.stamp_tables, pc);
             }
         }
         if self.cell_counts.is_empty() || self.cell_counts[cell_bucket(pc)] == 0 {
@@ -1756,6 +1804,7 @@ impl LookupTable {
             }
         }
         let sets = &self.sets;
+        let stamps = &self.stamp_tables;
         for (&group, &place) in self.granules.range(groups) {
             found = true;
             let listed = &mut self.lists[place as usize];
@@ -1768,6 +1817,7 @@ impl LookupTable {
                     let entry = held.load();
                     if entry.key != 0 && grouping.of(&entry) == group && forget(&entry) {
                         held.store(LookupEntry::default());
+                        forget_jumps(stamps, entry.pc);
                     }
                 }
                 holds(sets, set, grouping, group)
@@ -2539,7 +2589,7 @@ pub const CELL_PROBE_ENTRY: usize = 0;
 pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// Where a [`lookup_dispatcher`]'s stamping cell probe begins, after the
 /// table probe: a [`stamped_tail`]'s miss takes it.
-pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 512;
+pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
 /// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
 pub const TAIL_BYTES: usize = 5 + 5;
 /// Bytes in a [`cell_tail`].
@@ -3086,14 +3136,12 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
 
 /// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
 /// budget's return, and the plain tail ([`TAIL_BYTES`]) of a miss.
-pub const LOOKUP_TAIL_BYTES: usize = 144;
-// The engine installs a lookup tail where a stamped tail may go.
-const _: () = assert!(LOOKUP_TAIL_BYTES <= STAMPED_TAIL_BYTES);
+pub const LOOKUP_TAIL_BYTES: usize = 224;
 
 /// The tail at host address `at` that an exit's patch point jumps to once
 /// the exit is redirected through a lookup, for a branch that sets
-/// `btype`: a target this PE's jump cache holds in its current serial
-/// (and that accepts `btype`) is entered from here, counted as a probe
+/// `btype`: a target this PE's jump cache holds (and that accepts `btype`)
+/// is entered from here, counted as a probe
 /// counts its transfers, by a jump of the site's own; any other takes EDX
 /// the exit's `word` with the `ran` instructions of the block it leaves,
 /// which only a probe reads, then a jump to the table probe at `probe`,
@@ -3102,14 +3150,16 @@ const _: () = assert!(LOOKUP_TAIL_BYTES <= STAMPED_TAIL_BYTES);
 /// `None` when `ran` exceeds its field, `btype` is no BTYPE or `probe` is
 /// out of a 32-bit jump's reach.
 ///
-/// An entry holds only for the serial it was written in, which moves at
-/// every native entry and at every native change of the lookup contexts
-/// ([`JUMP_SERIAL`]). In one serial the PE's ITLB and contexts are what
-/// the probe that filled the entry translated through, and a block another
-/// PE releases meanwhile keeps its code until this PE's grace: the entry
-/// enters the block that probe would enter, as a direct link would. The
-/// control's stamps hold the cache: every PE's control has them before it
-/// runs (`LookupTable::new_stamps`).
+/// An entry holds while the target's half has the context and this PE's
+/// ITLB the drop epoch of that half that it names, as a stamp holds
+/// ([`stamped_tail`]): the PE's translation of the target's page is the one
+/// the probe that filled it found. The block table's change of the entry
+/// it was filled from takes it from the cache ([`JUMP_CACHE_ENTRIES`]); a
+/// block another PE releases meanwhile keeps its code until this PE's
+/// grace, so an entry read just before enters the block that probe would
+/// have entered, as a direct link would. The control's stamps hold the
+/// cache: every PE's control has them before it runs
+/// (`LookupTable::new_stamps`).
 pub fn lookup_tail(
     at: u64,
     word: impl Into<ExitWord>,
@@ -3138,13 +3188,20 @@ fn lookup_tail_with_policy(
 }
 
 /// Bytes in a [`paired_tail`], padded.
-pub const PAIRED_TAIL_BYTES: usize = 256;
-/// Bytes of the largest tail the engine installs where a lookup tail or a
-/// stamped one may go.
-pub const TAIL_ROOM: usize = if STAMPED_TAIL_BYTES > PAIRED_TAIL_BYTES {
-    STAMPED_TAIL_BYTES
-} else {
-    PAIRED_TAIL_BYTES
+pub const PAIRED_TAIL_BYTES: usize = 320;
+/// Bytes of the largest tail the engine installs: a lookup, stamped or
+/// paired one.
+pub const TAIL_ROOM: usize = {
+    let room = if STAMPED_TAIL_BYTES > PAIRED_TAIL_BYTES {
+        STAMPED_TAIL_BYTES
+    } else {
+        PAIRED_TAIL_BYTES
+    };
+    if LOOKUP_TAIL_BYTES > room {
+        LOOKUP_TAIL_BYTES
+    } else {
+        room
+    }
 };
 
 /// The tail at host address `at` of a return's exit: a [`lookup_tail`]
@@ -3192,22 +3249,32 @@ fn lookup_tail_code(
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
-    let entry = |field: i32| Mem::indexed(R10, R9, 8, JUMP_CACHE + field);
+    let entry = |field: i32| Mem::indexed(R10, R9, 1, JUMP_CACHE + field);
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses: Vec<_> = gate(&mut asm, policy, R8, false).into_iter().collect();
-    // R10 = this PE's stamps, R9 = 8 times the entry's index.
+    let mut misses: Vec<_> = gate(&mut asm, policy, R8, true).into_iter().collect();
+    // R10 = this PE's stamps, R9 = the entry's offset.
     asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
     asm.mov(Dword, R9, Rax);
     asm.alu_imm32(Alu::And, Dword, R9, JUMP_INDEX);
+    asm.shift_imm(ShiftOp::Shl, Dword, R9, JUMP_INDEX_SHIFT);
     asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
-    misses.push(asm.jcc8(Cond::Ne));
-    asm.mov_load(Qword, R8, Mem::base(R10, JUMP_SERIAL));
-    asm.alu_load(Alu::Cmp, Qword, R8, entry(JUMP_ENTRY_SERIAL));
-    misses.push(asm.jcc8(Cond::Ne));
+    misses.push(asm.jcc(Cond::Ne));
+    // The target's half still has the context and ITLB drop epoch the
+    // entry holds in. No context is 0, so an empty entry holds in none.
+    asm.mov(Qword, R8, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, R8, 55);
+    asm.alu_imm8(Alu::And, Dword, R8, 1);
+    asm.mov_load(Qword, R11, Mem::indexed(Rcx, R8, 8, CONTEXTS));
+    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_CONTEXT));
+    misses.push(asm.jcc(Cond::Ne));
+    asm.mov_load(Qword, R11, Mem::base(Rcx, ITLB));
+    asm.mov_load(Qword, R11, Mem::indexed(R11, R8, 8, ITLB_DROPS));
+    asm.alu_load(Alu::Cmp, Qword, R11, entry(JUMP_EPOCH));
+    misses.push(asm.jcc(Cond::Ne));
     if btype != 0 {
         asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
-        misses.push(asm.jcc8(Cond::E));
+        misses.push(asm.jcc(Cond::E));
     }
     spend_budget(&mut asm, policy);
     let exhausted = asm.jcc8(Cond::B);
@@ -3230,30 +3297,65 @@ fn lookup_tail_code(
 
 /// Count a table probe transfer ([`StampCount::Filled`]) and fill this
 /// PE's jump cache entry of the target in RAX ([`lookup_tail`]) with the
-/// block the table probe just entered: its code in R9, its index
-/// in R8D and its entry's last word in R11D, as the probe read them, whose
-/// low byte is the BTYPEs it accepts (`META_TARGETS`), all a tail reads of
-/// it; nothing for a control without stamps. Clobbers RDX, R10 and R11.
+/// block the table probe just entered from the entry at R10: its code in
+/// R9, its index in R8D and the entry's last word in R11D, as the probe
+/// read them, whose low byte is the BTYPEs it accepts (`META_TARGETS`),
+/// with the context and this PE's ITLB drop epoch of the target's half;
+/// nothing for a control without stamps. An entry of another PC loses its
+/// PC first; the PC goes in last, by a locked exchange, and the table
+/// entry's last word is read again after it: a writer that changed the
+/// entry meanwhile either finds the PC and takes it out ([`forget_jumps`]),
+/// or this does. An entry that holds the PC already keeps it, without the
+/// exchange: a writer finds it there, and one that took it out leaves the
+/// exchange to this. Clobbers RDX and R11.
 fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     const _: () = assert!(META_TARGETS == 0xff);
-    let entry = |field: i32| Mem::indexed(R10, Rdx, 8, JUMP_CACHE + field);
-    asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
-    asm.test(Qword, R10, R10);
-    let none = asm.jcc8(Cond::E);
-    asm.alu_imm8(
-        Alu::Add,
-        Qword,
-        Mem::base(R10, StampCount::Filled.offset()),
-        1,
-    );
+    let entry = |field: i32| Mem::base(Rdx, JUMP_CACHE + field);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, STAMPS), 0);
+    let none = asm.jcc(Cond::E);
+    // RDX = the entry's address, its PC out first unless it is the target.
     asm.mov(Dword, Rdx, Rax);
     asm.alu_imm32(Alu::And, Dword, Rdx, JUMP_INDEX);
-    asm.mov_store(Qword, entry(JUMP_PC), Rax);
+    asm.shift_imm(ShiftOp::Shl, Dword, Rdx, JUMP_INDEX_SHIFT);
+    asm.alu_load(Alu::Add, Qword, Rdx, Mem::base(Rcx, STAMPS));
+    asm.alu_load(Alu::Cmp, Qword, Rax, entry(JUMP_PC));
+    let held = asm.jcc8(Cond::E);
+    asm.mov_rm_imm32(Qword, entry(JUMP_PC), 0);
+    asm.bind(held);
     asm.mov_store(Qword, entry(JUMP_CODE), R9);
     asm.mov_store(Dword, entry(JUMP_BLOCK), R8);
     asm.mov_store(Dword, entry(JUMP_TARGETS), R11);
-    asm.mov_load(Qword, R11, Mem::base(R10, JUMP_SERIAL));
-    asm.mov_store(Qword, entry(JUMP_ENTRY_SERIAL), R11);
+    asm.mov_load(Qword, R11, Mem::base(Rcx, STAMPS));
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(R11, StampCount::Filled.offset()),
+        1,
+    );
+    asm.mov(Qword, R11, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, R11, 55);
+    asm.alu_imm8(Alu::And, Dword, R11, 1);
+    asm.mov_load(Qword, R11, Mem::indexed(Rcx, R11, 8, CONTEXTS));
+    asm.mov_store(Qword, entry(JUMP_CONTEXT), R11);
+    asm.mov(Qword, R11, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, R11, 55);
+    asm.alu_imm8(Alu::And, Dword, R11, 1);
+    asm.shift_imm(ShiftOp::Shl, Dword, R11, 3);
+    asm.alu_load(Alu::Add, Qword, R11, Mem::base(Rcx, ITLB));
+    asm.mov_load(Qword, R11, Mem::base(R11, ITLB_DROPS));
+    asm.mov_store(Qword, entry(JUMP_EPOCH), R11);
+    asm.alu_imm8(Alu::Cmp, Qword, entry(JUMP_PC), 0);
+    let kept_pc = asm.jcc8(Cond::Ne);
+    // xchg [rdx + JUMP_CACHE], r11 with R11 the PC: a locked store.
+    asm.mov(Qword, R11, Rax);
+    asm.fixed(&[0x4c, 0x87, 0x9a]);
+    asm.fixed(&(JUMP_CACHE + JUMP_PC).to_le_bytes());
+    asm.mov_load(Dword, R11, entry(JUMP_TARGETS));
+    asm.alu_load(Alu::Cmp, Dword, R11, Mem::base(R10, ENTRY_TARGETS));
+    let kept = asm.jcc8(Cond::E);
+    asm.mov_rm_imm32(Qword, entry(JUMP_PC), 0);
+    asm.bind(kept);
+    asm.bind(kept_pc);
     asm.bind(none);
 }
 

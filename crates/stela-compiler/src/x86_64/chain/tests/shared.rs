@@ -140,9 +140,6 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                 while !stop.load(Ordering::Acquire) {
                     control.budget = 1;
                     control.block = 0;
-                    // SAFETY: the table's stamps, which outlive the runners;
-                    // each runner's own, and nothing of its runs meanwhile.
-                    unsafe { next_jump_serial(stamps) };
                     let target = if round.is_multiple_of(2) {
                         TARGET
                     } else {
