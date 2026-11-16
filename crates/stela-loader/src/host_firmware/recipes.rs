@@ -179,6 +179,7 @@ enum Consumer {
     IntelRsa,
     Wifi,
     Nouveau,
+    Amdgpu,
 }
 
 const fn realtek(
@@ -929,6 +930,172 @@ pub const GSP: &[Recipe] = &[
     ),
 ];
 
+const AMDGPU_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: GSP_REVISION,
+    member: "LICENSES/LICENSE.amdgpu",
+    length: 2938,
+    sha256: "572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee",
+};
+
+/// A file of linux-firmware's `amdgpu` directory, under its notice, at the
+/// revision the GSP-RM files are pinned at.
+const fn amdgpu(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: GSP_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &AMDGPU_LICENSE,
+        consumer: Consumer::Amdgpu,
+    }
+}
+
+/// What amdgpu loads on the GPUs with pinned files, named as the driver
+/// names them: the graphics core's microcode (`gfx_v10_0.c`), the security
+/// processor's table of contents and trusted applications (`psp_v13_0.c`),
+/// the DMA engine's (`sdma_v5_2.c`), the display microcontroller's
+/// (`amdgpu_dm.c`) and the video decoder's (`amdgpu_vcn.c`).
+pub const AMDGPU: &[Recipe] = &[
+    amdgpu(
+        "amdgpu/gc_10_3_6_ce.bin",
+        263296,
+        "ed5fe8488d16ecc0923ff34afe8aa67177d5e1f3242e1de48ef1643b263ba33b",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_pfp.bin",
+        263424,
+        "042f5d2d223aac6a62b500a47d0d0bf33984200110da0ffca4fe5df9a96571c0",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_me.bin",
+        263424,
+        "776d2299bc4f3abffd4a7999f5a21a4e38aced8b6b4c199a83610dbabf08176d",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_mec.bin",
+        268592,
+        "7003c4a77537e9edaf67064104cd9371fac38a84f71f948349140b28d3c210e8",
+    ),
+    // The same bytes as `mec`, under the second name the driver asks for.
+    amdgpu(
+        "amdgpu/gc_10_3_6_mec2.bin",
+        268592,
+        "7003c4a77537e9edaf67064104cd9371fac38a84f71f948349140b28d3c210e8",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_rlc.bin",
+        177104,
+        "acfbac75c0dcfbfe40e222640ef17eb3dc8d206d30bc3863f275f2dd1cb132a5",
+    ),
+    amdgpu(
+        "amdgpu/psp_13_0_5_toc.bin",
+        1792,
+        "2dfcc2b4d6b7f072a471da3852164560ae709bb563626997c41ef1ef17588bbe",
+    ),
+    amdgpu(
+        "amdgpu/psp_13_0_5_ta.bin",
+        246784,
+        "0b7fc5a0bea6e3559df9791a57ae5a648ec6246679f8f8a6bc27defb2aa7a75e",
+    ),
+    amdgpu(
+        "amdgpu/sdma_5_2_6.bin",
+        34048,
+        "3a163db00eb7e4752be8adbd61cf7dd8f08d924e59a6f798ced7dfcd89f340ed",
+    ),
+    amdgpu(
+        "amdgpu/dcn_3_1_5_dmcub.bin",
+        239648,
+        "035015964e5a33514201b50f43cc0643550cbee811be20da9f5e31ef6f405d76",
+    ),
+    amdgpu(
+        "amdgpu/vcn_3_1_2.bin",
+        575056,
+        "31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4",
+    ),
+];
+
+/// A GPU family's name, PCI device IDs and files.
+type AmdgpuFamily = (&'static str, &'static [u16], &'static [&'static str]);
+
+/// The AMD GPUs that have pinned files. amdgpu names its files after the
+/// versions of the IP blocks the device's own discovery table reports, which
+/// only the device can say; the pairing of a PCI device ID with them here is
+/// what the driver's version tables give these integrated GPUs (graphics
+/// core 10.3.6, security processor 13.0.5, DMA engine 5.2.6, display 3.1.5,
+/// video 3.1.2). The driver asks for the video decoder's file in the same
+/// start as the rest and fails without it, so it is required too.
+const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[(
+    "Ryzen 7000 or 9000 desktop graphics (Raphael, Granite Ridge)",
+    &[0x164e, 0x13c0],
+    &[
+        "amdgpu/gc_10_3_6_ce.bin",
+        "amdgpu/gc_10_3_6_pfp.bin",
+        "amdgpu/gc_10_3_6_me.bin",
+        "amdgpu/gc_10_3_6_mec.bin",
+        "amdgpu/gc_10_3_6_mec2.bin",
+        "amdgpu/gc_10_3_6_rlc.bin",
+        "amdgpu/psp_13_0_5_toc.bin",
+        "amdgpu/psp_13_0_5_ta.bin",
+        "amdgpu/sdma_5_2_6.bin",
+        "amdgpu/dcn_3_1_5_dmcub.bin",
+        "amdgpu/vcn_3_1_2.bin",
+    ],
+)];
+
+/// The binding amdgpu's files take: Linux's names, as for nouveau's.
+const AMDGPU_TARGET: Target<'static> = Target {
+    driver: "amdgpu",
+    hardware: "amd",
+    revision: "linux-firmware",
+    board: None,
+};
+
+/// amdgpu's request for a file, by the name the driver gives it.
+fn select_amdgpu(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != AMDGPU_TARGET.hardware
+        || request.target.revision != AMDGPU_TARGET.revision
+    {
+        return None;
+    }
+    AMDGPU
+        .iter()
+        .find(|recipe| recipe.image.member == request.name)
+}
+
+/// The family of an AMD GPU with PCI device ID `device`, as people know it,
+/// when its files are pinned.
+pub fn amd_gpu_family(device: u16) -> Option<&'static str> {
+    AMDGPU_FAMILIES
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .map(|(name, ..)| *name)
+}
+
+/// Requires the files amdgpu asks for on the AMD GPU with PCI device ID
+/// `device`.
+pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
+    let (_, _, files) = AMDGPU_FAMILIES
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .ok_or_else(|| {
+            Error(format!(
+                "{device:04x} is no GPU amdgpu has pinned files for"
+            ))
+        })?;
+    for name in *files {
+        inventory.observe(Requirement {
+            name,
+            target: AMDGPU_TARGET,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
+}
+
 /// The chip whose `gsp` directory linux-firmware's `WHENCE` links `chip`'s to.
 fn gsp_directory(chip: &str) -> Option<&'static str> {
     Some(match chip {
@@ -1436,6 +1603,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
+        "amdgpu" => select_amdgpu(request),
         _ => None,
     }
 }
@@ -1694,6 +1862,80 @@ mod tests {
             );
         }
         assert!(REALTEK_USB_LICENSE.verify(b"changed license").is_err());
+    }
+
+    fn amdgpu_member(name: &str, hardware: &str) -> Option<&'static Recipe> {
+        let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
+            "name":name,"target":{"driver":"amdgpu","hardware":hardware,
+            "revision":"linux-firmware","board":null},"minimum_bytes":1}]});
+        let inventory = Inventory::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
+        Plan::select(&inventory)
+            .ok()
+            .map(|plan| plan.selections[0].recipe)
+    }
+
+    #[test]
+    fn an_amd_gpu_requires_the_files_amdgpu_names_for_its_ip_blocks() {
+        // Raphael and Granite Ridge integrated graphics load the same files.
+        for device in [0x164e, 0x13c0] {
+            let mut inventory = Inventory::default();
+            require_amdgpu(&mut inventory, device).unwrap();
+            let names = inventory
+                .requests()
+                .iter()
+                .map(|request| request.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 11);
+            assert_eq!(names[0], "amdgpu/gc_10_3_6_ce.bin");
+            assert!(names.contains(&"amdgpu/psp_13_0_5_toc.bin".into()));
+            assert!(names.contains(&"amdgpu/dcn_3_1_5_dmcub.bin".into()));
+            assert!(names.contains(&"amdgpu/vcn_3_1_2.bin".into()));
+            assert!(amd_gpu_family(device).unwrap().contains("Granite Ridge"));
+        }
+        // A discrete GPU (Navi 10) has no pinned files yet.
+        assert_eq!(amd_gpu_family(0x731f), None);
+        assert!(require_amdgpu(&mut Inventory::default(), 0x731f).is_err());
+    }
+
+    #[test]
+    fn amdgpu_files_are_pinned_once_under_the_amdgpu_notice() {
+        let mut devices = Vec::new();
+        for (family, ids, files) in AMDGPU_FAMILIES {
+            for device in *ids {
+                assert!(!devices.contains(device), "{family} {device:04x}");
+                devices.push(*device);
+            }
+            for file in *files {
+                assert!(amdgpu_member(file, "amd").is_some(), "{family} {file}");
+            }
+        }
+        for (index, recipe) in AMDGPU.iter().enumerate() {
+            let member = recipe.image.member;
+            assert!(member.starts_with("amdgpu/"), "{member}");
+            assert!(
+                AMDGPU[..index]
+                    .iter()
+                    .all(|other| other.image.member != member),
+                "{member}"
+            );
+            assert!(
+                AMDGPU_FAMILIES
+                    .iter()
+                    .any(|(_, _, files)| files.contains(&member)),
+                "{member} has no family"
+            );
+            assert_eq!(recipe.license.member, "LICENSES/LICENSE.amdgpu");
+            assert_eq!(recipe.image.revision, GSP_REVISION);
+            assert_eq!(recipe.image.sha256.len(), 64);
+        }
+        assert_eq!(
+            amdgpu_member("amdgpu/gc_10_3_6_ce.bin", "nvidia").map(|_| ()),
+            None
+        );
+        assert_eq!(
+            amdgpu_member("amdgpu/gc_11_0_0_pfp.bin", "amd").map(|_| ()),
+            None
+        );
     }
 
     fn gsp_member(name: &str) -> Option<&'static str> {
