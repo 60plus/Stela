@@ -386,18 +386,27 @@ pub fn tables() {
          /// and `require_force_probe`.\n\
          pub(crate) const DEVICES: &[(u16, u8, bool)] = &[\n",
     );
-    for (device, (bits, forced)) in devices {
+    for (device, (bits, forced, _, _)) in &devices {
         text.push_str(&format!("    ({device:#06x}, {bits}, {forced}),\n"));
+    }
+    text.push_str(
+        "];\n/// Each device ID's platform name (`PLATFORM()`) and `has_display`.\n\
+         pub(crate) const PLATFORMS: &[(u16, &str, bool)] = &[\n",
+    );
+    for (device, (_, _, platform, display)) in &devices {
+        text.push_str(&format!("    ({device:#06x}, {platform:?}, {display}),\n"));
     }
     text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     fs::write(output.join("xe_devices.rs"), text).expect("write xe's device table");
 }
 
-/// Each device ID of `pciidlist` in `table` with the mask bits and the
-/// force-probe requirement of the descriptor its entry names, the ID lists
-/// expanded from `ids`.
-fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> {
+/// Each device ID of `pciidlist` in `table` with the mask bits, the
+/// force-probe requirement, the platform name and whether it has a display
+/// engine, of the descriptor its entry names, the ID lists expanded from
+/// `ids`.
+type Described = (u8, bool, String, bool);
+fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
     // Each list macro's own IDs and the list macros it includes.
     let mut lists = BTreeMap::new();
     for definition in ids.replace("\\\n", " ").lines() {
@@ -430,6 +439,15 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> 
         }
         lists.insert(name.trim().to_owned(), (own, included));
     }
+    // The table's object-like macros, which descriptors include whole
+    // (`DG2_FEATURES`).
+    let joined = table.replace("\\\n", " ");
+    let macros: BTreeMap<&str, &str> = joined
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("#define "))
+        .filter_map(|rest| rest.split_once(|c: char| c.is_whitespace()))
+        .filter(|(name, _)| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .collect();
     // Each descriptor's mask.
     let mut masks = BTreeMap::new();
     for descriptor in table.split("struct xe_device_desc ").skip(1) {
@@ -440,15 +458,32 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> 
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
-        let body = body.split("};").next().unwrap_or("");
+        let mut body = body.split("};").next().unwrap_or("").to_owned();
+        let included: Vec<&str> = body
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter_map(|word| macros.get(word).copied())
+            .collect();
+        for definition in included {
+            body.push_str(",\n");
+            body.push_str(definition);
+        }
         if let Some(bits) = body.split(".dma_mask_size = ").nth(1) {
             let bits = bits.split(',').next().unwrap_or("").trim();
+            let platform = body
+                .split("PLATFORM(")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .map(str::trim)
+                .filter(|platform| !platform.is_empty())
+                .ok_or_else(|| format!("{name} names no platform"))?;
             masks.insert(
                 name.trim().to_owned(),
                 (
                     bits.parse::<u8>()
                         .map_err(|_| format!("{name} has mask {bits:?}"))?,
                     body.contains(".require_force_probe = true"),
+                    platform.to_owned(),
+                    body.contains(".has_display = true"),
                 ),
             );
         }
@@ -469,7 +504,7 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> 
             .and_then(|(list, rest)| Some((list, rest.split_once('&')?.1)))
             .ok_or_else(|| format!("entry {entry:?}"))?;
         let descriptor = descriptor.trim_end_matches("),");
-        let bits = *masks
+        let described = masks
             .get(descriptor)
             .ok_or_else(|| format!("{descriptor} has no dma_mask_size"))?;
         let mut pending = vec![list.to_owned()];
@@ -477,8 +512,11 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, (u8, bool)>, String> 
             let (own, included) = lists.get(&list).ok_or_else(|| format!("no list {list}"))?;
             pending.extend(included.iter().cloned());
             for id in own {
-                if devices.insert(*id, bits).is_some_and(|other| other != bits) {
-                    return Err(format!("{id:#06x} has two masks"));
+                if devices
+                    .insert(*id, described.clone())
+                    .is_some_and(|other| other != *described)
+                {
+                    return Err(format!("{id:#06x} has two descriptors"));
                 }
             }
         }
