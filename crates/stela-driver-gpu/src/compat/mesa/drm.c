@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* libdrm, as far as NVK reaches it: thin wrappers of DRM's ioctls, with the
- * entry points of xf86drm.h. Devices come from the host, not from /sys. */
+/* libdrm, as far as the Vulkan drivers and libdrm_amdgpu reach it: thin
+ * wrappers of DRM's ioctls, with the entry points of xf86drm.h. Devices come
+ * from the host, not from /sys, and each is a render node. */
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -215,6 +217,49 @@ void drmFreeDevices(drmDevicePtr devices[], int count)
 		drmFreeDevice(&devices[index]);
 }
 
+int drmGetNodeTypeFromFd(int fd)
+{
+	struct stat status;
+	if (fstat(fd, &status))
+		return -1;
+	if (major(status.st_rdev) != DRM_MAJOR || minor(status.st_rdev) < RENDER_MINOR) {
+		errno = EINVAL;
+		return -1;
+	}
+	return DRM_NODE_RENDER;
+}
+
+/* The host offers render nodes only, so no device has a primary node. */
+char *drmGetPrimaryDeviceNameFromFd(int fd)
+{
+	(void)fd;
+	return NULL;
+}
+
+/* A format modifier's name, for debug prints only. libdrm spells out each
+ * vendor's fields from its tables; here every modifier is named by its
+ * value, which identifies it as well. NULL, libdrm's answer when out of
+ * memory, is left for that case. */
+char *drmGetFormatModifierName(uint64_t modifier)
+{
+	char *name = malloc(sizeof("0x0123456789abcdef"));
+	if (name)
+		snprintf(name, sizeof("0x0123456789abcdef"), "0x%016llx", (unsigned long long)modifier);
+	return name;
+}
+
+/* libdrm's debug messages, which it prints only when LIBGL_DEBUG asks. */
+void drmMsg(const char *format, ...)
+{
+	const char *debug = getenv("LIBGL_DEBUG");
+	if (!debug || !strstr(debug, "verbose"))
+		return;
+	va_list arguments;
+	va_start(arguments, format);
+	vfprintf(stderr, format, arguments);
+	va_end(arguments);
+}
+
 int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
 {
 	return a->bustype == b->bustype && !memcmp(a->businfo.pci, b->businfo.pci, sizeof(drmPciBusInfo));
@@ -342,6 +387,11 @@ int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t count
 		.flags = flags,
 	};
 	return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &array);
+}
+
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
+{
+	return drmSyncobjQuery2(fd, handles, points, count, 0);
 }
 
 int drmSyncobjTransfer(int fd, uint32_t destination, uint64_t destination_point, uint32_t source,

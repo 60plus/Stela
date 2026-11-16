@@ -21,10 +21,14 @@ mod nouveau_firmware;
 
 /// The Vulkan drivers `cargo xtask gpu nvk` linked into the image's archives,
 /// as it lists them beside them: with `metal-linked`, Intel's sets
-/// `stela_vulkan_intel`, so the crate names only loader entries the image
-/// holds. NVK is always there.
+/// `stela_vulkan_intel` and AMD's `stela_vulkan_amd`, so the crate names only
+/// loader entries the image holds. NVK is always there.
 fn vulkan_drivers() {
-    println!("cargo:rustc-check-cfg=cfg(stela_vulkan_intel)");
+    const OPTIONAL: [(&str, &str); 2] =
+        [("intel", "stela_vulkan_intel"), ("amd", "stela_vulkan_amd")];
+    for (_, cfg) in OPTIONAL {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+    }
     if std::env::var_os("CARGO_FEATURE_METAL_LINKED").is_none() {
         return;
     }
@@ -32,8 +36,10 @@ fn vulkan_drivers() {
         .join("../../target/gpu/nvk/vulkan-drivers");
     println!("cargo:rerun-if-changed={}", list.display());
     let listed = std::fs::read_to_string(&list).unwrap_or_default();
-    if listed.lines().any(|name| name == "intel") {
-        println!("cargo:rustc-cfg=stela_vulkan_intel");
+    for (name, cfg) in OPTIONAL {
+        if listed.lines().any(|linked| linked == name) {
+            println!("cargo:rustc-cfg={cfg}");
+        }
     }
 }
 

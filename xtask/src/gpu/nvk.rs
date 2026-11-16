@@ -1,5 +1,6 @@
-//! Mesa's Vulkan drivers for `stela.efi`: NVK with NAK, and ANV with BRW
-//! when the build host has the tools ANV's build runs (`clc.rs`).
+//! Mesa's Vulkan drivers for `stela.efi`: NVK with NAK, and ANV with BRW and
+//! RADV with ACO when the build host has the tools their builds run
+//! (`clc.rs`).
 //!
 //! Meson configures Mesa for `sysroot`'s machine, the same from every build
 //! host, which leaves its generated sources and its compile plan. This task
@@ -74,6 +75,10 @@ pub(super) struct Driver {
     /// Mesa driver defines that loader entry; one image holds them all, so
     /// each but the first has its own compiled under this name.
     pub(super) entry: &'static str,
+    /// Other symbols an earlier driver's units also define, with the names
+    /// this driver's own units compile them under: Mesa names some of each
+    /// driver's application layers alike.
+    renamed: &'static [(&'static str, &'static str)],
     /// Meson options only this driver reads.
     options: &'static [&'static str],
     /// Whether its build runs the host tools (`clc.rs`): its internal
@@ -83,7 +88,63 @@ pub(super) struct Driver {
     model: &'static str,
     /// Its stand-ins and driver-internal calls, under `compat/mesa`.
     stand_ins: &'static [&'static str],
+    /// The libraries it calls that Mesa's configuration takes from the
+    /// system, built from their unchanged sources.
+    libraries: &'static [&'static Library],
 }
+
+/// A library Mesa's configuration takes from the system, which the image
+/// builds from its unchanged sources under `third_party` with the calling
+/// driver's model unit's flags.
+pub(super) struct Library {
+    /// Its name, which its objects' names start with.
+    name: &'static str,
+    /// Its sources, under `third_party`.
+    sources: &'static [&'static str],
+    /// What its own build defines.
+    defines: &'static [&'static str],
+    /// Its functions that a kernel driver in the same image also defines,
+    /// with the names every unit of the build gives them instead.
+    renamed: &'static [(&'static str, &'static str)],
+}
+
+/// libdrm's amdgpu library, which RADV and AMD's common code call for the
+/// device, its buffers, its GPU address space and its queries, over DRM's
+/// ioctls (`compat/mesa/drm.c`). The command-submission source is built for
+/// the timeout conversion the buffer calls share; RADV submits through its
+/// own ioctls (`ac_linux_drm.c`). The VM and user-queue sources are not
+/// called.
+const LIBDRM_AMDGPU: Library = Library {
+    name: "libdrm_amdgpu",
+    sources: &[
+        "libdrm/amdgpu/amdgpu_asic_id.c",
+        "libdrm/amdgpu/amdgpu_bo.c",
+        "libdrm/amdgpu/amdgpu_cs.c",
+        "libdrm/amdgpu/amdgpu_device.c",
+        "libdrm/amdgpu/amdgpu_gpu_info.c",
+        "libdrm/amdgpu/amdgpu_vamgr.c",
+        "libdrm/amdgpu/handle_table.c",
+    ],
+    // What libdrm's configuration (its `config.h`) and its amdgpu build set
+    // for a Linux target with GCC's atomic builtins. The table of marketing
+    // names lies under its data directory; the image holds no file system,
+    // so a device has no marketing name and libdrm says once per device
+    // which file it lacks.
+    defines: &[
+        "HAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
+        "HAVE_LIB_ATOMIC_OPS=0",
+        "HAVE_ALLOCA_H=1",
+        "HAVE_VISIBILITY=1",
+        "HAVE___BUILTIN_CLZLL=1",
+        "AMDGPU_ASIC_ID_TABLE=\"/usr/share/libdrm/amdgpu.ids\"",
+    ],
+    // amdgpu's own `amdgpu_bo_list.c` and `amdgpu_object.c` name these
+    // too. Nothing in Mesa calls them; any later caller reaches libdrm's.
+    renamed: &[
+        ("amdgpu_bo_list_create", "libdrm_amdgpu_bo_list_create"),
+        ("amdgpu_bo_set_metadata", "libdrm_amdgpu_bo_set_metadata"),
+    ],
+};
 
 /// The loader entry every Mesa Vulkan driver defines.
 const ENTRY: &str = "vk_icdGetInstanceProcAddr";
@@ -95,6 +156,7 @@ const NVK: Driver = Driver {
     objects: "src/nouveau/vulkan/",
     whole: &["libnvk_a"],
     entry: ENTRY,
+    renamed: &[],
     options: &[],
     host_tools: false,
     model: "nvk_query_pool.c",
@@ -107,6 +169,7 @@ const NVK: Driver = Driver {
         "nir_options",
         "submit_thread",
     ],
+    libraries: &[],
 };
 /// The Meson options only ANV reads, which the host test (`anv.rs`) builds
 /// with too.
@@ -120,13 +183,38 @@ const ANV: Driver = Driver {
     objects: "src/intel/vulkan/",
     whole: &["libanv_common_a", "libanv_per_hw_ver"],
     entry: "anv_icdGetInstanceProcAddr",
+    renamed: &[],
     options: &ANV_OPTIONS,
     host_tools: true,
     model: "anv_util.c",
     stand_ins: &["anv_nir_options"],
+    libraries: &[],
+};
+/// RADV, with ACO, for AMD GPUs from GFX6. Mesa's configuration has it
+/// compile the shaders that build acceleration structures from GLSL, which
+/// needs the host's glslang; without it RADV would report ray tracing it
+/// cannot build. Its objects are its shared library's own, not a library's,
+/// so they are linked whole for the entry points its tables reach by weak
+/// reference. ACO and addrlib are C++, built with LLVM's runtime
+/// (`llvm::cxx_flags`). No LLVM backend: the image's LLVM serves AIR only.
+const RADV: Driver = Driver {
+    name: "amd",
+    target: "src/amd/vulkan/libvulkan_radeon.so",
+    objects: "src/amd/vulkan/",
+    whole: &["libvulkan_radeon_so"],
+    entry: "radv_icdGetInstanceProcAddr",
+    renamed: &[(
+        "metro_exodus_GetSemaphoreCounterValue",
+        "radv_metro_exodus_GetSemaphoreCounterValue",
+    )],
+    options: &["-Damd-use-llvm=false"],
+    host_tools: true,
+    model: "radv_query.c",
+    stand_ins: &["radv_nir_options"],
+    libraries: &[&LIBDRM_AMDGPU],
 };
 /// Every driver the image may link, the first keeping Mesa's entry name.
-pub(super) const DRIVERS: [&Driver; 2] = [&NVK, &ANV];
+pub(super) const DRIVERS: [&Driver; 3] = [&NVK, &ANV, &RADV];
 /// Where the build lists the drivers it linked, beside the archives, for the
 /// crates that name their entries.
 pub(super) const LINKED: &str = "vulkan-drivers";
@@ -152,8 +240,9 @@ if "--depfile" in arguments:
         file.write(output + ":\n")
 "#;
 /// `.pc` files for what Mesa's configuration requires: libdrm's headers are
-/// vendored and its calls are `compat/mesa/drm.c`; the one user of libelf is
-/// `compat/mesa/nv_cubin.c`.
+/// vendored and its calls are `compat/mesa/drm.c`, libdrm_amdgpu is
+/// [`LIBDRM_AMDGPU`]; the one user of libelf is `compat/mesa/nv_cubin.c`,
+/// and AMD's code takes its path without it ([`HOST_DEFINES`]).
 pub(super) const LIBDRM_VERSION: &str = "2.4.133";
 const LIBELF_VERSION: &str = "0.190";
 
@@ -167,7 +256,7 @@ const WHOLE_RUNTIME: [&str; 3] = [
 
 /// Units not built, by a part of their source path: each either has a stand-in
 /// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
-const SKIPPED: [&str; 10] = [
+const SKIPPED: [&str; 12] = [
     "nvkcl",
     "build_id",
     "nv_cubin.c",
@@ -178,6 +267,8 @@ const SKIPPED: [&str; 10] = [
     "mesa_cache_db",
     "u_debug_stack",
     "wsi_common_display",
+    "ac_rtld",
+    "ac_rgp_elf_object_pack",
 ];
 /// The Metal compiler service, under `compiler`, built with the first
 /// driver's model unit's flags.
@@ -207,7 +298,9 @@ pub(super) const REGEX: [&str; 5] = ["regcomp", "regexec", "regfree", "regerror"
 
 /// What Meson's probes find that names a path the image does not take. SSE4.1
 /// and BLAKE3's assembly are host features; the image runs on any x86-64.
-pub(super) const HOST_DEFINES: [&str; 8] = [
+/// libelf's `.pc` is a stand-in, so AMD's code takes its path without it:
+/// no LLVM-made code objects (`ac_rtld`) and no ELF chunk in an RGP capture.
+pub(super) const HOST_DEFINES: [&str; 9] = [
     "ALLOW_KCMP",
     "HAVE_CET_H",
     "HAVE_DIRENT_D_TYPE",
@@ -216,6 +309,7 @@ pub(super) const HOST_DEFINES: [&str; 8] = [
     "HAVE_FLOCK",
     "HAVE_FUNC_ATTRIBUTE_VISIBILITY",
     "HAVE_RENDERDOC_INTEGRATION=1",
+    "USE_LIBELF",
 ];
 pub(super) const LATE_DEFINES: [&str; 3] = [
     "USE_SSE41",
@@ -375,6 +469,17 @@ impl Choice {
         record
     }
 
+    /// The defines that give the chosen drivers' libraries' clashing
+    /// functions their own names, for every unit of the build.
+    fn library_names(&self) -> Vec<String> {
+        self.drivers
+            .iter()
+            .flat_map(|driver| driver.libraries)
+            .flat_map(|library| library.renamed)
+            .map(|(name, renamed)| format!("-D{name}={renamed}"))
+            .collect()
+    }
+
     /// Whether `output`, a unit of the drivers, is `driver`'s own.
     fn owner(&self, output: &str) -> Option<&'static Driver> {
         let output = output.replace('\\', "/");
@@ -483,6 +588,14 @@ fn setup(
         format!(
             "Name: libdrm\nDescription: vendored headers\nVersion: {LIBDRM_VERSION}\n\
              Cflags: -I{0} -I{0}/include/drm\n",
+            slashed(&libdrm)
+        ),
+    )?;
+    fs::write(
+        packages.join("libdrm_amdgpu.pc"),
+        format!(
+            "Name: libdrm_amdgpu\nDescription: built from its sources\nVersion: {LIBDRM_VERSION}\n\
+             Cflags: -I{0} -I{0}/amdgpu -I{0}/include/drm\n",
             slashed(&libdrm)
         ),
     )?;
@@ -833,6 +946,7 @@ fn units(
             "{file} is neither C nor C++"
         );
         let mut arguments = retarget(&words, if is_cxx { cxx } else { common });
+        arguments.extend(choice.library_names());
         if file.ends_with("rust/bindings.c") {
             arguments.extend(
                 FLOAT_WRAPPERS
@@ -840,8 +954,16 @@ fn units(
                     .map(|name| format!("-D{name}__extern={name}__hard_float")),
             );
         }
-        if let Some(driver) = choice.owner(output).filter(|driver| driver.entry != ENTRY) {
-            arguments.push(format!("-D{ENTRY}={}", driver.entry));
+        if let Some(driver) = choice.owner(output) {
+            if driver.entry != ENTRY {
+                arguments.push(format!("-D{ENTRY}={}", driver.entry));
+            }
+            arguments.extend(
+                driver
+                    .renamed
+                    .iter()
+                    .map(|(name, renamed)| format!("-D{name}={renamed}")),
+            );
         }
         let mut name = object_name(output);
         if file.replace('\\', "/").ends_with(SIZED_UNIT) {
@@ -885,6 +1007,23 @@ fn units(
         for name in driver.stand_ins {
             let source = compat.join("mesa").join(format!("{name}.c"));
             units.push(like(file, words, &source, name, &[]));
+        }
+        for library in driver.libraries {
+            let mut defines: Vec<String> = library
+                .defines
+                .iter()
+                .map(|define| format!("-D{define}"))
+                .collect();
+            defines.extend(choice.library_names());
+            for source in library.sources {
+                let source = third_party(source);
+                let stem = source
+                    .file_stem()
+                    .context("library source")?
+                    .to_string_lossy();
+                let name = format!("{}_{stem}", library.name);
+                units.push(like(file, words, &source, &name, &defines));
+            }
         }
     }
     let (file, words) = model(choice.drivers.first().context("no Vulkan driver")?)?;
@@ -1259,9 +1398,9 @@ mod tests {
         );
     }
 
-    /// Without the host tools only NVK is built; with them ANV too, whose
-    /// own units compile its loader entry under its own name and whose
-    /// libraries Meson links whole are linked whole.
+    /// Without the host tools only NVK is built; with them ANV and RADV too,
+    /// whose own units compile their loader entries under their own names
+    /// and whose libraries Meson links whole are linked whole.
     #[test]
     fn the_drivers_follow_the_host_tools() {
         let without = Choice::new(Err("no glslangValidator on PATH".to_owned()));
@@ -1273,6 +1412,7 @@ mod tests {
                 .contains(&"-Dvulkan-drivers=nouveau".to_owned())
         );
         assert!(!without.record().contains("intel"));
+        assert!(!without.record().contains("amd"));
         assert!(
             without
                 .owner("src/intel/vulkan/libanv_common.a.p/anv_instance.c.o")
@@ -1289,11 +1429,26 @@ mod tests {
                 .iter()
                 .map(|driver| driver.name)
                 .collect::<Vec<_>>(),
-            ["nouveau", "intel"]
+            ["nouveau", "intel", "amd"]
         );
         let arguments = with.arguments();
-        assert!(arguments.contains(&"-Dvulkan-drivers=nouveau,intel".to_owned()));
+        assert!(arguments.contains(&"-Dvulkan-drivers=nouveau,intel,amd".to_owned()));
         assert!(arguments.contains(&"-Dintel-rt=disabled".to_owned()));
+        assert!(arguments.contains(&"-Damd-use-llvm=false".to_owned()));
+        let radv = with
+            .owner("src/amd/vulkan/libvulkan_radeon.so.p/radv_instance.c.o")
+            .unwrap();
+        assert_eq!(radv.entry, "radv_icdGetInstanceProcAddr");
+        assert_eq!(radv.libraries[0].name, "libdrm_amdgpu");
+        assert!(
+            with.library_names()
+                .contains(&"-Damdgpu_bo_list_create=libdrm_amdgpu_bo_list_create".to_owned())
+        );
+        assert!(without.library_names().is_empty());
+        assert!(
+            with.owner("src/amd/compiler/libaco.a.p/aco_ir.cpp.o")
+                .is_none()
+        );
         assert!(
             with.record()
                 .contains("glslang /usr/bin/glslangValidator 16.2.0")
@@ -1313,15 +1468,17 @@ mod tests {
             "src/intel/vulkan/libanv_common.a.p/anv_device.c.o",
             "src/intel/vulkan/libanv_per_hw_ver120.a.p/genX_cmd_buffer.c.o",
             "src/vulkan/runtime/libvulkan_runtime.a.p/vk_device.c.o",
+            "src/amd/vulkan/libvulkan_radeon.so.p/radv_device.c.o",
         ] {
             assert!(with.linked_whole(whole), "{whole}");
             assert_eq!(
                 without.linked_whole(whole),
-                !whole.contains("anv"),
+                !whole.contains("anv") && !whole.contains("radv"),
                 "{whole}"
             );
         }
         assert!(!with.linked_whole("src/intel/vulkan/libvulkan_intel.so.p/anv_gem.c.o"));
+        assert!(!with.linked_whole("src/amd/compiler/libaco.a.p/aco_ir.cpp.o"));
     }
 
     /// Two drivers' units defining one symbol, or a driver without its
@@ -1358,6 +1515,13 @@ mod tests {
         }));
         let object = Path::new("/o/src_intel_vulkan_libanv_common_a_p_anv_instance_c_o.o");
         assert_eq!(choice.owner_of_object(object).unwrap().name, "intel");
+        let object = Path::new("/o/src_amd_vulkan_libvulkan_radeon_so_p_radv_instance_c_o.o");
+        assert_eq!(choice.owner_of_object(object).unwrap().name, "amd");
+        assert!(
+            choice
+                .owner_of_object(Path::new("/o/stela_libdrm_amdgpu_amdgpu_bo.o"))
+                .is_none()
+        );
         assert!(
             choice
                 .owner_of_object(Path::new("/o/stela_anv_nir_options.o"))
