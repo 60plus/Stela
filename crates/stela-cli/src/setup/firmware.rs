@@ -634,8 +634,15 @@ pub(super) fn provision_bundle(
     Ok(notes)
 }
 
-/// Remove the older per-PC firmware on the EFI partition when the bundle on
-/// another volume holds every one of its files.
+/// Remove the older per-PC firmware on the EFI partition once the bundle on
+/// another volume makes it useless: every image is either in the bundle, or
+/// bound to a request today's recipes answer with a file the bundle holds,
+/// or bound to a request no recipe answers any more (a GSP-RM release nouveau
+/// no longer takes). A boot loads the set's images before the bundle's and
+/// binds them first, so a set left behind costs every boot its reads and
+/// could hold a file older than the bundle's. The set stays while one of its
+/// images is the only copy of a file today's recipes pin, as on a volume short
+/// of room.
 fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]) -> Result<()> {
     let old = esp.join(host_firmware::DIRECTORY);
     if esp == volume {
@@ -645,11 +652,24 @@ fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]
         return Ok(());
     };
     let manifest = host_firmware::Manifest::parse(&bytes)?;
-    if manifest.images.iter().all(|image| {
-        files
-            .iter()
-            .any(|(object, _)| object.sha256 == image.sha256)
-    }) {
+    let in_bundle = |sha256: &str| files.iter().any(|(object, _)| object.sha256 == sha256);
+    let needed = manifest.images.iter().any(|image| {
+        if in_bundle(image.sha256) {
+            return false;
+        }
+        let request = Request::from(Requirement {
+            name: image.name,
+            target: Target {
+                driver: image.target.driver,
+                hardware: image.target.hardware,
+                revision: image.target.revision,
+                board: image.target.board,
+            },
+            minimum_bytes: 1,
+        });
+        recipes::recipe(&request).is_some_and(|recipe| !in_bundle(recipe.image.sha256))
+    });
+    if !needed {
         fs::remove_dir_all(&old)?;
     }
     Ok(())
@@ -1269,6 +1289,64 @@ mod tests {
         remove_superseded(&esp, &esp, &files).unwrap();
         assert!(old.exists());
         remove_superseded(&esp, &volume, &files).unwrap();
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn an_older_per_pc_set_of_a_release_nouveau_no_longer_takes_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let esp = dir.path().join("esp");
+        let volume = dir.path().join("volume");
+        let old = esp.join(host_firmware::DIRECTORY);
+        fs::create_dir_all(&old).unwrap();
+        // A 0.3 set for an RTX 5080: GSP-RM 570.144's bootloader, which no
+        // recipe answers since GeForce Blackwell takes 570.211.01, beside a
+        // file today's recipe for its name pins differently.
+        let regdb = recipes::REGULATORY[0].image;
+        let image = |name: &str, driver: &str, hardware: &str, revision: &str, sha256: &str| {
+            serde_json::json!({"name":name, "path":format!("{}.bin", &sha256[..8]),
+                "target":{"driver":driver,"hardware":hardware,"revision":revision,"board":null},
+                "provenance":{"source":"s","revision":"r","member":name,"license":"x"},
+                "length":200812,"sha256":sha256})
+        };
+        let write = |images: Vec<serde_json::Value>| {
+            fs::write(
+                old.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"schema":1,"images":images})).unwrap(),
+            )
+            .unwrap();
+        };
+        let stale = image(
+            "nvidia/gb203/gsp/bootloader-570.144.bin",
+            "nouveau",
+            "nvidia",
+            "linux-firmware",
+            "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071",
+        );
+        let older = image(
+            "regulatory.db",
+            "wifi-regulatory",
+            "wireless-regdb",
+            "v20",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        write(vec![stale.clone(), older.clone()]);
+        let files = bundle::complete();
+        // A bundle short of the file today's recipe pins for one of them keeps
+        // the set: its copy is the only one.
+        let without: Vec<_> = files
+            .iter()
+            .copied()
+            .filter(|(object, _)| object.sha256 != regdb.sha256)
+            .collect();
+        remove_superseded(&esp, &volume, &without).unwrap();
+        assert!(old.exists());
+        remove_superseded(&esp, &volume, &files).unwrap();
+        assert!(!old.exists());
+        // So does a set holding only the old release.
+        fs::create_dir_all(&old).unwrap();
+        write(vec![stale]);
+        remove_superseded(&esp, &volume, &without).unwrap();
         assert!(!old.exists());
     }
 
