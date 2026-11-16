@@ -66,7 +66,7 @@ pub(super) struct Driver {
     /// Its name in Meson's `vulkan-drivers`.
     pub(super) name: &'static str,
     /// Its Meson target.
-    target: &'static str,
+    pub(super) target: &'static str,
     /// Where Meson puts its own objects, under the build directory.
     objects: &'static str,
     /// The libraries Meson links whole into it, by their objects' names.
@@ -80,17 +80,17 @@ pub(super) struct Driver {
     /// driver's application layers alike.
     renamed: &'static [(&'static str, &'static str)],
     /// Meson options only this driver reads.
-    options: &'static [&'static str],
+    pub(super) options: &'static [&'static str],
     /// Whether its build runs the host tools (`clc.rs`): its internal
     /// kernels are OpenCL C and its libraries GLSL.
     host_tools: bool,
     /// One of its own units, whose flags its stand-ins compile with.
-    model: &'static str,
+    pub(super) model: &'static str,
     /// Its stand-ins and driver-internal calls, under `compat/mesa`.
     stand_ins: &'static [&'static str],
     /// The libraries it calls that Mesa's configuration takes from the
     /// system, built from their unchanged sources.
-    libraries: &'static [&'static Library],
+    pub(super) libraries: &'static [&'static Library],
 }
 
 /// A library Mesa's configuration takes from the system, which the image
@@ -98,11 +98,11 @@ pub(super) struct Driver {
 /// driver's model unit's flags.
 pub(super) struct Library {
     /// Its name, which its objects' names start with.
-    name: &'static str,
+    pub(super) name: &'static str,
     /// Its sources, under `third_party`.
-    sources: &'static [&'static str],
+    pub(super) sources: &'static [&'static str],
     /// What its own build defines.
-    defines: &'static [&'static str],
+    pub(super) defines: &'static [&'static str],
     /// Its functions that a kernel driver in the same image also defines,
     /// with the names every unit of the build gives them instead.
     renamed: &'static [(&'static str, &'static str)],
@@ -197,7 +197,7 @@ const ANV: Driver = Driver {
 /// so they are linked whole for the entry points its tables reach by weak
 /// reference. ACO and addrlib are C++, built with LLVM's runtime
 /// (`llvm::cxx_flags`). No LLVM backend: the image's LLVM serves AIR only.
-const RADV: Driver = Driver {
+pub(super) const RADV: Driver = Driver {
     name: "amd",
     target: "src/amd/vulkan/libvulkan_radeon.so",
     objects: "src/amd/vulkan/",

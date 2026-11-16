@@ -2,8 +2,8 @@
 //! this machine with the image's options and a test's own, a test program
 //! linked from the inputs of a driver's link as Mesa links that driver, with
 //! Stela's own units first, and the kernel driver's ioctl table read from
-//! its unchanged Linux source. Each driver's test (`anv.rs`) names its
-//! driver, its DRM shim, its program and the devices it runs on.
+//! its unchanged Linux source. Each driver's test (`anv.rs`, `radv.rs`)
+//! names its driver, its DRM shim, its program and the devices it runs on.
 use super::support::{capture, third_party, tool};
 use super::toolchain::GENERATORS;
 use anyhow::{Context, Result};
@@ -178,6 +178,29 @@ pub(super) fn program_link(
     words
 }
 
+/// A preloaded shim library's link, Meson's with its output at `library`
+/// and undefined symbols allowed: the shim's libdrm calls resolve in the
+/// test program, whose libdrm stand-in is exported.
+pub(super) fn preloaded_link(link: &[String], library: &Path) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut output = false;
+    for word in link {
+        if std::mem::take(&mut output) {
+            words.push(library.display().to_string());
+            continue;
+        }
+        match word.as_str() {
+            "-Wl,--no-undefined" => {}
+            "-o" => {
+                output = true;
+                words.push(word.clone());
+            }
+            _ => words.push(word.clone()),
+        }
+    }
+    words
+}
+
 /// The host's `libdrm.so.2`, whose mode calls the display WSI units take;
 /// the image leaves those units out. Its other calls are the test's own
 /// (`compat/mesa/drm.c`), linked first.
@@ -279,6 +302,27 @@ mod tests {
             built_inputs(&link),
             ["x.o", "a.a"],
             "only what the build makes"
+        );
+    }
+
+    #[test]
+    fn a_preloaded_shim_links_with_its_libdrm_calls_left_to_the_program() {
+        let link: Vec<String> =
+            "cc -o src/shim.so -Wl,--as-needed -Wl,--no-undefined -shared a.o b.a"
+                .split(' ')
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(
+            preloaded_link(&link, Path::new("/t/shim.so")),
+            [
+                "cc",
+                "-o",
+                "/t/shim.so",
+                "-Wl,--as-needed",
+                "-shared",
+                "a.o",
+                "b.a"
+            ]
         );
     }
 

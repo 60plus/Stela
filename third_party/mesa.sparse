@@ -1,7 +1,7 @@
 # Shared NIR, the AMD, Intel and NVIDIA shader compilers with their command,
-# surface and sampler support, and the DRM shim the host tests run ANV on.
-# Other vendors' drivers, window systems and CI are left out; directories
-# Mesa's Meson build names unconditionally stay.
+# surface and sampler support, and the DRM shims the host tests run ANV and
+# RADV on. Other vendors' drivers, window systems and CI are left out;
+# directories Mesa's Meson build names unconditionally stay.
 /*
 !/.gitlab-ci/
 !/.github/
@@ -57,7 +57,6 @@
 !/src/amd/ci/
 !/src/intel/ci/
 !/src/nouveau/ci/
-!/src/amd/drm-shim/
 !/src/nouveau/drm-shim/
 !/src/intel/tools/
 !/src/intel/executor/
