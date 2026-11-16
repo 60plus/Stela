@@ -222,7 +222,7 @@ fn a_monitor_connected_later_joins_the_picture_in_its_size() {
 }
 
 #[test]
-fn a_monitor_connected_later_without_the_size_is_tried_once_per_connection() {
+fn a_monitor_connected_later_without_the_size_is_tried_for_a_few_looks_per_connection() {
     let mut card = two_monitors();
     card.first = vec![at(8, 4, PREFERRED, 60)];
     card.first_connected = false;
@@ -233,6 +233,10 @@ fn a_monitor_connected_later_without_the_size_is_tried_once_per_connection() {
         unshown: 1,
         ..unchanged
     };
+    // Its EDID may read late: tried at each look, counted at the last.
+    for _ in 1..RESTORE_TRIES {
+        assert_eq!(display.watch(), unchanged);
+    }
     assert_eq!(display.watch(), unshown);
     assert_eq!(display.unshown(), 1);
     let probes = display.drm.probes;
@@ -242,9 +246,55 @@ fn a_monitor_connected_later_without_the_size_is_tried_once_per_connection() {
     assert_eq!(display.watch(), unchanged);
     assert_eq!(display.unshown(), 0);
     display.drm.first_connected = true;
+    for _ in 1..RESTORE_TRIES {
+        assert_eq!(display.watch(), unchanged);
+    }
     assert_eq!(display.watch(), unshown);
     assert_eq!(display.outputs(), 1);
     assert!(display.drm.set_40.is_none());
+}
+
+/// A second monitor read connected at the take before its EDID, as one
+/// that searches its inputs after the GPU's reset, lists no mode or only
+/// DRM's fallback modes then, and its modes once its EDID reads.
+#[test]
+fn a_monitor_whose_edid_reads_late_joins_the_picture_at_a_later_look() {
+    for early in [vec![], vec![at(2, 2, 0, 60)]] {
+        let mut card = two_monitors();
+        card.first = early;
+        let joining;
+        {
+            let mut display = Display::take(&mut card, (6, 4)).unwrap();
+            assert_eq!((display.outputs(), display.unshown()), (1, 1));
+            assert_eq!(display.watch(), Watched::default());
+            display.drm.first = vec![at(8, 4, PREFERRED, 60), at(6, 4, 0, 60)];
+            joining = display.drm.first[1];
+            let joined = Watched {
+                joined: 1,
+                ..Watched::default()
+            };
+            assert_eq!(display.watch(), joined);
+            assert_eq!((display.outputs(), display.unshown()), (2, 0));
+        }
+        assert_eq!(card.set_40.map(|(mode, _)| mode), Some(joining));
+    }
+}
+
+/// An output the take found no free controller for stays so: it is not
+/// probed at each look.
+#[test]
+fn an_output_without_a_free_controller_is_not_tried_again() {
+    let mut card = two_monitors();
+    // Both reach only controller 40, which the first takes.
+    card.first_crtcs = 0b01;
+    card.possible_crtcs = 0b01;
+    let mut display = Display::take(&mut card, (6, 4)).unwrap();
+    assert_eq!((display.outputs(), display.unshown()), (1, 1));
+    let probes = display.drm.probes;
+    for _ in 0..RESTORE_TRIES + 1 {
+        assert_eq!(display.watch(), Watched::default());
+    }
+    assert_eq!(display.drm.probes, probes);
 }
 
 #[test]

@@ -353,7 +353,8 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
         ),
         (
             watched.unshown,
-            "new output has no free mode or controller in the display's size",
+            "connected output still has no free mode or controller in the display's size: \
+             left dark",
         ),
         (
             watched.modeless,

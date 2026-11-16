@@ -387,9 +387,9 @@ pub struct Display<D> {
     heads: Vec<Head>,
     /// Every controller of the card.
     crtcs: Vec<u32>,
-    /// The connectors not shown, each with whether it was read connected
-    /// and tried since it was last read disconnected.
-    others: Vec<(u32, bool)>,
+    /// The connectors not shown, each with the looks that tried to show it
+    /// since it was last read disconnected, up to [`RESTORE_TRIES`].
+    others: Vec<(u32, u8)>,
     /// Connected outputs the take left dark whose native size is smaller
     /// than the picture.
     smaller: usize,
@@ -408,9 +408,11 @@ pub struct Display<D> {
     retime: Option<ModeInfo>,
 }
 
-/// Looks at which a shown output connected again is set once more, before
-/// it is left dark until it is connected again: a monitor whose EDID is
-/// read late, or whose link trains at the second set.
+/// Looks at which a shown output connected again is set once more, or a
+/// connected output not shown is tried again, before it is left dark until
+/// it is connected again: a monitor whose EDID is read late, which lists
+/// only a fallback mode or none until then, or whose link trains at the
+/// second set.
 const RESTORE_TRIES: u8 = 3;
 
 /// What [`Display::watch`] read of the connectors since the last read.
@@ -431,8 +433,8 @@ pub struct Watched {
     pub error: Option<Error>,
     /// Outputs connected that now show the picture too.
     pub joined: u32,
-    /// Outputs connected that cannot show it: no mode of its size and no
-    /// scaling to it, or no free controller or encoder.
+    /// Outputs connected that cannot show it after their last try: no mode
+    /// of its size and no scaling to it, or no free controller or encoder.
     pub unshown: u32,
     /// Of the outputs joined or restored, those scaled: no mode of the
     /// display's size, a larger native one.
@@ -1164,8 +1166,14 @@ impl<D: Drm> Display<D> {
                 true => reach(&mut drm, &found.encoders, &crtcs)?,
                 false => 0,
             };
+            // Encoders that reach no controller stay so. A connected output
+            // that lists no mode yet is tried again: its EDID may read at a
+            // later probe.
             match reach {
-                0 => others.push((id, found.connected)),
+                0 if found.connected && !found.modes.is_empty() => {
+                    others.push((id, RESTORE_TRIES));
+                }
+                0 => others.push((id, u8::from(found.connected))),
                 _ => usable.push((id, found, reach)),
             }
         }
@@ -1184,7 +1192,7 @@ impl<D: Drm> Display<D> {
             let crtc =
                 free_crtc(reach, &crtcs, &heads).filter(|_| encoders_free(&found.encoders, &heads));
             let Some(crtc) = crtc else {
-                others.push((id, true));
+                others.push((id, RESTORE_TRIES));
                 continue;
             };
             let run = match heads.first() {
@@ -1212,7 +1220,8 @@ impl<D: Drm> Display<D> {
                     tries: 0,
                     behind: false,
                 }),
-                None => others.push((id, true)),
+                // Its mode list may still be a fallback until its EDID reads.
+                None => others.push((id, 1)),
             }
         }
         let display = Self::run(drm, heads, crtcs, others)?;
@@ -1236,7 +1245,7 @@ impl<D: Drm> Display<D> {
         mut drm: D,
         mut heads: Vec<Head>,
         crtcs: Vec<u32>,
-        mut others: Vec<(u32, bool)>,
+        mut others: Vec<(u32, u8)>,
     ) -> Result<Self, Error> {
         let Some(mode) = heads.first().map(|head| head.mode) else {
             return Err(Error::NoOutput);
@@ -1289,7 +1298,8 @@ impl<D: Drm> Display<D> {
                 if head.scaling.is_some() {
                     display.refused.get_or_insert(error);
                 }
-                others.push((head.connector, true));
+                // Its link may train at a later set.
+                others.push((head.connector, 1));
             }
         }
         display.others = others;
@@ -1405,9 +1415,13 @@ impl<D: Drm> Display<D> {
     /// connected again.
     ///
     /// An output not shown, connected since it was last read disconnected
-    /// or since the take, is probed once and joins the picture on a free
-    /// controller in its mode of the display's size, else scaled, else
-    /// stays dark until it is connected again.
+    /// or since the take, or left dark by the take for its modes or a
+    /// refused mode set, is probed and joins the picture on a free
+    /// controller in its mode of the display's size, else scaled. One that
+    /// cannot is tried at the next reads up to [`RESTORE_TRIES`] looks in
+    /// all, as its EDID may read late, then counted once and left dark
+    /// until it is connected again. One the take found no free controller
+    /// or encoder for is not tried again.
     ///
     /// A refused request stops only the output it was for: the others are
     /// still read and set, and the first refusal is in [`Watched::error`].
@@ -1460,12 +1474,12 @@ impl<D: Drm> Display<D> {
             }
         }
         let mut index = 0;
-        while let Some(&(id, tried)) = self.others.get(index) {
+        while let Some(&(id, tries)) = self.others.get(index) {
             index += 1;
             match detected_on(&mut self.drm, id) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.others[index - 1].1 = false;
+                    self.others[index - 1].1 = 0;
                     continue;
                 }
                 Err(error) => {
@@ -1473,10 +1487,11 @@ impl<D: Drm> Display<D> {
                     continue;
                 }
             }
-            if tried || self.dark {
+            if tries >= RESTORE_TRIES || self.dark {
                 continue;
             }
-            self.others[index - 1].1 = true;
+            self.others[index - 1].1 = tries + 1;
+            let last = tries + 1 == RESTORE_TRIES;
             match self.join(id) {
                 Ok(Joined::Shown { scaled }) => {
                     self.others.remove(index - 1);
@@ -1485,12 +1500,12 @@ impl<D: Drm> Display<D> {
                     watched.scaled += u32::from(scaled);
                 }
                 Ok(Joined::Dark { smaller }) => {
-                    watched.unshown += 1;
-                    watched.smaller += u32::from(smaller);
+                    watched.unshown += u32::from(last);
+                    watched.smaller += u32::from(last && smaller);
                 }
                 Err(error) => {
                     watched.error.get_or_insert(error);
-                    watched.unshown += 1;
+                    watched.unshown += u32::from(last);
                 }
             }
         }
@@ -1634,7 +1649,7 @@ impl<D: Drm> Display<D> {
     /// How many connected outputs do not show it: no mode of its size, or
     /// no free controller or encoder, or a refused mode set.
     pub fn unshown(&self) -> usize {
-        self.others.iter().filter(|(_, tried)| *tried).count()
+        self.others.iter().filter(|(_, tries)| *tries != 0).count()
     }
 
     /// Pixels across and down.

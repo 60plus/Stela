@@ -244,6 +244,9 @@ fn a_larger_monitor_connected_later_joins_scaled_and_is_set_back_on_release() {
         smaller: 1,
         ..Watched::default()
     };
+    for _ in 1..RESTORE_TRIES {
+        assert_eq!(display.watch(), Watched::default());
+    }
     assert_eq!(display.watch(), dark);
     assert_eq!(display.drm.property_requests(), 0);
 }
