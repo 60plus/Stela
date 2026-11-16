@@ -1986,6 +1986,11 @@ impl Heartbeat {
             ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            // All PEs: cell probe transfers through cells past the stamped
+            // ones, then the cells held, those past the stamped ones and
+            // those holding no entry (levels).
+            let mut overflow = 0;
+            let mut cells = (0, 0, 0);
             // All PEs: paired returns matched and missed, and calls past
             // the frame bound (`chain::PairCount`).
             let mut pairs = [0u64; stela_compiler::x86_64::chain::PAIR_COUNTS];
@@ -2152,6 +2157,10 @@ impl Heartbeat {
                 ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                overflow += now.stamped[promoted + 3].saturating_sub(before.stamped[promoted + 3]);
+                cells.0 = cells.0.max(now.stamped[promoted + 4]);
+                cells.1 = cells.1.max(now.stamped[promoted + 5]);
+                cells.2 = cells.2.max(now.stamped[promoted + 6]);
                 for (total, (now, before)) in
                     pairs.iter_mut().zip(now.pairs.iter().zip(&before.pairs))
                 {
@@ -2355,7 +2364,10 @@ impl Heartbeat {
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
             }
-            stamped.push_str(&format!(" in_use={stamped_in_use}"));
+            stamped.push_str(&format!(
+                " in_use={stamped_in_use} overflow={overflow} cells={}/{}/{}",
+                cells.0, cells.1, cells.2
+            ));
             let [matched, missed, refused] = pairs;
             stamped.push_str(&format!(" pairs={matched}/{missed}/{refused}"));
             stamped_line = Some((stamped, predicted, pac_fills));

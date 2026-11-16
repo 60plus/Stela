@@ -226,6 +226,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).block).write(block as u64);
             core::ptr::addr_of_mut!((*control).hits).write(0);
             core::ptr::addr_of_mut!((*control).linked).write(0);
+            core::ptr::addr_of_mut!((*control).heat).write(0);
         }
         // SAFETY: `set_stamps` stored 0 or the board's table's stamps for
         // this PE, and its native code does not run.
@@ -277,6 +278,15 @@ impl Owner {
             )
         };
         (block, retired, hits, chained.saturating_sub(hits))
+    }
+    /// The transfers the last native call's cell probes made through cells
+    /// past the stamped ones ([`ChainControl::heat`], whose low 32 bits they
+    /// count in and [`Self::begin`] zeroes).
+    pub(super) fn overflow(&self) -> u64 {
+        // SAFETY: the synchronous native call has returned; only this
+        // owner's native code writes the field.
+        let heat = unsafe { core::ptr::addr_of!((*self.storage.control.get()).heat).read() };
+        u64::from(heat as u32)
     }
     #[cfg(test)]
     pub(super) fn weak_storage(&self) -> alloc::sync::Weak<Storage> {

@@ -321,7 +321,8 @@ pub struct ChainControl {
     /// ([`LookupTable::stamped_cells`]), or 0.
     pub cells: u64,
     /// Where cell probes count the transfers through cells past the
-    /// stamped ones; nothing reads it.
+    /// stamped ones, in its low 32 bits: the engine zeroes it before each
+    /// native call and adds it to its counts after.
     pub heat: u64,
     /// Exits of blocks that ran their iterations inside themselves
     /// (`x86_64::block`'s self-loops), one per entry, and the instructions
@@ -945,6 +946,9 @@ pub struct LookupTable {
     cell_counts: Box<[u32]>,
     /// Each held cell by the host address of the exit holding it.
     cell_sites: BTreeMap<u64, u32>,
+    /// How many held cells are past the stamped ones ([`STAMPED_CELLS`]),
+    /// whose exits never take a stamped tail.
+    cells_past: usize,
     /// The host address of each PE's stamps ([`Self::new_stamps`]), whose
     /// stamps of a stamped cell go when the cell changes.
     stamp_tables: Vec<u64>,
@@ -1017,6 +1021,7 @@ impl LookupTable {
             cell_frames: BTreeSet::new(),
             cell_counts: Box::default(),
             cell_sites: BTreeMap::new(),
+            cells_past: 0,
             stamp_tables: Vec::new(),
             stamp_store: Vec::new(),
             stamped: BTreeSet::new(),
@@ -1195,6 +1200,9 @@ impl LookupTable {
         }
         self.cell_counts[cell_bucket(pc)] += 1;
         self.cell_sites.insert(site, cell);
+        if cell as usize >= STAMPED_CELLS {
+            self.cells_past += 1;
+        }
         Self::cell_slot(&self.cells, cell) as *const Slot as u64
     }
 
@@ -1221,6 +1229,9 @@ impl LookupTable {
         for _ in 0..most {
             let (&site, &cell) = self.cell_sites.range(from..=*sites.end()).next()?;
             self.cell_sites.remove(&site);
+            if cell as usize >= STAMPED_CELLS {
+                self.cells_past -= 1;
+            }
             if let Some(link) = self.cell_links.get_mut(cell as usize) {
                 *link = None;
             }
@@ -1253,6 +1264,20 @@ impl LookupTable {
     /// The cells exits hold.
     pub fn cells(&self) -> usize {
         self.cell_sites.len()
+    }
+
+    /// The cells exits hold past the stamped ones ([`STAMPED_CELLS`]):
+    /// their exits keep the cell probe, whose transfers through them each
+    /// PE counts in `ChainControl::heat`.
+    pub fn cells_past_stamped(&self) -> usize {
+        self.cells_past
+    }
+
+    /// The cells exits hold that hold no entry: their cell probes send
+    /// every transfer on to the table probe until the table takes an entry
+    /// of the cell's PC.
+    pub fn cells_empty(&self) -> usize {
+        self.cell_sites.len().saturating_sub(self.cell_frames.len())
     }
 
     fn cell(&self, cell: u32) -> LookupEntry {
@@ -4195,6 +4220,60 @@ mod tests {
             },
         );
         assert_eq!(table.site_cell(site + 16), None);
+    }
+
+    /// The census of held cells: those past the stamped ones, which no
+    /// promotion reaches, and those holding no entry, follow links,
+    /// relinks, the table's entries and releases.
+    #[test]
+    fn the_cell_census_counts_cells_past_the_stamped_ones_and_empty_ones() {
+        const PC: u64 = 0xffff_fe00_0123_4000;
+        let key = block_key(5 << PAGE_SHIFT, 1);
+        let entry = LookupEntry {
+            pc: PC,
+            key,
+            entry: 0x100,
+            block: 9,
+            targets: 1,
+        };
+        let mut table = LookupTable::new();
+        let census = |table: &LookupTable| {
+            (
+                table.cells(),
+                table.cells_past_stamped(),
+                table.cells_empty(),
+            )
+        };
+        // Every stamped cell held (cell 0 counts the cells past them).
+        for site in 1..STAMPED_CELLS as u64 {
+            table.link_cell(site, PC, Some(entry));
+        }
+        assert_eq!(census(&table), (STAMPED_CELLS - 1, 0, 0));
+        // The next two come from a chunk past them, one of them empty.
+        let past = STAMPED_CELLS as u64;
+        table.link_cell(past, PC, Some(entry));
+        table.link_cell(past + 1, PC + 4, None);
+        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 1));
+        // A relink keeps one cell for its exit.
+        table.link_cell(past + 1, PC + 4, None);
+        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 1));
+        // The table's entry of its PC fills the empty one.
+        table.set(
+            lookup_slot(PC + 4, key),
+            LookupEntry {
+                pc: PC + 4,
+                ..entry
+            },
+        );
+        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, 0));
+        // Forgetting the frame empties every cell of it.
+        table.forget_frames(5..=5, |_| true);
+        assert_eq!(census(&table), (STAMPED_CELLS + 1, 2, STAMPED_CELLS + 1));
+        // Releases go from the counts.
+        table.release_cells(past..=past + 1);
+        assert_eq!(census(&table), (STAMPED_CELLS - 1, 0, STAMPED_CELLS - 1));
+        table.release_cells(0..=u64::MAX);
+        assert_eq!(census(&table), (0, 0, 0));
     }
 
     /// Each tail calls its probe and jumps through R9 itself: the site's own

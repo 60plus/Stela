@@ -552,6 +552,15 @@ pub struct Statistics {
     /// How many exits had a stamped tail when this PE last looked (every
     /// promotion step): a level, which adding keeps the larger of.
     pub stamped_in_use: u64,
+    /// Transfers this PE's cell probes made through cells past the stamped
+    /// ones, which no promotion reaches (`ChainControl::heat`).
+    pub cell_overflow: u64,
+    /// The cells exits held, those past the stamped ones and those holding
+    /// no entry, when this PE last looked (every promotion step): levels,
+    /// as `stamped_in_use`.
+    pub cells_live: u64,
+    pub cells_past: u64,
+    pub cells_empty: u64,
     /// Links undone, as the blocks they chained into went.
     pub unlinks: u64,
     /// Exits redirected through a lookup of their target (returns and
@@ -771,6 +780,10 @@ impl core::ops::AddAssign for Statistics {
             stamped_tails,
             predicted_tails,
             stamped_in_use,
+            cell_overflow,
+            cells_live,
+            cells_past,
+            cells_empty,
             unlinks,
             lookups,
             lookup_hits,
@@ -928,6 +941,9 @@ impl core::ops::AddAssign for Statistics {
             *total += count;
         }
         self.stamped_in_use = self.stamped_in_use.max(stamped_in_use);
+        self.cells_live = self.cells_live.max(cells_live);
+        self.cells_past = self.cells_past.max(cells_past);
+        self.cells_empty = self.cells_empty.max(cells_empty);
         for (total, count) in self
             .store_sources
             .as_flattened_mut()
@@ -942,6 +958,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.links, links),
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
+            (&mut self.cell_overflow, cell_overflow),
             (&mut self.unlinks, unlinks),
             (&mut self.lookups, lookups),
             (&mut self.lookup_hits, lookup_hits),

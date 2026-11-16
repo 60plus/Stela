@@ -3314,6 +3314,27 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let _ = number;
 }
 
+/// The cell probe counts its transfers through cells past the stamped
+/// ones in the low 32 bits of the control's `heat`: each native call
+/// starts it at 0 and the engine adds what it holds after.
+#[test]
+fn a_native_runs_overflow_cell_transfers_are_counted() {
+    const NOP: u32 = 0xd503_201f;
+    let mut machine = machine(&[NOP, NOP]);
+    let control = machine.chain.address() as *mut chain::ChainControl;
+    // SAFETY: the PE's control, which no native code runs with now.
+    unsafe { core::ptr::addr_of_mut!((*control).heat).write(0xffff_ffff_0000_0007) };
+    assert_eq!(machine.chain.overflow(), 7);
+    machine.chain.begin(0, 10);
+    assert_eq!(machine.chain.overflow(), 0);
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: machine.cpu.pc + 4,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(machine.statistics.cell_overflow, 0);
+}
+
 #[test]
 fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1

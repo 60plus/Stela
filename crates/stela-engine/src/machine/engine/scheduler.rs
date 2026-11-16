@@ -353,6 +353,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let remaining = self.chain.budget().load(Ordering::Relaxed);
         let (block, retired, hits, _) = self.chain.completed();
+        self.statistics.cell_overflow += self.chain.overflow();
         self.promotion_runs = self.promotion_runs.wrapping_add(1);
         if self.promotion_runs.is_multiple_of(PROMOTION_RUNS) {
             self.promote_hot_exits();
@@ -1079,6 +1080,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             );
         }
         self.statistics.stamped_in_use = cache.targets.stamped_tails() as u64;
+        self.statistics.cells_live = cache.targets.cells() as u64;
+        self.statistics.cells_past = cache.targets.cells_past_stamped() as u64;
+        self.statistics.cells_empty = cache.targets.cells_empty() as u64;
     }
 
     /// The probes of `btype` and room for a tail of `bytes` that calls
