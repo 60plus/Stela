@@ -235,6 +235,94 @@ pub struct Pacing {
     /// completed.
     pub overlapped: u32,
     pub most_unanswered: usize,
+    /// The first [`SAMPLED_SWAPS`] swaps submitted in the window, each with
+    /// its own times: what decides when the AP starts its next frame, which
+    /// the window's averages cannot tell apart.
+    pub swaps: Vec<SwapTimes>,
+    /// The display's refresh period, in counter ticks, for the sample's
+    /// report.
+    pub refresh: u64,
+}
+
+/// How many swaps each pacing window samples ([`Pacing::swaps`]).
+pub const SAMPLED_SWAPS: usize = 24;
+
+/// One sampled swap ([`Pacing::swaps`]), in counter ticks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwapTimes {
+    pub swap_id: u32,
+    /// The first layer's surface ID, 0 for none: how many framebuffers the
+    /// AP turns through.
+    pub surface: u32,
+    /// The last vblank before the submit, the answer to that vblank's vsync
+    /// if it came before the submit, and the submit.
+    pub vblank: u64,
+    pub tick: Option<u64>,
+    pub submitted: u64,
+    /// The swap record's seven leading 64-bit words, +0x00 to +0x30: the
+    /// timestamps of types 1 to 7 that `IOMobileFramebufferSwapSetTimestamps`
+    /// writes (libIOMobileFramebuffer stores type n at the pending record's
+    /// word n - 1), counter values whose meaning the sample is to show; and
+    /// the small words at +0x48 and +0x50.
+    pub times: [u64; 7],
+    pub words: [u64; 2],
+    /// Ready (fences done), the vblank that showed or merged it, its
+    /// completion's answer, and the answer to that vblank's vsync.
+    pub ready: Option<u64>,
+    pub latched: Option<u64>,
+    pub answered: Option<u64>,
+    pub vsync: Option<u64>,
+}
+
+impl SwapTimes {
+    /// The record's words [`Self::times`] are read from, and [`Self::words`].
+    const TIMES: [usize; 7] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30];
+    const WORDS: [usize; 2] = [0x48, 0x50];
+
+    fn word(input: &[u8], offset: usize) -> u64 {
+        input.get(offset..offset + 8).map_or(0, |bytes| {
+            u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+        })
+    }
+
+    /// `swap:surface:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync`:
+    /// milliseconds after the vblank before the submit, the latch in whole
+    /// refreshes after it, completion and vsync answers in milliseconds after
+    /// the latch; `-` for a time not seen (a zero word, or an event after the
+    /// window closed), `far` for a word more than 100 s away.
+    fn write(&self, f: &mut core::fmt::Formatter<'_>, refresh: u64) -> core::fmt::Result {
+        let ms = |ticks: i128| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
+        let since = |base: u64, at: Option<u64>| at.map(|at| i128::from(at) - i128::from(base));
+        let show = |f: &mut core::fmt::Formatter<'_>, ticks: Option<i128>| match ticks {
+            None => write!(f, "-"),
+            Some(ticks) if ticks.unsigned_abs() > 100 * u128::from(COUNTER_HZ) => write!(f, "far"),
+            Some(ticks) => write!(f, "{:.1}", ms(ticks)),
+        };
+        write!(f, " {}:{}:", self.swap_id, self.surface)?;
+        show(f, since(self.vblank, Some(self.submitted)))?;
+        f.write_str("/")?;
+        show(f, since(self.vblank, self.tick))?;
+        for time in self.times {
+            f.write_str("/")?;
+            show(f, since(self.vblank, (time != 0).then_some(time)))?;
+        }
+        f.write_str("/")?;
+        show(f, since(self.vblank, self.ready))?;
+        f.write_str("/")?;
+        match self.latched {
+            Some(latched) => write!(
+                f,
+                "{}",
+                (latched.saturating_sub(self.vblank) + refresh / 2) / refresh.max(1)
+            )?,
+            None => f.write_str("-")?,
+        }
+        let latched = self.latched.unwrap_or(0);
+        f.write_str("/")?;
+        show(f, self.latched.and(since(latched, self.answered)))?;
+        f.write_str("/")?;
+        show(f, self.latched.and(since(latched, self.vsync)))
+    }
 }
 
 /// The longest gap, in refresh periods, still counted as part of a burst of
@@ -373,7 +461,22 @@ impl core::fmt::Display for Pacing {
             self.after_vsync,
             self.overlapped,
             self.most_unanswered,
-        )
+        )?;
+        let Some(first) = self.swaps.first() else {
+            return Ok(());
+        };
+        write!(
+            f,
+            "\nDCP SWAPS refresh_ms={:.2} words48_50={}/{} \
+             swap:surface:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync",
+            ms(self.refresh),
+            first.words[0],
+            first.words[1],
+        )?;
+        for swap in &self.swaps {
+            swap.write(f, self.refresh)?;
+        }
+        Ok(())
     }
 }
 
@@ -613,6 +716,8 @@ pub struct Methods {
     /// the last submit, and whether a completion is out to the AP: what a
     /// submit is timed against ([`Pacing::turnaround`]).
     last_vblank: Option<u64>,
+    /// The last vsync the AP answered: its vblank and the answer.
+    vsync_answered: Option<(u64, u64)>,
     completion_answered: Option<u64>,
     completing: bool,
     /// The monitor's power and sleep state, shared with its IOAV controller.
@@ -758,6 +863,7 @@ impl Methods {
             window_start: None,
             last_present: None,
             last_vblank: None,
+            vsync_answered: None,
             completion_answered: None,
             completing: false,
             display,
@@ -938,6 +1044,10 @@ impl Methods {
                 self.pacing
                     .fence
                     .add(self.now.saturating_sub(frame.submitted_at));
+                let now = self.now;
+                if let Some(sample) = self.sampled(swap_id) {
+                    sample.ready = Some(now);
+                }
             }
         } else if self.started.iter().any(|&(id, _)| id == swap_id) {
             if self.early_fences.len() == STARTED_SWAPS {
@@ -1055,7 +1165,11 @@ impl Methods {
         }
         let pacing = core::mem::take(&mut self.pacing);
         if pacing.presented != 0 || pacing.submitted != 0 {
-            self.record_log(Log::Pacing(Box::new(Pacing { ticks, ..pacing })));
+            self.record_log(Log::Pacing(Box::new(Pacing {
+                ticks,
+                refresh: self.refresh_ticks,
+                ..pacing
+            })));
         }
         self.window_start = Some(due);
     }
@@ -1299,6 +1413,9 @@ impl Methods {
         for frame in &batch {
             let ready = frame.ready_at.unwrap_or(now);
             self.pacing.latch.add(now.saturating_sub(ready));
+            if let Some(sample) = self.sampled(frame.swap_id) {
+                sample.latched = Some(due);
+            }
         }
         for (index, frame) in merged.iter().enumerate() {
             let later = batch[index + 1..]
@@ -2018,6 +2135,13 @@ impl Service for Methods {
                     methods.in_flight = false;
                     let waited = methods.now.saturating_sub(counter);
                     methods.pacing.vsync.add(waited);
+                    let now = methods.now;
+                    methods.vsync_answered = Some((counter, now));
+                    for sample in &mut methods.pacing.swaps {
+                        if sample.latched == Some(counter) {
+                            sample.vsync = Some(now);
+                        }
+                    }
                     Ok(())
                 }),
             });
@@ -2076,6 +2200,10 @@ impl Service for Methods {
                 methods.in_flight = false;
                 methods.completing = false;
                 methods.completion_answered = Some(methods.now);
+                let now = methods.now;
+                if let Some(sample) = methods.sampled(swap_id) {
+                    sample.answered = Some(now);
+                }
                 if let Some((_, submitted, presented)) = times {
                     let now = methods.now;
                     methods.pacing.complete.add(now.saturating_sub(presented));
@@ -2180,6 +2308,23 @@ impl Methods {
         });
         self.pacing.fence_waits += u32::from(fenced != 0);
         self.pace_submit();
+        if self.pacing.swaps.len() < SAMPLED_SWAPS {
+            let now = self.now;
+            self.pacing.swaps.push(SwapTimes {
+                swap_id,
+                surface: submission.surface_ids[0],
+                vblank: self.last_vblank.unwrap_or(now),
+                tick: self
+                    .vsync_answered
+                    .filter(|&(vblank, _)| Some(vblank) == self.last_vblank)
+                    .map(|(_, answered)| answered),
+                submitted: now,
+                times: SwapTimes::TIMES.map(|offset| SwapTimes::word(input, offset)),
+                words: SwapTimes::WORDS.map(|offset| SwapTimes::word(input, offset)),
+                ready: (fenced == 0).then_some(now),
+                ..SwapTimes::default()
+            });
+        }
         self.frames.push_back(Frame {
             swap_id,
             client,
@@ -2217,6 +2362,14 @@ impl Methods {
         let unanswered = self.frames.len() + self.completed.len() + usize::from(self.completing);
         self.pacing.overlapped += u32::from(unanswered != 0);
         self.pacing.most_unanswered = self.pacing.most_unanswered.max(unanswered);
+    }
+
+    /// This window's sample of `swap_id`, if it is one ([`Pacing::swaps`]).
+    fn sampled(&mut self, swap_id: u32) -> Option<&mut SwapTimes> {
+        self.pacing
+            .swaps
+            .iter_mut()
+            .find(|sample| sample.swap_id == swap_id)
     }
 
     /// Log each slot whose surface size, source rectangle or destination

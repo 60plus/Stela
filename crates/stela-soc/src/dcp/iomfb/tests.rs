@@ -1514,7 +1514,17 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert_eq!(pacing.after_vsync.count, pacing.submitted - 2);
     assert_eq!(pacing.after_vsync.longest, 100);
     assert_eq!((pacing.overlapped, pacing.most_unanswered), (1, 1));
-    let line = pacing.to_string();
+    let text = pacing.to_string();
+    let mut lines = text.lines();
+    let line = lines.next().unwrap();
+    // The swaps sampled follow on a line of their own.
+    assert!(
+        lines
+            .next()
+            .is_some_and(|swaps| swaps.starts_with("DCP SWAPS ")),
+        "{text}"
+    );
+    assert_eq!(pacing.swaps.len(), SAMPLED_SWAPS);
     assert!(
         line.starts_with("DCP PACING seconds=10.0 presented=") && line.contains(" merged=1 "),
         "{line}"
@@ -2258,6 +2268,78 @@ fn pacing_times_each_stage_of_a_swap_and_the_vsyncs() {
         line.contains(" swap_ms=n:avg/max fence=1:") && line.contains(" vsync=2:"),
         "{line}"
     );
+}
+
+#[test]
+fn the_pacing_report_samples_each_swaps_times_and_record_words() {
+    // 1 ms of the 24 MHz counter.
+    const MS: u64 = 24_000;
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    methods.notified = true;
+    let period = methods.refresh_ticks;
+    let answer_all = |methods: &mut Methods, at: u64| {
+        methods.observe(at);
+        while let Some(callback) = methods.take_callback() {
+            (callback.then)(methods, &[]).unwrap();
+        }
+    };
+    // The grid starts at 0.
+    methods.refresh(0);
+    answer_all(&mut methods, MS / 2);
+    // Submitted 7.5 ms after the vblank, its record naming 1 ms and the next
+    // vblank in its leading words and 4 and 2 in its small ones.
+    methods.observe(15 * MS / 2);
+    let id = start_swap(&mut methods);
+    let mut input = fenced_submission(id, &[(0, 4, 2, 0x1000)], 1, [5, 0, 0, 0]);
+    input[0x00..0x08].copy_from_slice(&MS.to_le_bytes());
+    input[0x08..0x10].copy_from_slice(&period.to_le_bytes());
+    input[0x48..0x50].copy_from_slice(&4u64.to_le_bytes());
+    input[0x50..0x58].copy_from_slice(&2u64.to_le_bytes());
+    returned(methods.call(*b"A407", &input, 0xc));
+    // Its fence is named at 12 ms, it is latched at the next vblank and both
+    // callbacks of that vblank are answered 2 ms after it.
+    let notice = 12 * MS;
+    methods.observe(notice);
+    let fence = Packed::new()
+        .u32(id)
+        .u32(5)
+        .u64(notice)
+        .u32(0)
+        .finish(0x14)
+        .unwrap();
+    returned(methods.call(*b"A470", &fence, 4));
+    methods
+        .present(period + 5, |_, bytes: &mut [u8]| {
+            bytes.fill(0x5a);
+            true
+        })
+        .unwrap();
+    answer_all(&mut methods, period + 2 * MS);
+    let pacing = Pacing {
+        refresh: period,
+        ..methods.pacing.clone()
+    };
+    assert_eq!(pacing.swaps.len(), 1);
+    let text = pacing.to_string();
+    let swaps = text.lines().nth(1).expect("a sample line");
+    assert!(
+        swaps.starts_with("DCP SWAPS refresh_ms=16.67 words48_50=4/2 "),
+        "{swaps}"
+    );
+    assert!(
+        swaps.ends_with(&alloc::format!(
+            " {id}:5:7.5/0.5/1.0/16.7/-/-/-/-/-/12.0/1/2.0/2.0"
+        )),
+        "{swaps}"
+    );
+    // Only the first swaps of a window are sampled.
+    for _ in 0..SAMPLED_SWAPS {
+        let id = start_swap(&mut methods);
+        returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    }
+    assert_eq!(methods.pacing.swaps.len(), SAMPLED_SWAPS);
 }
 
 /// A screen whose frames another thread can push, as a compose outside the
