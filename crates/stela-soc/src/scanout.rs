@@ -2560,86 +2560,88 @@ mod tests {
     #[test]
     #[ignore = "manual: opt-in"]
     fn refine_timings() {
-        const WIDTH: usize = 2560;
-        const HEIGHT: usize = 1440;
-        const SURFACE: usize = WIDTH * HEIGHT * 5;
-        let mode = Mode {
-            width: WIDTH as u32,
-            height: HEIGHT as u32,
-            format: PixelFormat::Bgra8888,
-        };
-        let whole = Rect::whole(WIDTH as u32, HEIGHT as u32);
-        let screen = |index: usize, extended: bool| {
-            let iova = (index * SURFACE) as u64;
-            Surface {
-                format: if extended {
-                    PixelFormat::Xr10A8 {
-                        alpha: iova + (WIDTH * HEIGHT * 4) as u64,
-                        alpha_stride: WIDTH as u32,
-                    }
-                } else {
-                    PixelFormat::Bgra8888
-                },
-                ..surface(WIDTH as u32, HEIGHT as u32, WIDTH as u32 * 4, iova)
-            }
-        };
-        let cursor_at = 2 * SURFACE;
-        let mut memory = alloc::vec![0u8; 2 * SURFACE + 32 * 32 * 4];
-        for (index, byte) in memory.iter_mut().enumerate() {
-            *byte = (index as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 0x40;
-        }
-        let first = memory[..SURFACE].to_vec();
-        for extended in [false, true] {
-            for cursor in [false, true] {
-                for (case, rows) in [("same", 0..0), ("band", 700..772), ("all", 0..HEIGHT)] {
-                    memory[SURFACE..2 * SURFACE].copy_from_slice(&first);
-                    for y in rows {
-                        memory[SURFACE + y * WIDTH * 4 + 8] ^= 0x10;
-                    }
-                    let layers = |index: usize| {
-                        let mut layers = alloc::vec![
-                            Layer::new(screen(index, extended), whole, whole, false).unwrap()
-                        ];
-                        if cursor {
-                            layers.push(
-                                Layer::new(
-                                    surface(32, 32, 128, cursor_at as u64),
-                                    Rect::whole(32, 32),
-                                    Rect {
-                                        x: 600,
-                                        y: 300,
-                                        ..Rect::whole(32, 32)
-                                    },
-                                    false,
-                                )
-                                .unwrap(),
-                            );
+        // The scanout sizes of a 1440p and a 4K monitor.
+        for (width, height) in [(2560usize, 1440usize), (3840, 2160)] {
+            let surface_bytes = width * height * 5;
+            let mode = Mode {
+                width: width as u32,
+                height: height as u32,
+                format: PixelFormat::Bgra8888,
+            };
+            let whole = Rect::whole(width as u32, height as u32);
+            let screen = |index: usize, extended: bool| {
+                let iova = (index * surface_bytes) as u64;
+                Surface {
+                    format: if extended {
+                        PixelFormat::Xr10A8 {
+                            alpha: iova + (width * height * 4) as u64,
+                            alpha_stride: width as u32,
                         }
-                        layers
-                    };
-                    let mut sink = Timed {
-                        mode,
-                        rows: alloc::vec![0; WIDTH * HEIGHT * 4],
-                    };
-                    let mut composed = Composed::default();
-                    present(&mut sink, &layers(0), None, reader(&memory), &mut composed).unwrap();
-                    const SWAPS: usize = 60;
-                    let start = std::time::Instant::now();
-                    for swap in 1..=SWAPS {
-                        present(
-                            &mut sink,
-                            &layers(swap % 2),
-                            Some(0..HEIGHT),
-                            reader(&memory),
-                            &mut composed,
-                        )
-                        .unwrap();
+                    } else {
+                        PixelFormat::Bgra8888
+                    },
+                    ..surface(width as u32, height as u32, width as u32 * 4, iova)
+                }
+            };
+            let cursor_at = 2 * surface_bytes;
+            let mut memory = alloc::vec![0u8; 2 * surface_bytes + 32 * 32 * 4];
+            for (index, byte) in memory.iter_mut().enumerate() {
+                *byte = (index as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 0x40;
+            }
+            let first = memory[..surface_bytes].to_vec();
+            for extended in [false, true] {
+                for cursor in [false, true] {
+                    for (case, rows) in [("same", 0..0), ("band", 700..772), ("all", 0..height)] {
+                        memory[surface_bytes..2 * surface_bytes].copy_from_slice(&first);
+                        for y in rows {
+                            memory[surface_bytes + y * width * 4 + 8] ^= 0x10;
+                        }
+                        let layers = |index: usize| {
+                            let mut layers = alloc::vec![
+                                Layer::new(screen(index, extended), whole, whole, false).unwrap()
+                            ];
+                            if cursor {
+                                layers.push(
+                                    Layer::new(
+                                        surface(32, 32, 128, cursor_at as u64),
+                                        Rect::whole(32, 32),
+                                        Rect {
+                                            x: 600,
+                                            y: 300,
+                                            ..Rect::whole(32, 32)
+                                        },
+                                        false,
+                                    )
+                                    .unwrap(),
+                                );
+                            }
+                            layers
+                        };
+                        let mut sink = Timed {
+                            mode,
+                            rows: alloc::vec![0; width * height * 4],
+                        };
+                        let mut composed = Composed::default();
+                        present(&mut sink, &layers(0), None, reader(&memory), &mut composed)
+                            .unwrap();
+                        const SWAPS: usize = 60;
+                        let start = std::time::Instant::now();
+                        for swap in 1..=SWAPS {
+                            present(
+                                &mut sink,
+                                &layers(swap % 2),
+                                Some(0..height),
+                                reader(&memory),
+                                &mut composed,
+                            )
+                            .unwrap();
+                        }
+                        let each = start.elapsed().as_secs_f64() * 1000.0 / SWAPS as f64;
+                        std::println!(
+                            "refine {width}x{height} {} cursor={cursor} {case}: {each:.3} ms",
+                            if extended { "&b38" } else { "BGRA" }
+                        );
                     }
-                    let each = start.elapsed().as_secs_f64() * 1000.0 / SWAPS as f64;
-                    std::println!(
-                        "refine {} cursor={cursor} {case}: {each:.3} ms",
-                        if extended { "&b38" } else { "BGRA" }
-                    );
                 }
             }
         }
