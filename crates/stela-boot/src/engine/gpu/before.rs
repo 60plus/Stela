@@ -45,6 +45,7 @@ pub(super) struct Before {
 pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
     match stack.vendor {
         Vendor::Nvidia => Some(&NOUVEAU),
+        Vendor::Amd => Some(&AMDGPU),
         _ => None,
     }
 }
@@ -82,6 +83,29 @@ static NOUVEAU: Before = Before {
         Some(chip) => wait_for_firmware_boot(services, registers, chip),
         None => Ok(()),
     },
+};
+
+/// amdgpu: the files are those its IP blocks ask for on the PCI device ID's
+/// GPU, as pinned. The driver reads which blocks the device has from the
+/// device's own discovery table and loads every engine's firmware itself,
+/// so nothing boots by itself after the reset and nothing waits here.
+static AMDGPU: Before = Before {
+    identify: |registers, adapter, catalog| {
+        use stela_loader::host_firmware::recipes;
+        // Register 0 identifies nothing here; the read proves the window.
+        registers.read32(0).map_err(ServiceError::Mapping)?;
+        let mut inventory = Inventory::default();
+        recipes::require_amdgpu(&mut inventory, adapter.device)
+            .map_err(|_| ServiceError::Refused("the GPU has no pinned amdgpu firmware recipe"))?;
+        let name = format!("{:04x}", adapter.device);
+        Ok(Identified {
+            firmware: select_firmware(&inventory, &name, catalog)?,
+            identity: None,
+            chip: recipes::amd_gpu_family(adapter.device),
+            parameters: None,
+        })
+    },
+    settle: |_, _, _| Ok(()),
 };
 
 /// The firmware of every request in `inventory`, each file bound under the
