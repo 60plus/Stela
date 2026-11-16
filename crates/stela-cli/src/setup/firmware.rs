@@ -65,6 +65,9 @@ enum Answer {
     Cut(String, bool),
     /// An answer asking again would not change.
     Final(String),
+    /// The source no longer has the pinned file: it answered 404 or 410, or
+    /// holds a file of another length under the name.
+    Gone(String),
 }
 
 /// The pause a `Retry-After` header asks for, in seconds; an HTTP date is
@@ -144,7 +147,14 @@ fn request(
         (200, None) => 0,
         (206, Some((offset, total))) => {
             let expected = (offset + had as u64, offset + length - 1, total);
-            if content_range(&response) != Some(expected) {
+            let sent = content_range(&response);
+            if let Some((_, _, other)) = sent.filter(|&(_, _, other)| other != total) {
+                part.clear();
+                return Err(Answer::Gone(format!(
+                    "holds a file of {other} bytes there, not the pinned one of {total}"
+                )));
+            }
+            if sent != Some(expected) {
                 part.clear();
                 return Err(Answer::Transient(
                     "sent a range other than the one asked for".into(),
@@ -161,6 +171,12 @@ fn request(
             }
             had
         }
+        (200, Some(_)) => {
+            return Err(Answer::Final(
+                "sent the whole file, not the part of it asked for".into(),
+            ));
+        }
+        (404 | 410, _) => return Err(Answer::Gone(format!("answered {status}"))),
         (416, _) if had > 0 => {
             part.clear();
             return Err(Answer::Transient(format!("answered {status} to a resume")));
@@ -274,12 +290,14 @@ fn download_slice(
 ) -> Result<Vec<u8>> {
     let mut waited = Duration::ZERO;
     let mut answers = Vec::new();
+    let mut all_gone = !urls.is_empty();
     for url in urls {
         let host = host_of(url);
         let mut part = Vec::with_capacity(artifact.length);
         let mut backoff = Duration::from_secs(1);
         let mut attempt = 1;
         let mut resumes = 0;
+        let mut gone = false;
         let last = loop {
             let pause = match request(client, url, artifact, slice, &mut part) {
                 Ok(()) => return Ok(part),
@@ -298,6 +316,10 @@ fn download_slice(
                     (Some(backoff), what)
                 }
                 Err(Answer::Final(what)) => (None, what),
+                Err(Answer::Gone(what)) => {
+                    gone = true;
+                    (None, what)
+                }
             };
             match pause {
                 (Some(pause), what)
@@ -321,11 +343,18 @@ fn download_slice(
             eprintln!("note: {} from {host}: {last}", artifact.member);
         }
         answers.push(format!("{host} {last}"));
+        all_gone &= gone;
     }
     anyhow::bail!(
-        "cannot download {}: {}",
+        "cannot download {}: {}{}",
         artifact.member,
-        answers.join("; ")
+        answers.join("; "),
+        if all_gone {
+            ". The file has moved or changed where it is published, so this Stela cannot get \
+             it; a newer Stela can"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1497,6 +1526,48 @@ mod tests {
         let heads = server.join().unwrap();
         assert!(!heads[0].contains("range:"), "{heads:?}");
         assert!(heads[1].contains("range: bytes=2-\r\n"), "{heads:?}");
+    }
+
+    #[test]
+    fn a_file_moved_or_replaced_at_every_source_is_named_so() {
+        // NVIDIA put another installer under the name: its length differs.
+        let replaced = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 100-102/900\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        let (first, first_server) = source(vec![replaced]);
+        let (second, second_server) = source(vec![GONE]);
+        let mut slept = Vec::new();
+        let error = download_slice(
+            &client(),
+            &ABC,
+            Some((100, 500)),
+            &[first, second],
+            &mut |d| slept.push(d),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("holds a file of 900 bytes there, not the pinned one of 500"),
+            "{error}"
+        );
+        assert!(error.contains("answered 404 Not Found"), "{error}");
+        assert!(
+            error.ends_with("The file has moved or changed where it is published, so this Stela cannot get it; a newer Stela can"),
+            "{error}"
+        );
+        // Neither is asked again.
+        assert!(slept.is_empty(), "{slept:?}");
+        assert_eq!(first_server.join().unwrap(), 1);
+        assert_eq!(second_server.join().unwrap(), 1);
+        // A server that ignores the range is not read: 376 MB for 52 MB.
+        let (url, server) = source(vec![OK]);
+        let error = download_slice(&client(), &ABC, Some((100, 500)), &[url], &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("sent the whole file, not the part of it asked for"),
+            "{error}"
+        );
+        assert!(!error.contains("moved or changed"), "{error}");
+        assert_eq!(server.join().unwrap(), 1);
     }
 
     #[test]
