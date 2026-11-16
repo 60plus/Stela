@@ -182,6 +182,11 @@ void device_set_of_node_from_dev(struct device *dev, const struct device *dev2)
 	dev_set_of_node_reused(dev);
 }
 
+int device_match_name(struct device *dev, const void *name)
+{
+	return sysfs_streq(dev_name(dev), name);
+}
+
 int device_match_of_node(struct device *dev, const void *np)
 {
 	return np && dev->of_node == np;
@@ -208,6 +213,28 @@ STELA_UNSUPPORTED(void, driver_unregister, struct device_driver *)
 STELA_UNSUPPORTED(struct device *, bus_find_device, const struct bus_type *, struct device *,
 		  const void *, device_match_t)
 STELA_UNSUPPORTED(int, device_for_each_child, struct device *, void *, device_iter_t)
+
+/* A class is its name: a device of one is created and attached like any
+ * other, and its attribute groups are files nothing reads. Registering a
+ * class therefore records nothing, as registering a bus does. A search of a
+ * class's devices and of a device's children need the driver core's lists,
+ * which do not exist; only a panel driver looks a backlight up by name or
+ * node and only an I2C sensor with packet error checking looks for its
+ * hwmon child, and the image holds neither. */
+int class_register(const struct class *class)
+{
+	return class && class->name ? 0 : -EINVAL;
+}
+
+void class_unregister(const struct class *class)
+{
+	(void)class;
+}
+
+STELA_UNSUPPORTED(struct device *, class_find_device, const struct class *, const struct device *,
+		  const void *, device_match_t)
+STELA_UNSUPPORTED(struct device *, device_find_child, struct device *, const void *,
+		  device_match_t)
 
 struct class *class_create(const char *name)
 {
@@ -456,10 +483,20 @@ int main(void)
 	device_set_of_node_from_dev(&other, &with_node);
 	assert(!other.of_node && dev_of_node_reused(&other));
 	assert(!device_match_of_node(&other, NULL));
+	struct device named = {};
+	device_initialize(&named);
+	assert(!dev_set_name(&named, "hwmon%d", 3));
+	assert(device_match_name(&named, "hwmon3\n") && !device_match_name(&named, "hwmon"));
+	kfree_const(named.kobj.name);
 	static const struct bus_type test_bus = {.name = "test"};
 	static const struct bus_type unnamed = {};
 	assert(!bus_register(&test_bus) && bus_register(&unnamed) == -EINVAL);
 	bus_unregister(&test_bus);
+
+	static const struct class test_class = {.name = "test"};
+	static const struct class unnamed_class = {};
+	assert(!class_register(&test_class) && class_register(&unnamed_class) == -EINVAL);
+	class_unregister(&test_class);
 
 	struct class *class = class_create("test");
 	assert(!IS_ERR(class) && !strcmp(class->name, "test"));

@@ -127,6 +127,16 @@ static void client_released(struct device *dev)
 	kfree(to_i2c_client(dev));
 }
 
+const struct device_type i2c_client_type = {
+	.release = client_released,
+};
+
+/* The client a device is, or NULL for a device of another type. */
+struct i2c_client *i2c_verify_client(struct device *dev)
+{
+	return dev->type == &i2c_client_type ? to_i2c_client(dev) : NULL;
+}
+
 struct i2c_client *i2c_new_client_device(struct i2c_adapter *adapter,
 					 const struct i2c_board_info *info)
 {
@@ -146,7 +156,7 @@ struct i2c_client *i2c_new_client_device(struct i2c_adapter *adapter,
 	device_initialize(&client->dev);
 	client->dev.parent = &adapter->dev;
 	client->dev.platform_data = info->platform_data;
-	client->dev.release = client_released;
+	client->dev.type = &i2c_client_type;
 	return client;
 }
 

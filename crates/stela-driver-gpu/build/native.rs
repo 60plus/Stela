@@ -186,7 +186,38 @@ const DRM_UNITS: &[UnitSpec] = &[
         module: "buddy",
         file: "drivers/gpu/buddy",
     },
+    // The hwmon and backlight classes, which a driver's sensors and panel
+    // brightness register devices of: each unit's initcall registers its
+    // class. Ordinal 9 is the MIPI DSI bus's.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "hwmon",
+            group_ordinal: 10,
+            unit_ordinal: 1,
+            global_ordinal: 10,
+        },
+        source: "drivers/hwmon/hwmon",
+        module: "hwmon",
+        file: "drivers/hwmon/hwmon",
+    },
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "backlight",
+            group_ordinal: 11,
+            unit_ordinal: 1,
+            global_ordinal: 11,
+        },
+        source: "drivers/video/backlight/backlight",
+        module: "backlight",
+        file: "drivers/video/backlight/backlight",
+    },
 ];
+
+/// The captured units that define `pr_fmt` themselves.
+#[cfg(feature = "linux-drm")]
+const PREFIXED: [&str; 2] = ["drivers/hwmon/hwmon", "drivers/video/backlight/backlight"];
 
 /// Reviewed common-first/DRM-next prefix, used again by the final class image.
 #[cfg(feature = "linux-drm")]
@@ -293,6 +324,13 @@ impl Linux {
                     ],
                 )
                 .expect("DRM source placement");
+                // A unit that names its messages (`pr_fmt`) does so before
+                // its first include; the registration header comes before
+                // that here and has printk.h's default defined already.
+                let mut captured_build = captured_build.clone();
+                if PREFIXED.contains(&spec.source) {
+                    captured_build.flag("-Wno-macro-redefined");
+                }
                 captured.push(linux_capture::compile(
                     &captured_build,
                     &Path::new(COMPAT).join("stela/registration.h"),

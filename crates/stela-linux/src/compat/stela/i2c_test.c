@@ -55,6 +55,8 @@ void stela_linux_i2c_test(void)
 	struct i2c_client *client = i2c_new_client_device(&adapter, &info);
 	assert(!IS_ERR(client) && client->addr == 0x48 && !client->dev.driver);
 	assert(!strcmp(client->name, "sensor") && client->adapter == &adapter);
+	/* A client is known by its device type; an adapter's device is none. */
+	assert(i2c_verify_client(&client->dev) == client && !i2c_verify_client(&adapter.dev));
 	i2c_unregister_device(client);
 	i2c_unregister_device(ERR_PTR(-ENODEV));
 	info.addr = 0x80;

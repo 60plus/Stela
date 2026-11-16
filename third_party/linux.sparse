@@ -386,3 +386,5 @@
 /drivers/gpu/drm/drm_client_modeset.c
 /drivers/gpu/drm/drm_client_sysrq.c
 /drivers/gpu/drm/drm_panel_backlight_quirks.c
+/drivers/video/backlight/backlight.c
+/drivers/hwmon/hwmon.c
