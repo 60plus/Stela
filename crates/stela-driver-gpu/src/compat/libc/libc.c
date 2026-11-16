@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <link.h>
+#include <linux/futex.h>
 #include <locale.h>
 #include <math.h>
 #include <poll.h>
@@ -720,11 +721,66 @@ int setpriority(int which, int who, int priority)
 	return 0;
 }
 
+/* Linux's futex on the host's word waits. A wake wakes every waiter of the
+ * word, which futex allows, since a waiter may always return early; the host
+ * does not count them, so a wake reports none. Waits time out on the
+ * monotonic clock only, as clock_nanosleep does. */
+static long futex(uint32_t *word, int operation, uint32_t value, va_list arguments)
+{
+	if (operation & FUTEX_CLOCK_REALTIME)
+		return fail(ENOTSUP);
+	int command = operation & ~FUTEX_PRIVATE_FLAG;
+	if (command != FUTEX_WAIT && command != FUTEX_WAKE && command != FUTEX_WAIT_BITSET &&
+	    command != FUTEX_WAKE_BITSET)
+		return fail(ENOSYS);
+	const struct timespec *timeout = NULL;
+	if (command != FUTEX_WAKE) {
+		timeout = va_arg(arguments, const struct timespec *);
+		(void)va_arg(arguments, uint32_t *);
+		/* A bitset operation names the waiters it is for. */
+		if (command != FUTEX_WAIT && !(uint32_t)va_arg(arguments, int))
+			return fail(EINVAL);
+	}
+	if (command == FUTEX_WAKE || command == FUTEX_WAKE_BITSET) {
+		stela_libc_wake(word);
+		return 0;
+	}
+	uint64_t until = UINT64_MAX;
+	if (timeout) {
+		int error = nanoseconds(timeout, &until);
+		if (error == EINVAL)
+			return fail(EINVAL);
+		if (error)
+			until = UINT64_MAX;
+		/* FUTEX_WAIT's timeout is relative, FUTEX_WAIT_BITSET's absolute. */
+		else if (command == FUTEX_WAIT) {
+			uint64_t now = stela_libc_now_ns();
+			until = until >= UINT64_MAX - 1 - now ? UINT64_MAX : until + now;
+		}
+	}
+	if (__atomic_load_n(word, __ATOMIC_SEQ_CST) != value)
+		return fail(EAGAIN);
+	stela_libc_wait(word, value, until);
+	if (until != UINT64_MAX && stela_libc_now_ns() >= until &&
+	    __atomic_load_n(word, __ATOMIC_SEQ_CST) == value)
+		return fail(ETIMEDOUT);
+	return 0;
+}
+
 long syscall(long number, ...)
 {
 	if (number == SYS_gettid)
 		return gettid();
-	return fail(ENOSYS);
+	if (number != SYS_futex)
+		return fail(ENOSYS);
+	va_list arguments;
+	va_start(arguments, number);
+	uint32_t *word = va_arg(arguments, uint32_t *);
+	int operation = va_arg(arguments, int);
+	uint32_t value = (uint32_t)va_arg(arguments, int);
+	long result = futex(word, operation, value, arguments);
+	va_end(arguments);
+	return result;
 }
 
 unsigned long getauxval(unsigned long type)

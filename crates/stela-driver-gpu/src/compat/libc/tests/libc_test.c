@@ -8,6 +8,7 @@
 #include <fenv.h>
 #include <inttypes.h>
 #include <link.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -24,6 +25,7 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <stela/host.h>
 #include "host.h"
@@ -268,6 +270,43 @@ static void test_refusals(void)
 	errno = 0;
 	CHECK(openat(3, "control", O_RDONLY) == -1 && errno == EBADF);
 	CHECK(imaxabs(-INTMAX_MAX) == INTMAX_MAX);
+}
+
+static void test_futex(void)
+{
+	uint32_t word = 0;
+	unsigned int before = waits, woken = wakes;
+	/* A word that no longer holds the value is not waited on. */
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL,
+		      FUTEX_BITSET_MATCH_ANY) == -1 && errno == EAGAIN);
+	CHECK(waits == before);
+	/* A wait returns once another processor changes the word. */
+	waited_word = (volatile unsigned int *)&word;
+	waited_value = 1;
+	CHECK(!syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 0, NULL, NULL,
+		       FUTEX_BITSET_MATCH_ANY));
+	CHECK(waits == before + 1 && word == 1);
+	waited_word = NULL;
+	/* A deadline that passed with the word unchanged is a timeout, absolute
+	 * for a bitset wait and relative for a plain one. */
+	struct timespec now, none = {0, 0};
+	CHECK(!clock_gettime(CLOCK_MONOTONIC, &now));
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET, 1, &now, NULL, FUTEX_BITSET_MATCH_ANY) ==
+		      -1 && errno == ETIMEDOUT);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT, 1, &none) == -1 && errno == ETIMEDOUT);
+	CHECK(!syscall(SYS_futex, &word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT32_MAX));
+	CHECK(wakes == woken + 1);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET, 1, NULL, NULL, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME, 1, NULL, NULL,
+		      FUTEX_BITSET_MATCH_ANY) == -1 && errno == ENOTSUP);
+	/* FUTEX_WAKE_OP, which no caller of the image uses. */
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, 5, 1) == -1 && errno == ENOSYS);
 }
 
 static int objects;
@@ -688,6 +727,7 @@ int main(void)
 	test_meminfo();
 	test_refusals();
 	test_loading();
+	test_futex();
 	test_division();
 	test_system();
 	test_wide();
