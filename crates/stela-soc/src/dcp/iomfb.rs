@@ -968,7 +968,9 @@ impl Methods {
         // display, and it stops a minute later: the size is published at
         // the usual rate instead, at which macOS then draws.
         let mut reported = Vec::new();
-        let advertised = Advertised::sized(scanout.mode(), refresh, scanout.physical_size_mm())
+        let size_mm = scanout.physical_size_mm();
+        let advertised = Advertised::sized(scanout.mode(), refresh, size_mm)
+            .map(|advertised| advertised.with_rates(&scanout.refresh_rates(), size_mm))
             .or_else(|refusal| {
                 let usual = super::super::scanout::DEFAULT_REFRESH_MILLIHERTZ;
                 reported.push(format!(
@@ -1857,6 +1859,25 @@ impl Methods {
         self.queue(PROP_END, Packed::new().bytes(&name))
     }
 
+    /// Run the monitor at `refresh` millihertz: the scanout switches, the
+    /// vblanks take its period from the next one on, and the refresh
+    /// dictionary is published again for it.
+    fn retime(&mut self, refresh: u32) -> Result<()> {
+        let ticks = refresh_ticks(refresh);
+        if ticks == self.refresh_ticks {
+            return Ok(());
+        }
+        self.scanout
+            .as_mut()
+            .ok_or_else(|| refuse!("the DCP has no scanout to set the refresh of"))?
+            .set_refresh(refresh)?;
+        self.refresh_ticks = ticks;
+        self.publish_property(
+            DISPLAY_REFRESH,
+            modes::display_refresh(self.refresh_ticks, COUNTER_HZ),
+        )
+    }
+
     fn queue_hotplug(&mut self) -> Result<()> {
         self.queue(
             HOTPLUG,
@@ -2162,11 +2183,25 @@ impl Service for Methods {
             (AP, "set_digital_out_mode") => {
                 let color = fields.u32()?;
                 let timing = fields.u32()?;
-                if (color, timing) != (modes::COLOR_ID, modes::TIMING_ID) {
+                let rate = self
+                    .advertised
+                    .as_ref()
+                    .ok()
+                    .filter(|_| color == modes::COLOR_ID)
+                    .and_then(|advertised| advertised.refresh_of(timing));
+                let Some(rate) = rate else {
                     return self.refuse(
                         tag,
                         refuse!("set_digital_out_mode names a mode the DCP never advertised"),
                     );
+                };
+                // Another rate of the size, or the preferred one again
+                // after another: the monitor runs it and the vblanks follow.
+                let other = |timing| timing != modes::TIMING_ID;
+                if (other(timing) || self.digital_out.is_some_and(|(_, set)| other(set)))
+                    && let Err(reason) = self.retime(rate)
+                {
+                    return self.refuse(tag, reason);
                 }
                 self.digital_out = Some((color, timing));
                 let packed = Packed::new().u32(IO_RETURN_SUCCESS).finish(output);

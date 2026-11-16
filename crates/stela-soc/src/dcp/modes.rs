@@ -49,6 +49,8 @@
 use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode};
 use crate::Result;
 use alloc::string::String;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::fmt::Write;
 use stela_contracts::refuse;
 
@@ -59,6 +61,9 @@ pub const TIMING_ID: u32 = 1;
 /// The color element's ID (a separate namespace: `getVideoDataForIDs` takes
 /// both).
 pub const COLOR_ID: u32 = 2;
+/// The first of the IDs of the timings at the mode's other refresh rates,
+/// one after another, slower rates later.
+pub const OTHER_TIMING_IDS: u32 = 3;
 /// `sizeof(IOAVVideoTimingData)`: the `ElementData` restored copies and
 /// `A364`'s first argument.
 pub const TIMING_BYTES: usize = 0x50;
@@ -130,8 +135,11 @@ type Blanking = (u32, u32, u32);
 /// The pixel clock, in 10 kHz units, of `width` by `height` with `blanking`
 /// at `refresh` millihertz, rounded to the nearest unit.
 fn clock(width: u32, height: u32, (_, h_blank, v_blank): Blanking, refresh: u32) -> u64 {
-    let total = u64::from(width + h_blank) * u64::from(height + v_blank);
-    (total * u64::from(refresh) + 5_000_000) / 10_000_000
+    let total = (u64::from(width) + u64::from(h_blank)) * (u64::from(height) + u64::from(v_blank));
+    total
+        .saturating_mul(u64::from(refresh))
+        .saturating_add(5_000_000)
+        / 10_000_000
 }
 
 /// The blanking of `width` by `height` at `refresh` millihertz: the nominal
@@ -165,6 +173,26 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
     let diagonal_mm = tenths_of_inch * 254 / 100;
     let mm = |pixels: u64| (diagonal_mm * pixels / diagonal_pixels) as u32;
     (mm(w), mm(h))
+}
+
+/// Whether `mode` at `refresh` millihertz has a pixel clock past a detailed
+/// timing's, so its record is built directly ([`fast_timing`]).
+fn fast(mode: Mode, refresh: u32) -> bool {
+    let (width, height) = (mode.width, mode.height);
+    clock(width, height, blanking(width, height, refresh), refresh) > MAX_CLOCK
+}
+
+/// The timing record of `mode` at `refresh` millihertz: a detailed timing's,
+/// or for a fast mode one built directly.
+fn timing_record(
+    mode: Mode,
+    refresh: u32,
+    size_mm: Option<(u32, u32)>,
+) -> Result<[u8; TIMING_BYTES]> {
+    if fast(mode, refresh) {
+        return record(&fast_timing(mode.width, mode.height, refresh)?);
+    }
+    timing_data(&detailed_timing_sized(mode, refresh, size_mm)?)
 }
 
 /// Whether a mode of this size at `refresh` millihertz can be published to
@@ -636,6 +664,11 @@ pub struct Advertised {
     pub edid: [u8; 128],
     pub timing: [u8; TIMING_BYTES],
     pub color: [u8; COLOR_BYTES],
+    /// The refresh in millihertz of [`Self::timing`], the preferred mode.
+    refresh: u32,
+    /// The same size at the monitor's other rates: each one's refresh and
+    /// timing record, IDs from [`OTHER_TIMING_IDS`] on.
+    others: Vec<(u32, [u8; TIMING_BYTES])>,
 }
 
 impl Advertised {
@@ -660,13 +693,13 @@ impl Advertised {
     /// size at 60 Hz, as a monitor's base block often does for its fast
     /// modes, which it lists in an extension.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
-        let (width, height) = (mode.width, mode.height);
-        if clock(width, height, blanking(width, height, refresh), refresh) > MAX_CLOCK {
-            let timing = record(&fast_timing(width, height, refresh)?)?;
+        if fast(mode, refresh) {
             return Ok(Self {
                 edid: edid_sized(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm)?,
-                timing,
+                timing: timing_record(mode, refresh, size_mm)?,
                 color: color_data(),
+                refresh,
+                others: Vec::new(),
             });
         }
         let edid = edid_sized(mode, refresh, size_mm)?;
@@ -675,13 +708,57 @@ impl Advertised {
             edid,
             timing: timing_data(&dtd)?,
             color: color_data(),
+            refresh,
+            others: Vec::new(),
         })
     }
 
-    /// The video records for `(timing, color)` IDs, when both are the
+    /// This mode also at each of `rates` (millihertz) other than its own
+    /// whose timing can be published, slower ones after faster: macOS
+    /// offers them in Displays settings and sets one with
+    /// `set_digital_out_mode`.
+    pub fn with_rates(mut self, rates: &[u32], size_mm: Option<(u32, u32)>) -> Self {
+        let mode = Mode {
+            width: get(&self.timing, 0x08),
+            height: get(&self.timing, 0x28),
+            format: super::super::scanout::PixelFormat::Bgra8888,
+        };
+        let mut rates: Vec<u32> = rates
+            .iter()
+            .copied()
+            .filter(|&r| r != self.refresh)
+            .collect();
+        rates.sort_unstable_by(|a, b| b.cmp(a));
+        rates.dedup();
+        self.others = rates
+            .into_iter()
+            .filter_map(|rate| Some((rate, timing_record(mode, rate, size_mm).ok()?)))
+            .collect();
+        self
+    }
+
+    /// Each timing's ID, refresh in millihertz and record, the preferred
+    /// one first.
+    fn timings(&self) -> impl Iterator<Item = (u32, u32, &[u8; TIMING_BYTES])> {
+        core::iter::once((TIMING_ID, self.refresh, &self.timing)).chain(
+            (OTHER_TIMING_IDS..)
+                .zip(&self.others)
+                .map(|(id, (rate, timing))| (id, *rate, timing)),
+        )
+    }
+
+    /// The refresh in millihertz of the advertised timing `timing`.
+    pub fn refresh_of(&self, timing: u32) -> Option<u32> {
+        self.timings()
+            .find(|&(id, _, _)| id == timing)
+            .map(|(_, rate, _)| rate)
+    }
+
+    /// The video records for `(timing, color)` IDs, when both are
     /// advertised ones.
     pub fn video_data(&self, timing: u32, color: u32) -> Option<(&[u8], &[u8])> {
-        (timing == TIMING_ID && color == COLOR_ID).then_some((&self.timing[..], &self.color[..]))
+        let (_, _, record) = self.timings().find(|&(id, _, _)| id == timing)?;
+        (color == COLOR_ID).then_some((&record[..], &self.color[..]))
     }
 
     /// The monitor's `DisplayAttributes`, the EDID's identity as WindowServer
@@ -758,36 +835,14 @@ impl Advertised {
     }
 
     /// The `TimingElements` array (`IOAVVideoTimingElement::copyProperties`
-    /// of the one timing, its `ColorModes` the one color element).
+    /// of each timing, the preferred one first, each one's `ColorModes` the
+    /// one color element).
     pub fn timing_elements(&self) -> String {
-        let t = &self.timing;
-        let mut xml = Xml(String::new());
-        xml.raw("<array><dict>")
-            .int("Score", u64::from(timing_score(t)), 32)
-            .int("ID", u64::from(TIMING_ID), 64)
-            .bool("IsVirtual", false)
-            .int("ElementType", u64::from(TIMING_ELEMENT), 32)
-            .data("ElementData", t)
-            .key("ColorModes")
-            .raw("<array>");
-        color_dict(&mut xml);
-        xml.raw("</array>")
-            .bool("IsInterlaced", get(t, 0) & 1 != 0)
-            .bool("IsSplit", get(t, 0) & 2 != 0)
-            .bool("IsOverscanned", get(t, 0x4c) == 1)
-            .bool("IsPreferred", true)
-            .bool("IsPromoted", false)
-            .int("ScanInformation", u64::from(get(t, 0x4c)), 32)
-            .int("ValidPixelEncodings", 1 << RGB_444, 32)
-            .int("StandardType", u64::from(VESA), 32)
-            .int("TimingType", u64::from(DETAILED), 32)
-            .int("AspectRatio", u64::from(get(t, 0x48)), 32)
-            .int("PreciseAspectRatio", u64::from(precise_aspect_ratio(t)), 32)
-            .key("HorizontalAttributes");
-        axis_dict(&mut xml, t, 0x04);
-        xml.key("VerticalAttributes");
-        axis_dict(&mut xml, t, 0x24);
-        xml.raw("</dict></array>");
+        let mut xml = Xml(String::from("<array>"));
+        for (id, _, t) in self.timings() {
+            timing_element(&mut xml, id, t, id == TIMING_ID);
+        }
+        xml.raw("</array>");
         xml.0
     }
 
@@ -798,6 +853,36 @@ impl Advertised {
         xml.raw("</array>");
         xml.0
     }
+}
+
+/// One timing's dictionary of the `TimingElements` array.
+fn timing_element(xml: &mut Xml, id: u32, t: &[u8; TIMING_BYTES], preferred: bool) {
+    xml.raw("<dict>")
+        .int("Score", u64::from(timing_score(t)), 32)
+        .int("ID", u64::from(id), 64)
+        .bool("IsVirtual", false)
+        .int("ElementType", u64::from(TIMING_ELEMENT), 32)
+        .data("ElementData", t)
+        .key("ColorModes")
+        .raw("<array>");
+    color_dict(xml);
+    xml.raw("</array>")
+        .bool("IsInterlaced", get(t, 0) & 1 != 0)
+        .bool("IsSplit", get(t, 0) & 2 != 0)
+        .bool("IsOverscanned", get(t, 0x4c) == 1)
+        .bool("IsPreferred", preferred)
+        .bool("IsPromoted", false)
+        .int("ScanInformation", u64::from(get(t, 0x4c)), 32)
+        .int("ValidPixelEncodings", 1 << RGB_444, 32)
+        .int("StandardType", u64::from(VESA), 32)
+        .int("TimingType", u64::from(DETAILED), 32)
+        .int("AspectRatio", u64::from(get(t, 0x48)), 32)
+        .int("PreciseAspectRatio", u64::from(precise_aspect_ratio(t)), 32)
+        .key("HorizontalAttributes");
+    axis_dict(xml, t, 0x04);
+    xml.key("VerticalAttributes");
+    axis_dict(xml, t, 0x24);
+    xml.raw("</dict>");
 }
 
 /// The `IOMFBDisplayRefresh` dictionary for a display that refreshes every
@@ -1040,6 +1125,57 @@ mod tests {
     /// The timing record's vertical rate in Hz, rounded.
     fn hertz(a: &Advertised) -> u32 {
         (get(&a.timing, 0x38) + 0x8000) >> 16
+    }
+
+    #[test]
+    fn a_mode_at_several_rates_publishes_a_timing_for_each_the_preferred_first() {
+        let qhd = Mode {
+            width: 2560,
+            height: 1440,
+            format: crate::scanout::PixelFormat::Bgra8888,
+        };
+        // 7000 Hz passes the record's 32-bit pixel clock: left out.
+        let rates = [144_000, 60_000, 240_000, 120_000, 60_000, 7_000_000];
+        let a = Advertised::at(qhd, 144_000)
+            .unwrap()
+            .with_rates(&rates, None);
+        let ids = [
+            TIMING_ID,
+            OTHER_TIMING_IDS,
+            OTHER_TIMING_IDS + 1,
+            OTHER_TIMING_IDS + 2,
+        ];
+        assert_eq!(
+            ids.map(|id| a.refresh_of(id)),
+            [Some(144_000), Some(240_000), Some(120_000), Some(60_000)]
+        );
+        assert_eq!(a.refresh_of(OTHER_TIMING_IDS + 3), None);
+        let rate_of = |id| {
+            let (timing, color) = a.video_data(id, COLOR_ID).unwrap();
+            assert_eq!(color, &a.color[..]);
+            (get(timing, 0x38) + 0x8000) >> 16
+        };
+        assert_eq!(ids.map(rate_of), [144, 240, 120, 60]);
+        assert!(a.video_data(OTHER_TIMING_IDS, TIMING_ID).is_none());
+        // The 240 Hz record is built directly, the others from detailed
+        // timings; the EDID stays the preferred mode's.
+        assert_eq!(&a.edid[..], &edid(qhd, 144_000).unwrap()[..]);
+        let elements = a.timing_elements();
+        assert_eq!(
+            elements.matches("<key>HorizontalAttributes</key>").count(),
+            4
+        );
+        assert_eq!(elements.matches("<key>IsPreferred</key><true/>").count(), 1);
+        let first = elements.find("<key>IsPreferred</key><true/>").unwrap();
+        let second = elements.find("<key>IsPreferred</key><false/>").unwrap();
+        assert!(first < second);
+        assert!(elements.starts_with("<array><dict><key>Score</key>"));
+        assert!(elements.ends_with("</dict></array>"));
+        // One rate alone publishes the one element as before.
+        let alone = Advertised::at(qhd, 144_000)
+            .unwrap()
+            .with_rates(&[144_000], None);
+        assert_eq!(alone, Advertised::at(qhd, 144_000).unwrap());
     }
 
     #[test]

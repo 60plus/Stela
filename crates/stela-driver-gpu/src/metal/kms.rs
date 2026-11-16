@@ -235,6 +235,8 @@ pub enum Error {
     FrameSize { expected: usize, actual: usize },
     /// Storage for the mode or resource lists could not be allocated.
     Allocation,
+    /// The display does not run the refresh rate asked for.
+    NoRate,
 }
 
 /// A DRM primary node of the bound GPU.
@@ -316,6 +318,12 @@ pub struct Display<D> {
     dark: bool,
     /// The power [`Self::set_power`] asked for, not yet requested.
     power: Option<bool>,
+    /// The first output's modes of the display's size the guest can be told
+    /// of, fastest first, one a refresh: the rates [`Self::set_refresh`]
+    /// switches between.
+    rates: Vec<ModeInfo>,
+    /// The mode [`Self::set_refresh`] asked for, not yet set.
+    retime: Option<ModeInfo>,
 }
 
 /// Looks at which a shown output connected again is set once more, before
@@ -631,6 +639,23 @@ fn size_of_mode(mode: &ModeInfo) -> (u32, u32) {
 /// in an extension, so the first listed is not the fastest. A monitor's
 /// fastest mode may not fit, as one past the guest's timing record's
 /// clock.
+/// The progressive modes of `size` in `modes` that `fits`, fastest first,
+/// the first DRM lists of each refresh.
+fn rates_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Vec<ModeInfo> {
+    let mut rates: Vec<ModeInfo> = modes
+        .iter()
+        .filter(|mode| {
+            size_of_mode(mode) == size
+                && mode.flags & INTERLACED == 0
+                && fits(size.0, size.1, refresh(mode))
+        })
+        .copied()
+        .collect();
+    rates.sort_by_key(|mode| core::cmp::Reverse(refresh(mode)));
+    rates.dedup_by_key(|mode| refresh(mode));
+    rates
+}
+
 fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
     let mut sized = modes.iter().filter(|mode| size_of_mode(mode) == size);
     let fitting = sized
@@ -903,6 +928,7 @@ impl<D: Drm> Display<D> {
         let first = usable.remove(first);
         let [width, height] = first.1.size_mm;
         let mut heads = Vec::new();
+        let rates = rates_of(&first.1.modes, size, fits);
         for (id, found, reach) in core::iter::once(first).chain(usable) {
             let fitting: Fits<'_> = match heads.is_empty() {
                 true => fits,
@@ -924,8 +950,14 @@ impl<D: Drm> Display<D> {
             }
         }
         let display = Self::run(drm, heads, crtcs, others)?;
+        // The rates hold the mode set, which may be one that does not fit.
+        let rates = match display.heads[0].mode {
+            set if rates.iter().any(|mode| refresh(mode) == refresh(&set)) => rates,
+            set => alloc::vec![set],
+        };
         Ok(Self {
             size_mm: (width != 0 && height != 0).then_some((width, height)),
+            rates,
             ..display
         })
     }
@@ -972,6 +1004,8 @@ impl<D: Drm> Display<D> {
             others: Vec::new(),
             dark: false,
             power: None,
+            rates: Vec::new(),
+            retime: None,
         };
         if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
@@ -1358,7 +1392,54 @@ impl<D: Drm> Display<D> {
     /// requested, or an output that follows the first waits for its flip
     /// to the newest buffer ([`Self::flush`]).
     pub fn queued(&self) -> bool {
-        self.queued || self.power.is_some() || self.heads.iter().any(|head| head.behind)
+        self.queued
+            || self.power.is_some()
+            || self.retime.is_some()
+            || self.heads.iter().any(|head| head.behind)
+    }
+
+    /// The refresh rates in millihertz the display runs its size at, fastest
+    /// first; the current one among them.
+    pub fn refresh_rates(&self) -> Vec<u32> {
+        self.rates.iter().map(refresh).collect()
+    }
+
+    /// Run the first output at `millihertz`, one of [`Self::refresh_rates`]:
+    /// at once where a request completes now, else at the next flush that
+    /// may. A rate it does not run is refused. The other outputs keep their
+    /// own modes and take its frames at their own blanks.
+    pub fn set_refresh(&mut self, millihertz: u32) -> Result<(), Error> {
+        let Some(&mode) = self.rates.iter().find(|mode| refresh(mode) == millihertz) else {
+            return Err(Error::NoRate);
+        };
+        self.retime = Some(mode);
+        self.apply_retime()
+    }
+
+    /// Set the mode [`Self::set_refresh`] asked for, where a request
+    /// completes now. A dark display takes it when it is lit again.
+    fn apply_retime(&mut self) -> Result<(), Error> {
+        if !self.drm.immediate() {
+            return Ok(());
+        }
+        let Some(mode) = self.retime.take() else {
+            return Ok(());
+        };
+        let previous = core::mem::replace(&mut self.heads[0].mode, mode);
+        if self.dark || self.heads[0].lost {
+            self.refresh = refresh(&mode);
+            return Ok(());
+        }
+        match self.set_mode(0) {
+            Ok(()) => {
+                self.refresh = refresh(&mode);
+                Ok(())
+            }
+            Err(error) => {
+                self.heads[0].mode = previous;
+                Err(error)
+            }
+        }
     }
 
     /// Request the queued frame's flip on the first output, if this
@@ -1372,6 +1453,11 @@ impl<D: Drm> Display<D> {
             return Ok(());
         }
         let mut flushed = self.apply_power();
+        if let Err(error) = self.apply_retime()
+            && flushed.is_ok()
+        {
+            flushed = Err(error);
+        }
         // An output that is off takes no flip: the newest frame waits.
         if self.dark {
             return flushed;

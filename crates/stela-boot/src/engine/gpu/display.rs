@@ -146,6 +146,31 @@ impl Scanout for KmsScanout {
         Ok(true)
     }
 
+    fn refresh_rates(&self) -> Vec<u32> {
+        match &self.display {
+            Some((_, display)) => display.refresh_rates(),
+            None => alloc::vec![self.refresh_millihertz],
+        }
+    }
+
+    /// Where a request must wait, the next flush on the boot CPU sets the
+    /// mode; the vblanks take the new period at once.
+    fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
+        let Some((_, display)) = &mut self.display else {
+            return Err(refuse!("no GPU display runs the guest's mode"));
+        };
+        display.set_refresh(millihertz).map_err(|error| {
+            refuse!(
+                "the GPU's display refused {millihertz} mHz: {error}",
+                error = format!("{error:?}")
+            )
+        })?;
+        self.refresh_millihertz = millihertz;
+        // The blank read before runs on the old period.
+        self.vblank_tsc = None;
+        Ok(())
+    }
+
     /// The display's vertical blanks run on from the one the last look
     /// read; the model takes the age past whole periods.
     fn vblank_age_ns(&self) -> Option<u64> {

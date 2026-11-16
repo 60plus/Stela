@@ -194,6 +194,20 @@ pub trait Scanout {
         Ok(false)
     }
 
+    /// The refresh rates in millihertz the monitor runs [`Self::mode`] at,
+    /// fastest first, [`Self::refresh_millihertz`] among them: what the
+    /// model advertises for the mode.
+    fn refresh_rates(&self) -> Vec<u32> {
+        alloc::vec![self.refresh_millihertz()]
+    }
+
+    /// Run the monitor at `millihertz`, one of [`Self::refresh_rates`], as
+    /// the AP's mode set asks; the model paces at it from then on. A sink
+    /// with one rate refuses.
+    fn set_refresh(&mut self, _millihertz: u32) -> Result<()> {
+        Err(refuse!("the host scanout runs one refresh rate"))
+    }
+
     /// How long ago, in nanoseconds, the monitor's last vertical blank
     /// began, when the sink knows its real scanout's timing: the model then
     /// keeps its vblanks on the monitor's, at a fixed offset. `None` (a

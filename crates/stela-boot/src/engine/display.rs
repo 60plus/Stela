@@ -383,6 +383,14 @@ impl Scanout for MirroredScanout {
         })
     }
 
+    fn refresh_rates(&self) -> Vec<u32> {
+        self.scanout.refresh_rates()
+    }
+
+    fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
+        self.scanout.set_refresh(millihertz)
+    }
+
     fn vblank_age_ns(&self) -> Option<u64> {
         self.scanout.vblank_age_ns()
     }

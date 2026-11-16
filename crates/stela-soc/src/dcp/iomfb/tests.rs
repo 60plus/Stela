@@ -3064,3 +3064,74 @@ fn a_vsync_leaves_beside_an_unanswered_swap_callback_and_vsyncs_keep_their_order
     }
     assert!(methods.check_reset().is_ok());
 }
+
+/// A 1920x1080 screen that runs 144 and 60 Hz and keeps the rate set.
+struct RatedScreen(alloc::sync::Arc<core::sync::atomic::AtomicU32>);
+impl Scanout for RatedScreen {
+    fn mode(&self) -> Mode {
+        FULL_HD
+    }
+    fn refresh_millihertz(&self) -> u32 {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn refresh_rates(&self) -> Vec<u32> {
+        alloc::vec![144_000, 60_000]
+    }
+    fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
+        if ![144_000, 60_000].contains(&millihertz) {
+            return Err(refuse!("not a rate of the screen"));
+        }
+        self.0
+            .store(millihertz, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let rate = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(144_000));
+    let mut methods = Methods::new(Box::new(RatedScreen(rate.clone())), interface());
+    let set = |timing: u32| {
+        Packed::new()
+            .u32(modes::COLOR_ID)
+            .u32(timing)
+            .finish(8)
+            .unwrap()
+    };
+    // The preferred timing is the rate the monitor runs.
+    assert_eq!(
+        returned(methods.call(*b"A413", &set(modes::TIMING_ID), 4)),
+        [0; 4]
+    );
+    assert_eq!(methods.refresh_ticks, 166_667);
+    assert!(drain(&mut methods, &[1]).is_empty());
+    // 60 Hz: the monitor switches, the vblanks take its period and the
+    // refresh dictionary goes out again.
+    assert_eq!(
+        returned(methods.call(*b"A413", &set(modes::OTHER_TIMING_IDS), 4)),
+        [0; 4]
+    );
+    assert_eq!(rate.load(Relaxed), 60_000);
+    assert_eq!(methods.refresh_ticks, 400_000);
+    assert_eq!(
+        methods.digital_out(),
+        Some((modes::COLOR_ID, modes::OTHER_TIMING_IDS))
+    );
+    let made = drain(&mut methods, &[1]);
+    assert_eq!(made.last().map(|(tag, _)| *tag), Some(PROP_END));
+    // The preferred one again.
+    returned(methods.call(*b"A413", &set(modes::TIMING_ID), 4));
+    assert_eq!(rate.load(Relaxed), 144_000);
+    assert_eq!(methods.refresh_ticks, 166_667);
+    // A timing never advertised is refused, and the rate stays.
+    assert!(
+        methods
+            .call(*b"A413", &set(modes::OTHER_TIMING_IDS + 1), 4)
+            .is_err()
+    );
+    assert_eq!(rate.load(Relaxed), 144_000);
+}
