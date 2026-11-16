@@ -130,6 +130,15 @@ impl RootLink {
         Some(self.send(frame))
     }
 
+    /// The adapter's own state line (`Link::diagnostic`) for a service
+    /// turn, as [`Self::transmit_now`]: `None` while another processor is
+    /// inside the host drivers.
+    fn diagnostic_now(&mut self) -> Option<Option<String>> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.diagnostic())
+    }
+
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
@@ -652,7 +661,14 @@ pub struct GuestNetwork {
     /// Whether the adapter's receive signal was pointed at
     /// [`set_receive_core`]'s core, which the first link up does.
     retargeted: bool,
+    /// Reports since the host adapter's state was last logged for a guest
+    /// that sends and receives nothing ([`Self::report`]).
+    silent_reports: u32,
 }
+
+/// Reports between two host adapter state lines while the guest receives
+/// nothing: one a minute at the ten-second report.
+const SILENT_REPORTS: u32 = 6;
 
 /// The APIC ID of the core the guest network's receive signal goes to once
 /// the guest's link is up ([`set_receive_core`]); none past 254.
@@ -696,6 +712,7 @@ impl GuestNetwork {
             received: alloc::collections::VecDeque::new(),
             unsent: alloc::collections::VecDeque::new(),
             retargeted: false,
+            silent_reports: 0,
         })
     }
 
@@ -738,8 +755,11 @@ impl GuestNetwork {
     /// The beat report's line: the frames the guest adapter moved each way
     /// and dropped (oversized, filtered and overflowed), and the NCM blocks
     /// from the guest that did not decode, so a run shows whether traffic
-    /// moves.
-    pub fn report(&self) {
+    /// moves. While the guest has sent frames and the host adapter has
+    /// given it none, not even a dropped one, the adapter's own state line
+    /// follows once a minute: a log that kept no early lines still shows
+    /// whether its link, receive ring and interrupts work.
+    pub fn report(&mut self) {
         let counters = self.counters;
         output::arguments(format_args!(
             "GUEST NETWORK frames link={} to_host={} to_guest={} drops={} oversized={} \
@@ -757,6 +777,21 @@ impl GuestNetwork {
             counters.overflowed,
             counters.malformed
         ));
+        // Frames the host adapter gave, delivered or dropped at the guest's
+        // filter or full queue (`oversized` counts both ways).
+        let given = counters.to_guest + counters.filtered + counters.overflowed;
+        if counters.to_host == 0 || given != 0 {
+            self.silent_reports = 0;
+            return;
+        }
+        if self.silent_reports.is_multiple_of(SILENT_REPORTS)
+            && let Some(Some(state)) = self.link.diagnostic_now()
+        {
+            output::arguments(format_args!(
+                "GUEST NETWORK host adapter gave the guest no frame: {state}\n"
+            ));
+        }
+        self.silent_reports = self.silent_reports.wrapping_add(1);
     }
 
     /// Read frames from the host adapter while the guest's receive queue

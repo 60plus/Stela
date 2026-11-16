@@ -462,7 +462,7 @@ impl Service {
             {
                 output::arguments(format_args!("{line}\n"));
             }
-            if let Some(network) = network.as_ref() {
+            if let Some(network) = network.as_mut() {
                 network.report();
             }
             power.disks().report(*tsc_hz);
