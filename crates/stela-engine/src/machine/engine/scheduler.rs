@@ -348,6 +348,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if transitioned {
             self.adopt_native_state();
         }
+        // An exception return native code made ends the interrupt handler
+        // the engine saw taken, as one the engine handles does.
+        if transitions[transition::EXCEPTION_RETURN] != 0
+            && let Some(timing) = &mut self.step_timing
+        {
+            timing.levels.exception_returned();
+        }
         let returned = self.timing_charge(step_timing::Phase::Native, entered);
         self.leave_amx_cell();
         self.cpu.pstate.daif = self.cpu.state.daif as u8;
