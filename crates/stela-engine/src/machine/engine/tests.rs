@@ -3314,6 +3314,62 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let _ = number;
 }
 
+/// An exit to a block another address space compiled, in a page this one
+/// does not translate yet, waits for the fetch of its target, which
+/// translates the page and finds the block's entry without adding one,
+/// and links through a cell holding that entry: a cell made at the exit
+/// would hold none, and send every transfer on to the table probe until
+/// the table took another entry of its PC.
+#[test]
+fn an_exit_to_an_untranslated_page_links_its_cell_at_the_fetch() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    const NG: u64 = 1 << 11;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let private = |machine: &mut Machine<FakeHost, NoDevices>, space: usize| {
+        paged_space(machine, space, &[BASE, BASE + 0x1000]);
+        let [_, _, l3] = SPACES_TABLES[space];
+        for page in 0..2 {
+            let frame = BASE + 0x1000 * page;
+            write_entry(machine, l3 + 8 * page, page_descriptor(frame, false) | NG);
+        }
+    };
+    let mut machine = machine(&words);
+    let far = BASE + 0x1000;
+    private(&mut machine, 0);
+    let Ok(Fetched::Block(target)) = machine.fetch_block(far, false) else {
+        panic!("the target's block");
+    };
+    let key = target_key(&machine, far);
+    let entry = machine
+        .code
+        .table
+        .find(machine.code.table.slot(far, key), far, key);
+    assert_eq!((entry.pc, entry.block), (far, target as u32));
+    private(&mut machine, 1);
+    machine.cpu.pc = BASE;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: far,
+        kind: ExitKind::Direct as u64,
+    }];
+    machine.step().unwrap();
+    let (_, first) = machine
+        .code
+        .blocks
+        .iter()
+        .find(|(_, block)| block.pc == BASE)
+        .expect("the exit's block");
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
+    assert!(
+        matches!(machine.fetch_block(far, false), Ok(Fetched::Block(index)) if index == target)
+    );
+    assert_eq!(machine.code.cache().targets.site_cell(site), Some(entry));
+}
+
 /// A promotion runs on whichever PE sweeps, often in another process or
 /// at another EL than the transfers that made the cell hot: its stamped
 /// tail enters the block the cell holds, and the cell keeps its entry. A
@@ -4147,8 +4203,9 @@ fn a_remapped_page_runs_its_new_frame_and_a_removed_permission_faults() {
 }
 
 /// No block crosses a page: one at a page's last instruction ends there,
-/// and its fallthrough into the next page goes through a cell, whose
-/// entry holds only while the next page translates to its frame. A remap
+/// and its fallthrough into the next page goes through a cell, made at the
+/// fetch of the next page's block, whose entry holds only while the next
+/// page translates to its frame. A remap
 /// of that page and its TLBI leave the cell's entry unreachable, and the
 /// next fetch gives the cell the new frame's block.
 #[test]
@@ -4183,14 +4240,14 @@ fn a_fallthrough_into_the_next_page_follows_that_pages_translation() {
         ),
         (last, 4)
     );
-    // The fallthrough is linked through a cell, empty until the next
-    // page's block is fetched.
+    // The fallthrough waits for the fetch of the next page's block, whose
+    // translation its cell starts with, then links through the cell.
     let installed =
         &machine.host.installed[machine.code.blocks[ended].code.0 / NATIVE_CODE_STRIDE - 1];
     let exit_end = chain::without_failures(installed).len();
     let exit = (machine.code.blocks[ended].code.0 + exit_end - chain::DIRECT_EXIT_BYTES) as u64;
     let site = chain::direct_patch(exit);
-    assert_eq!(machine.code.cache().targets.site_cell(site).unwrap().key, 0);
+    assert_eq!(machine.code.cache().targets.site_cell(site), None);
     let Ok(Fetched::Block(old)) = machine.fetch_block(next, false) else {
         panic!("a block");
     };
@@ -7241,21 +7298,36 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
 
-/// The first branch through a BRAA X16, X17's PAC thunk gives its exit a
-/// tail of its own that predicts the authenticated target: its direct exit
-/// to it is linked through a cell, with the probes of the branch's BTYPE,
-/// before the exit jumps to the tail; any other target takes the table
-/// probe, as a lookup tail sends it.
+/// The first branch through a BRAA X16, X17's PAC thunk to a target this
+/// PE translates gives its exit a tail of its own that predicts the
+/// authenticated target: its direct exit to it is linked through a cell,
+/// which starts with the target's entry, with the probes of the branch's
+/// BTYPE, before the exit jumps to the tail; any other target takes the
+/// table probe, as a lookup tail sends it. A branch before the target's
+/// first fetch leaves the exit open.
 #[test]
 fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
-    let mut machine = machine(&[BRAA]);
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 0x802];
+    words[0] = BRAA;
+    words[0x800] = RET;
+    let mut machine = machine(&words);
     let base = machine.cpu.pc;
     let target = base + 0x2000;
-    machine.host.exits = vec![NativeExit::Exit {
-        next_pc: target,
-        kind: ExitKind::Indirect as u64,
-    }];
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![
+        exit(target, ExitKind::Indirect),
+        exit(base, ExitKind::Return),
+        exit(target, ExitKind::Indirect),
+    ];
+    machine.step().unwrap();
+    assert!(machine.code.blocks.record(0).dynamic_open());
+    assert_eq!(machine.statistics.predicted_tails, 0);
+    machine.step().unwrap();
     machine.step().unwrap();
     let thunk = x86_64_pointer::thunk(
         x86_64_pointer::Form::of(block::PointerAuthenticationOperation::Branch {
@@ -7321,13 +7393,15 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         linked[3],
         (site as usize, chain::jump(site, tail).unwrap().to_vec())
     );
+    assert_eq!(cell.key, target_key(&machine, target));
+    // The target's RET took a lookup too.
     assert_eq!(
         (
             machine.statistics.lookups,
             machine.statistics.predicted_tails,
             machine.statistics.links
         ),
-        (1, 1, 1)
+        (2, 1, 1)
     );
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
@@ -7353,9 +7427,14 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
             next_pc,
             kind: kind as u64,
         };
-        machine.host.exits = vec![exit(far, ExitKind::Indirect), exit(base, ExitKind::Return)];
-        machine.step().unwrap();
-        machine.step().unwrap();
+        machine.host.exits = vec![
+            exit(far, ExitKind::Indirect),
+            exit(base, ExitKind::Return),
+            exit(far, ExitKind::Indirect),
+        ];
+        for _ in 0..3 {
+            machine.step().unwrap();
+        }
         assert_eq!(machine.statistics.predicted_tails, 1);
         let target_key = machine.current_key(far).expect("a translated page");
         let tail = machine

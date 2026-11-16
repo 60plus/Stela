@@ -687,6 +687,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
         if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0 {
+            // A cell needs the entry this PE's translation of the target
+            // names: without one it would hold none, and every transfer
+            // through it would go on to the table probe until the table
+            // took an entry of its PC, which a block another context
+            // compiled never takes again. The fetch of the target that
+            // follows translates its page and links the exit
+            // ([`Self::link_direct_exit`]).
+            if self.translated_entry(&cache, next_pc).is_none() {
+                self.direct_exit = Some((index, record.incarnation(), next_pc, word));
+                return false;
+            }
             let point = chain::direct_patch(block.successors[position].site);
             if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0) {
                 record.settle(position);
@@ -837,6 +848,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         let word = kind.into();
+        // The predicted target's cell needs the entry this PE's translation
+        // names, as a direct exit's does ([`Self::link`]): the exit stays
+        // open for its next transfer, after the fetch of the target.
+        if predicted && self.translated_entry(&cache, target).is_none() {
+            return;
+        }
         if (predicted
             && self.redirect_through_prediction(&mut cache, point, retired, word, btype, target))
             || self.redirect_through_lookup(&mut cache, point, retired, word, btype)

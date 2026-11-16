@@ -439,8 +439,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// it cannot link, [`Self::remember_target`]. A block only linked
     /// exits enter needs no lookup entry: the link is the page's, and
     /// enters it in every address space.
+    ///
+    /// An exit from another page links through a cell, which starts with
+    /// the block table's entry of its target: the entry goes in first.
     fn remember_or_link(&mut self, pc: u64, index: usize) {
-        if !self.link_direct_exit(pc) {
+        let from_another_page = self.direct_exit.is_some_and(|(block, _, target, _)| {
+            target == pc
+                && self
+                    .code
+                    .blocks
+                    .installed(block)
+                    .is_some_and(|block| (block.pc ^ pc) & !(FETCH_PAGE - 1) != 0)
+        });
+        if from_another_page {
+            self.remember_target(pc, index);
+            self.link_direct_exit(pc);
+        } else if !self.link_direct_exit(pc) {
             self.remember_target(pc, index);
         }
     }
