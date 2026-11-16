@@ -75,6 +75,14 @@ pub fn upstream_warnings(build: &mut cc::Build) {
     ] {
         build.flag(format!("-Wno-{warning}"));
     }
+    // Linux formats with GNU printf's length modifiers (`%Lx` for a long
+    // long, amdgpu_vm.c), which clang accepts only for a GNU target. The
+    // host build of the same units checks their formats under that
+    // dialect; for the UEFI target, whose dialect lacks them, the check is
+    // off rather than wrong.
+    if std::env::var("TARGET").is_ok_and(|target| target.ends_with("-uefi")) {
+        build.flag("-Wno-format");
+    }
     // SYSCALL_DEFINE aliases each entry point to a wrapper of another type.
     // Linux silences this with __diag pragmas keyed to the compiler's
     // version, which a compiler numbered apart from LLVM (Apple's) misses.
