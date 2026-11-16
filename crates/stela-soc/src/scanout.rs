@@ -275,6 +275,24 @@ pub trait Scanout {
         None
     }
 
+    /// Compose `layers` on the GPU and present the frame, when the sink
+    /// can: `damage` names the rows that may differ from the frame shown
+    /// (`None`: any row), and `physical` gives the guest physical address
+    /// of each byte the layers' rows reach, by I/O address (`None` past
+    /// what resolved). [`GpuPresent::Taken`]: the frame's flip follows at a
+    /// flush. A sink that declines leaves everything as it was, and the
+    /// model composes the frame on the CPU.
+    fn try_present_gpu(
+        &mut self,
+        _layers: &[Layer],
+        _damage: Option<Range<usize>>,
+        _physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<GpuPresent> {
+        Ok(GpuPresent::Declined(
+            "the host scanout composes no layers on the GPU",
+        ))
+    }
+
     /// Whether an earlier present left work only [`Self::flush`] finishes,
     /// such as a page flip whose request must wait for another processor.
     fn queued(&self) -> bool {
@@ -363,6 +381,16 @@ impl ChannelMasks {
             })
             .fold(0, |pixel, channel| pixel | channel)
     }
+}
+
+/// What a sink made of a present offered for GPU composition
+/// ([`Scanout::try_present_gpu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPresent {
+    /// The GPU composes the frame.
+    Taken,
+    /// The model composes it on the CPU, for this reason.
+    Declined(&'static str),
 }
 
 /// One surface plane the model reads pixels from: its format, size and the
@@ -762,6 +790,15 @@ pub struct Composed {
     shown: Vec<Shown>,
     /// A source row being compared.
     scratch: Vec<u8>,
+}
+
+impl Composed {
+    /// The scanout shows a frame these rows did not make: the next present
+    /// on the CPU composes every row its damage or a change needs again.
+    pub(crate) fn forget(&mut self) {
+        self.current = false;
+        self.shown.clear();
+    }
 }
 
 /// The most layers whose source rows [`refine`] keeps: the DCP's four

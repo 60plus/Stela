@@ -897,6 +897,9 @@ pub struct Methods {
     /// For each queued completion, in the same order: its swap and the
     /// counter when it was submitted and presented ([`Pacing::complete`]).
     completion_times: VecDeque<(u32, u64, u64)>,
+    /// Why the scanout left frames to the CPU's compose, each reported
+    /// once.
+    cpu_composes: BTreeSet<&'static str>,
     /// A swap, mode or hot-plug callback is out and not answered yet:
     /// these leave one at a time, in order.
     in_flight: bool,
@@ -1037,6 +1040,7 @@ impl Methods {
             completed: VecDeque::new(),
             completion_times: VecDeque::new(),
             in_flight: false,
+            cpu_composes: BTreeSet::new(),
             vsync_out: false,
             shut_down: false,
             now: 0,
@@ -1504,10 +1508,17 @@ impl Methods {
             composed,
             result,
             missed,
+            declined,
         }) = finished
         else {
             return Ok(false);
         };
+        if let Some(reason) = declined
+            && self.cpu_composes.insert(reason)
+        {
+            self.reported
+                .push(format!("IOMFB composes on the CPU: {reason}"));
+        }
         let (batch, _) = self.composing.take().expect("checked above");
         self.scanout = Some(sink);
         self.frame = composed;

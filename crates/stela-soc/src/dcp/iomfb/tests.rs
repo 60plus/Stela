@@ -3217,3 +3217,91 @@ fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
         ]
     );
 }
+
+/// Each offer's layer count and the physical address of its first pixel.
+type Offers = alloc::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>)>>>;
+
+/// A screen whose GPU takes every frame, recording each offer, or declines
+/// with a reason.
+struct GpuScreen {
+    offers: Offers,
+    frames: alloc::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    declines: Option<&'static str>,
+}
+impl Scanout for GpuScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, rows: &[u8]) -> Result<()> {
+        self.frames.lock().unwrap().push(rows.to_vec());
+        Ok(())
+    }
+    fn try_present_gpu(
+        &mut self,
+        layers: &[scanout::Layer],
+        _: Option<core::ops::Range<usize>>,
+        physical: &dyn Fn(u64) -> Option<u64>,
+    ) -> Result<scanout::GpuPresent> {
+        self.offers
+            .lock()
+            .unwrap()
+            .push((layers.len(), physical(layers[0].surface.iova)));
+        Ok(match self.declines {
+            Some(reason) => scanout::GpuPresent::Declined(reason),
+            None => scanout::GpuPresent::Taken,
+        })
+    }
+}
+
+#[test]
+fn a_composed_present_goes_to_the_gpu_and_falls_back_to_the_cpu_reported_once() {
+    for declines in [None, Some("no GPU composition here")] {
+        let offers = Offers::default();
+        let frames = alloc::sync::Arc::default();
+        let screen = GpuScreen {
+            offers: alloc::sync::Arc::clone(&offers),
+            frames: alloc::sync::Arc::clone(&frames),
+            declines,
+        };
+        let mut methods = Methods::new(Box::new(screen), interface());
+        let mut ram = guest_ram();
+        let submits = compose_swaps(&mut methods);
+        let mut completed = 0;
+        for (step, input) in submits.iter().enumerate() {
+            assert_eq!(returned(methods.call(*b"A407", input, 0xc)), [0; 12]);
+            let compose = methods
+                .compose(step as u64 * 1_000_000, DART_PAGE, resolve)
+                .expect("pages resolve");
+            compose.run(&mut ram);
+            assert!(methods.finish_compose(0).unwrap());
+            while let Some(callback) = methods.take_callback() {
+                completed += usize::from(callback.tag == SWAP_COMPLETE);
+                (callback.then)(&mut methods, &[]).unwrap();
+            }
+        }
+        let offers = offers.lock().unwrap().clone();
+        assert_eq!(offers.len(), submits.len());
+        assert!(
+            offers
+                .iter()
+                .all(|&(layers, first)| layers >= 1 && first.is_some())
+        );
+        // Every swap completes either way; only the fallback composes rows.
+        assert_eq!(completed, submits.len());
+        let reports: Vec<_> = methods
+            .take_unmodeled()
+            .into_iter()
+            .filter(|line| line.contains("composes on the CPU"))
+            .collect();
+        match declines {
+            None => {
+                assert!(frames.lock().unwrap().is_empty());
+                assert!(reports.is_empty());
+            }
+            Some(reason) => {
+                assert!(!frames.lock().unwrap().is_empty());
+                assert_eq!(reports, [format!("IOMFB composes on the CPU: {reason}")]);
+            }
+        }
+    }
+}
