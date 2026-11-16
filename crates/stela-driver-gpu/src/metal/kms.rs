@@ -2320,8 +2320,10 @@ impl<D: Drm> Display<D> {
     /// The buffer the next frame fills, by its framebuffer, and the rows of
     /// it the GPU must compose: `damage` (`None`: every row) and the rows it
     /// lacks of the newest frame. Until [`Self::present_drawn`] the CPU
-    /// fills no rows.
+    /// fills no rows, and a frame the buffer held waits for no flip: the
+    /// GPU draws the newer frame over it, the rows it showed included.
     pub fn draw_rows(&mut self, damage: Option<Range<usize>>) -> (u32, Range<usize>) {
+        self.queued = false;
         let height = self.height as usize;
         let damage = damage.map_or(0..height, |rows| {
             rows.start.min(height)..rows.end.min(height)

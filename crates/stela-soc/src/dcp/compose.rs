@@ -107,7 +107,7 @@ pub(crate) struct Missed;
 /// The I/O address ranges `layer`'s source rows occupy in each of its
 /// surface's planes: from its first row's first pixel to its last row's
 /// last; `None` on overflow.
-fn layer_spans(layer: &Layer) -> Option<Vec<Range<u64>>> {
+pub(crate) fn layer_spans(layer: &Layer) -> Option<Vec<Range<u64>>> {
     let source = layer.source;
     if source.width == 0 || source.height == 0 {
         return Some(Vec::new());

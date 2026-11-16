@@ -293,6 +293,12 @@ pub trait Scanout {
         ))
     }
 
+    /// What became of the frames [`Self::try_present_gpu`] took since the
+    /// last call.
+    fn take_gpu_stats(&mut self) -> GpuStats {
+        GpuStats::default()
+    }
+
     /// Whether an earlier present left work only [`Self::flush`] finishes,
     /// such as a page flip whose request must wait for another processor.
     fn queued(&self) -> bool {
@@ -393,6 +399,18 @@ pub enum GpuPresent {
     Declined(&'static str),
 }
 
+/// What became of frames the GPU composed ([`Scanout::take_gpu_stats`]):
+/// those flipped, those a newer frame replaced before their composition
+/// completed, and the total and longest nanoseconds from a composition's
+/// commit until it was seen complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuStats {
+    pub flipped: u32,
+    pub replaced: u32,
+    pub total_ns: u64,
+    pub longest_ns: u64,
+}
+
 /// One surface plane the model reads pixels from: its format, size and the
 /// DART I/O address (DVA) of its top-left pixel. Built from the driver's
 /// `SurfaceContents` (`IOMFB::DCP::SurfaceContents::from`).
@@ -444,6 +462,17 @@ impl Rect {
 /// stay bounded by the screen whatever the layer's ratio.
 const SPAN_PER_SHOWN: usize = 4;
 
+/// The page size of the guest RAM runs [`Layer::planes`] answers: the
+/// host's, which every IOMMU page of the display holds whole.
+pub const HOST_PAGE: u64 = 0x1000;
+
+/// A plane of a layer in guest RAM ([`Layer::planes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanePages {
+    pub runs: Vec<(u64, u64)>,
+    pub origin: i64,
+}
+
 /// One layer of a composed frame: a source rectangle of a surface shown in
 /// a destination rectangle of the screen, its colour premultiplied by its
 /// alpha or not.
@@ -479,6 +508,43 @@ impl Layer {
             destination,
             premultiplied,
         })
+    }
+
+    /// The planes of the layer's surface its source rows occupy, the
+    /// colour plane first: for each, the runs of guest RAM under its pages
+    /// in I/O address order, as `(physical address, bytes)` in whole
+    /// [`HOST_PAGE`]s, and the offset from the first run's first byte to
+    /// the plane's first pixel, negative when the rows start past the
+    /// plane's first page. `physical` resolves an I/O address; `None` when
+    /// a page does not resolve or an address overflows.
+    pub fn planes(&self, physical: &dyn Fn(u64) -> Option<u64>) -> Option<Vec<PlanePages>> {
+        let surface = self.surface;
+        let mut bases = alloc::vec![surface.iova];
+        if let PixelFormat::Xr10A8 { alpha, .. } = surface.format {
+            bases.push(alpha);
+        }
+        let spans = crate::dcp::compose::layer_spans(self)?;
+        let mut planes = Vec::new();
+        for (span, base) in spans.into_iter().zip(bases) {
+            let first = span.start & !(HOST_PAGE - 1);
+            let end = span
+                .end
+                .max(span.start + 1)
+                .checked_next_multiple_of(HOST_PAGE)?;
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for page in (first..end).step_by(HOST_PAGE as usize) {
+                let address = physical(page)?;
+                match runs.last_mut() {
+                    Some((start, bytes)) if *start + *bytes == address => *bytes += HOST_PAGE,
+                    _ => runs.push((address, HOST_PAGE)),
+                }
+            }
+            planes.push(PlanePages {
+                runs,
+                origin: base.wrapping_sub(first) as i64,
+            });
+        }
+        Some(planes)
     }
 
     /// Whether the source is shown at its own size.
@@ -2763,5 +2829,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_layers_planes_are_the_runs_of_pages_under_its_rows() {
+        // Rows of 0x1000 bytes from I/O address 0x1_0800: the source's
+        // rows 1 and 2 span 0x1_1800..0x1_2840, the pages 0x1_1000 to
+        // 0x1_2000. Those pages lie at 0x50_0000 and 0x50_1000, then the
+        // alpha plane's page apart at 0x90_0000.
+        let mut surface = surface(0x400, 4, 0x1000, 0x1_0800);
+        surface.format = PixelFormat::Xr10A8 {
+            alpha: 0x2_0000,
+            alpha_stride: 0x400,
+        };
+        let source = Rect {
+            x: 0,
+            y: 1,
+            width: 0x10,
+            height: 2,
+        };
+        let layer = Layer::new(surface, source, Rect::whole(0x10, 2), false).unwrap();
+        let physical = |iova: u64| match iova {
+            0x1_1000 => Some(0x50_0000),
+            0x1_2000 => Some(0x50_1000),
+            0x2_0000 => Some(0x90_0000),
+            _ => None,
+        };
+        let planes = layer.planes(&physical).unwrap();
+        assert_eq!(
+            planes,
+            [
+                PlanePages {
+                    runs: alloc::vec![(0x50_0000, 0x2000)],
+                    origin: -0x800,
+                },
+                PlanePages {
+                    runs: alloc::vec![(0x90_0000, 0x1000)],
+                    origin: 0,
+                },
+            ]
+        );
+        let unresolved = |iova: u64| (iova != 0x1_2000).then_some(0x50_0000);
+        assert_eq!(layer.planes(&unresolved), None);
     }
 }

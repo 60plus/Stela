@@ -98,7 +98,7 @@
 //! (`plane.c`), which marks premultiplied only its formats without alpha
 //! (XRGB, XBGR, XBGR2101010) and straight its ARGB ones: premultiplied over
 //! black, an X byte of any value shows the colour unchanged.
-use super::super::scanout::{self, Mode, Scanout};
+use super::super::scanout::{self, GpuStats, Mode, Scanout};
 use super::Log;
 use super::abi::{self, Fields, IO_RETURN_SUCCESS, Interface, LINK_UNSUPPORTED, Method, Packed};
 use super::avipc::DisplayState;
@@ -325,6 +325,11 @@ pub struct Pacing {
     /// completed.
     pub overlapped: u32,
     pub most_unanswered: usize,
+    /// Swaps composed on the GPU and on the CPU, and what became of the
+    /// GPU's frames ([`Scanout::take_gpu_stats`]).
+    pub gpu_composed: u32,
+    pub cpu_composed: u32,
+    pub gpu: GpuStats,
     /// The first [`SAMPLED_SWAPS`] swaps submitted in the window, each with
     /// its own times: what decides when the AP starts its next frame, which
     /// the window's averages cannot tell apart.
@@ -561,6 +566,17 @@ impl core::fmt::Display for Pacing {
             self.after_vsync,
             self.overlapped,
             self.most_unanswered,
+        )?;
+        let gpu = self.gpu;
+        write!(
+            f,
+            " composed=gpu:{}/cpu:{} gpu_frames=flipped:{}/replaced:{} gpu_ms={:.2}/{:.2}",
+            self.gpu_composed,
+            self.cpu_composed,
+            gpu.flipped,
+            gpu.replaced,
+            gpu.total_ns as f64 / 1e6 / f64::from(gpu.flipped + gpu.replaced).max(1.0),
+            gpu.longest_ns as f64 / 1e6,
         )?;
         let Some(first) = self.swaps.first() else {
             return Ok(());
@@ -1327,7 +1343,11 @@ impl Methods {
         if ticks < PACING_WINDOW {
             return;
         }
-        let pacing = core::mem::take(&mut self.pacing);
+        let mut pacing = core::mem::take(&mut self.pacing);
+        // A scanout composing now keeps its count for the next window.
+        if let Some(scanout) = &mut self.scanout {
+            pacing.gpu = scanout.take_gpu_stats();
+        }
         if pacing.presented != 0 || pacing.submitted != 0 {
             self.record_log(Log::Pacing(Box::new(Pacing {
                 ticks,
@@ -1513,6 +1533,7 @@ impl Methods {
         else {
             return Ok(false);
         };
+        let on_gpu = declined.is_none() && result.is_ok();
         if let Some(reason) = declined
             && self.cpu_composes.insert(reason)
         {
@@ -1530,6 +1551,8 @@ impl Methods {
             return self.repainted(result).map(|()| false);
         }
         result?;
+        self.pacing.gpu_composed += u32::from(on_gpu);
+        self.pacing.cpu_composed += u32::from(!on_gpu);
         self.presented(batch);
         Ok(true)
     }

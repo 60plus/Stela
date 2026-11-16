@@ -405,6 +405,10 @@ impl Scanout for MirroredScanout {
         self.scanout.try_present_gpu(layers, damage, physical)
     }
 
+    fn take_gpu_stats(&mut self) -> stela_soc::scanout::GpuStats {
+        self.scanout.take_gpu_stats()
+    }
+
     fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
         self.scanout.set_refresh(millihertz)
     }

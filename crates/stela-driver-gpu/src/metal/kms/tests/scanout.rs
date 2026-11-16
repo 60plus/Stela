@@ -240,7 +240,17 @@ fn the_gpu_composes_into_the_shared_hidden_buffer_and_its_frame_flips() {
     display.present_drawn().unwrap();
     let (_, rows) = display.draw_rows(Some(3..4));
     assert_eq!(rows, 3..4);
-    // Where a request must wait, nothing is shared.
+    // Where a request must wait, nothing is shared, and a frame drawn
+    // waits for its flip until a newer frame drawn over it replaces it.
     display.drm.immediate = false;
     assert!(display.share_buffers().is_none());
+    display.present_drawn().unwrap();
+    assert!(display.queued());
+    let (_, rows) = display.draw_rows(Some(0..1));
+    assert_eq!(rows, 0..1, "it holds the frame it replaces whole");
+    assert!(!display.queued(), "no flip while the GPU draws");
+    let flips = display.drm.flips.len();
+    display.drm.immediate = true;
+    display.flush().unwrap();
+    assert_eq!(display.drm.flips.len(), flips);
 }

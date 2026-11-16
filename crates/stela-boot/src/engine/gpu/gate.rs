@@ -45,7 +45,7 @@ use stela_linux::{
 };
 use stela_loader::{apple_device_tree::DeviceTree, stela_gpu};
 
-type Shared = SharedService<NativeBackend, AirCompiler>;
+pub(super) type Shared = SharedService<NativeBackend, AirCompiler>;
 
 /// A process's main stack, as big as the deepest compile LLVM bounds.
 pub(super) const STACK_BYTES: usize = 16 << 20;
@@ -61,6 +61,8 @@ static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
 /// The bound GPU, by its index (its DRM minor), of each service, in the
 /// services' order.
 static SERVED: AtomicPtr<Vec<usize>> = AtomicPtr::new(ptr::null_mut());
+/// The name of each service's GPU, in the same order.
+static SERVICE_GPUS: AtomicPtr<Vec<String>> = AtomicPtr::new(ptr::null_mut());
 
 /// The compile stacks ([`open_gpu`]), whose jobs [`run`] runs with the
 /// shootdown vector open; a GPU past these runs its jobs masked.
@@ -1287,8 +1289,13 @@ pub(in crate::engine) fn open_service() {
             ));
         }
     }
+    let names: Vec<String> = opened
+        .iter()
+        .map(|&(index, _)| bound[index].name.clone())
+        .collect();
     let (served, services): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
     SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
+    SERVICE_GPUS.store(Box::into_raw(Box::new(names)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
 }
 
@@ -1496,6 +1503,14 @@ fn open_gpu(
 /// the report shows `GPU PASSES`.
 pub(in crate::engine) fn profile_passes() {
     pass_times::set_pass_profile(true);
+}
+
+/// The service of the GPU named `name`, once the services are open.
+pub(super) fn service_of(name: &str) -> Option<&'static Arc<Shared>> {
+    // SAFETY: the names are published before the services and leaked.
+    let names = unsafe { SERVICE_GPUS.load(Ordering::Acquire).as_ref() }?;
+    let index = names.iter().position(|gpu| gpu == name)?;
+    shared().get(index)
 }
 
 pub(super) fn shared() -> &'static [Arc<Shared>] {

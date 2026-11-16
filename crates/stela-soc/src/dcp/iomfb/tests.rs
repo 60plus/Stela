@@ -1678,7 +1678,10 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert!(
         line.contains(&format!(" gaps=1:{}/2:0/3:1/4-7:0/8+:0 ", pacing.gaps - 1))
             && line.contains(" burst_fps=")
-            && line.ends_with(" overlapped=1/1"),
+            && line.contains(" overlapped=1/1 ")
+            && line.ends_with(
+                " composed=gpu:0/cpu:0 gpu_frames=flipped:0/replaced:0 gpu_ms=0.00/0.00"
+            ),
         "{line}"
     );
     // A window in which nothing was submitted or shown is not reported.
@@ -3288,6 +3291,16 @@ fn a_composed_present_goes_to_the_gpu_and_falls_back_to_the_cpu_reported_once() 
         );
         // Every swap completes either way; only the fallback composes rows.
         assert_eq!(completed, submits.len());
+        let composed = (methods.pacing.gpu_composed, methods.pacing.cpu_composed);
+        let swaps = submits.len() as u32;
+        assert_eq!(
+            composed,
+            if declines.is_some() {
+                (0, swaps)
+            } else {
+                (swaps, 0)
+            }
+        );
         let reports: Vec<_> = methods
             .take_unmodeled()
             .into_iter()
