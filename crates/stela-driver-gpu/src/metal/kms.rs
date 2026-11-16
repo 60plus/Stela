@@ -328,8 +328,9 @@ struct Buffer {
 struct Head {
     crtc: u32,
     connector: u32,
-    /// The connector's encoders, which no other head may use.
-    encoders: Vec<u32>,
+    /// The encoder counted as this head's: one of its connector's, which no
+    /// other head is given ([`free_encoder`]).
+    encoder: u32,
     /// The mode the controller is set to, of the display's size. A scaled
     /// output's is another output's mode, which the driver takes as the
     /// picture's size and timing only.
@@ -704,13 +705,19 @@ fn free_crtc(reach: u32, crtcs: &[u32], heads: &[Head]) -> Option<u32> {
         .map(|(_, &crtc)| crtc)
 }
 
-/// Whether an output of `encoders` can join `heads` without taking an
-/// encoder one of them may use: the driver would move it, and that output
-/// would go dark.
-fn encoders_free(encoders: &[u32], heads: &[Head]) -> bool {
-    heads
+/// The first of an output's `encoders` that no head of `heads` is given.
+/// An encoder drives one controller at a time, so an output joins only
+/// with one of its own free: where two outputs share their one encoder,
+/// as a DVI-I and a VGA connector on one converter, the driver would move
+/// it and the first would go dark. A DisplayPort hub's outputs (MST) each
+/// list the same encoders, one a controller, of which the driver takes
+/// the one of the controller set, so each output of the hub shows while
+/// one is free, as Linux's fbdev helper lights them.
+fn free_encoder(encoders: &[u32], heads: &[Head]) -> Option<u32> {
+    encoders
         .iter()
-        .all(|head| head.encoders.iter().all(|used| !encoders.contains(used)))
+        .copied()
+        .find(|&encoder| heads.iter().all(|head| head.encoder != encoder))
 }
 
 /// Whether whoever shows the output's picture to the guest can describe a
@@ -1152,10 +1159,10 @@ impl<D: Drm> Display<D> {
 
     /// [`Self::take`] in the size [`plan`] picks for [`Wanted`] and `fits`.
     /// Every connected output with a controller no other output runs and
-    /// encoders of its own shows the picture: the output that gives the
-    /// guest's mode is set first, and its refusal stops the take; each
-    /// other in its mode of that size, else scaled ([`follow`]). A refusal
-    /// of another leaves it dark.
+    /// a free encoder of its own ([`free_encoder`]) shows the picture: the
+    /// output that gives the guest's mode is set first, and its refusal
+    /// stops the take; each other in its mode of that size, else scaled
+    /// ([`follow`]). A refusal of another leaves it dark.
     pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         let mut usable = Vec::new();
@@ -1189,9 +1196,8 @@ impl<D: Drm> Display<D> {
         let rates = rates_of(&first.1.modes, size, fits);
         let (mut smaller, mut refused) = (0, None);
         for (id, found, reach) in core::iter::once(first).chain(usable) {
-            let crtc =
-                free_crtc(reach, &crtcs, &heads).filter(|_| encoders_free(&found.encoders, &heads));
-            let Some(crtc) = crtc else {
+            let free = free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
+            let Some((crtc, encoder)) = free else {
                 others.push((id, RESTORE_TRIES));
                 continue;
             };
@@ -1213,7 +1219,7 @@ impl<D: Drm> Display<D> {
                 Some((mode, scaling)) => heads.push(Head {
                     crtc,
                     connector: id,
-                    encoders: found.encoders,
+                    encoder,
                     mode,
                     scaling,
                     lost: false,
@@ -1563,14 +1569,16 @@ impl<D: Drm> Display<D> {
     }
 
     /// Show the picture on connector `id` as well, where it has a free
-    /// controller and encoders of its own, in its mode of the display's
-    /// size or scaled ([`follow`]).
+    /// controller and a free encoder of its own, in its mode of the
+    /// display's size or scaled ([`follow`]).
     fn join(&mut self, id: u32) -> Result<Joined, Error> {
         let found = output(&mut self.drm, id)?;
         let reach = reach(&mut self.drm, &found.encoders, &self.crtcs)?;
-        let crtc = free_crtc(reach, &self.crtcs, &self.heads)
-            .filter(|_| encoders_free(&found.encoders, &self.heads));
-        let (Some(crtc), Some(shown), true) = (crtc, self.heads.first(), found.connected) else {
+        let free = free_crtc(reach, &self.crtcs, &self.heads)
+            .zip(free_encoder(&found.encoders, &self.heads));
+        let (Some((crtc, encoder)), Some(shown), true) =
+            (free, self.heads.first(), found.connected)
+        else {
             return Ok(Joined::Dark { smaller: false });
         };
         let size = (self.width, self.height);
@@ -1581,7 +1589,7 @@ impl<D: Drm> Display<D> {
         self.heads.push(Head {
             crtc,
             connector: id,
-            encoders: found.encoders,
+            encoder,
             mode,
             scaling,
             lost: false,

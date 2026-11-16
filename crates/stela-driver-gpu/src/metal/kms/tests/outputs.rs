@@ -165,6 +165,33 @@ fn an_output_that_cannot_be_set_stays_dark_and_the_others_keep_the_buffers() {
     assert_eq!((display.outputs(), display.unshown()), (1, 1));
 }
 
+/// A DisplayPort hub's monitors (MST) each list the hub's encoders, one a
+/// controller: every one of them shows the picture, at the take or when
+/// connected later.
+#[test]
+fn a_hubs_monitors_each_show_the_picture() {
+    let mut card = two_monitors();
+    card.mst = true;
+    {
+        let display = Display::take(&mut card, (6, 4)).unwrap();
+        assert_eq!((display.outputs(), display.unshown()), (2, 0));
+    }
+    assert!(card.set_40.is_some() && card.set.is_some());
+
+    let mut later = two_monitors();
+    later.mst = true;
+    later.connected = false;
+    let mut display = Display::take(&mut later, (6, 4)).unwrap();
+    assert_eq!(display.outputs(), 1);
+    display.drm.connected = true;
+    let joined = Watched {
+        joined: 1,
+        ..Watched::default()
+    };
+    assert_eq!(display.watch(), joined);
+    assert_eq!(display.outputs(), 2);
+}
+
 #[test]
 fn a_set_guest_size_shows_only_where_an_output_runs_it() {
     let mut card = Card::new(vec![at(8, 4, PREFERRED, 60)]);

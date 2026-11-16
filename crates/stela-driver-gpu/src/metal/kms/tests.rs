@@ -53,6 +53,9 @@ struct Card {
     first_crtcs: u32,
     /// The first connector lists encoder 60, the second's.
     shared_encoder: bool,
+    /// Both connectors are a DisplayPort hub's outputs (MST): each lists
+    /// encoders 62 and 63, one a controller, each reaching both.
+    mst: bool,
     /// The connector the driver read back as lit, with a current encoder.
     lit: u32,
     /// Controller 40's mode and framebuffer, its flips, and the requests to
@@ -117,6 +120,7 @@ impl Card {
             first_connected: false,
             first_crtcs: 0b11,
             shared_encoder: false,
+            mst: false,
             lit: 0,
             set_40: None,
             flips_40: Vec::new(),
@@ -205,11 +209,16 @@ unsafe impl Drm for &mut Card {
                         let list = connector.modes as *mut ModeInfo;
                         ptr::copy_nonoverlapping(modes.as_ptr(), list, modes.len());
                     }
-                    if connector.encoder_count != 0 {
-                        (connector.encoders as *mut u32).write(encoder);
+                    let encoders: &[u32] = match self.mst {
+                        true => &[62, 63],
+                        false => &[encoder],
+                    };
+                    if connector.encoder_count as usize >= encoders.len() {
+                        let list = connector.encoders as *mut u32;
+                        ptr::copy_nonoverlapping(encoders.as_ptr(), list, encoders.len());
                     }
                     connector.mode_count = modes.len() as u32;
-                    connector.encoder_count = 1;
+                    connector.encoder_count = encoders.len() as u32;
                     if connected && connector.modes != 0 && self.mode_changes != 0 {
                         self.mode_changes -= 1;
                         connector.mode_count += 1;
@@ -220,6 +229,7 @@ unsafe impl Drm for &mut Card {
                     encoder.possible_crtcs = match encoder.id {
                         60 => self.possible_crtcs,
                         61 => self.first_crtcs,
+                        62 | 63 if self.mst => 0b11,
                         other => panic!("encoder {other}"),
                     };
                 }
