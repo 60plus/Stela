@@ -46,6 +46,7 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
     match stack.vendor {
         Vendor::Nvidia => Some(&NOUVEAU),
         Vendor::Amd => Some(&AMDGPU),
+        Vendor::Intel => Some(&XE),
         _ => None,
     }
 }
@@ -102,6 +103,28 @@ static AMDGPU: Before = Before {
             firmware: select_firmware(&inventory, &name, catalog)?,
             identity: None,
             chip: recipes::amd_gpu_family(adapter.device),
+            parameters: None,
+        })
+    },
+    settle: |_, _, _| Ok(()),
+};
+
+/// xe: the platform is the PCI device ID's, as in xe's own table, and its
+/// GuC, HuC, GSC and DMC files are that platform's. Nothing of the GPU's
+/// boots by itself after a reset: xe loads all of it.
+static XE: Before = Before {
+    identify: |registers, adapter, catalog| {
+        use stela_loader::host_firmware::recipes;
+        // Register 0 identifies nothing here; the read proves the window.
+        registers.read32(0).map_err(ServiceError::Mapping)?;
+        let mut inventory = Inventory::default();
+        recipes::require_xe(&mut inventory, adapter.device)
+            .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
+        let name = format!("{:04x}", adapter.device);
+        Ok(Identified {
+            firmware: select_firmware(&inventory, &name, catalog)?,
+            identity: None,
+            chip: recipes::intel_gpu_platform(adapter.device),
             parameters: None,
         })
     },
