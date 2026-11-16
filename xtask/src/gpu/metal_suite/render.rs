@@ -3934,6 +3934,32 @@ fn tiles(plan: &mut Plan, library: &str) {
 /// Early fragment tests: an occluding instance, then one over the whole
 /// target behind it, whose fragment function counts its runs. The hidden
 /// fragments are rejected before they run, so the counts are exact.
+/// A pass shaped as a path coverage pass: varyings without perspective, an
+/// output to color attachment 1 alone and early fragment tests. With
+/// p = (0.3, 0.4), p1p2 = (0.6, 0.8) and denom 0.5 every pixel's coverage
+/// is 0.375.
+fn second_target_coverage(plan: &mut Plan, library: &str) {
+    let n = (W * H) as usize;
+    let coverage: Vec<f64> = (0..n).flat_map(|_| [0.0, 0.375]).collect();
+    plan.add(
+        Case::render(
+            "render.targets.second_only_no_perspective",
+            library,
+            "vert_distance",
+            Some("frag_distance"),
+            json!({"colors": [{"texture": "c0", "clear": [0, 0, 0, 0]},
+                              {"texture": "c1", "clear": [1, 1, 1, 1]}],
+                   "vertex_count": 3}),
+        )
+        .texture(target("c0", "rgba8unorm"))
+        .texture(target("c1", "rg32float"))
+        .buffer(
+            Buffer::data("c", 0, f32s(&[0.3, 0.4, 0.6, 0.8, 0.5, 0.0, 0.0, 0.0])).stage("vertex"),
+        )
+        .output(Output::new("c1", Dtype::F32, Tolerance::abs(1e-5)).expect_same(f32s(&coverage))),
+    );
+}
+
 fn early_fragment_tests(plan: &mut Plan, library: &str) {
     let colors = [[0.25, 0.5, 0.75, 1.0], [1.0, 0.0, 0.5, 0.25]];
     let image: Vec<f64> = pixels()
@@ -4404,6 +4430,7 @@ pub fn build(plan: &mut Plan) {
     extended_range_blends(plan, &library);
     extended_range_two_plane(plan, &library);
     early_fragment_tests(plan, &library);
+    second_target_coverage(plan, &library);
     interpolation(plan, &library);
     derivatives(plan, &library);
     branch_derivatives(plan, &library);
