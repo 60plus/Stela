@@ -51,6 +51,8 @@ fn main() {
     // Active ports declare their native source inputs below. Without this
     // baseline Cargo watches every vendored file even when no C port is used.
     println!("cargo:rerun-if-changed=build.rs");
+    #[cfg(feature = "amdgpu-port")]
+    amdgpu::tables();
     // Clippy reads Rust and links nothing, so it needs no C objects.
     println!("cargo:rerun-if-env-changed=CLIPPY_ARGS");
     #[cfg(feature = "linux-kernel")]

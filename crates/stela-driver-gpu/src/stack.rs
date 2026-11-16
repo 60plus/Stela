@@ -60,7 +60,11 @@ impl Kernel {
 }
 
 /// Every stack this build holds.
-pub static STACKS: &[&GpuStack] = &[&NVIDIA];
+pub static STACKS: &[&GpuStack] = &[
+    &NVIDIA,
+    #[cfg(feature = "amdgpu-port")]
+    &AMD,
+];
 
 /// nouveau with GSP firmware, NVK and NAK.
 pub static NVIDIA: GpuStack = GpuStack {
@@ -84,6 +88,32 @@ pub static NVIDIA: GpuStack = GpuStack {
     metal: Some(crate::metal::nvidia::ADMISSION),
     #[cfg(all(feature = "metal-linked", not(test)))]
     vulkan: Some(crate::metal::nvidia::DRIVER),
+};
+
+/// amdgpu with its display core. No Vulkan driver yet: its GPU shows the
+/// frames another GPU draws, on the displays wired to it.
+#[cfg(feature = "amdgpu-port")]
+pub static AMD: GpuStack = GpuStack {
+    vendor: Vendor::Amd,
+    kernel: Kernel {
+        driver: "amdgpu",
+        admits: crate::amdgpu::admits,
+        // `rmmio_base` of every family from Bonaire on (`amdgpu_device.c`);
+        // BAR 0 is the memory aperture. The older families are refused.
+        registers: 5,
+        // The mask the device's memory controller block sets
+        // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
+        dma_bits: crate::amdgpu::dma_bits,
+        // Its table flags only the older APUs it names by ID; IP discovery
+        // flags the rest during the probe, after the claim.
+        integrated: |_| false,
+        chip: crate::amdgpu::query::family,
+        memory_bytes: crate::amdgpu::query::memory_bytes,
+    },
+    #[cfg(feature = "metal")]
+    metal: None,
+    #[cfg(all(feature = "metal-linked", not(test)))]
+    vulkan: None,
 };
 
 /// Brings Linux up and registers every kernel driver built into the image,
@@ -296,13 +326,38 @@ mod tests {
         let nvidia = GpuStack::select(&adapter(0x10de)).unwrap();
         assert!(core::ptr::eq(nvidia, &NVIDIA));
         assert_eq!(nvidia.kernel.driver, "nouveau");
-        for vendor in [0x1002, 0x8086, 0x1234] {
+        for vendor in [
+            #[cfg(not(feature = "amdgpu-port"))]
+            0x1002,
+            0x8086,
+            0x1234,
+        ] {
             let adapter = adapter(vendor);
             assert_eq!(
                 GpuStack::select(&adapter).err(),
                 Some(adapter.unavailable_reason())
             );
         }
+    }
+
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn amd_is_selected_for_what_amdgpus_probe_takes_and_draws_nothing() {
+        // A GPU amdgpu's table does not name, found by its VGA class.
+        let mut integrated = adapter(0x1002);
+        integrated.device = 0x0001;
+        let amd = GpuStack::select(&integrated).unwrap();
+        assert!(core::ptr::eq(amd, &AMD));
+        assert_eq!(amd.kernel.driver, "amdgpu");
+        assert_eq!(amd.kernel.dma_limit(&integrated), (1 << 44) - 1);
+        assert!(!amd.draws());
+        // An audio function of the same vendor is no device of the table.
+        let mut audio = adapter(0x1002);
+        audio.class = [4, 3, 0];
+        assert_eq!(
+            GpuStack::select(&audio).err(),
+            Some("amdgpu's PCI ID table does not hold this device")
+        );
     }
 
     #[test]
