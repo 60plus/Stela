@@ -886,7 +886,8 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         if jobs.ran != 0 || jobs.deferred != 0 {
             output::arguments(format_args!(
                 "GPU JOBS ran={} total_us={} longest_us={} slices={} longest_slice_us={} \
-                 longest_queued_us={} deferred={} repeated={} waiting={} heap_rise={}M from={}M\n",
+                 longest_queued_us={} deferred={} repeated={} waiting={} heap_rise={}M from={}M \
+                 queued_mean_us={} resumed={} resumed_mean_us={} resumed_longest_us={}\n",
                 jobs.ran,
                 micros(jobs.ticks),
                 micros(jobs.longest),
@@ -898,6 +899,10 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
                 service.jobs_waiting(),
                 JOB_RISE.swap(0, Ordering::Relaxed) >> 20,
                 JOB_RISE_FROM.load(Ordering::Relaxed) >> 20,
+                micros(jobs.queued / jobs.ran.max(1)),
+                jobs.resumed,
+                micros(jobs.resumed_after / jobs.resumed.max(1)),
+                micros(jobs.longest_resumed_after),
             ));
         }
     }

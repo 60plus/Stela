@@ -227,6 +227,8 @@ struct Parked {
     operation: u32,
     request: u64,
     key: [u8; 32],
+    /// When it was first answered `Pending`, in the platform's ticks.
+    at: u64,
 }
 
 /// More calls than wait at once; the oldest is forgotten, and asks again.
@@ -243,11 +245,18 @@ pub struct JobReport {
     /// one step.
     pub slices: u64,
     pub longest_slice: u64,
-    /// From queueing to running, the longest.
+    /// From queueing to running, the longest and the total over `ran`.
     pub longest_queued: u64,
+    pub queued: u64,
     /// Calls answered `Pending`, with a turn and without one.
     pub deferred: u64,
     pub repeated: u64,
+    /// Parked calls made again after their job ran: how many, and from
+    /// their first `Pending` to that call, the total and the longest. The
+    /// time a guest thread waited for its job.
+    pub resumed: u64,
+    pub resumed_after: u64,
+    pub longest_resumed_after: u64,
 }
 
 /// The operation [`Served`] names for the kext's import of wired memory,
@@ -985,6 +994,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             report.longest = report.longest.max(ticks);
             report.slices += slices;
             report.longest_queued = report.longest_queued.max(waited);
+            report.queued += waited;
         });
     }
 
@@ -1136,13 +1146,20 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                     call.request.address,
                 )
             })?;
-            let key = jobs.parked[at].key;
+            let Parked { key, at: since, .. } = jobs.parked[at];
             let waits =
                 jobs.running == Some(key) || jobs.queued.iter().any(|(job, _)| job.key == key);
             if waits {
                 jobs.report.repeated += 1;
             } else {
                 jobs.parked.remove(at);
+                let report = &mut jobs.report;
+                // Read only here: a call that parked nothing reads the
+                // clock as it rings, enters and leaves, no more.
+                let after = (self.host.ticks)().wrapping_sub(since);
+                report.resumed += 1;
+                report.resumed_after += after;
+                report.longest_resumed_after = report.longest_resumed_after.max(after);
             }
             Some(waits)
         });
@@ -1308,14 +1325,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
     /// run one at a time, oldest first.
     fn park(&self, connection: NonZeroU64, record: u64, call: GateCall, jobs: Vec<Job>) {
         let keys: Vec<[u8; 32]> = jobs.iter().map(|job| job.key).collect();
+        let now = (self.host.ticks)();
         let mut parked = Parked {
             connection: connection.get(),
             record,
             operation: call.operation,
             request: call.request.address,
             key: keys[0],
+            at: now,
         };
-        let now = (self.host.ticks)();
         let new = jobs;
         let unwanted = self.jobs.with(|jobs| {
             jobs.report.deferred += 1;

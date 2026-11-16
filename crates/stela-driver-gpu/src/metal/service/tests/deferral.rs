@@ -640,3 +640,49 @@ fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
     assert!(!shared.jobs_waiting());
     *WITHDRAWING.lock().unwrap() = None;
 }
+
+/// The report says how long a parked call waited for its job: from its
+/// first `Pending` to the run that found the job done, with the job's own
+/// wait in the queue.
+#[test]
+fn the_job_report_says_how_long_a_parked_call_waited_for_its_job() {
+    use crate::metal::service::wire::TextureResponse;
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    let gate = Arc::new(AtomicBool::new(false));
+    service.device().backend().image_gate = Some(gate.clone());
+    let shared = Arc::new(SharedService::new(service, host(|_| {})));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let texture = gate_call(
+        &mut memory,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Private),
+        size_of::<TextureResponse>(),
+    );
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    std::thread::sleep(Duration::from_millis(1));
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    // The job runs, held by its gate, for at least 2 ms.
+    while shared.jobs_waiting() {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Ok);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.deferred, report.resumed), (1, 1, 1));
+    assert!(report.queued >= 1_000_000, "{report:?}");
+    assert!(
+        report.resumed_after >= report.queued + 2_000_000,
+        "{report:?}"
+    );
+    assert_eq!(report.longest_resumed_after, report.resumed_after);
+    assert_eq!(report.longest_queued, report.queued);
+}
