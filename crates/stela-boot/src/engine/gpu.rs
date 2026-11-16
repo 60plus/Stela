@@ -1146,6 +1146,12 @@ fn claim(
             "a firmware framebuffer writer is still active",
         ));
     }
+    // A refusal from here until the GPU is sealed for its reset leaves what
+    // it scans out as it was, so the firmware's screen is given back.
+    let screen = RetiredScreen {
+        address,
+        retired: owns_screen,
+    };
     let mut placement = Placement {
         bus: address.bus,
         devfn: address.device << 3 | address.function,
@@ -1271,6 +1277,8 @@ fn claim(
         // its private domain is the one the cold attempt binds.
         cold = unsafe { cold.translated() };
     }
+    // The seal and the reset below end the firmware's picture on this GPU.
+    screen.spend();
     let ready = cold
         .quiesce_and_bind()
         .map_err(|failure| cold_refusal(address, failure.error))?;
@@ -1378,6 +1386,34 @@ fn claim(
         #[cfg(feature = "nvk")]
         link,
     })
+}
+
+/// The firmware's screen a claim retired before it sized the GPU's BARs. A
+/// claim that stops before the GPU's views are sealed for its reset changed
+/// nothing the GPU scans out, so the screen is given back: the boot's text
+/// and, when another GPU draws, the guest's copied frames show there again.
+struct RetiredScreen {
+    address: stela_drivers::bus::pci::Address,
+    retired: bool,
+}
+
+impl RetiredScreen {
+    /// The claim goes on to seal and reset the GPU, which ends its picture.
+    fn spend(mut self) {
+        self.retired = false;
+    }
+}
+
+impl Drop for RetiredScreen {
+    fn drop(&mut self) {
+        if self.retired && crate::console::restore_firmware() {
+            output::arguments(format_args!(
+                "GPU {}: the firmware's picture stays on its screen, as the claim stopped \
+                 before the GPU was reset\n",
+                self.address
+            ));
+        }
+    }
 }
 
 /// After a reset, which puts each Resizable BAR back at the size firmware

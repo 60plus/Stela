@@ -817,6 +817,17 @@ pub(crate) fn retire_firmware() -> bool {
     .unwrap_or(false)
 }
 
+/// Undo [`retire_firmware`] for a GPU claim that stopped before the GPU was
+/// sealed and reset, so the firmware's picture still shows: the boot CPU and
+/// the guest's frames may draw there again, and the parked text returns.
+pub(crate) fn restore_firmware() -> bool {
+    let restored = FIRMWARE_ACCESS.restore();
+    if restored {
+        reclaim();
+    }
+    restored
+}
+
 /// Take the screen back after [`release`] and draw the kept text again, so
 /// a stop shows its reason instead of the guest's last frame.
 pub fn reclaim() {
