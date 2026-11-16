@@ -344,7 +344,16 @@ pub struct AirCompiler {
     /// recalled.
     restored: u64,
     recalled: u64,
+    /// The keys the service compiled this boot, and its compilations of a
+    /// key it had compiled before: NIR the cache evicted that neither an
+    /// earlier boot's store nor this boot's recall held.
+    compiled_keys: alloc::collections::BTreeSet<[u8; 32]>,
+    recompiled: u64,
 }
+
+/// Keys [`AirCompiler::compiled_keys`] remembers; past this it forgets them
+/// all, which only undercounts `recompiled` for a while.
+const COMPILED_KEYS: usize = 1 << 14;
 
 /// Where a compilation's serialized NIR goes for the next boot, by key.
 pub type Persist = fn(&[u8; 32], &[u8]);
@@ -448,6 +457,23 @@ impl AirCompiler {
             recall: None,
             restored: 0,
             recalled: 0,
+            compiled_keys: alloc::collections::BTreeSet::new(),
+            recompiled: 0,
+        }
+    }
+
+    /// Counts a compilation the service ran for `key`, and whether it had
+    /// compiled that key before this boot.
+    fn note_compiled(&mut self, key: Option<[u8; 32]>) {
+        self.compiled += 1;
+        let Some(key) = key else {
+            return;
+        };
+        if self.compiled_keys.len() >= COMPILED_KEYS {
+            self.compiled_keys.clear();
+        }
+        if !self.compiled_keys.insert(key) {
+            self.recompiled += 1;
         }
     }
 
@@ -558,7 +584,7 @@ impl AirCompiler {
         match restored {
             Some(false) => self.restored += 1,
             Some(true) => self.recalled += 1,
-            None => self.compiled += 1,
+            None => self.note_compiled(Some(key)),
         }
         self.keep_serialized(&key, serialized.as_deref());
         let Some(nir) = self.nir.as_mut() else {
@@ -662,10 +688,11 @@ impl AirCompiler {
 
     /// `GPU COMPILER reflected=… reflections=… nir_hits=… nir_misses=…
     /// compiled=… restored=…/stored deferred=… nir=entries/MiB evicted=…
-    /// recalled=…`, since the device opened: reflections and compilations
+    /// recalled=… recompiled=…`, since the device opened: reflections and compilations
     /// the service ran, cache hits and misses, stored NIR deserialized of
     /// what the store held, calls that compiled outside the lock, the cache,
-    /// and evicted compilations of this boot deserialized again.
+    /// evicted compilations of this boot deserialized again, and
+    /// compilations of a key the service had compiled before this boot.
     pub fn report(&self) -> String {
         let (hits, misses, entries, bytes, evicted) =
             self.nir.as_ref().map_or((0, 0, 0, 0, 0), |nir| {
@@ -680,7 +707,7 @@ impl AirCompiler {
         alloc::format!(
             "GPU COMPILER reflected={} reflections={} nir_hits={hits} nir_misses={misses} \
              compiled={} restored={}/{} deferred={} nir={entries}/{}M evicted={evicted} \
-             recalled={}",
+             recalled={} recompiled={}",
             self.reflected,
             self.reflections.as_ref().map_or(0, ReflectionCache::len),
             self.compiled,
@@ -689,6 +716,7 @@ impl AirCompiler {
             self.deferrals,
             bytes >> 20,
             self.recalled,
+            self.recompiled,
         )
     }
 
@@ -1314,7 +1342,7 @@ impl AirCompiler {
             let _held = self.lock.hold(self.relax);
             job.run()
         };
-        self.compiled += 1;
+        self.note_compiled(job.key);
         match result {
             Ok((shader, bytes)) => {
                 if let Some(key) = job.key
