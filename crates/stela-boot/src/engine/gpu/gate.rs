@@ -1206,14 +1206,30 @@ pub(super) fn metal_choice(
 }
 
 /// Whether the bound GPU at `index` is integrated: its kernel driver's
-/// answer for the bound device where it gives one, else its table's.
+/// answer for the bound device where it gives one, else its table's. A
+/// driver that decides during its probe and does not answer leaves the
+/// kind unknown, and the GPU counts as integrated, so a discrete GPU takes
+/// the Metal device first; that is reported once per GPU.
 fn integrated(index: usize, bound: &Bound) -> bool {
-    bound
-        .stack
-        .kernel
-        .probed_integrated
-        .and_then(|query| client::query(index as u32, query))
-        .unwrap_or(bound.integrated.unwrap_or(false))
+    /// The bound GPUs, by index, whose unanswered query was reported.
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let Some(query) = bound.stack.kernel.probed_integrated else {
+        return bound.integrated.unwrap_or(false);
+    };
+    if let Some(integrated) = client::query(index as u32, query) {
+        return integrated;
+    }
+    let integrated = bound.integrated.unwrap_or(true);
+    let bit = 1u64 << index.min(63);
+    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        output::arguments(format_args!(
+            "GPU {}: {} did not say whether it is integrated, so it counts as {}\n",
+            bound.name,
+            bound.stack.kernel.driver,
+            if integrated { "integrated" } else { "discrete" }
+        ));
+    }
+    integrated
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.
