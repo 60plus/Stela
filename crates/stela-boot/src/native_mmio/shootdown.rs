@@ -32,7 +32,7 @@ use core::{
     ops::Range,
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
-use stela_boot_core::aperture::{Doing, Lates, RANGE_PAGES};
+use stela_boot_core::aperture::{Doing, Lates, NmiGate, RANGE_PAGES};
 
 /// How long a retirement waits before it reports the processors it waits
 /// for.
@@ -252,15 +252,48 @@ pub(crate) fn before_stop_screen() {
     }
 }
 
-/// In this processor's NMI gate: whether a retirement sent the NMI
-/// ([`aperture::Processors::poke`]). The gate answers it ([`answer_nmi`])
-/// unless it is also the step watchdog's.
+/// How long after a gate that claimed a counter sample and a retirement's
+/// NMI together an NMI with nothing to claim is taken as the other one:
+/// a retirement's NMI has reached a processor up to 16 ms after it was
+/// sent under a hypervisor (`shootdown late ... answered=nmi`).
+const SPARE_NMI_MS: u64 = 100;
+
+/// NMIs the gates took as the second of two sources since [`take_waits`].
+static SPARE_NMIS: AtomicU64 = AtomicU64::new(0);
+
+/// In this processor's NMI gate, after its counter sample (`sampled`):
+/// whether it returns. A retirement's NMI ([`aperture::Processors::poke`])
+/// is answered ([`answer_nmi`]) unless it is also the step watchdog's
+/// (`watchdog`); one with nothing to claim returns only as the second NMI
+/// of two sources an earlier gate claimed together
+/// ([`aperture::Processors::nmi_gate`]). Takes no lock and allocates
+/// nothing.
 ///
 /// [`aperture::Processors::poke`]: stela_boot_core::aperture::Processors::poke
-pub(crate) fn take_poke() -> bool {
-    crate::engine::host::shootdown()
-        .0
-        .is_some_and(|slot| PROCESSORS.take_poke(slot))
+/// [`aperture::Processors::nmi_gate`]: stela_boot_core::aperture::Processors::nmi_gate
+pub(crate) fn gate(sampled: bool, rip: u64, watchdog: fn() -> bool) -> bool {
+    let Some(slot) = crate::engine::host::shootdown().0 else {
+        return sampled && !watchdog();
+    };
+    let within = crate::firmware::tsc_hz() / 1000 * SPARE_NMI_MS;
+    match PROCESSORS.nmi_gate(
+        slot,
+        sampled,
+        watchdog,
+        crate::engine::host::rdtsc(),
+        within,
+    ) {
+        NmiGate::Sample => true,
+        NmiGate::Poke => {
+            answer_nmi(rip);
+            true
+        }
+        NmiGate::Spare => {
+            SPARE_NMIS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        NmiGate::Stop => false,
+    }
 }
 
 /// Answer a retirement's NMI, which found this processor at `rip`: flush
@@ -524,15 +557,17 @@ impl Drop for Counted {
 }
 
 /// The shootdowns since the last call, the ticks they waited, how many of
-/// them retired a range peers flushed page by page, and the NMIs they sent
-/// late processors, for the GPU gate's report.
+/// them retired a range peers flushed page by page, the NMIs they sent
+/// late processors, and the NMIs gates took as the second of two sources
+/// ([`gate`]), for the GPU gate's report.
 #[cfg(feature = "nvk")]
-pub(crate) fn take_waits() -> (u64, u64, u64, u64) {
+pub(crate) fn take_waits() -> (u64, u64, u64, u64, u64) {
     (
         WAITS[0].swap(0, Ordering::Relaxed),
         WAITS[1].swap(0, Ordering::Relaxed),
         RANGED.swap(0, Ordering::Relaxed),
         NMIS.swap(0, Ordering::Relaxed),
+        SPARE_NMIS.swap(0, Ordering::Relaxed),
     )
 }
 

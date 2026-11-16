@@ -375,27 +375,21 @@ stela_nmi_gate:
 );
 
 /// Whether the NMI at `rip`, the interrupted stack at `rsp`, was a
-/// `--profile` sample's ([`host::sampling::overflow`]) or a shootdown's, now
-/// answered: the gate then returns. The step watchdog's keeps its stop even when a shootdown's came
-/// with it, as two NMIs pending at once are taken as one. On a processor
-/// already in a terminal handler, which no retirement sends one to, an NMI
-/// (a platform's, or the step watchdog's for the step the handler
-/// interrupted) returns too: that handler's stop goes on and keeps its
-/// reason, where the NMI's terminal stub would find the terminal entry slot
-/// in use and halt.
+/// `--profile` sample's ([`host::sampling::overflow`]), a shootdown's, now
+/// answered, or the second NMI of two such sources one gate already
+/// claimed (`native_mmio::shootdown::gate`): the gate then returns. The
+/// step watchdog's keeps its stop even when a shootdown's came with it. On
+/// a processor already in a terminal handler, which no retirement sends
+/// one to, an NMI (a platform's, or the step watchdog's for the step the
+/// handler interrupted) returns too: that handler's stop goes on and keeps
+/// its reason, where the NMI's terminal stub would find the terminal entry
+/// slot in use and halt.
 extern "sysv64" fn nmi_answer(rip: u64, rsp: u64) -> bool {
     let sampled = host::sampling::overflow(rip, rsp);
     if crate::native_mmio::shootdown::terminal_here() {
         return true;
     }
-    if !crate::native_mmio::shootdown::take_poke() {
-        return sampled && !super::step_watchdog::nmi_is_watchdog();
-    }
-    if super::step_watchdog::nmi_is_watchdog() {
-        return false;
-    }
-    crate::native_mmio::shootdown::answer_nmi(rip);
-    true
+    crate::native_mmio::shootdown::gate(sampled, rip, super::step_watchdog::nmi_is_watchdog)
 }
 
 // One stub per vector: push a zero error code when the CPU pushes none,

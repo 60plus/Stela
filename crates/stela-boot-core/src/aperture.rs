@@ -163,10 +163,28 @@ struct Sharer {
     reachable: AtomicBool,
     /// A retirement sent it an NMI its gate has not taken yet.
     poked: AtomicBool,
+    /// NMIs its gate may take with nothing left to claim, and the TSC of
+    /// the latest gate that left one ([`Processors::nmi_gate`]). Only the
+    /// processor's own gate, which no NMI interrupts, uses them.
+    spare: AtomicU64,
+    spare_at: AtomicU64,
     /// The latest generation its NMI gate flushed through, and the
     /// instruction the NMI found it at.
     answered: AtomicU64,
     rip: AtomicU64,
+}
+
+/// What a processor's NMI gate does with one NMI ([`Processors::nmi_gate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NmiGate {
+    /// A counter sample, already taken: return.
+    Sample,
+    /// A retirement's: answer it (flush and acknowledge), then return.
+    Poke,
+    /// The second NMI of two sources a gate claimed together: return.
+    Spare,
+    /// Nothing claims it, or the step watchdog's: stop.
+    Stop,
 }
 
 /// The range one request retired, by generation; read like a sequence
@@ -240,6 +258,8 @@ impl Processors {
                     terminal: AtomicBool::new(false),
                     reachable: AtomicBool::new(false),
                     poked: AtomicBool::new(false),
+                    spare: AtomicU64::new(0),
+                    spare_at: AtomicU64::new(0),
                     answered: AtomicU64::new(0),
                     rip: AtomicU64::new(0),
                 }
@@ -491,8 +511,10 @@ impl Processors {
     /// Ask slot `slot`'s processor, which has not acknowledged `generation`
     /// in time, to answer by NMI: whether the caller sends it one. One that
     /// cannot take it (not reachable), needs none (idle or acknowledged) or
-    /// has one outstanding gets none, so its gate takes each NMI sent for a
-    /// retirement as one ([`Self::take_poke`]) and two never merge into one.
+    /// has one outstanding gets none. The mark is set before the NMI is
+    /// sent, so the gate of an NMI that comes first (a counter sample's) may
+    /// take it, and the retirement's NMI then finds nothing to claim
+    /// ([`Self::nmi_gate`]).
     pub fn poke(&self, slot: usize, generation: u64) -> bool {
         let Some(sharer) = self.sharers.get(slot) else {
             return false;
@@ -511,6 +533,62 @@ impl Processors {
         if let Some(sharer) = self.sharers.get(slot) {
             sharer.poked.store(false, Ordering::Release);
         }
+    }
+
+    /// Slot `slot`'s NMI gate decides what one NMI was: a counter sample
+    /// its own handler took (`sampled`), a retirement's ([`Self::poke`]),
+    /// the step watchdog's (`watchdog`, asked only when needed), or the
+    /// second NMI of two sources one gate already claimed together.
+    ///
+    /// Two NMI sources do not always arrive as one NMI: a processor holds
+    /// one NMI back while its gate runs and takes it after, and a
+    /// hypervisor queues two. The retirement marks its NMI before it sends
+    /// it, so a gate that took a sample may find that mark while the
+    /// retirement's NMI is still on its way, or a retirement's gate may
+    /// reload a counter whose own NMI is held back. Either way the other
+    /// NMI then comes with nothing to claim, as Linux's `swallow_nmi` knows
+    /// (`arch/x86/kernel/nmi.c`): a gate that claimed both leaves one
+    /// spare, and an NMI with nothing to claim within `within` TSC ticks
+    /// of it takes that spare and returns. Any other unclaimed NMI stops.
+    pub fn nmi_gate(
+        &self,
+        slot: usize,
+        sampled: bool,
+        watchdog: impl FnOnce() -> bool,
+        now: u64,
+        within: u64,
+    ) -> NmiGate {
+        let Some(sharer) = self.sharers.get(slot) else {
+            return if sampled && !watchdog() {
+                NmiGate::Sample
+            } else {
+                NmiGate::Stop
+            };
+        };
+        if !self.take_poke(slot) {
+            if watchdog() {
+                return NmiGate::Stop;
+            }
+            if sampled {
+                return NmiGate::Sample;
+            }
+            let spare = sharer.spare.load(Ordering::Relaxed);
+            let fresh = now.wrapping_sub(sharer.spare_at.load(Ordering::Relaxed)) <= within;
+            if spare == 0 || !fresh {
+                sharer.spare.store(0, Ordering::Relaxed);
+                return NmiGate::Stop;
+            }
+            sharer.spare.store(spare - 1, Ordering::Relaxed);
+            return NmiGate::Spare;
+        }
+        if watchdog() {
+            return NmiGate::Stop;
+        }
+        if sampled {
+            sharer.spare.fetch_add(1, Ordering::Relaxed);
+            sharer.spare_at.store(now, Ordering::Relaxed);
+        }
+        NmiGate::Poke
     }
 
     /// In slot `slot`'s NMI gate: whether a retirement sent the NMI it
@@ -1082,6 +1160,90 @@ mod tests {
         assert!(processors.poke(ap, next));
         assert!(!processors.poke(MAX_PROCESSORS, next));
         assert!(!processors.take_poke(MAX_PROCESSORS));
+    }
+
+    /// A counter sample's NMI that comes while a retirement's NMI is on its
+    /// way takes the retirement's mark; the retirement's NMI then comes
+    /// with nothing to claim and returns as the spare, once and only soon
+    /// after. Without a gate that claimed two sources, an unclaimed NMI
+    /// stops, as does the step watchdog's.
+    #[test]
+    fn the_second_nmi_of_two_sources_one_gate_claimed_returns() {
+        let processors = Processors::new();
+        let _bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        processors.set_reachable(ap);
+        let quiet = || false;
+        // Nothing sent and no sample: stop.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 10, 100),
+            NmiGate::Stop
+        );
+        // A sample alone returns; the watchdog's stops.
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 10, 100),
+            NmiGate::Sample
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, true, || true, 10, 100),
+            NmiGate::Stop
+        );
+        // A retirement marks its NMI; a sample's NMI comes first and
+        // claims both.
+        let generation = processors.request(None);
+        assert!(processors.poke(ap, generation));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 1000, 100),
+            NmiGate::Poke
+        );
+        // The retirement's own NMI: nothing to claim, the spare returns it.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 1050, 100),
+            NmiGate::Spare
+        );
+        // Only once.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 1060, 100),
+            NmiGate::Stop
+        );
+        // A retirement's NMI alone leaves no spare.
+        let next = processors.request(None);
+        assert!(processors.poke(ap, next));
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 2000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 2010, 100),
+            NmiGate::Stop
+        );
+        // A spare left by two sources that came as one NMI does not cover
+        // an unclaimed NMI long after.
+        let late = processors.request(None);
+        assert!(processors.poke(ap, late));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 3000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 3101, 100),
+            NmiGate::Stop
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 3102, 100),
+            NmiGate::Stop
+        );
+        // The watchdog's NMI stops even with a mark or a spare.
+        let last = processors.request(None);
+        assert!(processors.poke(ap, last));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 4000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, || true, 4001, 100),
+            NmiGate::Stop
+        );
     }
 
     /// Late acknowledgements reach one report a period at most, which
