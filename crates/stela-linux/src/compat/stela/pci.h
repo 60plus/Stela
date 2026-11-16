@@ -49,9 +49,14 @@ struct stela_linux_pci_function {
 	void (*release_context)(void *context);
 	/* Original initialized device enrollment; called before any driver probe. */
 	int (*enroll)(void *context, struct device *device);
+	/* The function's platform ROM, a video BIOS image firmware publishes
+	 * apart from the function (as x86 Linux takes the one EFI hands over),
+	 * which the attach copies into pci_dev::rom: rom_length 0 for none. */
+	const void *rom;
+	size_t rom_length;
 };
 
-_Static_assert(sizeof(struct stela_linux_pci_function) == 240, "Linux PCI function ABI");
+_Static_assert(sizeof(struct stela_linux_pci_function) == 256, "Linux PCI function ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, release_context) == 224,
 	       "Linux PCI context release ABI");
 
@@ -67,6 +72,11 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 /* Cumulative final releases quarantined outside the original process owner.
  * Atomic observation only; no reset or deferred reclamation is implied. */
 u64 stela_linux_pci_quarantined_functions(void);
+/* An attached function's platform ROM copy, which ioremap answers with its
+ * kernel address when [start, start + size) lies in it, or NULL; and whether
+ * an address iounmap is given is one of those answers. */
+void __iomem *stela_linux_pci_rom_map(phys_addr_t start, size_t size);
+bool stela_linux_pci_rom_mapped(const volatile void __iomem *address);
 /* Cache what Linux's probe reads from a PCI Express function's capability:
  * its flags, device capabilities and supported link speeds. A PCIBIOS error
  * when the function does not answer. */

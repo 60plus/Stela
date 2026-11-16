@@ -4,6 +4,7 @@
  * through its owner's callbacks, as an x86 host bridge's pci_ops and IOMMU's
  * dma_map_ops would. x86 caches snoop DMA, so no operation syncs. */
 #include <linux/dma-map-ops.h>
+#include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -17,7 +18,57 @@ struct host_function {
 	struct pci_bus bus;
 	struct pci_dev dev;
 	struct host_function *quarantined_next;
+	/* The copy of the function's platform ROM, and the next attached
+	 * function's with one. */
+	struct page *rom;
+	struct host_function *rom_next;
 };
+
+/* The functions with a platform ROM copy. Only the serialized owner attaches
+ * and releases. */
+static struct host_function *rom_hosts;
+
+/* x86 Linux keeps the video BIOS EFI hands over in memory the firmware
+ * reserved, and amdgpu maps pci_dev::rom with ioremap. The copy here is
+ * pages of the layer's own, which the owner's device mappings do not hold,
+ * so ioremap answers it from this list. */
+void __iomem *stela_linux_pci_rom_map(phys_addr_t start, size_t size)
+{
+	for (struct host_function *host = rom_hosts; host; host = host->rom_next) {
+		phys_addr_t rom = host->dev.rom;
+
+		if (start >= rom && size <= host->dev.romlen && start - rom <= host->dev.romlen - size)
+			return (void __iomem __force *)((u8 *)page_address(host->rom) + (start - rom));
+	}
+	return NULL;
+}
+
+bool stela_linux_pci_rom_mapped(const volatile void __iomem *address)
+{
+	unsigned long at = (unsigned long)address;
+
+	for (struct host_function *host = rom_hosts; host; host = host->rom_next) {
+		unsigned long copy = (unsigned long)page_address(host->rom);
+
+		if (at >= copy && at - copy < host->dev.romlen)
+			return true;
+	}
+	return false;
+}
+
+static void release_rom(struct host_function *host)
+{
+	if (!host->rom)
+		return;
+	for (struct host_function **link = &rom_hosts; *link; link = &(*link)->rom_next) {
+		if (*link == host) {
+			*link = host->rom_next;
+			break;
+		}
+	}
+	__free_pages(host->rom, (unsigned int)get_order(host->dev.romlen));
+	host->rom = NULL;
+}
 
 static u64 quarantined_functions;
 static struct host_function *quarantined_hosts;
@@ -256,6 +307,7 @@ static void release(struct device *dev)
 			__atomic_store_n(&quarantined_functions, count + 1, __ATOMIC_RELAXED);
 		return;
 	}
+	release_rom(host);
 	if (host->function.release_context)
 		host->function.release_context(host->function.context);
 	kfree(host);
@@ -321,6 +373,22 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 		dev->resource[i].start = region->start;
 		dev->resource[i].end = region->start + region->size - 1;
 		dev->resource[i].flags = region->flags;
+	}
+	/* The caller's image lasts only for the attach. */
+	host->function.rom = NULL;
+	if (function->rom_length) {
+		host->rom = alloc_pages(GFP_KERNEL, (unsigned int)get_order(function->rom_length));
+		if (!host->rom) {
+			if (status)
+				*status = -ENOMEM;
+			kfree(host);
+			return NULL;
+		}
+		memcpy(page_address(host->rom), function->rom, function->rom_length);
+		dev->rom = page_to_phys(host->rom);
+		dev->romlen = function->rom_length;
+		host->rom_next = rom_hosts;
+		rom_hosts = host;
 	}
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
@@ -556,9 +624,32 @@ int main(void)
 	/* A legacy caller can still retain ownership without a release callback. */
 	function.release_context = NULL;
 	dev = stela_linux_pci_attach(&function, NULL);
-	assert(dev);
+	assert(dev && !dev->rom && !dev->romlen);
 	stela_linux_pci_remove_device(dev);
 	assert(context_releases == 1);
+	/* A platform ROM is copied at the attach: Linux finds it at pci_dev::rom
+	 * through ioremap, whole or in part, and iounmap leaves the copy, which
+	 * lasts until the function is released. */
+	static u8 rom_image[5000];
+	for (size_t i = 0; i < sizeof(rom_image); i++)
+		rom_image[i] = (u8)(i * 7);
+	function.rom = rom_image;
+	function.rom_length = sizeof(rom_image);
+	dev = stela_linux_pci_attach(&function, NULL);
+	rom_image[0] = 0xff;
+	assert(dev && dev->rom && dev->romlen == sizeof(rom_image));
+	u8 __iomem *rom = ioremap(dev->rom, dev->romlen);
+	assert(rom && readb(rom) == 0 && readb(rom + 4999) == (u8)(4999 * 7));
+	assert(ioremap(dev->rom + 4096, 904) == rom + 4096);
+	assert(!stela_linux_pci_rom_map(dev->rom + 4096, 905));
+	assert(!stela_linux_pci_rom_map(dev->rom - 1, 2));
+	iounmap(rom);
+	assert(readb(rom + 1) == 7);
+	phys_addr_t copy = dev->rom;
+	stela_linux_pci_remove_device(dev);
+	assert(!stela_linux_pci_rom_map(copy, 1) && !stela_linux_pci_rom_mapped(rom));
+	function.rom = NULL;
+	function.rom_length = 0;
 	/* An atomic final put cannot destroy the host or callback context. */
 	function.release_context = test_release_context;
 	dev = stela_linux_pci_attach(&function, NULL);

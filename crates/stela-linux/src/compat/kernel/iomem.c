@@ -4,6 +4,7 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <stela/linux.h>
+#include <stela/pci.h>
 
 void memcpy_fromio(void *dst, const volatile void __iomem *src, size_t count)
 {
@@ -32,6 +33,10 @@ void memset_io(volatile void __iomem *addr, int val, size_t count)
 static void __iomem *map(phys_addr_t offset, size_t size, bool write_combining)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
+	void __iomem *rom = stela_linux_pci_rom_map(offset, size);
+
+	if (rom)
+		return rom;
 
 	if (!owner->services->map_device) {
 		stela_linux_unsupported("device memory mappings");
@@ -71,7 +76,8 @@ void iounmap(volatile void __iomem *addr)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
 
-	if (addr)
+	/* A platform ROM copy stays until its function is released. */
+	if (addr && !stela_linux_pci_rom_mapped(addr))
 		owner->services->unmap_device(owner->context,
 					      (void *)((unsigned long)addr & PAGE_MASK));
 }

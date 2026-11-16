@@ -97,6 +97,10 @@ pub struct Placement {
     /// The highest bus address `domain` hands out.
     pub dma_limit: u64,
     pub regions: [Region; BARS],
+    /// The function's platform ROM: a video BIOS image firmware publishes
+    /// apart from the function, which Linux keeps as `pci_dev::rom`. Empty
+    /// for none. The attach copies it.
+    pub rom: &'static [u8],
 }
 
 /// A function's MSI capability (PCI Local Bus 3.0 6.8.1), one message at most.
@@ -185,9 +189,12 @@ struct RawFunction {
     regions: [Region; BARS],
     release_context: Option<unsafe extern "C" fn(*mut c_void)>,
     enroll: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    rom: *const u8,
+    rom_length: usize,
 }
 
-const _: () = assert!(size_of::<RawFunction>() == 240);
+const _: () = assert!(size_of::<RawFunction>() == 256);
+const _: () = assert!(core::mem::offset_of!(RawFunction, rom_length) == 248);
 const _: () = assert!(core::mem::offset_of!(RawFunction, enroll) == 232);
 const _: () = assert!(core::mem::offset_of!(RawFunction, release_context) == 224);
 
@@ -812,6 +819,8 @@ impl<H: Host> Attached<H> {
             regions: placement.regions,
             release_context: Some(release_context::<H>),
             enroll: catalogued.then_some(enroll::<H>),
+            rom: placement.rom.as_ptr(),
+            rom_length: placement.rom.len(),
         };
         let mut error = 0;
         // SAFETY: caller's attach contract; C copies the table and returns a
