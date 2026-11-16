@@ -23,23 +23,102 @@ pub const WIFI_FIRMWARE_REVISION: &str = "59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a
 /// this build answers it under both.
 pub const MT7925_BLUETOOTH_REVISION: &str = "2d70539375587a68bdef08fec2e0e1a51698c93a";
 pub const GSP_REVISION: &str = "1987bb2044a6c2d68c39d01c360bdbe17f1eb60c";
-/// The GSP-RM release nouveau takes on every chip family but GeForce
-/// Blackwell, which takes [`GB20X_GSP_RELEASE`] ([`gsp_release`]).
-const GSP_RELEASE: &str = "570.144";
-/// The R570 LTS GSP-RM release for GeForce Blackwell (`gb20x`), which adds
-/// RTX 5060 / 5060 Ti (`GB206`) and updated signed GB202 FMC and bootloader.
-pub const GB20X_GSP_RELEASE: &str = "570.211.01";
-/// NVIDIA's open GPU kernel modules repository (`tag 570.211.01`), whose
-/// generated `bindata` sources hold the signed GB202 bootloader and GSP-FMC
-/// images before `linux-firmware` publishes them.
+/// NVIDIA's open GPU kernel modules repository, whose generated `bindata`
+/// sources hold the signed bootloader and GSP-FMC images of each release.
 pub const NVIDIA_OPEN_GPU: &str = "https://github.com/NVIDIA/open-gpu-kernel-modules";
-/// The commit of [`NVIDIA_OPEN_GPU`]'s tag `570.211.01`.
-pub const GB20X_OPEN_GPU_REVISION: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
-/// NVIDIA's Linux x86_64 release archive, whose compressed tar stream begins
-/// with `firmware/gsp_ga10x.bin`.
+/// NVIDIA's Linux x86_64 driver releases, one directory per release.
 pub const NVIDIA_LINUX_DRIVER: &str = "https://download.nvidia.com/XFree86/Linux-x86_64";
 /// The US mirror of [`NVIDIA_LINUX_DRIVER`], asked second.
 pub const NVIDIA_LINUX_DRIVER_MIRROR: &str = "https://us.download.nvidia.com/XFree86/Linux-x86_64";
+
+/// Where the files of a GSP-RM release come from.
+#[derive(Clone, Copy, Debug)]
+pub enum GspOrigin {
+    /// linux-firmware at [`GSP_REVISION`], under its `LICENCE.nvidia`.
+    LinuxFirmware,
+    /// NVIDIA's own publication of the release, which linux-firmware does
+    /// not have.
+    Nvidia(&'static NvidiaGsp),
+}
+
+/// A chip family's GSP-RM release as NVIDIA publishes it: the bootloader
+/// and GSP-FMC images are built from open-gpu-kernel-modules' generated
+/// sources at the release's tag, the format linux-firmware's own files of
+/// earlier releases have; the GSP-RM image is the first file of the driver
+/// installer's `zstd` tar stream, cut out of a pinned byte range of it. Each
+/// download and each image is pinned by length and SHA-256.
+#[derive(Debug)]
+pub struct NvidiaGsp {
+    /// The chip the `bindata` arrays are named after, as in
+    /// `kgspBinArchiveGspRmBoot_GB202_ucode_image_prod_data`.
+    pub bindata_chip: &'static str,
+    /// The generated source holding the bootloader's descriptor and image.
+    pub bootloader_source: Artifact,
+    /// The generated source holding the GSP-FMC's hash, signature, public
+    /// key and image.
+    pub fmc_source: Artifact,
+    /// The installer's first `length` bytes from `installer_offset`, where
+    /// its `zstd` stream starts, of `installer_length`.
+    pub installer_prefix: Artifact,
+    pub installer_offset: u64,
+    pub installer_length: u64,
+    /// The bootloader, the GSP-FMC and the GSP-RM image, as the stick holds
+    /// them under nouveau's names.
+    pub images: [Recipe; 3],
+}
+
+/// Which of an [`NvidiaGsp`]'s images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaPart {
+    Bootloader,
+    Fmc,
+    Gsp,
+}
+
+impl NvidiaGsp {
+    /// The download `part` is made from.
+    pub fn source(&self, part: NvidiaPart) -> &Artifact {
+        match part {
+            NvidiaPart::Bootloader => &self.bootloader_source,
+            NvidiaPart::Fmc => &self.fmc_source,
+            NvidiaPart::Gsp => &self.installer_prefix,
+        }
+    }
+}
+
+/// One GSP-RM release and the chip families (`gsp` directories, see
+/// [`gsp_directory`]) nouveau runs it on. nouveau's firmware list names one
+/// release per family; a test checks that its source names the same
+/// releases as this table. A further release is one row here, with an
+/// [`NvidiaGsp`] when linux-firmware does not have it.
+#[derive(Debug)]
+pub struct GspRelease {
+    pub release: &'static str,
+    pub directories: &'static [&'static str],
+    pub origin: GspOrigin,
+}
+
+/// Every GSP-RM release nouveau takes. GeForce Blackwell takes 570.211.01:
+/// 570.144 refuses GSP_RM_ALLOC on the RTX 5060 (GB206), and its supported
+/// list lacks every GB206 and GB207 board and the newer GB202, GB203 and
+/// GB205 boards (RTX PRO 4000 to 5000 Blackwell, RTX 5070 Laptop), which
+/// 570.211.01 adds. 570.211.01 adds no Turing to Hopper board, so the other
+/// families stay on linux-firmware's 570.144.
+pub const GSP_RELEASES: [GspRelease; 2] = [
+    GspRelease {
+        release: "570.144",
+        directories: &[
+            "tu102", "tu116", "ga100", "ga102", "ad102", "gh100", "gb100",
+        ],
+        origin: GspOrigin::LinuxFirmware,
+    },
+    GspRelease {
+        release: "570.211.01",
+        directories: &["gb202"],
+        origin: GspOrigin::Nvidia(&GB20X_570_211_01),
+    },
+];
+
 /// The files of a release, of which each chip family has some.
 const GSP_KINDS: [&str; 6] = [
     "booter_load",
@@ -68,30 +147,23 @@ pub struct Artifact {
 
 impl Artifact {
     /// The member at the pinned revision: cgit's `plain` form on
-    /// git.kernel.org, raw GitHub / NVIDIA archive URLs for `NVIDIA_*`, and
-    /// GitLab's `raw` form elsewhere.
+    /// git.kernel.org, raw GitHub for open-gpu-kernel-modules, a release
+    /// directory's file for NVIDIA's drivers, and GitLab's `raw` form
+    /// elsewhere. An image built from NVIDIA's release is fetched as the
+    /// download it is made from ([`NvidiaGsp::source`]).
     pub fn url(&self) -> alloc::string::String {
+        if let Some((release, part)) = nvidia_gsp(self) {
+            return release.source(part).url();
+        }
         if self.source.starts_with(KERNEL_ORG_GIT) {
             format!("{}/plain/{}?h={}", self.source, self.member, self.revision)
         } else if self.source == NVIDIA_OPEN_GPU {
-            let bindata = match self.member {
-                "nvidia/gb202/gsp/bootloader-570.211.01.bin" => {
-                    "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c"
-                }
-                "nvidia/gb202/gsp/fmc-570.211.01.bin" => {
-                    "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB202.c"
-                }
-                other => other,
-            };
             format!(
-                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/{}/{bindata}",
-                self.revision
+                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/{}/{}",
+                self.revision, self.member
             )
         } else if self.source == NVIDIA_LINUX_DRIVER {
-            format!(
-                "{}/{}/NVIDIA-Linux-x86_64-{}.run",
-                self.source, self.revision, self.revision
-            )
+            format!("{}/{}/{}", self.source, self.revision, self.member)
         } else {
             format!("{}/-/raw/{}/{}", self.source, self.revision, self.member)
         }
@@ -99,9 +171,12 @@ impl Artifact {
     /// Every source of the member at the pinned revision, the one to try
     /// first first: linux-firmware's git.kernel.org repository, then its
     /// GitLab mirror, whose unauthenticated traffic has an hourly per-IP
-    /// limit; or NVIDIA's primary and US download mirrors for release
-    /// archives. The pinned hash is checked whichever answers.
+    /// limit; NVIDIA's primary, then US download host for its drivers. The
+    /// pinned hash is checked whichever answers.
     pub fn urls(&self) -> Vec<alloc::string::String> {
+        if let Some((release, part)) = nvidia_gsp(self) {
+            return release.source(part).urls();
+        }
         if self.source == LINUX_FIRMWARE {
             alloc::vec![
                 format!(
@@ -114,8 +189,8 @@ impl Artifact {
             alloc::vec![
                 self.url(),
                 format!(
-                    "{NVIDIA_LINUX_DRIVER_MIRROR}/{}/NVIDIA-Linux-x86_64-{}.run",
-                    self.revision, self.revision
+                    "{NVIDIA_LINUX_DRIVER_MIRROR}/{}/{}",
+                    self.revision, self.member
                 ),
             ]
         } else {
@@ -765,17 +840,11 @@ const GSP_LICENSE: Artifact = Artifact {
     sha256: "bc5225a57f49c5249dcf238e4ae6437811677a2a8a7f579c3d839e058653ee44",
 };
 
-const fn gsp_from(
-    source: &'static str,
-    revision: &'static str,
-    member: &'static str,
-    length: usize,
-    sha256: &'static str,
-) -> Recipe {
+const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
     Recipe {
         image: Artifact {
-            source,
-            revision,
+            source: LINUX_FIRMWARE,
+            revision: GSP_REVISION,
             member,
             length,
             sha256,
@@ -785,13 +854,108 @@ const fn gsp_from(
     }
 }
 
-const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
-    gsp_from(LINUX_FIRMWARE, GSP_REVISION, member, length, sha256)
+/// An image of an [`NvidiaGsp`] release.
+const fn nvidia_image(
+    source: &'static str,
+    revision: &'static str,
+    member: &'static str,
+    length: usize,
+    sha256: &'static str,
+    license: &'static Artifact,
+) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source,
+            revision,
+            member,
+            length,
+            sha256,
+        },
+        license,
+        consumer: Consumer::Nouveau,
+    }
 }
 
-/// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`], and the
-/// unversioned ACR bootloader Turing's FWSEC path loads beside them
-/// ([`ACR_BOOTLOADER`]).
+/// open-gpu-kernel-modules at its tag `570.211.01`.
+const OPEN_GPU_570_211_01: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
+
+/// GeForce Blackwell's GSP-RM 570.211.01 (`gb202` directory).
+pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
+    bindata_chip: "GB202",
+    bootloader_source: Artifact {
+        source: NVIDIA_OPEN_GPU,
+        revision: OPEN_GPU_570_211_01,
+        member: "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c",
+        length: 2_517_198,
+        sha256: "b439c85d1fb4f6d1aba262008f28b824547998211314ec5bdc5cf712c7aadfa1",
+    },
+    fmc_source: Artifact {
+        source: NVIDIA_OPEN_GPU,
+        revision: OPEN_GPU_570_211_01,
+        member: "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB202.c",
+        length: 1_254_981,
+        sha256: "7cb11763c4c80f1e212624819a1ec9f4a97cd17c5f6ed3457cecc256586bf0c9",
+    },
+    // The stream starts after the installer's 164,426-byte script; its
+    // first file, `firmware/gsp_ga10x.bin`, ends within 52,500,000 bytes.
+    installer_prefix: Artifact {
+        source: NVIDIA_LINUX_DRIVER,
+        revision: "570.211.01",
+        member: "NVIDIA-Linux-x86_64-570.211.01.run",
+        length: 52_500_000,
+        sha256: "3788bd873fb7298b3679e159c1a6824584be2552af45534caf290eec7f4674c0",
+    },
+    installer_offset: 164_426,
+    installer_length: 376_192_072,
+    images: [
+        nvidia_image(
+            NVIDIA_OPEN_GPU,
+            OPEN_GPU_570_211_01,
+            "nvidia/gb202/gsp/bootloader-570.211.01.bin",
+            200812,
+            "e5e505fb453bcd618a4966464aa601e97a1ced2b1d450cab5bcb69e4043dc7f2",
+            &GSP_LICENSE,
+        ),
+        nvidia_image(
+            NVIDIA_OPEN_GPU,
+            OPEN_GPU_570_211_01,
+            "nvidia/gb202/gsp/fmc-570.211.01.bin",
+            199820,
+            "e0950cdd16fe7045adbce11543f5b6d13146fca89e78158a9ab07d28dcbe576a",
+            &GSP_LICENSE,
+        ),
+        nvidia_image(
+            NVIDIA_LINUX_DRIVER,
+            "570.211.01",
+            "nvidia/gb202/gsp/gsp-570.211.01.bin",
+            64116464,
+            "3ce89a251900d0238d0593e4b9eb039c4571c6c54d09661fad7399f89e37d4bc",
+            &GSP_LICENSE,
+        ),
+    ],
+};
+
+/// The [`NvidiaGsp`] release `image` is one of, and which.
+pub fn nvidia_gsp(image: &Artifact) -> Option<(&'static NvidiaGsp, NvidiaPart)> {
+    GSP_RELEASES.iter().find_map(|row| {
+        let GspOrigin::Nvidia(release) = row.origin else {
+            return None;
+        };
+        let part = release
+            .images
+            .iter()
+            .position(|recipe| recipe.image == *image)?;
+        Some((
+            release,
+            [NvidiaPart::Bootloader, NvidiaPart::Fmc, NvidiaPart::Gsp][part],
+        ))
+    })
+}
+
+/// Every GSP-RM file nouveau loads: linux-firmware's for each family of a
+/// [`GspOrigin::LinuxFirmware`] release, an [`NvidiaGsp`]'s images for the
+/// others, and the unversioned ACR bootloader Turing's FWSEC path loads
+/// beside them ([`ACR_BOOTLOADER`]).
 pub const GSP: &[Recipe] = &[
     gsp(
         "nvidia/ad102/gsp/booter_load-570.144.bin",
@@ -858,27 +1022,9 @@ pub const GSP: &[Recipe] = &[
         198028,
         "bc7497c2d8116cceec2fe5638081d60b8f9c0e3dceb0b57dc93950c84909ce21",
     ),
-    gsp_from(
-        NVIDIA_OPEN_GPU,
-        GB20X_OPEN_GPU_REVISION,
-        "nvidia/gb202/gsp/bootloader-570.211.01.bin",
-        200812,
-        "e5e505fb453bcd618a4966464aa601e97a1ced2b1d450cab5bcb69e4043dc7f2",
-    ),
-    gsp_from(
-        NVIDIA_OPEN_GPU,
-        GB20X_OPEN_GPU_REVISION,
-        "nvidia/gb202/gsp/fmc-570.211.01.bin",
-        199820,
-        "e0950cdd16fe7045adbce11543f5b6d13146fca89e78158a9ab07d28dcbe576a",
-    ),
-    gsp_from(
-        NVIDIA_LINUX_DRIVER,
-        GB20X_GSP_RELEASE,
-        "nvidia/gb202/gsp/gsp-570.211.01.bin",
-        64116464,
-        "3ce89a251900d0238d0593e4b9eb039c4571c6c54d09661fad7399f89e37d4bc",
-    ),
+    GB20X_570_211_01.images[0],
+    GB20X_570_211_01.images[1],
+    GB20X_570_211_01.images[2],
     gsp(
         "nvidia/gh100/gsp/bootloader-570.144.bin",
         168044,
@@ -1527,11 +1673,10 @@ fn acr_directory(chip: &str) -> Option<&'static str> {
 
 /// The GSP-RM release nouveau asks for on the chips of a `gsp` directory
 /// ([`gsp_directory`]): its firmware list names one release per family.
-fn gsp_release(directory: &str) -> &'static str {
-    match directory {
-        "gb202" => GB20X_GSP_RELEASE,
-        _ => GSP_RELEASE,
-    }
+pub fn gsp_release(directory: &str) -> Option<&'static GspRelease> {
+    GSP_RELEASES
+        .iter()
+        .find(|row| row.directories.contains(&directory))
 }
 
 /// nouveau's request for a chip's GSP-RM file, through `WHENCE`'s links: the
@@ -1553,7 +1698,7 @@ fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     let (chip, file) = named.split_once("/gsp/")?;
     let directory = gsp_directory(chip)?;
     let (kind, release) = file.strip_suffix(".bin")?.split_once('-')?;
-    if release != gsp_release(directory) {
+    if release != gsp_release(directory)?.release {
         return None;
     }
     let owner = match (directory, kind) {
@@ -1605,7 +1750,10 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
         revision: "linux-firmware",
         board: None,
     };
-    let release = gsp_directory(chip).map_or(GSP_RELEASE, gsp_release);
+    let release = gsp_directory(chip)
+        .and_then(gsp_release)
+        .ok_or_else(|| Error(format!("{chip} is no chip nouveau runs GSP-RM on")))?
+        .release;
     let mut found = false;
     for kind in GSP_KINDS {
         let name = format!("nvidia/{chip}/gsp/{kind}-{release}.bin");
@@ -2443,6 +2591,157 @@ mod tests {
         assert_eq!(xe_member("i915/skl_guc_70.bin", "intel").map(|_| ()), None);
     }
 
+    /// The `(chip, release)` pairs nouveau's GSP firmware lists name, and
+    /// the release strings of its `*_gsps[]` entries, from the patched
+    /// checkout when it is there, else from the lines Stela's patch series
+    /// adds and removes (which is where a release change is made).
+    fn nouveau_gsp_releases() -> (
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        bool,
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party");
+        let directory = root.join("linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp");
+        // `NVKM_GSP_FIRMWARE_FMC(gb202, 570.211.01);` names a chip's files.
+        let pair = |line: &str| -> Option<(String, String)> {
+            let rest = line.split("NVKM_GSP_FIRMWARE_").nth(1)?;
+            let (_, args) = rest.split_once('(')?;
+            let (chip, release) = args.split_once(')')?.0.split_once(',')?;
+            Some((chip.trim().to_owned(), release.trim().to_owned()))
+        };
+        let mut chips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let checkout = std::fs::read_dir(&directory)
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false);
+        if checkout {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|e| e != "c") {
+                    continue;
+                }
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    if let Some((chip, release)) = pair(line) {
+                        chips.entry(chip).or_default().insert(release);
+                    }
+                }
+            }
+            return (chips, true);
+        }
+        let mut patches: Vec<_> = std::fs::read_dir(root.join("patches/linux"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        patches.sort();
+        for patch in patches {
+            let mut gsp_file = false;
+            for line in std::fs::read_to_string(&patch).unwrap().lines() {
+                if let Some(path) = line.strip_prefix("+++ ") {
+                    gsp_file = path.contains("nvkm/subdev/gsp/") && path.ends_with(".c");
+                    continue;
+                }
+                if !gsp_file || line.starts_with("---") {
+                    continue;
+                }
+                let Some((chip, release)) = line.get(1..).and_then(pair) else {
+                    continue;
+                };
+                match line.as_bytes()[0] {
+                    b'+' => {
+                        chips.entry(chip).or_default().insert(release);
+                    }
+                    b'-' => {
+                        if let Some(set) = chips.get_mut(&chip) {
+                            set.remove(&release);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        chips.retain(|_, set| !set.is_empty());
+        (chips, false)
+    }
+
+    #[test]
+    fn nouveau_the_release_table_and_the_recipes_name_the_same_gsp_releases() {
+        let (chips, checkout) = nouveau_gsp_releases();
+        // The series moves GeForce Blackwell; a checkout names every family.
+        for chip in ["gb202", "gb203", "gb205", "gb206", "gb207"] {
+            assert_eq!(
+                chips.get(chip).map(|releases| releases.len()),
+                Some(1),
+                "nouveau names no single release for {chip}"
+            );
+        }
+        if checkout {
+            assert!(chips.contains_key("tu102") && chips.contains_key("ad102"));
+        }
+        for (chip, releases) in &chips {
+            let directory = gsp_directory(chip).unwrap_or_else(|| panic!("{chip}"));
+            let row = gsp_release(directory).unwrap_or_else(|| panic!("{directory}"));
+            // nouveau tries its newest release first; older ones it lists
+            // (535.113.01) are only fallbacks Stela provides no files for.
+            let version = |release: &str| -> Vec<u32> {
+                release
+                    .split('.')
+                    .map(|part| part.parse().unwrap())
+                    .collect()
+            };
+            let newest = releases.iter().max_by_key(|release| version(release));
+            assert_eq!(
+                newest.map(String::as_str),
+                Some(row.release),
+                "nouveau and GSP_RELEASES differ on {chip}"
+            );
+            // Every file nouveau asks for on the chip has a recipe of that
+            // release.
+            let mut inventory = Inventory::default();
+            require_gsp(&mut inventory, chip).unwrap();
+            for request in inventory.requests() {
+                if request.name.ends_with(ACR_BOOTLOADER) {
+                    continue;
+                }
+                assert!(
+                    request.name.ends_with(&format!("-{}.bin", row.release)),
+                    "{}",
+                    request.name
+                );
+                assert!(recipe(request).is_some(), "{}", request.name);
+            }
+        }
+        // Each family is in exactly one row; each NVIDIA release's images
+        // are in the catalog, and the catalog's NVIDIA images all belong to
+        // a row.
+        for (index, row) in GSP_RELEASES.iter().enumerate() {
+            for directory in row.directories {
+                assert!(
+                    GSP_RELEASES[index + 1..]
+                        .iter()
+                        .all(|other| !other.directories.contains(directory))
+                );
+            }
+            if let GspOrigin::Nvidia(release) = row.origin {
+                for (recipe, kind) in release.images.iter().zip(["bootloader", "fmc", "gsp"]) {
+                    let member = format!(
+                        "nvidia/{}/gsp/{kind}-{}.bin",
+                        row.directories[0], row.release
+                    );
+                    assert_eq!(recipe.image.member, member);
+                    assert!(GSP.iter().any(|known| known.image == recipe.image));
+                }
+            }
+        }
+        for recipe in GSP {
+            let nvidia = matches!(recipe.image.source, NVIDIA_OPEN_GPU | NVIDIA_LINUX_DRIVER);
+            assert_eq!(
+                nvidia_gsp(&recipe.image).is_some(),
+                nvidia,
+                "{}",
+                recipe.image.member
+            );
+        }
+    }
+
     fn gsp_member(name: &str) -> Option<&'static str> {
         let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":name,"target":{"driver":"nouveau","hardware":"nvidia",
@@ -2614,27 +2913,38 @@ mod tests {
         );
         assert_eq!(artifact.urls(), [artifact.url()]);
         for recipe in super::super::bundle::recipes() {
-            assert_eq!(
-                recipe.image.urls().len(),
-                if matches!(recipe.image.source, WIRELESS_REGDB | NVIDIA_OPEN_GPU) {
-                    1
-                } else {
-                    2
-                },
-                "{}",
-                recipe.image.member
-            );
-            assert_eq!(
-                recipe.license.urls().len(),
-                if recipe.license.source == WIRELESS_REGDB {
-                    1
-                } else {
-                    2
-                },
-                "{}",
-                recipe.license.member
-            );
+            // An image built from NVIDIA's release has its download's sources.
+            let image = nvidia_gsp(&recipe.image)
+                .map_or(&recipe.image, |(release, part)| release.source(part));
+            for artifact in [image, recipe.license] {
+                assert_eq!(
+                    artifact.urls().len(),
+                    if matches!(artifact.source, WIRELESS_REGDB | NVIDIA_OPEN_GPU) {
+                        1
+                    } else {
+                        2
+                    },
+                    "{}",
+                    artifact.member
+                );
+            }
         }
+        // NVIDIA's images come from where NVIDIA publishes them.
+        let [bootloader, _, gsp] = &GB20X_570_211_01.images;
+        assert_eq!(
+            bootloader.image.urls(),
+            [
+                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/498793d5e2a86c981b83c1bfb31f1f4a082d0f7b/src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c"
+            ]
+        );
+        assert_eq!(
+            gsp.image.urls(),
+            [
+                "https://download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run",
+                "https://us.download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run"
+            ]
+        );
+
         let value = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":"regulatory.db", "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},"minimum_bytes":8
         }]});

@@ -1,81 +1,45 @@
-//! Extraction of pinned NVIDIA R570.211.01 `GB20x` GSP firmware images from
-//! NVIDIA's upstream release artifacts (`open-gpu-kernel-modules` `bindata`
-//! sources and the `zstd`-compressed `NVIDIA-Linux-x86_64` tar stream), before
-//! `linux-firmware` publishes them. Every wire slice and extracted image is
-//! verified against its pinned SHA-256.
+//! GSP-RM images of a release NVIDIA publishes and linux-firmware does not
+//! have ([`recipes::NvidiaGsp`]): the bootloader and GSP-FMC built from
+//! open-gpu-kernel-modules' generated `bindata` sources, the GSP-RM image cut
+//! out of the driver installer's `zstd` tar stream. Each download is checked
+//! against its pin before it is parsed, and each image after.
 use anyhow::{Context, Result, bail, ensure};
 use std::io::Read;
-use stela_loader::host_firmware::recipes::{
-    Artifact, GB20X_GSP_RELEASE, GB20X_OPEN_GPU_REVISION, NVIDIA_LINUX_DRIVER, NVIDIA_OPEN_GPU,
-};
+use stela_loader::host_firmware::recipes::{self, Artifact, NvidiaGsp, NvidiaPart};
 
-/// How a recipe's pinned upstream wire bytes map to the final firmware image.
+/// How an image's pinned download maps to the image.
 pub(super) struct WireSpec {
-    /// Pinned length and SHA-256 of the raw HTTP response (or slice).
-    pub(super) wire: Artifact,
-    /// Byte offset and total resource size when fetching a bounded Range slice.
+    /// Pinned length and SHA-256 of the download (or its byte range).
+    pub(super) wire: &'static Artifact,
+    /// Byte offset and total size of the file when the download is a range.
     pub(super) slice: Option<(u64, u64)>,
-    /// Deterministic unpacker from `wire` bytes to the pinned firmware image.
-    pub(super) extract: fn(&[u8]) -> Result<Vec<u8>>,
+    release: &'static NvidiaGsp,
+    part: NvidiaPart,
 }
 
-const BOOTLOADER_WIRE: Artifact = Artifact {
-    source: NVIDIA_OPEN_GPU,
-    revision: GB20X_OPEN_GPU_REVISION,
-    member: "nvidia/gb202/gsp/bootloader-570.211.01.bin",
-    length: 2_517_198,
-    sha256: "b439c85d1fb4f6d1aba262008f28b824547998211314ec5bdc5cf712c7aadfa1",
-};
+impl WireSpec {
+    /// The image built from `wire`, the checked download.
+    pub(super) fn extract(&self, wire: &[u8]) -> Result<Vec<u8>> {
+        let chip = self.release.bindata_chip;
+        match self.part {
+            NvidiaPart::Bootloader => extract_bootloader(wire, chip),
+            NvidiaPart::Fmc => extract_fmc(wire, chip),
+            NvidiaPart::Gsp => extract_gsp_from_zstd_tar(wire),
+        }
+    }
+}
 
-const FMC_WIRE: Artifact = Artifact {
-    source: NVIDIA_OPEN_GPU,
-    revision: GB20X_OPEN_GPU_REVISION,
-    member: "nvidia/gb202/gsp/fmc-570.211.01.bin",
-    length: 1_254_981,
-    sha256: "7cb11763c4c80f1e212624819a1ec9f4a97cd17c5f6ed3457cecc256586bf0c9",
-};
-
-/// `NVIDIA-Linux-x86_64-570.211.01.run` (`376,192,072` bytes): its `zstd` tar
-/// stream starts at byte `164,426`, and `firmware/gsp_ga10x.bin` is its first
-/// file (`uncompressed offset 1024`, `64,116,464` bytes), complete within the
-/// first `52,500,000` compressed bytes.
-const GSP_RUN_OFFSET: u64 = 164_426;
-const GSP_RUN_TOTAL: u64 = 376_192_072;
-const GSP_WIRE: Artifact = Artifact {
-    source: NVIDIA_LINUX_DRIVER,
-    revision: GB20X_GSP_RELEASE,
-    member: "nvidia/gb202/gsp/gsp-570.211.01.bin",
-    length: 52_500_000,
-    sha256: "3788bd873fb7298b3679e159c1a6824584be2552af45534caf290eec7f4674c0",
-};
-
+/// How `artifact`, an image of an NVIDIA release, is made; `None` for any
+/// other file.
 pub(super) fn spec(artifact: &Artifact) -> Option<WireSpec> {
-    if artifact.source == NVIDIA_OPEN_GPU && artifact.revision == GB20X_OPEN_GPU_REVISION {
-        return match artifact.member {
-            "nvidia/gb202/gsp/bootloader-570.211.01.bin" => Some(WireSpec {
-                wire: BOOTLOADER_WIRE,
-                slice: None,
-                extract: extract_bootloader,
-            }),
-            "nvidia/gb202/gsp/fmc-570.211.01.bin" => Some(WireSpec {
-                wire: FMC_WIRE,
-                slice: None,
-                extract: extract_fmc,
-            }),
-            _ => None,
-        };
-    }
-    if artifact.source == NVIDIA_LINUX_DRIVER
-        && artifact.revision == GB20X_GSP_RELEASE
-        && artifact.member == "nvidia/gb202/gsp/gsp-570.211.01.bin"
-    {
-        return Some(WireSpec {
-            wire: GSP_WIRE,
-            slice: Some((GSP_RUN_OFFSET, GSP_RUN_TOTAL)),
-            extract: extract_gsp_from_zstd_tar,
-        });
-    }
-    None
+    let (release, part) = recipes::nvidia_gsp(artifact)?;
+    Some(WireSpec {
+        wire: release.source(part),
+        slice: (part == NvidiaPart::Gsp)
+            .then_some((release.installer_offset, release.installer_length)),
+        release,
+        part,
+    })
 }
 
 /// Extract one named `NvU8` array from an `open-gpu-kernel-modules` `bindata` C
@@ -142,12 +106,19 @@ fn parse_bindata_array(source: &str, symbol: &str) -> Result<Vec<u8>> {
     bail!("cannot decompress bindata array {symbol} to {expected_size} bytes")
 }
 
-/// Build `nvidia/gb202/gsp/bootloader-<ver>.bin` (`nvfw_bin_hdr` + descriptor +
-/// ucode image), matching Nouveau's `extract-firmware-nouveau.py`.
-fn extract_bootloader(wire: &[u8]) -> Result<Vec<u8>> {
+/// Build `nvidia/<chip>/gsp/bootloader-<ver>.bin` (`nvfw_bin_hdr` +
+/// descriptor + ucode image), as nouveau's `extract-firmware-nouveau.py`
+/// does and linux-firmware's files of earlier releases are.
+fn extract_bootloader(wire: &[u8], chip: &str) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(wire).context("bindata source is not UTF-8")?;
-    let desc = parse_bindata_array(text, "kgspBinArchiveGspRmBoot_GB202_ucode_desc_prod_data")?;
-    let img = parse_bindata_array(text, "kgspBinArchiveGspRmBoot_GB202_ucode_image_prod_data")?;
+    let desc = parse_bindata_array(
+        text,
+        &format!("kgspBinArchiveGspRmBoot_{chip}_ucode_desc_prod_data"),
+    )?;
+    let img = parse_bindata_array(
+        text,
+        &format!("kgspBinArchiveGspRmBoot_{chip}_ucode_image_prod_data"),
+    )?;
 
     let hdr_off: u32 = 24;
     let desc_len = u32::try_from(desc.len()).context("descriptor too large")?;
@@ -165,26 +136,20 @@ fn extract_bootloader(wire: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Build `nvidia/gb202/gsp/fmc-<ver>.bin` in the 6-section ELF32 layout
+/// Build `nvidia/<chip>/gsp/fmc-<ver>.bin` in the 6-section ELF32 layout
 /// `gh100.c:elf_validate_sections()` validates (including CRC-32 in `sh_info`).
-fn extract_fmc(wire: &[u8]) -> Result<Vec<u8>> {
+fn extract_fmc(wire: &[u8], chip: &str) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(wire).context("bindata source is not UTF-8")?;
-    let hash = parse_bindata_array(
-        text,
-        "kgspBinArchiveGspRmFmcGfwProdSigned_GB202_ucode_hash_data",
-    )?;
-    let sig = parse_bindata_array(
-        text,
-        "kgspBinArchiveGspRmFmcGfwProdSigned_GB202_ucode_sig_data",
-    )?;
-    let pkey = parse_bindata_array(
-        text,
-        "kgspBinArchiveGspRmFmcGfwProdSigned_GB202_ucode_pkey_data",
-    )?;
-    let img = parse_bindata_array(
-        text,
-        "kgspBinArchiveGspRmFmcGfwProdSigned_GB202_ucode_image_data",
-    )?;
+    let array = |name: &str| {
+        parse_bindata_array(
+            text,
+            &format!("kgspBinArchiveGspRmFmcGfwProdSigned_{chip}_ucode_{name}_data"),
+        )
+    };
+    let hash = array("hash")?;
+    let sig = array("sig")?;
+    let pkey = array("pkey")?;
+    let img = array("image")?;
 
     const SHSTRTAB: &[u8] = b"\0.shstrtab\0hash\0signature\0publickey\0image\0";
     // Exact 52-byte ELF32 header expected by `gh100.c:elf_header`.
@@ -390,7 +355,7 @@ mod tests {
             hex_list(&compressed_desc),
             hex_list(&[0x55_u8; 16]),
         );
-        let bl = extract_bootloader(boot_src.as_bytes()).unwrap();
+        let bl = extract_bootloader(boot_src.as_bytes(), "GB202").unwrap();
         assert_eq!(bl.len(), 24 + 84 + 16);
         assert_eq!(u32::from_le_bytes(bl[0..4].try_into().unwrap()), 0x10de);
         assert_eq!(u32::from_le_bytes(bl[16..20].try_into().unwrap()), 24 + 84);
@@ -411,7 +376,7 @@ mod tests {
             hex_list(&[9, 10, 11, 12, 13]),
             hex_list(&[14, 15, 16, 17, 18, 19, 20, 21]),
         );
-        let fmc = extract_fmc(fmc_src.as_bytes()).unwrap();
+        let fmc = extract_fmc(fmc_src.as_bytes(), "GB202").unwrap();
         assert_eq!(&fmc[..4], b"\x7fELF");
         // Verify CRC-32 stored in section[2].sh_info (`hash`).
         let sh2_info =

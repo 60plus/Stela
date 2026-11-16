@@ -226,13 +226,21 @@ fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
     if let Some(spec) = nvidia::spec(artifact) {
         let wire = download_slice(
             client,
-            &spec.wire,
+            spec.wire,
             spec.slice,
-            &artifact.urls(),
+            &spec.wire.urls(),
             &mut std::thread::sleep,
         )?;
-        let bytes = (spec.extract)(&wire)?;
-        artifact.verify(&bytes)?;
+        // The download matched its pin, so a failure here is Stela's.
+        let bytes = spec
+            .extract(&wire)
+            .and_then(|bytes| Ok(artifact.verify(&bytes).map(|()| bytes)?))
+            .with_context(|| {
+                format!(
+                    "cannot build {} from NVIDIA's {}",
+                    artifact.member, spec.wire.member
+                )
+            })?;
         return Ok(bytes);
     }
     download_from(client, artifact, &artifact.urls(), &mut std::thread::sleep)
@@ -1817,13 +1825,13 @@ mod tests {
         let http = client();
         let gb20x: Vec<_> = bundle::complete()
             .into_iter()
-            .map(|(object, _)| object)
-            .filter(|a| {
-                a.source == recipes::NVIDIA_OPEN_GPU || a.source == recipes::NVIDIA_LINUX_DRIVER
-            })
+            .filter(|(object, _)| recipes::nvidia_gsp(object).is_some())
             .collect();
         assert_eq!(gb20x.len(), 3);
-        for artifact in gb20x {
+        for artifact in gb20x
+            .into_iter()
+            .flat_map(|(object, notice)| [object, notice])
+        {
             let bytes = download(&http, artifact).unwrap();
             artifact.verify(&bytes).unwrap();
         }
