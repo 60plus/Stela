@@ -986,12 +986,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
-        let current = self.current_key(next_pc).and_then(|key| {
-            let held = cache
-                .targets
-                .find(cache.targets.slot(next_pc, key), next_pc, key);
-            (held.pc == next_pc && held.key == key).then_some(held)
-        });
+        // A relinked exit keeps what its cell holds, which its transfers
+        // entered: a promotion runs on any PE, whose own context may not
+        // translate the target at all. Else the entry this PE's
+        // translation of the target names now.
+        let current = cache
+            .targets
+            .site_cell(site)
+            .filter(|held| held.pc == next_pc && held.key != 0)
+            .or_else(|| self.translated_entry(cache, next_pc));
         let cell = cache.targets.link_cell(site, next_pc, current);
         let number = cache.targets.site_cell_number(site);
         if let Some(number) = number {
@@ -1051,10 +1054,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
         true
     }
 
+    /// The block table's entry of `pc` for the key this PE's translation
+    /// of its page names now ([`Self::current_key`]), if both are there:
+    /// what a cell of an exit to `pc` starts with.
+    fn translated_entry(&self, cache: &board::Cache, pc: u64) -> Option<chain::LookupEntry> {
+        let key = self.current_key(pc)?;
+        let held = cache.targets.find(cache.targets.slot(pc, key), pc, key);
+        (held.pc == pc && held.key == key).then_some(held)
+    }
+
     /// Give the exits of the next [`PROMOTION_CELLS`] stamped cells whose
     /// cell probe transfers made them hot a stamped tail
     /// ([`chain::stamped_tail`]): a bounded step every [`PROMOTION_RUNS`]
     /// native runs, sweeping every stamped cell in turn.
+    ///
+    /// The stamped tail enters the block the cell holds, which every
+    /// transfer that made the cell hot entered, whatever this PE's own
+    /// context translates now: each PE's stamp still requires its own
+    /// translation of the target to name the cell's key. A cell that holds
+    /// no entry yet stays hot for a later step; one whose block takes no
+    /// transfer of the exit's BTYPE settles with the exit as it is.
     pub(super) fn promote_hot_exits(&mut self) {
         let from = self.promotion_cursor;
         let to = from + PROMOTION_CELLS;
@@ -1066,9 +1085,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(board::LockSite::Link);
         for link in cache.targets.hot_links(from..to) {
-            if let Some(cell) = cache.targets.site_cell_number(link.site) {
-                // Hot once: tried now whatever the link finds.
-                cache.targets.settle_heat(cell);
+            let Some(cell) = cache.targets.site_cell_number(link.site) else {
+                continue;
+            };
+            let Some(held) = cache
+                .targets
+                .site_cell(link.site)
+                .filter(|held| held.pc == link.pc && held.key != 0)
+            else {
+                self.statistics.promotions_waiting += 1;
+                continue;
+            };
+            // Hot once: tried now whatever the link finds.
+            cache.targets.settle_heat(cell);
+            if link.btype != 0 && held.targets & 1 << link.btype == 0 {
+                continue;
             }
             self.link_through_cell(
                 &mut cache,

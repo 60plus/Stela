@@ -3314,6 +3314,95 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let _ = number;
 }
 
+/// A promotion runs on whichever PE sweeps, often in another process or
+/// at another EL than the transfers that made the cell hot: its stamped
+/// tail enters the block the cell holds, and the cell keeps its entry. A
+/// cell holding nothing yet stays hot, and the sweep after its entry came
+/// stamps it.
+#[test]
+fn a_promotion_in_another_context_stamps_what_the_cell_holds() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let far = base + 0x1000;
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
+    machine.step().unwrap();
+    machine.step().unwrap();
+    let first = &machine.code.blocks[0];
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
+    let (number, cells, held) = {
+        let mut cache = machine.code.cache();
+        let held = cache.targets.site_cell(site).expect("a cell");
+        (
+            cache.targets.site_cell_number(site).expect("a cell"),
+            cache.targets.stamped_cells(),
+            held,
+        )
+    };
+    assert_eq!(held.pc, far);
+    assert_ne!(held.key, 0);
+    let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
+        as *const core::sync::atomic::AtomicU32;
+    // SAFETY: the board's stamped cells live while it does; the word is an atomic.
+    let heat = unsafe { &*heat };
+    let sweep = |machine: &mut Machine<FakeHost, NoDevices>| {
+        for _ in 0..chain::STAMPED_CELLS / 256 {
+            machine.promote_hot_exits();
+        }
+    };
+    // The sweeping PE now runs in contexts no fetch translated a page in.
+    let contexts = machine.chain.contexts();
+    machine
+        .chain
+        .set_contexts([contexts[0] + 1000, contexts[1] + 1000]);
+    assert_eq!(machine.current_key(far), None);
+    // Its cell emptied, as a forget of its entry leaves it: still hot after
+    // a sweep, which patches nothing.
+    {
+        let mut cache = machine.code.cache();
+        let frame = chain::key_frame(held.key);
+        cache.targets.forget_frames(frame..=frame, |_| true);
+        assert_eq!(cache.targets.site_cell(site).map(|cell| cell.key), Some(0));
+    }
+    heat.store(chain::HOT_CELL, Ordering::Relaxed);
+    let patches = machine.host.patches.len();
+    sweep(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches);
+    assert_eq!(machine.statistics.promotions_waiting, 1);
+    // The table takes the entry again, and the cell with it.
+    {
+        let mut cache = machine.code.cache();
+        let slot = cache.targets.slot(far, held.key);
+        cache.targets.set(slot, held);
+        assert_eq!(cache.targets.site_cell(site), Some(held));
+    }
+    sweep(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches + 2);
+    assert_eq!(machine.statistics.stamped_tails, 1);
+    let (tail, bytes) = machine.host.patches[patches].clone();
+    assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+    let direct = (0..bytes.len() - 5).any(|at| {
+        bytes[at] == 0xe9 && {
+            let relative = i32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap());
+            (tail as u64 + at as u64 + 5).wrapping_add(relative as i64 as u64) == held.entry
+        }
+    });
+    assert!(direct, "no direct jump to the held block");
+    let cache = machine.code.cache();
+    assert_eq!(cache.targets.site_cell(site), Some(held));
+    assert_eq!(cache.targets.stamped_tails(), 1);
+}
+
 /// The cell probe counts its transfers through cells past the stamped
 /// ones in the low 32 bits of the control's `heat`: each native call
 /// starts it at 0 and the engine adds what it holds after.
@@ -7300,6 +7389,16 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
         for _ in 0..chain::STAMPED_CELLS / 256 {
             machine.promote_hot_exits();
         }
+        if !accepts {
+            // Settled with its cell tail: no stamped tail could enter the
+            // block, and a relink would only install the same tail again.
+            assert_eq!(machine.host.patches.len(), patches);
+            assert_eq!(machine.statistics.stamped_tails, 0);
+            let cache = machine.code.cache();
+            assert!(cache.targets.cell_heat(number) >= chain::HOT_CELL);
+            assert!(cache.targets.hot_links(number..number + 1).is_empty());
+            continue;
+        }
         assert_eq!(machine.host.patches.len(), patches + 2);
         let (tail, bytes) = machine.host.patches[patches].clone();
         assert_eq!(
@@ -7309,18 +7408,13 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
                 chain::jump(site, tail as u64).unwrap().to_vec()
             )
         );
-        if accepts {
-            assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
-            assert_eq!(machine.statistics.stamped_tails, 1);
-            // mov r9, block | BTYPE 0b01 above it.
-            let named = u64::from(held.block) | 1 << chain::BLOCK_BTYPE_SHIFT;
-            let mut movabs = vec![0x49, 0xb9];
-            movabs.extend(named.to_le_bytes());
-            assert!(bytes.windows(10).any(|window| window == movabs));
-        } else {
-            assert_eq!(bytes.len(), chain::CELL_TAIL_BYTES);
-            assert_eq!(machine.statistics.stamped_tails, 0);
-        }
+        assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+        assert_eq!(machine.statistics.stamped_tails, 1);
+        // mov r9, block | BTYPE 0b01 above it.
+        let named = u64::from(held.block) | 1 << chain::BLOCK_BTYPE_SHIFT;
+        let mut movabs = vec![0x49, 0xb9];
+        movabs.extend(named.to_le_bytes());
+        assert!(bytes.windows(10).any(|window| window == movabs));
     }
 }
 

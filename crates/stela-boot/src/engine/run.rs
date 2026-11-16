@@ -1988,8 +1988,10 @@ impl Heartbeat {
             let mut predicted = 0;
             // All PEs: cell probe transfers through cells past the stamped
             // ones, then the cells held, those past the stamped ones and
-            // those holding no entry (levels).
+            // those holding no entry (levels), and the hot exits promotion
+            // left waiting for their cell's entry.
             let mut overflow = 0;
+            let mut waiting = 0;
             let mut cells = (0, 0, 0);
             // All PEs: paired returns matched and missed, and calls past
             // the frame bound (`chain::PairCount`).
@@ -2161,6 +2163,7 @@ impl Heartbeat {
                 cells.0 = cells.0.max(now.stamped[promoted + 4]);
                 cells.1 = cells.1.max(now.stamped[promoted + 5]);
                 cells.2 = cells.2.max(now.stamped[promoted + 6]);
+                waiting += now.stamped[promoted + 7].saturating_sub(before.stamped[promoted + 7]);
                 for (total, (now, before)) in
                     pairs.iter_mut().zip(now.pairs.iter().zip(&before.pairs))
                 {
@@ -2365,7 +2368,7 @@ impl Heartbeat {
                 output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
             }
             stamped.push_str(&format!(
-                " in_use={stamped_in_use} overflow={overflow} cells={}/{}/{}",
+                " in_use={stamped_in_use} overflow={overflow} cells={}/{}/{} waiting={waiting}",
                 cells.0, cells.1, cells.2
             ));
             let [matched, missed, refused] = pairs;

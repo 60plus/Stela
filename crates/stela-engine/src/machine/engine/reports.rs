@@ -555,6 +555,9 @@ pub struct Statistics {
     /// Transfers this PE's cell probes made through cells past the stamped
     /// ones, which no promotion reaches (`ChainControl::heat`).
     pub cell_overflow: u64,
+    /// Hot exits a promotion step found whose cell held no entry yet, left
+    /// for a later step.
+    pub promotions_waiting: u64,
     /// The cells exits held, those past the stamped ones and those holding
     /// no entry, when this PE last looked (every promotion step): levels,
     /// as `stamped_in_use`.
@@ -781,6 +784,7 @@ impl core::ops::AddAssign for Statistics {
             predicted_tails,
             stamped_in_use,
             cell_overflow,
+            promotions_waiting,
             cells_live,
             cells_past,
             cells_empty,
@@ -959,6 +963,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
             (&mut self.cell_overflow, cell_overflow),
+            (&mut self.promotions_waiting, promotions_waiting),
             (&mut self.unlinks, unlinks),
             (&mut self.lookups, lookups),
             (&mut self.lookup_hits, lookup_hits),
