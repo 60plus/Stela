@@ -7,7 +7,7 @@ mod image;
 #[cfg(feature = "linux-drm")]
 #[path = "build/imports.rs"]
 mod imports;
-#[cfg(feature = "linux-drm")]
+#[cfg(feature = "nouveau-port")]
 #[path = "build/kbuild.rs"]
 mod kbuild;
 #[cfg(feature = "linux-kernel")]
@@ -71,11 +71,11 @@ fn main() {
         let drivers = vec![
             #[cfg(feature = "nouveau-port")]
             nouveau::port(&linux),
+            #[cfg(feature = "amdgpu-port")]
+            amdgpu::port(&linux),
         ];
         image::link(&linux, drivers);
     }
-    #[cfg(feature = "amdgpu-port")]
-    amdgpu::port(&linux);
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }

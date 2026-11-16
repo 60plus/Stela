@@ -24,9 +24,9 @@ linux-drm = ["linux-kernel", "stela-c-build/linux-registry"]
 # nouveau's hardware resource manager (NVKM), compiled unchanged; it reaches
 # no device until the kernel services it imports are supplied.
 nouveau-port = ["linux-drm"]
-# amdgpu with its display core, compiled unchanged and checked against the
-# environment nouveau runs in; not linked into the image yet.
-amdgpu-port = ["nouveau-port"]
+# amdgpu with its display core, compiled unchanged; its unit joins the
+# image's registrations and AMD's stack its GPUs.
+amdgpu-port = ["linux-drm"]
 # Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
 metal = ["dep:stela-contracts"]
 # The Metal device's native backend over a loaded Vulkan driver (NVK).

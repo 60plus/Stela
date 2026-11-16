@@ -3,9 +3,8 @@
 //! those makefiles give, and the kernel services it imports that the
 //! environment does not yet supply.
 //!
-//! The composite is archived and checked, not linked into the image: its
-//! imports are still open ([`OPEN`]) and its Kconfig entry's selections that
-//! change other drivers are not in the shared profile yet ([`PENDING`]).
+//! The unit of its `module_init` (`amdgpu_drv.c`) is compiled with its
+//! registrations captured, for the build's one registration image.
 use super::native::Linux;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
     thread,
 };
+use stela_c_build::linux_capture::{self as initcalls, UnitSpec};
 use stela_c_build::{kbuild_make::Make, linux::Module};
 
 const AMDGPU: &str = "../../third_party/linux/drivers/gpu/drm/amd/amdgpu";
@@ -22,24 +22,103 @@ const MODULE: Module<'static> = Module {
     file: "drivers/gpu/drm/amd/amdgpu/amdgpu",
 };
 
-/// What `config DRM_AMDGPU` selects that Stela's shared Kconfig does not set,
-/// because setting it also changes nouveau and the DRM core: each needs its
-/// Linux service complete before the profile takes it. amdgpu compiles
-/// without them only as far as its own `IS_ENABLED` branches allow, so the
-/// port is not a valid configuration of the driver until this is empty.
-pub const PENDING: [&str; 6] = [
-    "CONFIG_BACKLIGHT_CLASS_DEVICE",
-    "CONFIG_DRM_CLIENT",
-    "CONFIG_DRM_CLIENT_SELECTION",
-    "CONFIG_DRM_PANEL_BACKLIGHT_QUIRKS",
-    "CONFIG_HWMON",
-    "CONFIG_POWER_SUPPLY",
+/// Whether Stela's Kconfig header sets `symbol`.
+fn defined(autoconf: &str, symbol: &str) -> bool {
+    autoconf.lines().any(|line| {
+        line.strip_prefix("#define ")
+            .is_some_and(|rest| rest.split_whitespace().next() == Some(symbol))
+    })
+}
+
+/// The symbols `config DRM_AMDGPU` selects under the configuration `set`
+/// answers for: every `select` of the entry whose condition, a conjunction
+/// of symbols, holds. The shared profile must hold them all for the port to
+/// be a configuration of the driver that Kconfig allows.
+fn selected(kconfig: &str, set: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+    let entry = kconfig
+        .split("\nconfig ")
+        .find_map(|entry| entry.strip_prefix("DRM_AMDGPU\n"))
+        .ok_or("no config DRM_AMDGPU")?;
+    let mut selected = Vec::new();
+    for line in entry.lines() {
+        let Some(select) = line.trim().strip_prefix("select ") else {
+            continue;
+        };
+        let (symbol, condition) = match select.split_once(" if ") {
+            Some((symbol, condition)) => (symbol, condition),
+            None => (select, ""),
+        };
+        let mut holds = true;
+        for term in condition.split("&&").map(str::trim) {
+            if !term.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(format!("the condition of {line:?} is no conjunction"));
+            }
+            holds &= term.is_empty() || set(&format!("CONFIG_{term}"));
+        }
+        if holds {
+            selected.push(format!("CONFIG_{}", symbol.trim()));
+        }
+    }
+    if selected.is_empty() {
+        return Err("DRM_AMDGPU selects nothing".into());
+    }
+    Ok(selected)
+}
+
+/// The kernel services the composite imports that Stela's Linux environment
+/// lacks, or defines only as a trap, by service. Building fails when the
+/// imports change, so each supplied service leaves this list with its change.
+const OPEN: super::image::Open = &[
+    // As nouveau's list has them: TTM allocates from its own pool and Stela
+    // never swaps it out.
+    (
+        "shmem and page cache",
+        &[
+            "folio_clear_dirty_for_io",
+            "mm_get_unmapped_area",
+            "shmem_read_folio_gfp",
+            "shmem_read_mapping_page_gfp",
+            "shmem_truncate_range",
+            "shmem_writeout",
+        ],
+    ),
+    (
+        "reopening a file without a VFS path",
+        &["stela_linux_reopen_unowned_path"],
+    ),
+    // Only SMU 14's USB-C controller link makes a device link.
+    ("device links", &["device_link_add", "device_link_del"]),
+    // Only the partitions of a partitioned accelerator (amdxcp) are
+    // platform devices.
+    (
+        "platform devices",
+        &[
+            "platform_device_register_full",
+            "platform_device_unregister",
+        ],
+    ),
+    // Only the NUMA placement of an accelerator's memory partitions asks.
+    ("the firmware's memory map", &["page_is_ram"]),
+    // As nouveau's list has them, through hwmon.c and backlight.c.
+    (
+        "the driver core's device lists",
+        &["class_find_device", "device_find_child"],
+    ),
 ];
 
-/// The kernel services the composite imports that neither it nor Stela's
-/// Linux environment defines, one per line. Building fails when the imports
-/// change, so each supplied service leaves the list with its change.
-const OPEN: &str = include_str!("amdgpu.open");
+/// The unit of amdgpu's own `module_init`.
+const INITCALLS: UnitSpec = UnitSpec {
+    scope: stela_c_build::linux_capture::Scope {
+        slice: "gpu",
+        group: "amdgpu",
+        group_ordinal: 34,
+        unit_ordinal: 1,
+        global_ordinal: 34,
+    },
+    source: "drivers/gpu/drm/amd/amdgpu/amdgpu_drv",
+    module: MODULE.name,
+    file: MODULE.file,
+};
 
 /// Variables amdgpu's makefiles read that nothing defines, which Make
 /// expands to nothing: a switch only an out-of-tree build sets, and a warning
@@ -54,16 +133,26 @@ struct Unit {
     remove: Vec<String>,
 }
 
-pub fn port(linux: &Linux) {
+pub fn port(linux: &Linux) -> super::image::Driver {
+    let autoconf = fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header");
     let mut make = Make::default();
-    make.configure(&fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header"))
+    make.configure(&autoconf)
         .unwrap_or_else(|error| panic!("{AUTOCONF}: {error}"));
-    for pending in PENDING {
-        assert!(
-            make.words(pending).expect("a Kconfig value").is_empty(),
-            "{pending} is set: remove it from amdgpu's pending selections"
-        );
-    }
+    let kconfig = Path::new(AMDGPU).join("Kconfig");
+    println!("cargo:rerun-if-changed={}", kconfig.display());
+    let set = |symbol: &str| defined(&autoconf, symbol);
+    let missing = selected(
+        &fs::read_to_string(&kconfig).expect("read amdgpu's Kconfig"),
+        set,
+    )
+    .unwrap_or_else(|error| panic!("{}: {error}", kconfig.display()))
+    .into_iter()
+    .filter(|symbol| !set(symbol))
+    .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "DRM_AMDGPU selects {missing:?}, which Stela's Kconfig does not set"
+    );
     make.set("src", AMDGPU);
     // Linux's arch/x86/Makefile: the flags of a unit that may use floating
     // point, and those such a unit drops. Stela's general-register-only
@@ -76,7 +165,6 @@ pub fn port(linux: &Linux) {
     for file in &make.files {
         println!("cargo:rerun-if-changed={}", file.display());
     }
-    println!("cargo:rerun-if-changed=build/amdgpu.open");
     let words = |make: &mut Make, name: &str| {
         make.words(name)
             .unwrap_or_else(|error| panic!("{name}: {error}"))
@@ -129,7 +217,7 @@ pub fn port(linux: &Linux) {
     // A makefile included twice names its objects twice (the display core
     // lists `dml` in two places); Make links a prerequisite once.
     let mut seen = BTreeSet::new();
-    let units = objects
+    let mut units = objects
         .iter()
         .filter(|object| seen.insert(*object))
         .map(|object| {
@@ -144,6 +232,14 @@ pub fn port(linux: &Linux) {
         .collect::<Vec<_>>();
     // Flags a makefile gives an object the configuration does not build go
     // unused, as in Kbuild.
+    // Compiled below, with its registrations captured.
+    let registering = initcalls::Unit::from(INITCALLS).path();
+    let registering = units.remove(
+        units
+            .iter()
+            .position(|unit| unit.source == registering)
+            .expect("amdgpu's composite holds amdgpu_drv.c"),
+    );
 
     let mut build = stela_c_build::native::configure();
     let mut includes = Vec::new();
@@ -212,37 +308,42 @@ pub fn port(linux: &Linux) {
         failed.len(),
         units.len()
     );
+    let mut registering_build = build.clone();
+    for flag in &registering.remove {
+        registering_build.remove_flag(flag);
+    }
+    for flag in &registering.add {
+        registering_build.flag(flag);
+    }
+    let compiler = initcalls::compiler(&registering_build);
+    let placement = initcalls::Placement::new(
+        &registering.source,
+        &stela_c_build::linux_build::out_dir(),
+        &[
+            Path::new("../.."),
+            compiler.parent().expect("compiler root"),
+        ],
+    )
+    .expect("amdgpu source placement");
+    let captured = initcalls::compile(
+        &registering_build,
+        Path::new("../stela-linux/src/compat/stela/registration.h"),
+        INITCALLS,
+        &placement,
+    );
     build
         .objects(results.into_iter().flatten().flatten())
+        .object(captured.object())
         .compile("stela-amdgpu");
-    let archive = stela_c_build::linux_build::out_dir().join("libstela-amdgpu.a");
-    check_imports(&archive, &[&linux.archive, &linux.common_archive]);
-}
-
-/// Compare the services the driver reaches when linked, directly or through
-/// the environment's objects, and that nothing supplies, with [`OPEN`].
-fn check_imports(port: &Path, environment: &[&Path]) {
-    let open = super::imports::open(port, environment);
-    let listed = OPEN
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    if open != listed {
-        // The whole census, for whoever updates the list.
-        let census = stela_c_build::linux_build::out_dir().join("amdgpu.open");
-        fs::write(
-            &census,
-            open.iter()
-                .map(|symbol| format!("{symbol}\n"))
-                .collect::<String>(),
-        )
-        .expect("write the import census");
-        panic!(
-            "amdgpu's imports changed: newly open {:?}; now supplied {:?}; all of them are in {}",
-            open.difference(&listed).collect::<Vec<_>>(),
-            listed.difference(&open).collect::<Vec<_>>(),
-            census.display()
-        );
+    // Hosted programs test the environment and link no driver.
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
+        println!("cargo:rustc-link-lib=static=stela-amdgpu");
+    }
+    super::image::Driver {
+        name: MODULE.name,
+        spec: INITCALLS,
+        captured,
+        archive: stela_c_build::linux_build::out_dir().join("libstela-amdgpu.a"),
+        open: OPEN,
     }
 }
