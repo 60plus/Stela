@@ -416,9 +416,9 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
     let bound = &gpu.start.bound;
     // SAFETY: the one boot CPU, before any reader.
     let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
-    for (minor, bound_gpu) in bound.iter().enumerate() {
+    for (index, bound_gpu) in bound.iter().enumerate() {
         let name = &bound_gpu.name;
-        let Some(fd) = client::open_node(minor as u32) else {
+        let Some(fd) = client::minor(index).and_then(client::open_node) else {
             continue;
         };
         let began = host::rdtsc();
@@ -464,8 +464,8 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                 // A GPU that serves no Metal device shows what another
                 // draws: the display is wired to it (a laptop's panel on its
                 // integrated GPU), and each frame is copied into its buffer.
-                let chosen = super::gate::metal_choice(bound, Some(minor));
-                if !chosen.serve.contains(&minor)
+                let chosen = super::gate::metal_choice(bound, Some(index));
+                if !chosen.serve.contains(&index)
                     && let Some(&drawing) = chosen.serve.first()
                 {
                     output::arguments(format_args!(
@@ -475,7 +475,7 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                         bound[drawing].name
                     ));
                 }
-                TAKEN_INDEX.store(minor, Ordering::Relaxed);
+                TAKEN_INDEX.store(index, Ordering::Relaxed);
                 report_outputs(name, &display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {

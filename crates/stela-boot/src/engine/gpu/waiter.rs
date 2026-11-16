@@ -211,7 +211,8 @@ unsafe extern "C" fn run(argument: *mut c_void) {
     let watch = unsafe { Box::from_raw(argument.cast::<Watch>()) };
     // A render node of the service's own GPU.
     let Some(file) = gate::served_gpu(watch.service)
-        .and_then(|index| client::open_node(client::RENDER_MINOR + index as u32))
+        .and_then(client::minor)
+        .and_then(|minor| client::open_node(client::RENDER_MINOR + minor))
     else {
         client::close_descriptor(watch.fd);
         ended(&watch);

@@ -103,10 +103,144 @@ pub(super) struct DrmDevice {
     pub slot: u8,
     pub function: u8,
     pub revision: u8,
+    /// Its DRM minor ([`minor`]), filled as Mesa asks.
+    pub minor: u32,
 }
 
 /// The first render node's minor.
 pub(super) const RENDER_MINOR: u32 = 128;
+/// How many primary minors DRM gives out before [`RENDER_MINOR`].
+const PRIMARY_MINORS: u32 = 64;
+/// `DRM_IOCTL_GET_UNIQUE`: `DRM_IOWR(0x01, struct drm_unique)`.
+const GET_UNIQUE: u32 = 0xc010_6401;
+/// `DRM_IOCTL_SET_VERSION`: `DRM_IOWR(0x07, struct drm_set_version)`.
+const SET_VERSION: u32 = 0xc010_6407;
+
+/// `struct drm_set_version`: interface 1.4, which names a master's bus,
+/// and no driver version.
+#[repr(C)]
+struct SetVersion {
+    interface_major: i32,
+    interface_minor: i32,
+    driver_major: i32,
+    driver_minor: i32,
+}
+
+/// `struct drm_unique`.
+#[repr(C)]
+struct Unique {
+    length: usize,
+    name: *mut u8,
+}
+
+/// The primary minor of each bound GPU, by its index, once found.
+static MINORS: AtomicPtr<Vec<Option<u32>>> = AtomicPtr::new(ptr::null_mut());
+
+/// The DRM minor of the bound GPU at `index`: its primary node's, and its
+/// render node's past [`RENDER_MINOR`]. DRM gives a device both when it is
+/// made, each the lowest free in its range, and every GPU driver here makes
+/// both, so they move in step. They follow the order the drivers made their
+/// devices in, which is not the bound GPUs' order when a probe that made one
+/// failed or hung while others went on, so each GPU's is found once by the
+/// name DRM gives its device: its PCI function's (`drm_dev_init`). A GPU
+/// whose node is not found is said once and has none. The first call opens
+/// each primary node as its master, as libdrm's `drmGetBusid` does, so it
+/// comes before anything holds one ([`super::display::take`]).
+pub(super) fn minor(index: usize) -> Option<u32> {
+    // SAFETY: published once below and leaked.
+    let minors = match unsafe { MINORS.load(Ordering::Acquire).as_ref() } {
+        Some(minors) => minors,
+        None => {
+            let found = Box::into_raw(Box::new(find_minors()?));
+            match MINORS.compare_exchange(
+                ptr::null_mut(),
+                found,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // SAFETY: just published, never freed.
+                Ok(_) => unsafe { &*found },
+                Err(first) => {
+                    // SAFETY: never published; the first finder's stays.
+                    drop(unsafe { Box::from_raw(found) });
+                    // SAFETY: published and leaked.
+                    unsafe { &*first }
+                }
+            }
+        }
+    };
+    minors.get(index).copied().flatten()
+}
+
+/// Each bound GPU's primary minor, by the PCI function its master names.
+fn find_minors() -> Option<Vec<Option<u32>>> {
+    let bound = &installed()?.start.bound;
+    // A function by its bus, slot and function; DRM puts its domain first.
+    let functions: Vec<_> = bound
+        .iter()
+        .map(|gpu| {
+            alloc::format!(
+                "{:02x}:{:02x}.{}",
+                gpu.drm.bus,
+                gpu.drm.slot,
+                gpu.drm.function
+            )
+        })
+        .collect();
+    let mut minors = alloc::vec![None; bound.len()];
+    for minor in 0..PRIMARY_MINORS {
+        let Some(fd) = open_node(minor) else {
+            continue;
+        };
+        let mut name = [0u8; 32];
+        let named = bus_name(fd, &mut name);
+        close_descriptor(fd);
+        // "pci:DDDD:BB:SS.F" from a PCI device's master, else the device's
+        // own name, "DDDD:BB:SS.F".
+        let Some((_, function)) = named
+            .map(|name| name.trim_start_matches("pci:"))
+            .and_then(|name| name.split_once(':'))
+        else {
+            continue;
+        };
+        if let Some(index) = functions.iter().position(|name| name == function)
+            && minors[index].is_none()
+        {
+            minors[index] = Some(minor);
+        }
+    }
+    for (gpu, minor) in bound.iter().zip(&minors) {
+        if minor.is_none() {
+            output::arguments(format_args!(
+                "GPU {}: its driver bound it, but no DRM node of it was found\n",
+                gpu.name
+            ));
+        }
+    }
+    Some(minors)
+}
+
+/// The bus name the master of the primary node `fd` gives its device, read
+/// into `name`.
+fn bus_name(fd: c_int, name: &mut [u8]) -> Option<&str> {
+    let mut version = SetVersion {
+        interface_major: 1,
+        interface_minor: 4,
+        driver_major: -1,
+        driver_minor: -1,
+    };
+    if control(fd, SET_VERSION, ptr::addr_of_mut!(version).cast()) != 0 {
+        return None;
+    }
+    let mut unique = Unique {
+        length: name.len(),
+        name: name.as_mut_ptr(),
+    };
+    if control(fd, GET_UNIQUE, ptr::addr_of_mut!(unique).cast()) != 0 {
+        return None;
+    }
+    str::from_utf8(name.get(..unique.length)?).ok()
+}
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -1442,7 +1576,7 @@ pub(super) fn query<T>(
     index: u32,
     ask: fn(stela_drivers::gpu::stack::Control) -> Option<T>,
 ) -> Option<T> {
-    let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
+    let fd = submit(Operation::Open(RENDER_MINOR + minor(index as usize)?)) as c_int;
     if fd < 0 {
         return None;
     }
@@ -1737,7 +1871,12 @@ extern "C" fn stela_libc_drm_devices() -> c_uint {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn stela_libc_drm_device(index: c_uint, device: *mut DrmDevice) {
     if let Some(found) = installed().and_then(|gpu| gpu.start.bound.get(index as usize)) {
+        let record = DrmDevice {
+            // A GPU without a node gets one past DRM's, which opens nothing.
+            minor: minor(index as usize).unwrap_or(PRIMARY_MINORS),
+            ..found.drm
+        };
         // SAFETY: the C library's record.
-        unsafe { device.write(found.drm) };
+        unsafe { device.write(record) };
     }
 }

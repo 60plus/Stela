@@ -136,7 +136,7 @@ static drmDevicePtr device_at(unsigned int index)
 		return NULL;
 	stela_libc_drm_device(index, &host);
 	snprintf(block->render, sizeof(block->render), DRM_DIR_NAME "/renderD%u",
-		 RENDER_MINOR + index);
+		 RENDER_MINOR + host.minor);
 	block->nodes[DRM_NODE_RENDER] = block->render;
 	block->bus = (drmPciBusInfo){
 		.domain = host.segment,
@@ -185,14 +185,22 @@ int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max)
 	return count;
 }
 
+/* The device whose render node is `id`: devices are listed in the host's
+ * order, which need not be their minors'. */
 int drmGetDeviceFromDevId(dev_t id, uint32_t flags, drmDevicePtr *device)
 {
 	(void)flags;
-	unsigned int index = minor(id) - RENDER_MINOR;
-	if (major(id) != DRM_MAJOR || index >= stela_libc_drm_devices())
+	if (major(id) != DRM_MAJOR || minor(id) < RENDER_MINOR)
 		return -ENODEV;
-	*device = device_at(index);
-	return *device ? 0 : -ENOMEM;
+	for (unsigned int index = 0; index < stela_libc_drm_devices(); index++) {
+		struct stela_libc_drm_device host;
+		stela_libc_drm_device(index, &host);
+		if (RENDER_MINOR + host.minor == minor(id)) {
+			*device = device_at(index);
+			return *device ? 0 : -ENOMEM;
+		}
+	}
+	return -ENODEV;
 }
 
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)

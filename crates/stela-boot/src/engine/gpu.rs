@@ -1353,6 +1353,7 @@ fn claim(
             slot: address.device,
             function: address.function,
             revision,
+            minor: 0,
         }
     };
     #[cfg(feature = "nvk")]
