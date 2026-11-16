@@ -90,8 +90,12 @@ pub static NVIDIA: GpuStack = GpuStack {
     vulkan: Some(crate::metal::nvidia::DRIVER),
 };
 
-/// amdgpu with its display core. No Vulkan driver yet: its GPU shows the
-/// frames another GPU draws, on the displays wired to it.
+/// amdgpu with its display core, and RADV's admission. Its Vulkan driver is
+/// not given yet, even in an image that holds RADV: a PC with an AMD and
+/// another GPU would then serve a Metal device on each, which no rule
+/// chooses between yet, and RADV has run on no AMD GPU under Stela. Until
+/// then its GPU shows the frames another GPU draws, on the displays wired to
+/// it.
 #[cfg(feature = "amdgpu-port")]
 pub static AMD: GpuStack = GpuStack {
     vendor: Vendor::Amd,
@@ -111,7 +115,7 @@ pub static AMD: GpuStack = GpuStack {
         memory_bytes: crate::amdgpu::query::memory_bytes,
     },
     #[cfg(feature = "metal")]
-    metal: None,
+    metal: Some(crate::metal::amd::ADMISSION),
     #[cfg(all(feature = "metal-linked", not(test)))]
     vulkan: None,
 };
@@ -351,6 +355,8 @@ mod tests {
         assert_eq!(amd.kernel.driver, "amdgpu");
         assert_eq!(amd.kernel.dma_limit(&integrated), (1 << 44) - 1);
         assert!(!amd.draws());
+        #[cfg(feature = "metal")]
+        assert!(amd.metal.is_some());
         // An audio function of the same vendor is no device of the table.
         let mut audio = adapter(0x1002);
         audio.class = [4, 3, 0];

@@ -56,6 +56,15 @@ pub fn dma_bits(adapter: &Adapter) -> u8 {
     listed(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
 }
 
+/// The name amdgpu's interface gives the family `family`
+/// (`AMDGPU_FAMILY_*` without its prefix), which its device query answers.
+pub fn family_name(family: u32) -> Option<&'static str> {
+    FAMILIES
+        .binary_search_by_key(&family, |(number, _)| *number)
+        .ok()
+        .map(|index| FAMILIES[index].1)
+}
+
 /// amdgpu's query ioctl, `DRM_IOCTL_AMDGPU_INFO`.
 pub mod query {
     use super::Control;
@@ -139,6 +148,17 @@ mod tests {
         assert_eq!(DISCOVERY_BITS, 44);
         // VGA, other display and processing accelerator.
         assert_eq!(CLASSES, [0x03_0000, 0x03_8000, 0x12_0000]);
+    }
+
+    #[test]
+    fn families_are_named_as_amdgpus_interface_names_them() {
+        assert!(FAMILIES.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        // Navi 10, Raphael and Granite Ridge graphics, GFX12.
+        assert_eq!(family_name(143), Some("NV"));
+        assert_eq!(family_name(149), Some("GC_10_3_6"));
+        assert_eq!(family_name(152), Some("GC_12_0_0"));
+        assert_eq!(family_name(0), None);
+        assert_eq!(family_name(147), None);
     }
 
     #[test]

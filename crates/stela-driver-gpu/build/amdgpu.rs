@@ -431,8 +431,37 @@ pub fn tables() {
         "];\n/// The narrowest mask of the memory controllers IP discovery chooses from.\n\
          pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n"
     ));
+    text.push_str(
+        "/// amdgpu's interface's families (`AMDGPU_FAMILY_*`), by number.\n\
+         pub(crate) const FAMILIES: &[(u32, &str)] = &[\n",
+    );
+    for (number, name) in families(&read(PathBuf::from(
+        "../../third_party/linux/include/uapi/drm/amdgpu_drm.h",
+    ))) {
+        text.push_str(&format!("    ({number}, {name:?}),\n"));
+    }
+    text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     fs::write(output.join("amdgpu_devices.rs"), text).expect("write amdgpu's device table");
+}
+
+/// The families `amdgpu_drm.h` defines, `#define AMDGPU_FAMILY_<name>
+/// <number>`, by number, without the unknown family 0.
+fn families(header: &str) -> Vec<(u32, String)> {
+    let mut families: Vec<(u32, String)> = header
+        .lines()
+        .filter_map(|line| {
+            let mut words = line
+                .strip_prefix("#define AMDGPU_FAMILY_")?
+                .split_whitespace();
+            let name = words.next()?;
+            let number = words.next()?.parse().ok()?;
+            (number != 0).then(|| (number, name.to_owned()))
+        })
+        .collect();
+    families.sort();
+    assert!(!families.is_empty(), "amdgpu_drm.h defines no family");
+    families
 }
 
 /// `amdgpu_drv.c`'s device table and probe rules.

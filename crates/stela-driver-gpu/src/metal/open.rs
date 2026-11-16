@@ -100,6 +100,8 @@ pub struct Admission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     Nvidia(nvidia::Refusal),
+    #[cfg(feature = "amdgpu-port")]
+    Amd(crate::metal::amd::Refusal),
 }
 
 /// The GPU the platform hands the Metal device.
@@ -321,6 +323,50 @@ mod tests {
         assert_eq!(capabilities.architecture, CHIPS[0].name);
         assert!(capabilities.removable);
         assert_eq!(capabilities.location_number, 2);
+    }
+
+    /// A stack's admission is what serves its GPU: RADV's integrated
+    /// device through the AMD admission, with amdgpu's family name and a
+    /// built-in location, and refused by the NVIDIA one.
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn an_amd_gpu_is_served_through_its_stacks_admission() {
+        use crate::metal::{abi::DeviceLocation, amd, vulkan::PhysicalDeviceType};
+        use crate::stack::AMD;
+        let radv = || {
+            let mut backend = MockBackend::new();
+            let identity = &mut backend.physical.as_mut().unwrap().identity;
+            identity.vendor_id = amd::VENDOR_ID;
+            identity.driver_id = DriverId::MesaRadv;
+            identity.device_id = 0x13c0;
+            identity.device_type = PhysicalDeviceType::IntegratedGpu;
+            backend
+        };
+        let mut raphael = gpu(0);
+        raphael.stack = &AMD;
+        raphael.chip = 149;
+        let mut service = serve_on(radv(), &raphael).unwrap();
+        let capabilities = service.device().capabilities();
+        assert_eq!(capabilities.architecture, "GC_10_3_6");
+        assert_eq!(capabilities.location, DeviceLocation::BuiltIn);
+        assert_eq!(capabilities.max_transfer_rate, 0);
+        let mut on_nvidia = raphael;
+        on_nvidia.stack = &NVIDIA;
+        assert_eq!(
+            serve_on(radv(), &on_nvidia).err(),
+            Some(OpenError::Refused(Refusal::Nvidia(
+                nvidia::Refusal::NotNvidia {
+                    vendor_id: amd::VENDOR_ID
+                }
+            )))
+        );
+        raphael.chip = 0;
+        assert_eq!(
+            serve_on(radv(), &raphael).err(),
+            Some(OpenError::Refused(Refusal::Amd(
+                amd::Refusal::UnknownFamily { family: 0 }
+            )))
+        );
     }
 
     #[test]
