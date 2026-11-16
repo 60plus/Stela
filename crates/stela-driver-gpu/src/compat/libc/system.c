@@ -6,9 +6,12 @@
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -170,4 +173,36 @@ size_t strftime(char *buffer, size_t size, const char *format, const struct tm *
 	(void)format;
 	(void)time;
 	return 0;
+}
+
+int inotify_init1(int flags)
+{
+	(void)flags;
+	return refused();
+}
+
+int inotify_add_watch(int fd, const char *path, uint32_t mask)
+{
+	(void)fd;
+	(void)path;
+	(void)mask;
+	return refused();
+}
+
+int inotify_rm_watch(int fd, int watch)
+{
+	(void)fd;
+	(void)watch;
+	return refused();
+}
+
+int system(const char *command)
+{
+	return command ? refused() : 0;
+}
+
+int uname(struct utsname *name)
+{
+	(void)name;
+	return refused();
 }

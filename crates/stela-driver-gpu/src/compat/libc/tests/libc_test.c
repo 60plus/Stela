@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* The C library against the C standard's answers, as a static Linux program:
  * `cargo xtask gpu nvk` builds and runs it. */
+#include <ctype.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -23,6 +24,8 @@
 #include <wchar.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/inotify.h>
+#include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -332,6 +335,18 @@ static void test_loading(void)
 	CHECK(!dl_iterate_phdr(count_object, NULL) && !objects);
 }
 
+/* No stream has bytes to read, so getline reads no line and leaves the
+ * caller's buffer as it was. */
+static void test_lines(void)
+{
+	char *line = NULL;
+	size_t size = 0;
+	CHECK(getline(&line, &size, stdin) == -1);
+	CHECK(line == NULL && size == 0);
+	errno = 0;
+	CHECK(getdelim(&line, NULL, '\n', stdin) == -1 && errno == EINVAL);
+}
+
 static void test_division(void)
 {
 	div_t small = div(-7, 2);
@@ -351,6 +366,16 @@ static void test_system(void)
 	CHECK(opendir("/") == NULL);
 	struct passwd entry, *found = &entry;
 	CHECK(getpwuid_r(0, &entry, path, sizeof(path), &found) == 0 && found == NULL);
+	errno = 0;
+	CHECK(inotify_init1(IN_NONBLOCK) == -1 && errno == ENOSYS);
+	CHECK(inotify_add_watch(0, "/", IN_MODIFY) == -1);
+	struct utsname name;
+	errno = 0;
+	CHECK(uname(&name) == -1 && errno == ENOSYS);
+	CHECK(system(NULL) == 0);
+	CHECK(system("true") == -1 && errno == ENOSYS);
+	CHECK(isblank(' ') && isblank('\t') && !isblank('\n') && !isblank('a'));
+	CHECK(ENODATA == 61);
 }
 
 static void test_wide(void)
@@ -732,6 +757,7 @@ int main(void)
 	test_refusals();
 	test_loading();
 	test_futex();
+	test_lines();
 	test_division();
 	test_system();
 	test_wide();

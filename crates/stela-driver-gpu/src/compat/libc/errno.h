@@ -34,6 +34,7 @@ int *__errno_location(void);
 #define ENOBUFS 105
 #define ENOTSUP EOPNOTSUPP
 #define ETIME 62
+#define ENODATA 61
 #define ETIMEDOUT 110
 #define ECANCELED 125
 __END_DECLS
