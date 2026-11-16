@@ -255,6 +255,10 @@ static void test_meminfo(void)
 	CHECK(!close(file) && read(file, text, 1) == -1 && errno == EBADF);
 	errno = 0;
 	CHECK(open("/proc/cpuinfo", O_RDONLY) == -1 && errno == ENOENT);
+	/* A NULL path is outside the process, as Linux answers it. */
+	const char *volatile none = NULL;
+	CHECK(open(none, O_RDONLY) == -1 && errno == EFAULT);
+	CHECK(stat(none, &status) == -1 && errno == EFAULT);
 }
 
 static void test_refusals(void)

@@ -920,6 +920,10 @@ static int open_meminfo(void)
 int open(const char *path, int flags, ...)
 {
 	(void)flags;
+	/* Linux's answer to a path outside the process: ANV stats its device's
+	 * primary node, which libdrm leaves NULL when only a render node exists. */
+	if (!path)
+		return fail(EFAULT);
 	if (!strcmp(path, "/proc/meminfo"))
 		return open_meminfo();
 	static const char prefix[] = "/dev/dri/renderD";
