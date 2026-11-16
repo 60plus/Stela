@@ -23,7 +23,8 @@ pub const WIFI_FIRMWARE_REVISION: &str = "59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a
 /// this build answers it under both.
 pub const MT7925_BLUETOOTH_REVISION: &str = "2d70539375587a68bdef08fec2e0e1a51698c93a";
 pub const GSP_REVISION: &str = "1987bb2044a6c2d68c39d01c360bdbe17f1eb60c";
-/// The GSP-RM release nouveau's newest interface takes.
+/// The GSP-RM release nouveau takes on every chip family but GeForce
+/// Blackwell, which takes [`GB20X_GSP_RELEASE`] ([`gsp_release`]).
 const GSP_RELEASE: &str = "570.144";
 /// The R570 LTS GSP-RM release for GeForce Blackwell (`gb20x`), which adds
 /// RTX 5060 / 5060 Ti (`GB206`) and updated signed GB202 FMC and bootloader.
@@ -32,10 +33,12 @@ pub const GB20X_GSP_RELEASE: &str = "570.211.01";
 /// generated `bindata` sources hold the signed GB202 bootloader and GSP-FMC
 /// images before `linux-firmware` publishes them.
 pub const NVIDIA_OPEN_GPU: &str = "https://github.com/NVIDIA/open-gpu-kernel-modules";
+/// The commit of [`NVIDIA_OPEN_GPU`]'s tag `570.211.01`.
 pub const GB20X_OPEN_GPU_REVISION: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
 /// NVIDIA's Linux x86_64 release archive, whose compressed tar stream begins
 /// with `firmware/gsp_ga10x.bin`.
 pub const NVIDIA_LINUX_DRIVER: &str = "https://download.nvidia.com/XFree86/Linux-x86_64";
+/// The US mirror of [`NVIDIA_LINUX_DRIVER`], asked second.
 pub const NVIDIA_LINUX_DRIVER_MIRROR: &str = "https://us.download.nvidia.com/XFree86/Linux-x86_64";
 /// The files of a release, of which each chip family has some.
 const GSP_KINDS: [&str; 6] = [
@@ -959,6 +962,8 @@ fn acr_directory(chip: &str) -> Option<&'static str> {
     matches!(gsp_directory(chip)?, "tu102" | "tu116").then_some("tu102")
 }
 
+/// The GSP-RM release nouveau asks for on the chips of a `gsp` directory
+/// ([`gsp_directory`]): its firmware list names one release per family.
 fn gsp_release(directory: &str) -> &'static str {
     match directory {
         "gb202" => GB20X_GSP_RELEASE,
