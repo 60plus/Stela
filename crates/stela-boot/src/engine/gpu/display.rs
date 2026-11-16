@@ -26,7 +26,7 @@ use crate::engine::host;
 use crate::{Result, output};
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::ops::Range;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
@@ -370,6 +370,14 @@ type Displays = (Option<(String, Display<Node>)>, Vec<(String, c_int)>);
 unsafe impl Sync for Taken {}
 
 static TAKEN: Taken = Taken(UnsafeCell::new((None, Vec::new())));
+/// The bound GPU whose output [`take`] took, or `usize::MAX`.
+static TAKEN_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// The bound GPU, by its index, whose output took the connected display.
+pub(super) fn taken_index() -> Option<usize> {
+    let index = TAKEN_INDEX.load(Ordering::Relaxed);
+    (index != usize::MAX).then_some(index)
+}
 
 /// Which GPU showed the firmware's picture.
 #[derive(Clone, Copy)]
@@ -453,19 +461,21 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
-                // A GPU that draws nothing shows what another draws: the
-                // display is wired to it (a laptop's panel on its integrated
-                // GPU), and each frame is copied into its buffer.
-                if !bound_gpu.stack.draws()
-                    && let Some(drawing) = bound.iter().find(|other| other.stack.draws())
+                // A GPU that serves no Metal device shows what another
+                // draws: the display is wired to it (a laptop's panel on its
+                // integrated GPU), and each frame is copied into its buffer.
+                let chosen = super::gate::metal_choice(bound, Some(minor));
+                if !chosen.serve.contains(&minor)
+                    && let Some(&drawing) = chosen.serve.first()
                 {
                     output::arguments(format_args!(
                         "GPU {name}: the connected display is on this GPU, so it shows the \
                          frames GPU {} draws, each copied into its buffer and flipped on its \
                          own vblank\n",
-                        drawing.name
+                        bound[drawing].name
                     ));
                 }
+                TAKEN_INDEX.store(minor, Ordering::Relaxed);
                 report_outputs(name, &display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {

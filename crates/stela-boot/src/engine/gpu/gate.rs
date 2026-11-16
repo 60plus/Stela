@@ -29,7 +29,7 @@ use stela_drivers::gpu::metal::{
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
     native::{self, ExportedMemory, Loader, MemoryExporter, NativeBackend, pipeline_store},
-    open::{Attachment, Gpu, OpenError, open, reopen},
+    open::{Attachment, Gpu, OpenError, PcieLink, open, reopen},
     service::{JobSlice, Served, ServiceHost, SharedService, identity::DeviceEpoch, wire::Status},
     timing::{ExitWatch, Totals},
     vulkan::physical::PciBusInfo,
@@ -1158,21 +1158,51 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
     )))
 }
 
-/// Open a service over every bound GPU. What stops one is reported, and the
-/// Mac boots without Metal on that GPU.
+/// Open a service over each bound GPU that [`metal_devices`] chooses, the
+/// PC's Metal device first. A drawing GPU it leaves display-only is
+/// reported once. What stops one is reported, and the Mac boots without
+/// Metal on that GPU.
+///
+/// [`metal_devices`]: stela_drivers::gpu::stack::metal_devices
 pub(in crate::engine) fn open_service() {
     let Some(gpu) = installed() else {
         return;
     };
+    let bound = &gpu.start.bound;
+    let chosen = metal_choice(bound, super::display::taken_index());
+    for &index in &chosen.display_only {
+        if let Some(&serving) = chosen.serve.first() {
+            output::arguments(format_args!(
+                "GPU {}: shows displays only: GPU {}, a discrete GPU, draws for Metal\n",
+                bound[index].name, bound[serving].name
+            ));
+        }
+    }
     let mut constructed = false;
-    let services: Vec<_> = gpu
-        .start
-        .bound
+    let services: Vec<_> = chosen
+        .serve
         .iter()
-        .enumerate()
-        .filter_map(|(index, bound)| open_gpu(gpu, index, bound, &mut constructed))
+        .filter_map(|&index| open_gpu(gpu, index, &bound[index], &mut constructed))
         .collect();
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
+}
+
+/// Which bound GPUs serve Metal devices, given the one whose output took
+/// the connected display.
+pub(super) fn metal_choice(
+    bound: &[Bound],
+    display: Option<usize>,
+) -> stela_drivers::gpu::stack::MetalDevices {
+    let candidates: Vec<_> = bound
+        .iter()
+        .enumerate()
+        .map(|(index, bound)| stela_drivers::gpu::stack::Candidate {
+            draws: bound.stack.draws(),
+            integrated: bound.integrated,
+            drives_display: display == Some(index),
+        })
+        .collect();
+    stela_drivers::gpu::stack::metal_devices(&candidates)
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.
@@ -1198,8 +1228,9 @@ fn open_gpu(
         // Its kernel driver shows frames; `display` takes its outputs.
         return None;
     }
-    let Some(link) = bound.link else {
-        return refuse("no PCIe link");
+    let link = match PcieLink::admitted(bound.link, bound.integrated) {
+        Ok(link) => link,
+        Err(reason) => return refuse(reason),
     };
     let Some(chip) = client::query(index as u32, bound.stack.kernel.chip) else {
         return refuse("no chipset reported");

@@ -38,6 +38,22 @@ pub struct PcieLink {
 }
 
 impl PcieLink {
+    /// No link: a function on the processor's own fabric, such as an
+    /// integrated GPU, which Metal reports with no transfer rate.
+    pub const NONE: Self = Self { speed: 0, width: 0 };
+
+    /// The link a GPU is admitted with: the one its PCIe capability reports,
+    /// or [`Self::NONE`] for a GPU its stack reports as integrated, whose
+    /// function has no such capability. A discrete GPU without one is
+    /// refused with the reason.
+    pub fn admitted(link: Option<Self>, integrated: bool) -> Result<Self, &'static str> {
+        match (link, integrated) {
+            (Some(link), _) => Ok(link),
+            (None, true) => Ok(Self::NONE),
+            (None, false) => Err("no PCIe link"),
+        }
+    }
+
     pub const fn from_link_status(status: u16) -> Self {
         Self {
             speed: (status & 0xf) as u8,
@@ -255,6 +271,17 @@ mod tests {
         nvidia::CHIPS,
         vulkan::DriverId,
     };
+
+    #[test]
+    fn a_gpu_without_a_link_is_admitted_only_when_integrated() {
+        let gen4_x16 = PcieLink::from_link_status(4 | 16 << 4);
+        assert_eq!(PcieLink::admitted(Some(gen4_x16), false), Ok(gen4_x16));
+        // An integrated GPU behind a link keeps what the link reports.
+        assert_eq!(PcieLink::admitted(Some(gen4_x16), true), Ok(gen4_x16));
+        assert_eq!(PcieLink::admitted(None, true), Ok(PcieLink::NONE));
+        assert_eq!(PcieLink::NONE.bytes_per_second(), 0);
+        assert_eq!(PcieLink::admitted(None, false), Err("no PCIe link"));
+    }
     use crate::stack::NVIDIA;
     use core::num::NonZeroU64;
 

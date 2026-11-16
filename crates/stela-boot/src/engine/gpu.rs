@@ -996,6 +996,9 @@ pub(super) struct Claimed {
     name: String,
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
     stack: &'static GpuStack,
+    /// Its kernel driver's [`stela_drivers::gpu::stack::Kernel::integrated`].
+    #[cfg(feature = "nvk")]
+    integrated: bool,
     #[cfg(feature = "nvk")]
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
@@ -1278,6 +1281,8 @@ fn claim(
         name: format!("{address}"),
         stack,
         #[cfg(feature = "nvk")]
+        integrated: (stack.kernel.integrated)(adapter),
+        #[cfg(feature = "nvk")]
         drm,
         #[cfg(feature = "nvk")]
         link,
@@ -1385,9 +1390,10 @@ pub(super) fn claim_all(
             )),
         }
     }
-    // The GPUs that draw come first, in the firmware's order, so their DRM
-    // minors and Metal services are numbered as without a display-only GPU.
-    driven.sort_by_key(|(stack, _)| !stack.draws());
+    // Drawing discrete GPUs come first, then drawing integrated ones, then
+    // display-only ones, each in the firmware's order, so the GPUs Metal
+    // prefers have the first DRM minors whatever else the PC holds.
+    driven.sort_by_key(|(stack, adapter)| stack.claim_order(adapter));
     if !cfg!(feature = "nvk") {
         let mut refused = Vec::new();
         for (_, adapter) in driven {
@@ -1448,6 +1454,7 @@ struct Bound {
     /// screen's function is unknown.
     shows_screen: bool,
     stack: &'static GpuStack,
+    integrated: bool,
     drm: client::DrmDevice,
     link: Option<PcieLink>,
 }
@@ -1543,6 +1550,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         name: claimed.name,
                         shows_screen: claimed.shows_screen,
                         stack: claimed.stack,
+                        integrated: claimed.integrated,
                         drm: claimed.drm,
                         link: claimed.link,
                     });
@@ -1640,9 +1648,20 @@ fn environment_error(error: WorkError) -> kernel_work::Error {
 /// then panics the system, so a boot of macOS stops here instead.
 pub(super) fn no_metal_device() -> Option<&'static str> {
     #[cfg(feature = "nvk")]
-    return gate::shared()
-        .is_empty()
-        .then_some("no GPU started; the lines above say why");
+    return gate::shared().is_empty().then(|| {
+        let bound = installed().map_or(&[][..], |gpu| gpu.start.bound.as_slice());
+        match (bound.is_empty(), bound.iter().any(|gpu| gpu.stack.draws())) {
+            (true, _) => "no GPU started; the lines above say why",
+            // Its stack has a kernel driver alone in this image.
+            (false, false) => {
+                "the GPU that started only shows a picture: this image has no Vulkan driver \
+                 for it, and macOS needs a GPU that draws"
+            }
+            (false, true) => {
+                "no Metal device opened on the GPUs that started; the lines above say why"
+            }
+        }
+    });
     #[cfg(not(feature = "nvk"))]
     Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
 }

@@ -24,6 +24,10 @@ pub struct Kernel {
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
+    /// Whether the driver's own table describes the device as built into
+    /// the processor, sharing its memory and on its fabric rather than a
+    /// PCIe link. [`metal_devices`] reads it.
+    pub integrated: fn(&Adapter) -> bool,
     /// The driver's own identifier of the bound chip, by its query ioctl.
     pub chip: fn(Control) -> Option<u32>,
     /// The bytes of device memory the driver makes available.
@@ -66,6 +70,9 @@ pub static NVIDIA: GpuStack = GpuStack {
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,
+        // nouveau drives discrete GPUs only (`nvkm_device_pci_new`); Tegra's
+        // built-in GPUs are platform devices, not PCI functions.
+        integrated: |_| false,
         chip: crate::nouveau_chip::query::chipset,
         memory_bytes: crate::nouveau_chip::query::memory_bytes,
     },
@@ -124,6 +131,15 @@ impl GpuStack {
         false
     }
 
+    /// Where `adapter` comes among the GPUs claimed: drawing discrete GPUs
+    /// first, then drawing integrated ones, then those that only show
+    /// frames, each group in the firmware's order (the sort is stable). The
+    /// GPUs [`metal_devices`] prefers then have the first DRM minors, so a
+    /// PC numbers them as it would without the others.
+    pub fn claim_order(&self, adapter: &Adapter) -> u8 {
+        claim_rank(self.draws(), (self.kernel.integrated)(adapter))
+    }
+
     /// The stack for `adapter`: its vendor's, when that stack's kernel
     /// driver holds the device. Otherwise why Stela drives it with none.
     pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
@@ -137,10 +153,125 @@ impl GpuStack {
     }
 }
 
+/// [`GpuStack::claim_order`] of a GPU that draws or not and is integrated
+/// or not.
+fn claim_rank(draws: bool, integrated: bool) -> u8 {
+    match (draws, integrated) {
+        (true, false) => 0,
+        (true, true) => 1,
+        (false, _) => 2,
+    }
+}
+
+/// A bound GPU as the choice of Metal devices sees it: only what its stack
+/// reports and where the display was taken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Candidate {
+    /// Its stack draws ([`GpuStack::draws`]): it admits the GPU's Vulkan
+    /// device as a Metal device and the image holds that driver.
+    pub draws: bool,
+    /// Its kernel driver's [`Kernel::integrated`].
+    pub integrated: bool,
+    /// The connected display was taken on one of its outputs.
+    pub drives_display: bool,
+}
+
+/// What [`metal_devices`] chose, by index into its candidates.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetalDevices {
+    /// The GPUs that serve a Metal device, the PC's Metal device first.
+    pub serve: alloc::vec::Vec<usize>,
+    /// GPUs that draw but stay display-only, because a more capable GPU
+    /// serves Metal.
+    pub display_only: alloc::vec::Vec<usize>,
+}
+
+/// Which bound GPUs serve Metal devices. They are the drawing GPUs of the
+/// most capable kind present: discrete GPUs, with memory and a link of their
+/// own, before GPUs built into the processor. When a discrete GPU draws, an
+/// integrated one only shows the displays wired to it, as a GPU without a
+/// Vulkan driver does, and serves no second Metal device; an integrated GPU
+/// alone serves the Metal device. Any drawing GPU feeds any display, since
+/// each frame is copied into the buffer of the GPU that drives it, so among
+/// equals the GPU that drives the connected display comes first and the
+/// others keep the firmware's order.
+pub fn metal_devices(candidates: &[Candidate]) -> MetalDevices {
+    let drawing = || candidates.iter().enumerate().filter(|(_, gpu)| gpu.draws);
+    let discrete = drawing().any(|(_, gpu)| !gpu.integrated);
+    let (mut serve, display_only): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
+        drawing().partition(|(_, gpu)| !discrete || !gpu.integrated);
+    serve.sort_by_key(|(_, gpu)| !gpu.drives_display);
+    MetalDevices {
+        serve: serve.into_iter().map(|(index, _)| index).collect(),
+        display_only: display_only.into_iter().map(|(index, _)| index).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bus::pci::Address;
+    use alloc::vec;
+
+    fn candidate(draws: bool, integrated: bool, drives_display: bool) -> Candidate {
+        Candidate {
+            draws,
+            integrated,
+            drives_display,
+        }
+    }
+
+    #[test]
+    fn an_integrated_gpu_alone_serves_the_metal_device() {
+        let chosen = metal_devices(&[candidate(true, true, true)]);
+        assert_eq!(chosen.serve, [0]);
+        assert!(chosen.display_only.is_empty());
+        // Also when its panel is dark and the display is elsewhere.
+        assert_eq!(metal_devices(&[candidate(true, true, false)]).serve, [0]);
+    }
+
+    #[test]
+    fn a_drawing_discrete_gpu_leaves_the_integrated_one_display_only() {
+        // A muxless laptop: the panel on the integrated GPU, which draws too.
+        let laptop = [candidate(true, false, false), candidate(true, true, true)];
+        let chosen = metal_devices(&laptop);
+        assert_eq!(chosen.serve, [0]);
+        assert_eq!(chosen.display_only, [1]);
+        // In either order of the firmware's enumeration.
+        let chosen = metal_devices(&[laptop[1], laptop[0]]);
+        assert_eq!(chosen.serve, [1]);
+        assert_eq!(chosen.display_only, [0]);
+    }
+
+    #[test]
+    fn a_gpu_that_draws_nothing_is_neither_served_nor_chosen_against() {
+        // A discrete GPU without a Vulkan driver leaves the integrated GPU
+        // the Metal device.
+        let chosen = metal_devices(&[candidate(false, false, true), candidate(true, true, false)]);
+        assert_eq!(chosen.serve, [1]);
+        assert!(chosen.display_only.is_empty());
+        // A display-only stack is no candidate of either list.
+        let chosen = metal_devices(&[candidate(true, false, false), candidate(false, true, true)]);
+        assert_eq!(chosen.serve, [0]);
+        assert!(chosen.display_only.is_empty());
+        assert_eq!(metal_devices(&[]), MetalDevices::default());
+    }
+
+    #[test]
+    fn among_equals_the_gpu_driving_the_display_comes_first() {
+        let desktop = [
+            candidate(true, false, false),
+            candidate(true, false, false),
+            candidate(true, false, true),
+            candidate(true, true, false),
+        ];
+        let chosen = metal_devices(&desktop);
+        assert_eq!(chosen.serve, [2, 0, 1]);
+        assert_eq!(chosen.display_only, [3]);
+        // Without a display taken, the firmware's order stands.
+        let headless = vec![candidate(true, false, false); 3];
+        assert_eq!(metal_devices(&headless).serve, [0, 1, 2]);
+    }
 
     fn adapter(vendor: u16) -> Adapter {
         Adapter {
@@ -187,6 +318,21 @@ mod tests {
             );
             assert!(!stack.kernel.driver.is_empty());
         }
+    }
+
+    #[test]
+    fn claims_put_drawing_discrete_gpus_first_then_integrated_then_display_only() {
+        // (draws, integrated) in the firmware's order: an integrated GPU on
+        // bus 0, a display-only GPU, then a discrete GPU.
+        let mut gpus = vec![(true, true), (false, false), (true, false), (false, true)];
+        gpus.sort_by_key(|&(draws, integrated)| claim_rank(draws, integrated));
+        assert_eq!(
+            gpus,
+            [(true, false), (true, true), (false, false), (false, true)]
+        );
+        // This test binary links no Vulkan driver, so its stacks come last.
+        assert_eq!(NVIDIA.claim_order(&adapter(0x10de)), 2);
+        assert!(!(NVIDIA.kernel.integrated)(&adapter(0x10de)));
     }
 
     #[test]
