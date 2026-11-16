@@ -806,7 +806,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             // The same page content, compiled at another address of this
             // boot: its kept entry, rebased to this page.
-            match self.code.rebases.look(key, offset as u16, context, pc) {
+            // A block the ring took away and the guest runs again: its
+            // form is kept, and its next return relocated from it.
+            let again = self.ring_took(pc, physical, variant);
+            match self
+                .code
+                .rebases
+                .look(key, offset as u16, context, pc, again)
+            {
                 super::rebase::Found::Entry(entry) => {
                     if entry.input.len() > available && !whole {
                         return Ok(None);
