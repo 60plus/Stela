@@ -2511,10 +2511,11 @@ fn board_code(
     )
 }
 
-/// `HEAP small=310M large=62M 128K:352/73M cores=300M/20M classes=16:8M,…`:
-/// the heap's live bytes in size-class blocks and free-list allocations,
-/// the latter by power of two where a size holds a megabyte or more, each
-/// tagged core's share, the tagged cores' bytes by size class, the failed
+/// `HEAP small=310M large=62M 128K:352/73M cores=300M/20M classes=16:8M,…
+/// slabs=4800/40M`: the heap's live bytes in size-class blocks and
+/// free-list allocations, the latter by power of two where a size holds a
+/// megabyte or more, each tagged core's share, the tagged cores' bytes by
+/// size class, the size-class slabs and their free blocks' bytes, the failed
 /// allocations so far and whether the heap is low.
 fn heap_report(heap: &stela_boot_core::heap::Usage) {
     let large: usize = heap.large.iter().map(|&(_, bytes)| bytes).sum();
@@ -2546,6 +2547,8 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
         .map(|(class, &bytes)| format!("{}:{}M", 16 << class, bytes >> 20))
         .collect();
     line.push_str(&format!(" classes={}", classes.join(",")));
+    // The size-class slabs, and the bytes of free blocks they keep.
+    line.push_str(&format!(" slabs={}/{}M", heap.slabs, heap.slab_free >> 20));
     // Allocations that found no memory, which fallible callers survive, and
     // whether the heap is low enough that the engine gives memory back.
     line.push_str(&format!(
