@@ -415,6 +415,68 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 	return dev;
 }
 
+static int read_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
+				u32 *value)
+{
+	(void)bus, (void)devfn, (void)where, (void)size;
+	*value = ~(u32)0;
+	return PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+static int write_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
+				 u32 value)
+{
+	(void)bus, (void)devfn, (void)where, (void)size, (void)value;
+	stela_linux_unsupported("a PCI configuration write to a function published for searches only");
+	return PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+static struct pci_ops identity_ops = {.read = read_identity_config,
+				      .write = write_identity_config};
+
+struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_identity *identity,
+						 int *status)
+{
+	int error = stela_linux_kernel_hosted() ? -EPERM : -ENOMEM;
+	struct host_function *host = error == -EPERM ? NULL : kzalloc_obj(*host);
+
+	if (status)
+		*status = error;
+	if (!host)
+		return NULL;
+	/* No callback and no context: the release frees the host alone. */
+	host->function.bus = identity->bus;
+	host->function.devfn = identity->devfn;
+	host->owner = stela_linux_owner();
+	host->bus.sysdata = &host->function;
+	host->bus.ops = &identity_ops;
+	host->bus.number = (unsigned char)identity->bus;
+	struct pci_dev *dev = &host->dev;
+
+	dev->bus = &host->bus;
+	dev->devfn = identity->devfn;
+	dev->vendor = identity->vendor;
+	dev->device = identity->device;
+	dev->subsystem_vendor = identity->subsystem_vendor;
+	dev->subsystem_device = identity->subsystem_device;
+	dev->revision = (u8)identity->class_revision;
+	dev->class = identity->class_revision >> 8;
+	dev->current_state = PCI_D0;
+	dev->dev.release = release;
+	device_initialize(&dev->dev);
+	error = dev_set_name(&dev->dev, "%04x:%02x:%02x.%d", 0, identity->bus,
+			     PCI_SLOT(identity->devfn), PCI_FUNC(identity->devfn));
+	if (!error)
+		error = stela_linux_pci_publish_for_searches(dev);
+	if (status)
+		*status = error;
+	if (error) {
+		put_device(&dev->dev);
+		return NULL;
+	}
+	return dev;
+}
+
 #ifdef STELA_LINUX_PCI_HOST_TEST
 #include <linux/bottom_half.h>
 #include <stela/page_test.h>
@@ -499,6 +561,76 @@ static void test_unsupported(void *context, const char *operation)
 	refusals++;
 }
 
+static unsigned int probes;
+
+static int test_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	(void)dev, (void)id;
+	probes++;
+	return 0;
+}
+
+/* A function published for searches is found by class, table and address,
+ * says who it is, and is offered to no driver, registered before or after. */
+static void test_identity(void)
+{
+	static const struct pci_device_id bridges[] = {
+		{.vendor = PCI_VENDOR_ID_INTEL, .device = 0x5182,
+		 .subvendor = (u32)PCI_ANY_ID, .subdevice = (u32)PCI_ANY_ID}, {}};
+	static struct pci_driver early = {.name = "early", .id_table = bridges,
+					  .probe = test_probe};
+	static struct pci_driver late = {.name = "late", .id_table = bridges,
+					 .probe = test_probe};
+	const struct stela_linux_pci_identity identity = {
+		.bus = 0, .devfn = PCI_DEVFN(0x1f, 0),
+		.vendor = PCI_VENDOR_ID_INTEL, .device = 0x5182,
+		.subsystem_vendor = 0x17aa, .subsystem_device = 0x22e7,
+		.class_revision = PCI_CLASS_BRIDGE_ISA << 16 | 0x01,
+	};
+	int status = 1;
+	u64 quarantined = stela_linux_pci_quarantined_functions();
+
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL));
+	assert(!pci_register_driver(&early));
+	struct pci_dev *bridge = stela_linux_pci_publish_identity(&identity, &status);
+
+	assert(bridge && !status);
+	assert(!pci_register_driver(&late));
+	assert(!probes && !stela_linux_pci_bound(bridge));
+	assert(pci_dev_present(bridges));
+	struct pci_dev *found = pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL);
+
+	assert(found == bridge);
+	assert(found->vendor == PCI_VENDOR_ID_INTEL && found->device == 0x5182);
+	assert(found->subsystem_vendor == 0x17aa && found->subsystem_device == 0x22e7);
+	assert(found->class == PCI_CLASS_BRIDGE_ISA << 8 && found->revision == 0x01);
+	assert(!pci_resource_len(found, 0) && !found->irq);
+	assert(!strcmp(dev_name(&found->dev), "0000:00:1f.0"));
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, found));
+	found = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 0));
+	assert(found == bridge);
+	pci_dev_put(found);
+
+	/* Its configuration is its owner's: reads fail as for an absent
+	 * function, and a write is refused and reported. */
+	u32 value = 0;
+	unsigned int before = refusals;
+
+	assert(pci_read_config_dword(bridge, PCI_VENDOR_ID, &value) == PCIBIOS_DEVICE_NOT_FOUND);
+	assert(value == ~(u32)0);
+	assert(pci_write_config_word(bridge, PCI_COMMAND, PCI_COMMAND_MASTER) ==
+	       PCIBIOS_DEVICE_NOT_FOUND);
+	assert(refusals == before + 1);
+	/* The cases after this one count their own refusals from here. */
+	refusals = before;
+
+	stela_linux_pci_remove_device(bridge);
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL) && !pci_dev_present(bridges));
+	assert(stela_linux_pci_quarantined_functions() == quarantined);
+	pci_unregister_driver(&early);
+	pci_unregister_driver(&late);
+}
+
 static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
 static const struct stela_linux_owner test_owner = {.services = &test_services};
 
@@ -525,6 +657,7 @@ int main(void)
 	struct pci_dev *dev = stela_linux_pci_attach(&function, NULL);
 
 	assert(dev && !stela_linux_pci_bound(dev));
+	test_identity();
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);

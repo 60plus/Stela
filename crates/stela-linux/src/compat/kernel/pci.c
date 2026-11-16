@@ -490,11 +490,15 @@ struct registered_driver {
 static LIST_HEAD(devices);
 static LIST_HEAD(drivers);
 
+/* drivers/pci/pci.h: the bit of priv_flags pci_bus_add_device sets on a device
+ * drivers may match, which pci_bus_match asks for first. */
+#define PCI_DEV_ALLOW_BINDING 7
+
 static void bind(struct pci_driver *driver, struct pci_dev *dev)
 {
 	const struct pci_device_id *id = pci_match_id(driver->id_table, dev);
 
-	if (dev->driver || !id)
+	if (dev->driver || !id || !test_bit(PCI_DEV_ALLOW_BINDING, &dev->priv_flags))
 		return;
 	dev->driver = driver;
 	dev->dev.driver = &driver->driver;
@@ -534,9 +538,22 @@ int stela_linux_pci_publish_device(struct pci_dev *dev)
 		return -EPERM;
 
 	dev->dev.bus = &pci_bus_type;
+	set_bit(PCI_DEV_ALLOW_BINDING, &dev->priv_flags);
 	list_add_tail(&dev->bus_list, &devices);
 	list_for_each_entry(registered, &drivers, node)
 		bind(registered->driver, dev);
+	return 0;
+}
+
+/* A function no driver may bind, for the searches of other functions' drivers
+ * (pci_get_class, pci_dev_present, pci_get_domain_bus_and_slot): it never
+ * allows binding, so it needs and is given no enrolled authority. */
+int stela_linux_pci_publish_for_searches(struct pci_dev *dev)
+{
+	if (stela_linux_kernel_hosted())
+		return -EPERM;
+	dev->dev.bus = &pci_bus_type;
+	list_add_tail(&dev->bus_list, &devices);
 	return 0;
 }
 
