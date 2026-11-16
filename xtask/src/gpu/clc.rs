@@ -175,13 +175,27 @@ fn programs(path: &Path, jobs: u16) -> Result<std::result::Result<Vec<PathBuf>, 
         }
         fs::write(&record, &arguments)?;
     }
-    crate::tools::exec(
-        Command::new(tool("ninja", GENERATORS)?)
-            .arg(format!("-j{jobs}"))
-            .args(PROGRAMS)
-            .current_dir(&build)
-            .env("PATH", path),
-    )?;
+    // A host whose libraries Meson found but cannot compile against (a
+    // pkg-config file naming headers that are not there) fails here, not in
+    // the configuration, and builds the drivers that do not need the tools.
+    let built = Command::new(tool("ninja", GENERATORS)?)
+        .arg(format!("-j{jobs}"))
+        .args(PROGRAMS)
+        .current_dir(&build)
+        .env("PATH", path)
+        .output()?;
+    if !built.status.success() {
+        // Configured again next time, as the host may have changed.
+        let _ = fs::remove_file(&record);
+        let kept = directory.join("ninja-log.txt");
+        let _ = fs::write(&kept, [&built.stdout[..], &built.stderr[..]].concat());
+        let output = String::from_utf8_lossy(&built.stdout);
+        return Ok(Err(format!(
+            "mesa_clc cannot be built here ({}; the build's output is {})",
+            compile_error(&output).unwrap_or("its build failed"),
+            kept.display()
+        )));
+    }
     Ok(Ok(PROGRAMS
         .iter()
         .map(|program| build.join(format!("{program}{}", std::env::consts::EXE_SUFFIX)))
@@ -193,6 +207,14 @@ fn meson_error(output: &str) -> Option<&str> {
     output
         .lines()
         .find_map(|line| line.split_once("ERROR: ").map(|(_, error)| error.trim()))
+}
+
+/// The first compiler error in a build's output, as the compiler printed it.
+fn compile_error(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find(|line| line.contains("error: "))
+        .map(str::trim)
 }
 
 #[cfg(test)]
@@ -222,6 +244,21 @@ mod tests {
             Some("Dependency \"LLVMSPIRVLib\" not found, tried pkgconfig")
         );
         assert_eq!(meson_error("fine\n"), None);
+    }
+
+    #[test]
+    fn a_builds_first_compiler_error_is_named() {
+        let output = "[12/80] Compiling C object src/util/libmesa_util.a.p/u_sync_provider.c.o\n\
+                      FAILED: src/util/libmesa_util.a.p/u_sync_provider.c.o\n\
+                      ../src/util/u_sync_provider.c:8:10: fatal error: xf86drm.h: No such file or directory\n\
+                      compilation terminated.\n";
+        assert_eq!(
+            compile_error(output),
+            Some(
+                "../src/util/u_sync_provider.c:8:10: fatal error: xf86drm.h: No such file or directory"
+            )
+        );
+        assert_eq!(compile_error("[1/1] Linking target mesa_clc\n"), None);
     }
 
     #[cfg(unix)]
