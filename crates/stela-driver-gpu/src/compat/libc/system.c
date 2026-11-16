@@ -206,3 +206,15 @@ int uname(struct utsname *name)
 	(void)name;
 	return refused();
 }
+
+/* The processor model __builtin_cpu_supports reads, compiler-rt's layout.
+ * Every feature reads as absent, so code that checks one takes its generic
+ * path (addrlib's swizzled copies take their scalar loop): the image's C
+ * target is built for SSE, and nothing proves wider vector state survives
+ * where that code runs. */
+struct __processor_model {
+	unsigned int __cpu_vendor;
+	unsigned int __cpu_type;
+	unsigned int __cpu_subtype;
+	unsigned int __cpu_features[1];
+} __cpu_model;

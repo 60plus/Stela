@@ -376,6 +376,7 @@ static void test_system(void)
 	CHECK(system("true") == -1 && errno == ENOSYS);
 	CHECK(isblank(' ') && isblank('\t') && !isblank('\n') && !isblank('a'));
 	CHECK(ENODATA == 61);
+	CHECK(!__builtin_cpu_supports("avx2"));
 }
 
 static void test_wide(void)
