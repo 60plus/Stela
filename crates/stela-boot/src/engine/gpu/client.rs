@@ -1457,11 +1457,12 @@ pub(super) fn query<T>(
     answer
 }
 
-/// The device memory bytes of the bound GPU at `index`, for the guest's
-/// `StelaHost`.
-pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
-    let stack = installed()?.start.bound.get(index as usize)?.stack;
-    query(index, stack.kernel.memory_bytes)
+/// The device memory bytes of the GPU of Metal service `service`, for the
+/// guest's `StelaHost` of that gate.
+pub(in crate::engine) fn vram_bytes(service: u32) -> Option<u64> {
+    let index = super::gate::served_gpu(service as usize)?;
+    let stack = installed()?.start.bound.get(index)?.stack;
+    query(index as u32, stack.kernel.memory_bytes)
 }
 
 /// Whether a fault at `address` may be on a client's mapping: a page past

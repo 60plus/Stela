@@ -53,6 +53,9 @@ const STOP_UNLOAD_SECONDS: u64 = 10;
 
 /// The services for the kernel's interrupts, once all are open.
 static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
+/// The bound GPU, by its index (its DRM minor), of each service, in the
+/// services' order.
+static SERVED: AtomicPtr<Vec<usize>> = AtomicPtr::new(ptr::null_mut());
 
 /// The compile stacks ([`open_gpu`]), whose jobs [`run`] runs with the
 /// shootdown vector open; a GPU past these runs its jobs masked.
@@ -1179,12 +1182,25 @@ pub(in crate::engine) fn open_service() {
         }
     }
     let mut constructed = false;
-    let services: Vec<_> = chosen
+    let (served, services): (Vec<_>, Vec<_>) = chosen
         .serve
         .iter()
-        .filter_map(|&index| open_gpu(gpu, index, &bound[index], &mut constructed))
-        .collect();
+        .filter_map(|&index| {
+            open_gpu(gpu, index, &bound[index], &mut constructed).map(|service| (index, service))
+        })
+        .unzip();
+    SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
+}
+
+/// The bound GPU, by its index, that service `service` runs on: services
+/// follow [`metal_choice`]'s order, which puts the GPU driving the display
+/// first and leaves out display-only and failed GPUs, so it is not the
+/// claims' order.
+pub(super) fn served_gpu(service: usize) -> Option<usize> {
+    // SAFETY: published once, before any service exists, and leaked.
+    unsafe { SERVED.load(Ordering::Acquire).as_ref() }
+        .and_then(|served| served.get(service).copied())
 }
 
 /// Which bound GPUs serve Metal devices, given the one whose output took
