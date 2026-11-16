@@ -53,6 +53,11 @@ pub(super) struct Observed<'a> {
 
 /// One stack's part of the claim.
 pub(super) struct Before {
+    /// What the boot can check from the function's PCI identity alone, before
+    /// the claim changes anything on the function or takes the firmware's
+    /// screen: that the driver's files for the device are pinned and on the
+    /// USB. A GPU refused here keeps the firmware's picture.
+    pub(super) admits: fn(&gpu::Adapter, &Catalog) -> Result<(), ServiceError>,
     /// Reads what selects the driver's firmware, through the first page of
     /// the stack's register BAR mapped read-only before the reset, and
     /// selects it.
@@ -76,6 +81,8 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
 /// nouveau: the chip is `PMC_BOOT_0`'s, its GSP-RM files are that chip's, and
 /// a Turing-to-Ada GPU's own firmware must have booted again after the reset.
 static NOUVEAU: Before = Before {
+    // Its files are the chip's, which only its registers name.
+    admits: |_, _| Ok(()),
     identify: |observed, catalog| {
         let registers = observed.registers;
         let endian = registers.read32(4).map_err(ServiceError::Mapping)?;
@@ -115,6 +122,13 @@ static NOUVEAU: Before = Before {
 /// device's own discovery table and loads every engine's firmware itself,
 /// so nothing boots by itself after the reset and nothing waits here.
 static AMDGPU: Before = Before {
+    admits: |adapter, catalog| {
+        on_usb(
+            &amdgpu_files(adapter.device)?,
+            &format!("{:04x}", adapter.device),
+            catalog,
+        )
+    },
     identify: |observed, catalog| {
         use stela_loader::host_firmware::recipes;
         let adapter = observed.adapter;
@@ -123,9 +137,7 @@ static AMDGPU: Before = Before {
             .registers
             .read32(0)
             .map_err(ServiceError::Mapping)?;
-        let mut inventory = Inventory::default();
-        recipes::require_amdgpu(&mut inventory, adapter.device)
-            .map_err(|_| ServiceError::Refused("the GPU has no pinned amdgpu firmware recipe"))?;
+        let inventory = amdgpu_files(adapter.device)?;
         let name = format!("{:04x}", adapter.device);
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, None)?,
@@ -143,6 +155,13 @@ static AMDGPU: Before = Before {
 /// boots by itself after a reset: xe loads all of it. The display code's
 /// Video BIOS Table is the one file the PC itself holds.
 static XE: Before = Before {
+    admits: |adapter, catalog| {
+        on_usb(
+            &xe_files(adapter.device)?,
+            &format!("{:04x}", adapter.device),
+            catalog,
+        )
+    },
     identify: |mut observed, catalog| {
         use stela_loader::host_firmware::recipes;
         let adapter = observed.adapter;
@@ -151,9 +170,7 @@ static XE: Before = Before {
             .registers
             .read32(0)
             .map_err(ServiceError::Mapping)?;
-        let mut inventory = Inventory::default();
-        recipes::require_xe(&mut inventory, adapter.device)
-            .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
+        let inventory = xe_files(adapter.device)?;
         let target = inventory
             .requests()
             .first()
@@ -285,6 +302,82 @@ fn video_bios_table(
     image
 }
 
+/// The files amdgpu asks for on the AMD GPU with PCI device ID `device`.
+fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
+    let mut inventory = Inventory::default();
+    stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
+        ServiceError::Refused(
+            "Stela pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
+                 not for this GPU",
+        )
+    })?;
+    Ok(inventory)
+}
+
+/// The files xe and the display code ask for on the Intel GPU with PCI
+/// device ID `device`.
+fn xe_files(device: u16) -> Result<Inventory, ServiceError> {
+    let mut inventory = Inventory::default();
+    stela_loader::host_firmware::recipes::require_xe(&mut inventory, device)
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
+    Ok(inventory)
+}
+
+/// The image `selection` names in `stored`: its exact binding, else the
+/// bundle's file by its pinned digest.
+fn find<'a>(
+    stored: &'a Catalog,
+    selection: &stela_loader::host_firmware::recipes::Selection,
+) -> Result<Image<'a>, firmware::Error> {
+    use stela_loader::host_firmware::bundle;
+    let request = &selection.request;
+    match stored.load(request.view()) {
+        Err(error) if error.kind == FirmwareError::Missing => {
+            let name = bundle::name(selection.recipe.image.sha256);
+            match stored.load(Requirement {
+                name: &name,
+                target: bundle::TARGET,
+                minimum_bytes: request.minimum_bytes,
+            }) {
+                Err(stored_error) if stored_error.kind == FirmwareError::Missing => Err(error),
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Whether every file of `inventory` is in `catalog`, before anything of the
+/// GPU `name` changes: one line naming the files the USB lacks, and the
+/// refusal [`select_firmware`] would give for them later.
+fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), ServiceError> {
+    let plan = stela_loader::host_firmware::recipes::Plan::select(inventory)
+        .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
+    let missing: Vec<_> = plan
+        .selections()
+        .iter()
+        .filter(|selection| {
+            find(catalog, selection).is_err_and(|error| error.kind == FirmwareError::Missing)
+        })
+        .map(|selection| selection.request.name.clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    lacks(name, &missing, plan.selections().len());
+    Err(ServiceError::Refused(NO_FIRMWARE))
+}
+
+/// Says which of the `files` files of the GPU `name` the USB lacks.
+fn lacks(name: &str, missing: &[String], files: usize) {
+    output::arguments(format_args!(
+        "GPU {name}: the USB's firmware bundle lacks {} of this chip's {files} files ({}); \
+         `stela repair` completes it\n",
+        missing.len(),
+        missing.join(", ")
+    ));
+}
+
 /// The firmware of every request in `inventory`, each file bound under the
 /// exact name and target its driver asks for. A driver needs every file of
 /// its recipe: one missing fails its start later with a generic error.
@@ -296,7 +389,7 @@ fn select_firmware(
     catalog: Arc<Catalog>,
     read: Option<(Image<'static>, &str)>,
 ) -> Result<PciFirmware, ServiceError> {
-    use stela_loader::host_firmware::{bundle, recipes};
+    use stela_loader::host_firmware::recipes;
     let mut names = Vec::new();
     let request = inventory.requests().first().ok_or(ServiceError::Refused(
         "the GPU has no pinned firmware recipe",
@@ -317,21 +410,7 @@ fn select_firmware(
     let mut missing = Vec::new();
     for selection in plan.selections() {
         let request = &selection.request;
-        // An exact binding, else the bundle's file by its pinned digest.
-        let found = match stored.load(request.view()) {
-            Err(error) if error.kind == FirmwareError::Missing => {
-                let name = bundle::name(selection.recipe.image.sha256);
-                match stored.load(stela_drivers::firmware::Requirement {
-                    name: &name,
-                    target: bundle::TARGET,
-                    minimum_bytes: request.minimum_bytes,
-                }) {
-                    Err(stored_error) if stored_error.kind == FirmwareError::Missing => Err(error),
-                    other => other,
-                }
-            }
-            other => other,
-        };
+        let found = find(stored, selection);
         if let Ok(image) = found {
             output::arguments(format_args!(
                 "GPU {name}: firmware {} of {} bytes\n",
@@ -368,13 +447,7 @@ fn select_firmware(
         names.push(request.name.clone());
     }
     if !missing.is_empty() {
-        output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks {} of this chip's {} files ({}); \
-             `stela repair` completes it\n",
-            missing.len(),
-            names.len(),
-            missing.join(", ")
-        ));
+        lacks(name, &missing, names.len());
         return Err(ServiceError::Refused(NO_FIRMWARE));
     }
     names.extend(read.iter().map(|(_, name)| String::from(*name)));

@@ -1089,6 +1089,12 @@ fn claim(
 ) -> Result<Claimed, ServiceError> {
     use crate::pci_io::ScreenOwner;
     let address = adapter.address;
+    let before = before::of(stack).ok_or(ServiceError::Refused(
+        "the boot has no preparation for this GPU's kernel driver",
+    ))?;
+    // A GPU whose driver lacks its files is refused before anything of it
+    // changes, the firmware's screen included.
+    (before.admits)(adapter, &catalog)?;
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
     let bus_reset = requester.bus_reset_available();
@@ -1242,9 +1248,6 @@ fn claim(
             Protection::ReadOnly,
         )
         .map_err(ServiceError::Mapping)?;
-    let before = before::of(stack).ok_or(ServiceError::Refused(
-        "the boot has no preparation for this GPU's kernel driver",
-    ))?;
     let identified = (before.identify)(
         before::Observed {
             services,
