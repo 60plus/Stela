@@ -286,6 +286,57 @@ pub fn take_recoveries() -> (alloc::vec::Vec<Recovery>, u32) {
     (TEST_RECORDS.with(|records| records.take()), 0)
 }
 
+/// Published units whose medium was found changed since the last
+/// [`take_media_changes`], and the last sense that said so, packed as
+/// `VALID_SENSE | key << 16 | asc << 8 | ascq`.
+const VALID_SENSE: u32 = 1 << 31;
+#[cfg(not(test))]
+static MEDIA_CHANGES: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(test))]
+static MEDIA_CHANGE_SENSE: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+std::thread_local! {
+    static TEST_MEDIA: core::cell::Cell<(u32, u32)> = const { core::cell::Cell::new((0, 0)) };
+}
+
+fn pack(why: Option<crate::block::Sense>) -> u32 {
+    why.map_or(0, |sense| {
+        VALID_SENSE | u32::from(sense.key) << 16 | u32::from(sense.asc) << 8 | u32::from(sense.ascq)
+    })
+}
+fn unpack(bits: u32) -> Option<crate::block::Sense> {
+    (bits & VALID_SENSE != 0).then_some(crate::block::Sense {
+        key: (bits >> 16) as u8,
+        asc: (bits >> 8) as u8,
+        ascq: bits as u8,
+    })
+}
+
+/// A published unit's medium was found changed, by the sense `why`, or by
+/// an eject without one: its disk fails until it is published again.
+pub(super) fn media_changed(why: Option<crate::block::Sense>) {
+    #[cfg(not(test))]
+    {
+        MEDIA_CHANGES.fetch_add(1, Ordering::Relaxed);
+        MEDIA_CHANGE_SENSE.store(pack(why), Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    TEST_MEDIA.with(|media| media.set((media.get().0 + 1, pack(why))));
+}
+
+/// How many published units found their medium changed since the last
+/// call, and the last sense that said so.
+pub fn take_media_changes() -> (u32, Option<crate::block::Sense>) {
+    #[cfg(not(test))]
+    let (count, sense) = (
+        MEDIA_CHANGES.swap(0, Ordering::Relaxed),
+        MEDIA_CHANGE_SENSE.load(Ordering::Relaxed),
+    );
+    #[cfg(test)]
+    let (count, sense) = TEST_MEDIA.with(|media| media.replace((0, 0)));
+    (count, unpack(sense))
+}
+
 /// A command's runs on its way down the ladder.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Ladder {

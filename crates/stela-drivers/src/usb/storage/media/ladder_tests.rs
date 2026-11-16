@@ -1,6 +1,6 @@
 //! The recovery ladder of a published unit's commands, on a transport that
 //! fails each step once ([`Flaky`]).
-use super::super::recovery::{Cause, End, Step, take_recoveries};
+use super::super::recovery::{Cause, End, Step, take_media_changes, take_recoveries};
 use super::*;
 use crate::block::BlockDevice;
 use alloc::collections::VecDeque;
@@ -284,4 +284,31 @@ fn a_queued_read_waits_for_the_class_reset_to_settle_and_runs_again() {
         recoveries(),
         [(Cause::Device(4), Step::ClassReset, 2, End::Completed)]
     );
+}
+
+#[test]
+fn an_unexpected_unit_attention_ends_a_removable_disk_and_is_counted_with_its_sense() {
+    let (mut disk, _script) = published(&[]);
+    take_media_changes();
+    // A UNIT ATTENTION no reset of this owner raised: a removable unit's
+    // medium may have changed, as Linux's sd takes it.
+    disk.bot.borrow_mut().transport.attention = true;
+    assert!(matches!(
+        disk.read(0, &mut [0; 512]),
+        Err(BlockError::Sense(_))
+    ));
+    assert!(!disk.media.get());
+    assert!(disk.read(0, &mut [0; 512]).is_err());
+    assert_eq!(
+        take_media_changes(),
+        (
+            1,
+            Some(Sense {
+                key: Sense::UNIT_ATTENTION,
+                asc: Sense::RESET_OCCURRED,
+                ascq: 0
+            })
+        )
+    );
+    assert_eq!(take_media_changes(), (0, None));
 }

@@ -18,6 +18,14 @@ pub(super) fn changed(sense: &Sense, removable: bool) -> bool {
         || sense.key == Sense::ILLEGAL_REQUEST && sense.asc == Sense::UNSUPPORTED_UNIT
 }
 
+/// The sense a failed command's `result` carries.
+fn sense_of<R>(result: &Result<R, BlockError>) -> Option<Sense> {
+    match result {
+        Err(BlockError::Sense(sense)) => Some(*sense),
+        _ => None,
+    }
+}
+
 /// Port resets an owner may run on its own in [`RESET_WINDOW_US`]; past
 /// that the device is left failed until an explicit rescan rebinds it.
 const RESET_LIMIT: usize = 3;
@@ -215,7 +223,10 @@ impl<T: Scsi> Owner<T> {
             .find(|(unit, _)| *unit == lun)
             .is_none_or(|(_, removable)| removable)
     }
-    fn changed(&mut self, lun: T::Lun) {
+    /// `lun`'s medium changed, as the sense `why` says, or by an eject:
+    /// its publication ends. A published unit's end is counted for the log
+    /// ([`super::recovery::take_media_changes`]).
+    fn changed(&mut self, lun: T::Lun, why: Option<Sense>) {
         for (unit, valid, _) in &self.pending {
             if *unit == lun {
                 valid.set(false);
@@ -223,6 +234,9 @@ impl<T: Scsi> Owner<T> {
         }
         for unit in &mut self.units {
             if unit.lun == lun {
+                if unit.valid.get() {
+                    super::recovery::media_changed(why);
+                }
                 unit.valid.set(false);
                 // Its publication ended for another medium, which a device
                 // that comes back must never revive.
@@ -379,7 +393,7 @@ impl<T: Scsi> Owner<T> {
                     .get(4)
                     .is_some_and(|flags| flags & scsi::LOAD_EJECT != 0)
         {
-            self.changed(lun);
+            self.changed(lun, sense_of(&result));
         }
         self.settle(generation, &result);
         result
@@ -502,7 +516,7 @@ impl<T: Scsi> Owner<T> {
                     .get(4)
                     .is_some_and(|flags| flags & scsi::LOAD_EJECT != 0)
         {
-            self.changed(begun.lun);
+            self.changed(begun.lun, sense_of(&result));
         }
         self.settle(begun.generation, &result);
         let rebound = core::mem::take(&mut self.rebound);
@@ -884,7 +898,7 @@ impl<T: Scsi> Scsi for Owner<T> {
         let result = self.transport.read_before_mode_sense(lun, block_size);
         let removable = self.removable(lun);
         if matches!(&result, Err(BlockError::Sense(sense)) if changed(sense, removable)) {
-            self.changed(lun);
+            self.changed(lun, sense_of(&result));
         }
         self.settle(generation, &result);
         result

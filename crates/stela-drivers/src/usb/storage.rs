@@ -26,7 +26,7 @@ mod media;
 pub use media::UsbStorage;
 mod bot;
 mod recovery;
-pub use recovery::{Cause, End, Recovery, Step, take_recoveries};
+pub use recovery::{Cause, End, Recovery, Step, take_media_changes, take_recoveries};
 mod scsi;
 pub mod uas;
 use bot::{Bot, Io, Native};

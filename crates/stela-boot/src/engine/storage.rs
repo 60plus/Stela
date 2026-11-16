@@ -725,6 +725,20 @@ fn report_usb_recoveries() {
             "HOST USB DISK RECOVERY {replaced} more commands recovered or failed since the last report\n"
         ));
     }
+    let (changed, sense) = stela_drivers::usb::storage::take_media_changes();
+    if changed != 0 {
+        let why = sense.map_or(String::from("an eject"), |sense| {
+            format!(
+                "sense {:02x}/{:02x}/{:02x}",
+                sense.key, sense.asc, sense.ascq
+            )
+        });
+        output::arguments(format_args!(
+            "HOST USB DISK media changed on {changed} published units, the last by {why}: \
+             their disks fail until published again, as Linux's sd fails a removable unit \
+             after an unexpected UNIT ATTENTION\n"
+        ));
+    }
 }
 
 impl Service {
