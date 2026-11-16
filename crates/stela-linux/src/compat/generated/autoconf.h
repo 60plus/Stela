@@ -95,6 +95,12 @@
 #define CONFIG_DRM_SUBALLOC_HELPER 1
 #define CONFIG_CRC16 1
 #define CONFIG_INTERVAL_TREE 1
+/* In-kernel DRM clients: the client interfaces, and the selection of the
+ * default clients, of which none is configured (no fbdev emulation and no
+ * log client), so DRM_CLIENT_LIB stays unselected. */
+#define CONFIG_DRM_CLIENT 1
+#define CONFIG_DRM_CLIENT_SELECTION 1
+#define CONFIG_DRM_PANEL_BACKLIGHT_QUIRKS 1
 
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_XE_FORCE_PROBE ""

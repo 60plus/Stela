@@ -381,3 +381,8 @@
 /drivers/gpu/buddy.c
 /lib/vsscanf.c
 /lib/vsprintf_atoi.h
+/drivers/gpu/drm/drm_client.c
+/drivers/gpu/drm/drm_client_event.c
+/drivers/gpu/drm/drm_client_modeset.c
+/drivers/gpu/drm/drm_client_sysrq.c
+/drivers/gpu/drm/drm_panel_backlight_quirks.c
