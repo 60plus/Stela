@@ -1213,7 +1213,7 @@ fn integrated(index: usize, bound: &Bound) -> bool {
         .kernel
         .probed_integrated
         .and_then(|query| client::query(index as u32, query))
-        .unwrap_or(bound.integrated)
+        .unwrap_or(bound.integrated.unwrap_or(false))
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.

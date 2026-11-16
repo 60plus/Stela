@@ -1069,9 +1069,10 @@ pub(super) struct Claimed {
     name: String,
     #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
     stack: &'static GpuStack,
-    /// Its kernel driver's [`stela_drivers::gpu::stack::Kernel::integrated`].
+    /// Whether it is integrated as its kernel driver's table says before the
+    /// probe ([`stela_drivers::gpu::stack::Kernel::table_integrated`]).
     #[cfg(feature = "nvk")]
-    integrated: bool,
+    integrated: Option<bool>,
     #[cfg(feature = "nvk")]
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
@@ -1383,7 +1384,7 @@ fn claim(
         name: format!("{address}"),
         stack,
         #[cfg(feature = "nvk")]
-        integrated: (stack.kernel.integrated)(adapter),
+        integrated: stack.kernel.table_integrated(adapter),
         #[cfg(feature = "nvk")]
         drm,
         #[cfg(feature = "nvk")]
@@ -1551,10 +1552,10 @@ pub(super) fn claim_all(
             return (claimed, refused);
         }
     };
-    // The claimed GPUs that draw, each with whether it is integrated.
+    // The claimed GPUs that draw, each with how it counts as integrated.
     let mut drawing: Vec<(String, bool)> = Vec::new();
     for (stack, adapter) in driven {
-        let integrated = (stack.kernel.integrated)(adapter);
+        let integrated = stack.kernel.table_integrated(adapter);
         if let Some(drawer) = shows_frames_only(&drawing, stack.draws(), integrated)
             && !may_show_screen(source, adapter.address)
         {
@@ -1581,7 +1582,10 @@ pub(super) fn claim_all(
         match result {
             Ok(function) => {
                 if stack.draws() {
-                    drawing.push((function.name.clone(), integrated));
+                    drawing.push((
+                        function.name.clone(),
+                        stela_drivers::gpu::stack::drawing_kind(integrated),
+                    ));
                 }
                 claimed.push(function);
             }
@@ -1598,12 +1602,16 @@ pub(super) fn claim_all(
     (claimed, refused)
 }
 
-/// The claimed drawing GPU whose frames a GPU would only show
-/// ([`stela_drivers::gpu::stack::shows_frames_of`]). `drawing` holds each
-/// claimed drawing GPU's name and whether it is integrated.
-fn shows_frames_only(drawing: &[(String, bool)], draws: bool, integrated: bool) -> Option<&str> {
+/// The claimed drawing GPU whose frames a GPU surely would only show
+/// ([`stela_drivers::gpu::stack::only_shows_frames_of`]). `drawing` holds
+/// each claimed drawing GPU's name and how it counts as integrated.
+fn shows_frames_only(
+    drawing: &[(String, bool)],
+    draws: bool,
+    integrated: Option<bool>,
+) -> Option<&str> {
     let kinds: Vec<bool> = drawing.iter().map(|(_, integrated)| *integrated).collect();
-    stela_drivers::gpu::stack::shows_frames_of(&kinds, draws, integrated)
+    stela_drivers::gpu::stack::only_shows_frames_of(&kinds, draws, integrated)
         .map(|index| drawing[index].0.as_str())
 }
 
@@ -1634,7 +1642,8 @@ struct Bound {
     /// screen's function is unknown.
     shows_screen: bool,
     stack: &'static GpuStack,
-    integrated: bool,
+    /// As [`Claimed::integrated`].
+    integrated: Option<bool>,
     drm: client::DrmDevice,
     link: Option<PcieLink>,
 }
@@ -2211,9 +2220,10 @@ fn mount_and_start(
 }
 
 /// The claimed GPUs in the two turns of their probes: first those that may
-/// serve the Metal device, then those that would only show the frames
-/// another draws ([`stela_drivers::gpu::stack::shows_frames_of`]), each in
-/// the claims' order. A probe of the second turn that hangs or fails then
+/// serve the Metal device, then those that may only show the frames another
+/// draws ([`stela_drivers::gpu::stack::may_only_show_frames_of`]), each in
+/// the claims' order: a GPU whose kind only its probe tells waits for a
+/// known discrete one. A probe of the second turn that hangs or fails then
 /// costs its own GPU, not the one macOS draws on.
 fn by_probe_turn(
     claimed: ManuallyDrop<Vec<Claimed>>,
@@ -2225,11 +2235,14 @@ fn by_probe_turn(
             .into_iter()
             .partition(|claimed| {
                 let draws = claimed.stack.draws();
-                let first =
-                    stela_drivers::gpu::stack::shows_frames_of(&drawing, draws, claimed.integrated)
-                        .is_none();
+                let first = stela_drivers::gpu::stack::may_only_show_frames_of(
+                    &drawing,
+                    draws,
+                    claimed.integrated,
+                )
+                .is_none();
                 if first && draws {
-                    drawing.push(claimed.integrated);
+                    drawing.push(stela_drivers::gpu::stack::drawing_kind(claimed.integrated));
                 }
                 first
             });

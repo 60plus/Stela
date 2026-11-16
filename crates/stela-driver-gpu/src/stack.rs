@@ -304,10 +304,43 @@ pub fn metal_devices(candidates: &[Candidate]) -> MetalDevices {
 /// claims take drawing GPUs first ([`GpuStack::claim_order`]). Stela shows
 /// one display and a drawing GPU's outputs take it first, so such a GPU is
 /// worth starting only where the firmware's picture may be on it.
-pub fn shows_frames_of(drawing: &[bool], draws: bool, integrated: bool) -> Option<usize> {
+fn shows_frames_of(drawing: &[bool], draws: bool, integrated: bool) -> Option<usize> {
     drawing
         .iter()
         .position(|&other_integrated| !draws || (integrated && !other_integrated))
+}
+
+/// The drawing GPU whose frames a GPU surely would only show
+/// ([`shows_frames_of`]), so that it is left with the firmware unless the
+/// firmware's picture may be on it. `integrated` is
+/// [`Kernel::table_integrated`]: a GPU whose kind only its probe tells may
+/// be discrete and serve a Metal device of its own, so it is claimed.
+pub fn only_shows_frames_of(
+    drawing: &[bool],
+    draws: bool,
+    integrated: Option<bool>,
+) -> Option<usize> {
+    shows_frames_of(drawing, draws, integrated.unwrap_or(false))
+}
+
+/// The drawing GPU whose frames a GPU may only show ([`shows_frames_of`]),
+/// so that it is probed after the GPUs that serve Metal devices, under a
+/// deadline of its own. `integrated` is [`Kernel::table_integrated`]: a GPU
+/// whose kind only its probe tells may be integrated, so its probe waits.
+pub fn may_only_show_frames_of(
+    drawing: &[bool],
+    draws: bool,
+    integrated: Option<bool>,
+) -> Option<usize> {
+    shows_frames_of(drawing, draws, integrated.unwrap_or(true))
+}
+
+/// How a drawing GPU counts in the `drawing` list of
+/// [`only_shows_frames_of`] and [`may_only_show_frames_of`]: one whose kind
+/// only its probe tells counts as integrated, so it never leaves another
+/// GPU out.
+pub fn drawing_kind(integrated: Option<bool>) -> bool {
+    integrated.unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -533,6 +566,31 @@ mod tests {
         integrated.device = 0x13c0;
         assert_eq!(AMD.kernel.table_integrated(&integrated), None);
         assert!(claim_rank(true, None) > claim_rank(true, Some(false)));
+    }
+
+    #[test]
+    fn a_gpu_of_unknown_kind_beside_a_drawing_discrete_gpu_is_claimed_and_probed_after_it() {
+        // amdgpu's class-matched GPU beside a drawing NVIDIA GPU: it may be
+        // a discrete card that serves Metal too, so it is claimed, and it
+        // may be the processor's GPU, so its probe waits for the NVIDIA one.
+        assert_eq!(only_shows_frames_of(&[false], true, None), None);
+        assert_eq!(may_only_show_frames_of(&[false], true, None), Some(0));
+        // Alone, it is claimed and probed first.
+        assert_eq!(only_shows_frames_of(&[], true, None), None);
+        assert_eq!(may_only_show_frames_of(&[], true, None), None);
+        // Without a Vulkan driver it only shows frames, whatever its kind.
+        assert_eq!(only_shows_frames_of(&[false], false, None), Some(0));
+        // Drawing ahead of an integrated GPU, it leaves that one claimed.
+        let drawing = [drawing_kind(None)];
+        assert_eq!(only_shows_frames_of(&drawing, true, Some(true)), None);
+        assert_eq!(may_only_show_frames_of(&drawing, true, Some(true)), None);
+        // A known kind decides both the same way.
+        for integrated in [false, true] {
+            assert_eq!(
+                only_shows_frames_of(&[false], true, Some(integrated)),
+                may_only_show_frames_of(&[false], true, Some(integrated))
+            );
+        }
     }
 
     #[test]
