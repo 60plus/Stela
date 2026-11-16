@@ -63,6 +63,17 @@ impl Kernel {
     pub fn dma_limit(&self, adapter: &Adapter) -> u64 {
         u64::MAX >> (64 - (self.dma_bits)(adapter))
     }
+
+    /// Whether `adapter` is integrated as far as the driver's table says
+    /// before its probe: `None` for a device the table does not flag of a
+    /// driver that decides during its probe ([`Self::probed_integrated`]).
+    pub fn table_integrated(&self, adapter: &Adapter) -> Option<bool> {
+        match ((self.integrated)(adapter), self.probed_integrated) {
+            (true, _) => Some(true),
+            (false, Some(_)) => None,
+            (false, None) => Some(false),
+        }
+    }
 }
 
 /// Every stack this build holds.
@@ -208,12 +219,14 @@ impl GpuStack {
     }
 
     /// Where `adapter` comes among the GPUs claimed: drawing discrete GPUs
-    /// first, then drawing integrated ones, then those that only show
-    /// frames, each group in the firmware's order (the sort is stable). The
-    /// GPUs [`metal_devices`] prefers then have the first DRM minors, so a
-    /// PC numbers them as it would without the others.
+    /// first, then drawing GPUs whose kind only their probe tells, then
+    /// drawing integrated ones, then those that only show frames, each group
+    /// in the firmware's order (the sort is stable). The GPUs
+    /// [`metal_devices`] prefers then have the first DRM minors, so a PC
+    /// numbers them as it would without the others, and a GPU that may turn
+    /// out integrated never comes before one known to be discrete.
     pub fn claim_order(&self, adapter: &Adapter) -> u8 {
-        claim_rank(self.draws(), (self.kernel.integrated)(adapter))
+        claim_rank(self.draws(), self.kernel.table_integrated(adapter))
     }
 
     /// The stack for `adapter`: its vendor's, when that stack's kernel
@@ -229,13 +242,14 @@ impl GpuStack {
     }
 }
 
-/// [`GpuStack::claim_order`] of a GPU that draws or not and is integrated
-/// or not.
-fn claim_rank(draws: bool, integrated: bool) -> u8 {
+/// [`GpuStack::claim_order`] of a GPU that draws or not and is integrated,
+/// discrete or not known before its probe.
+fn claim_rank(draws: bool, integrated: Option<bool>) -> u8 {
     match (draws, integrated) {
-        (true, false) => 0,
-        (true, true) => 1,
-        (false, _) => 2,
+        (true, Some(false)) => 0,
+        (true, None) => 1,
+        (true, Some(true)) => 2,
+        (false, _) => 3,
     }
 }
 
@@ -482,16 +496,43 @@ mod tests {
     #[test]
     fn claims_put_drawing_discrete_gpus_first_then_integrated_then_display_only() {
         // (draws, integrated) in the firmware's order: an integrated GPU on
-        // bus 0, a display-only GPU, then a discrete GPU.
-        let mut gpus = vec![(true, true), (false, false), (true, false), (false, true)];
+        // bus 0, a display-only GPU, a GPU only its probe tells the kind of
+        // (an AMD GPU amdgpu matches by class), then a discrete GPU.
+        let mut gpus = vec![
+            (true, Some(true)),
+            (false, Some(false)),
+            (true, None),
+            (true, Some(false)),
+            (false, None),
+        ];
         gpus.sort_by_key(|&(draws, integrated)| claim_rank(draws, integrated));
         assert_eq!(
             gpus,
-            [(true, false), (true, true), (false, false), (false, true)]
+            [
+                (true, Some(false)),
+                (true, None),
+                (true, Some(true)),
+                (false, Some(false)),
+                (false, None)
+            ]
         );
         // This test binary links no Vulkan driver, so its stacks come last.
-        assert_eq!(NVIDIA.claim_order(&adapter(0x10de)), 2);
-        assert!(!(NVIDIA.kernel.integrated)(&adapter(0x10de)));
+        assert_eq!(NVIDIA.claim_order(&adapter(0x10de)), 3);
+        assert_eq!(
+            NVIDIA.kernel.table_integrated(&adapter(0x10de)),
+            Some(false)
+        );
+    }
+
+    #[cfg(feature = "amdgpu-port")]
+    #[test]
+    fn an_amd_gpu_matched_by_class_has_no_kind_before_its_probe() {
+        // An iGPU beside a drawing NVIDIA GPU on a lower bus would otherwise
+        // take DRM minor 0 and the first claim.
+        let mut integrated = adapter(0x1002);
+        integrated.device = 0x13c0;
+        assert_eq!(AMD.kernel.table_integrated(&integrated), None);
+        assert!(claim_rank(true, None) > claim_rank(true, Some(false)));
     }
 
     #[test]
