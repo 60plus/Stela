@@ -105,6 +105,21 @@ fn devices_missing_a_required_feature_are_refused() {
     assert!(matches!(device, Err(Error::Unsupported("nullDescriptor"))));
 }
 
+/// Images stay in `GENERAL`, which core Vulkan allows for every access, so
+/// a device whose driver does not promise that `GENERAL` costs nothing
+/// still serves Metal.
+#[test]
+fn devices_without_unified_image_layouts_are_served() {
+    let mut backend = MockBackend::new();
+    backend
+        .physical
+        .as_mut()
+        .unwrap()
+        .features
+        .unified_image_layouts = false;
+    device_on(backend);
+}
+
 /// A guest's poll takes the completion marker's serial as the timeline: no
 /// driver query, whether or not the marker shows something new; without a
 /// marker the driver is asked as before.

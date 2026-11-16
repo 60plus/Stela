@@ -1,9 +1,10 @@
 //! Buffers, textures and texture views: Metal descriptors validated against
 //! Metal's rules and the device, then lowered to Vulkan objects.
 //!
-//! Every texture uses one image layout for its whole life
-//! (`VK_KHR_unified_image_layouts`), so lowering never schedules layout
-//! transitions. Storage modes map to memory as a discrete Mac GPU realizes
+//! Every texture uses one image layout, `VK_IMAGE_LAYOUT_GENERAL`, for its
+//! whole life after its first barrier, so lowering never schedules layout
+//! transitions; `VK_KHR_unified_image_layouts`, where offered, promises
+//! that this layout costs nothing (`vulkan::backend::requirements`). Storage modes map to memory as a discrete Mac GPU realizes
 //! them: shared and managed resources live in host-visible memory, private
 //! resources in device-local memory. Memoryless textures live in device-local
 //! memory too: a pass may neither load nor store them, so no content outlives

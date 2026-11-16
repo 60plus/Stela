@@ -159,8 +159,6 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 			 v12.shaderStorageImageArrayNonUniformIndexing},
 		{"extendedDynamicState",
 		 dynamic.extendedDynamicState && dynamic2.extendedDynamicState2},
-		{"unifiedImageLayouts",
-		 has_extension(instance, physical, "VK_KHR_unified_image_layouts")},
 		{"maintenance5", v13.maintenance4 && maintenance5.maintenance5},
 		{"vulkanMemoryModel", v12.vulkanMemoryModel},
 		{"storageImageWithoutFormat",

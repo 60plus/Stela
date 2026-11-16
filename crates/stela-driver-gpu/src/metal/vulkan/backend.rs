@@ -464,7 +464,15 @@ pub struct Requirement {
 
 /// The features the binding ABI, dynamic state model and synchronization
 /// rely on; a device missing any is refused rather than half-supported.
-pub fn requirements(features: &Features) -> [Requirement; 20] {
+///
+/// `unifiedImageLayouts` is not among them: every image stays in
+/// `VK_IMAGE_LAYOUT_GENERAL`, which core Vulkan allows for each access the
+/// layer makes (transfers, sampling, storage, attachments, and input
+/// attachments read with `dynamicRenderingLocalRead`). The feature only
+/// promises that `GENERAL` costs nothing beside the optimal layouts, and
+/// lets `GENERAL` stand for the attachment feedback loop and video layouts,
+/// which the layer never uses. The device enables it when offered.
+pub fn requirements(features: &Features) -> [Requirement; 19] {
     let requirement = |name, present| Requirement { name, present };
     [
         requirement("bufferDeviceAddress", features.buffer_device_address),
@@ -497,7 +505,6 @@ pub fn requirements(features: &Features) -> [Requirement; 20] {
             "extendedDynamicState",
             features.extended_dynamic_state && features.extended_dynamic_state2,
         ),
-        requirement("unifiedImageLayouts", features.unified_image_layouts),
         requirement(
             "maintenance5",
             features.maintenance4 && features.maintenance5,
