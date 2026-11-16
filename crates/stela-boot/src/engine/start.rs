@@ -1443,9 +1443,13 @@ fn open_gpus(
     work: &'static kernel_work::KernelWork,
     mmio: Option<&'static crate::native_mmio::Source>,
     remappers: &'static remapping::Remappers,
+    acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    adapters: Vec<stela_drivers::gpu::Adapter>,
+    (adapters, isa_bridges): (
+        Vec<stela_drivers::gpu::Adapter>,
+        Vec<stela_drivers::probe::IsaBridge>,
+    ),
 ) -> bool {
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
     let guest_ram = handoff.guest[..handoff.guest_count]
@@ -1478,13 +1482,15 @@ fn open_gpus(
     let found = adapters.clone();
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
-        let services = services::Services::new(mmio, remappers, None, heap, tsc_hz, Vec::new())
+        // The firmware's memory is read through the ACPI owner: a GPU's
+        // configuration may point at a table there.
+        let services = services::Services::new(mmio, remappers, acpi, heap, tsc_hz, Vec::new())
             .with_guest_ram(guest_ram);
         let random = stela_drivers::probe::NativeServices::entropy(&services)
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, gop, firmware.as_ref())
+            gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
         });
         (claimed, refused, random)
     });
@@ -1497,6 +1503,7 @@ fn open_gpus(
                 None => crate::status::warn(&gpu_status::none(&found)),
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
+                        first.vendor,
                         &first.address,
                         first.device,
                         first.reason,
@@ -1504,6 +1511,7 @@ fn open_gpus(
                     ));
                     for gpu in rest {
                         crate::status::info(&gpu_status::refused(
+                            gpu.vendor,
                             &gpu.address,
                             gpu.device,
                             gpu.reason,
@@ -3055,6 +3063,7 @@ fn start_devices(
                 mut links,
                 network_account,
                 gpus,
+                isa_bridges,
                 usb,
                 bluetooth: host_controller,
                 usb_disks,
@@ -3105,7 +3114,15 @@ fn start_devices(
             });
             if options.boots_macos()
                 && let Ok(work) = work
-                && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
+                && open_gpus(
+                    work,
+                    mmio,
+                    remappers,
+                    host_acpi,
+                    handoff,
+                    host_firmware,
+                    (gpus, isa_bridges),
+                )
             {
                 let firmware = handoff
                     .screen

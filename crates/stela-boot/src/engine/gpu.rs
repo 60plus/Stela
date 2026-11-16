@@ -1062,6 +1062,8 @@ pub(super) struct Claimed {
     firmware: PciFirmware,
     /// The words of Linux's command line its driver needs for it.
     parameters: Option<String>,
+    /// Other functions its driver searches for, published before it.
+    searched: Vec<stela_linux::function::Identity>,
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
@@ -1080,6 +1082,7 @@ fn claim(
     services: &dyn NativeServices,
     stack: &'static GpuStack,
     adapter: &gpu::Adapter,
+    isa_bridges: &[stela_drivers::probe::IsaBridge],
     line: u32,
     gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
@@ -1236,7 +1239,16 @@ fn claim(
     let before = before::of(stack).ok_or(ServiceError::Refused(
         "the boot has no preparation for this GPU's kernel driver",
     ))?;
-    let identified = (before.identify)(&registers, adapter, catalog)?;
+    let identified = (before.identify)(
+        before::Observed {
+            services,
+            adapter,
+            isa_bridges,
+            function,
+            registers: &registers,
+        },
+        catalog,
+    )?;
     if let Some(chip) = identified.chip {
         crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip);
     }
@@ -1354,6 +1366,7 @@ fn claim(
         },
         firmware: identified.firmware,
         parameters: identified.parameters,
+        searched: identified.searched,
         placement,
         bars,
         name: format!("{address}"),
@@ -1435,6 +1448,7 @@ fn cold_refusal(
 /// An adapter with a driver stack that [`claim_all`] did not claim, for the boot screen
 /// (`stela_boot_core::gpu_status`).
 pub(super) struct Refused {
+    pub(super) vendor: gpu::Vendor,
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
@@ -1448,11 +1462,13 @@ pub(super) struct Refused {
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
+    isa_bridges: &[stela_drivers::probe::IsaBridge],
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
+        vendor: adapter.vendor,
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
@@ -1504,6 +1520,7 @@ pub(super) fn claim_all(
                     services,
                     stack,
                     adapter,
+                    isa_bridges,
                     claimed.len() as u32,
                     source,
                     catalog.clone(),
@@ -1546,6 +1563,10 @@ struct Start {
 
 struct Started {
     _attached: Vec<Attached<Device>>,
+    _searched: Vec<stela_linux::function::Published>,
+    /// The claimed GPUs no driver bound: each one's address, the driver,
+    /// and whether the firmware's picture was on it.
+    unbound: Vec<(String, &'static str, bool)>,
     #[cfg(feature = "nvk")]
     bound: Vec<Bound>,
     result: Result<(), Errno>,
@@ -1567,6 +1588,8 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     stela_boot_core::heap::set_peak_hook(gate::peak_passed);
     let mut job = Started {
         _attached: Vec::new(),
+        _searched: Vec::new(),
+        unbound: Vec::new(),
         #[cfg(feature = "nvk")]
         bound: Vec::new(),
         result: Ok(()),
@@ -1587,6 +1610,30 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
         return job;
+    }
+    // What the drivers search for, each function once, before any driver's
+    // probe: a probe looks for them (`intel_pch.c` for the chipset).
+    let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
+    for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
+        if searched
+            .iter()
+            .any(|seen| (seen.bus, seen.devfn) == (identity.bus, identity.devfn))
+        {
+            continue;
+        }
+        searched.push(*identity);
+        // SAFETY: entered, on the canonical kernel task; the publication is
+        // kept for the boot.
+        match unsafe { stela_linux::function::Published::new(*identity) } {
+            Ok(published) => job._searched.push(published),
+            Err(error) => output::arguments(format_args!(
+                "GPU: PCI function {:02x}:{:02x}.{} could not be published for searches: \
+                 Linux error {error}\n",
+                identity.bus,
+                identity.devfn >> 3,
+                identity.devfn & 7
+            )),
+        }
     }
     for claimed in claimed {
         let authority = {
@@ -1623,6 +1670,10 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
             Ok(attached) => {
                 // SAFETY: entered.
                 if unsafe { attached.bound() } {
+                    output::arguments(format_args!(
+                        "GPU {}: {} bound it\n",
+                        claimed.name, claimed.stack.kernel.driver
+                    ));
                     #[cfg(feature = "nvk")]
                     job.bound.push(Bound {
                         name: claimed.name,
@@ -1633,9 +1684,23 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         link: claimed.link,
                     });
                 } else {
+                    // The claim reset the function, so the firmware's
+                    // picture on its outputs is gone and nothing draws there.
                     output::arguments(format_args!(
-                        "GPU {}: {} did not bind it\n",
-                        claimed.name, claimed.stack.kernel.driver
+                        "GPU {}: {} did not bind it; Linux's lines above say why.{}\n",
+                        claimed.name,
+                        claimed.stack.kernel.driver,
+                        if claimed.shows_screen {
+                            " The firmware's picture was on this GPU and ended when it was \
+                             reset for the claim, so a display wired to it stays dark"
+                        } else {
+                            ""
+                        }
+                    ));
+                    job.unbound.push((
+                        claimed.name,
+                        claimed.stack.kernel.driver,
+                        claimed.shows_screen,
                     ));
                 }
                 job._attached.push(attached);
@@ -1882,6 +1947,10 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
             time.as_ref(),
         ))
     })??;
+    // On the boot screen too, for the case that another adapter shows it.
+    for (name, driver, dark) in &job.unbound {
+        crate::status::warning(&stela_boot_core::gpu_status::unbound(name, driver, *dark));
+    }
     let result = job.result.map_err(Error::Init);
     #[cfg(feature = "nvk")]
     let result = result.and_then(|()| {
@@ -2125,7 +2194,7 @@ impl core::fmt::Display for Error {
                 f.write_str("GPU startup exceeded its deadline; native owners remain held")
             }
             #[cfg(feature = "nvk")]
-            Self::NoDevices => f.write_str("nouveau bound no NVIDIA GPUs"),
+            Self::NoDevices => f.write_str("no Linux driver bound a claimed GPU"),
         }
     }
 }
