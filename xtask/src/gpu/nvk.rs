@@ -264,6 +264,28 @@ fn paths(directory: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((stubs, path.into()))
 }
 
+/// Where Mesa's configuration records the Meson arguments it was made with.
+const CONFIGURATION: &str = "configuration";
+
+/// Whether Mesa's configuration in `build` is current: made after the C
+/// library its probes linked, for the machine `description` and with the
+/// Meson `arguments`, as `directory` records them.
+fn configured(
+    directory: &Path,
+    build: &Path,
+    libc: &Path,
+    description: &str,
+    arguments: &str,
+) -> bool {
+    let modified = |path: &Path| fs::metadata(path).and_then(|file| file.modified()).ok();
+    let recorded = |name: &str, expected: &str| {
+        fs::read_to_string(directory.join(name)).is_ok_and(|current| current == expected)
+    };
+    modified(&build.join("build.ninja")) > modified(libc)
+        && recorded("machine.ini", description)
+        && recorded(CONFIGURATION, arguments)
+}
+
 fn setup(
     toolchain: &Toolchain,
     sysroot: &Sysroot,
@@ -274,16 +296,15 @@ fn setup(
     let packages = directory.join("pkgconfig");
     let machine = directory.join("machine.ini");
     let description = sysroot.machine_file(toolchain, &packages)?;
-    let plan = build.join("build.ninja");
-    let modified = |path: &Path| fs::metadata(path).and_then(|file| file.modified()).ok();
-    if modified(&plan) > modified(&sysroot.libc())
-        && fs::read_to_string(&machine).is_ok_and(|current| current == description)
-    {
+    let arguments = OPTIONS.join("\n") + "\n";
+    if configured(directory, build, &sysroot.libc(), &description, &arguments) {
         return Ok(());
     }
     if build.is_dir() {
         fs::remove_dir_all(build)?;
     }
+    // A configuration that fails leaves no record that it was made.
+    let _ = fs::remove_file(directory.join(CONFIGURATION));
     fs::write(&machine, description)?;
     let (stubs, _) = paths(directory)?;
     fs::create_dir_all(&stubs)?;
@@ -341,6 +362,7 @@ fn setup(
             kept.display()
         );
     }
+    fs::write(directory.join(CONFIGURATION), arguments)?;
     Ok(())
 }
 
@@ -712,23 +734,33 @@ fn units(
     Ok(units)
 }
 
-/// Whether anything the last compile read has changed, by its dependency file.
-fn stale(output: &Path, build: &Path) -> bool {
-    let (Ok(built), Ok(depends)) = (
+/// The record of the command a unit was last compiled with, beside its object.
+fn command_record(output: &Path) -> PathBuf {
+    output.with_extension("command")
+}
+
+/// Whether the unit's command or anything its last compile read has changed,
+/// by the command's record and the dependency file. A new result of Meson's
+/// probes changes a command and no file the unit read.
+fn stale(unit: &Unit, build: &Path) -> bool {
+    let output = &unit.output;
+    let (Ok(built), Ok(depends), Ok(command)) = (
         fs::metadata(output).and_then(|file| file.modified()),
         fs::read_to_string(output.with_extension("d")),
+        fs::read_to_string(command_record(output)),
     ) else {
         return true;
     };
-    depends
-        .split_whitespace()
-        .skip(1)
-        .filter(|word| *word != "\\")
-        .any(|input| {
-            fs::metadata(build.join(input))
-                .and_then(|file| file.modified())
-                .map_or(true, |modified: SystemTime| modified > built)
-        })
+    command != unit.arguments.join("\n")
+        || depends
+            .split_whitespace()
+            .skip(1)
+            .filter(|word| *word != "\\")
+            .any(|input| {
+                fs::metadata(build.join(input))
+                    .and_then(|file| file.modified())
+                    .map_or(true, |modified: SystemTime| modified > built)
+            })
 }
 
 pub(super) fn compile(clang: &Path, build: &Path, units: &[Unit], jobs: u16) -> Result<()> {
@@ -738,9 +770,10 @@ pub(super) fn compile(clang: &Path, build: &Path, units: &[Unit], jobs: u16) -> 
         for _ in 0..jobs {
             scope.spawn(|| {
                 while let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    if !stale(&unit.output, build) {
+                    if !stale(unit, build) {
                         continue;
                     }
+                    let _ = fs::remove_file(command_record(&unit.output));
                     let output = Command::new(clang)
                         .args(&unit.arguments)
                         .arg("-w")
@@ -752,7 +785,13 @@ pub(super) fn compile(clang: &Path, build: &Path, units: &[Unit], jobs: u16) -> 
                         .current_dir(build)
                         .output();
                     let report = match output {
-                        Ok(output) if output.status.success() => continue,
+                        Ok(output) if output.status.success() => {
+                            match fs::write(command_record(&unit.output), unit.arguments.join("\n"))
+                            {
+                                Ok(()) => continue,
+                                Err(error) => error.to_string(),
+                            }
+                        }
                         Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
                         Err(error) => error.to_string(),
                     };
@@ -946,6 +985,58 @@ mod tests {
             retarget(&words, &common),
             ["--target=x", "-Iinclude", "-DMESA_DEBUG=0", "-c", "a.c"]
         );
+    }
+
+    /// Mesa is configured again when its Meson arguments, its machine or
+    /// the C library its probes linked change, and only then.
+    #[test]
+    fn a_change_of_meson_arguments_configures_mesa_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (directory, build) = (root.path(), root.path().join("build"));
+        let libc = directory.join("libc.a");
+        fs::write(&libc, "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("build.ninja"), "").unwrap();
+        fs::write(directory.join("machine.ini"), "machine").unwrap();
+        let current = |arguments: &str| configured(directory, &build, &libc, "machine", arguments);
+        // A configuration from before the record existed.
+        assert!(!current("-Da=1\n"));
+        fs::write(directory.join(CONFIGURATION), "-Da=1\n").unwrap();
+        assert!(current("-Da=1\n"));
+        assert!(!current("-Da=1\n-Db=2\n"));
+        assert!(!configured(directory, &build, &libc, "other", "-Da=1\n"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&libc, "newer").unwrap();
+        assert!(!current("-Da=1\n"));
+    }
+
+    /// A unit is compiled again when its command changes, as when Meson's
+    /// probes find more, though none of the files it read did.
+    #[test]
+    fn a_unit_whose_command_changed_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let build = root.path();
+        fs::write(build.join("futex.c"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let unit = |arguments: &[&str]| Unit {
+            output: build.join("futex.o"),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        };
+        let old = unit(&["-c", "futex.c"]);
+        fs::write(&old.output, "").unwrap();
+        fs::write(old.output.with_extension("d"), "futex.o: futex.c\n").unwrap();
+        // An object from before the record existed.
+        assert!(stale(&old, build));
+        fs::write(command_record(&old.output), "-c\nfutex.c").unwrap();
+        assert!(!stale(&old, build));
+        assert!(stale(
+            &unit(&["-DHAVE_LINUX_FUTEX_H", "-c", "futex.c"]),
+            build
+        ));
     }
 
     #[test]
