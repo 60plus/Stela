@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod anv;
 mod clc;
 pub mod fetch;
 mod llvm;
@@ -101,6 +102,15 @@ pub enum Command {
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
     },
+    /// Build ANV for this machine with the image's options and run it on an
+    /// xe render node with no GPU behind it: device creation, a BRW compute
+    /// pipeline and one submission per platform xe binds, through Stela's
+    /// libdrm stand-in, each xe ioctl checked against Stela's xe.
+    AnvTest {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+    },
     /// Differential testing of the Metal stack: plan the suite's assertions,
     /// prove them on a Mac, carry them to a guest and check its results.
     #[command(subcommand)]
@@ -143,6 +153,7 @@ pub fn run(command: Command) -> Result<()> {
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
+        Command::AnvTest { jobs } => anv::test(jobs),
         Command::MetalSuite(command) => metal_suite::run(command),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::discover()?, jobs, test),
     }

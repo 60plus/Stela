@@ -108,6 +108,9 @@ const NVK: Driver = Driver {
         "submit_thread",
     ],
 };
+/// The Meson options only ANV reads, which the host test (`anv.rs`) builds
+/// with too.
+pub(super) const ANV_OPTIONS: [&str; 2] = ["-Dintel-rt=disabled", "-Dintel-elk=false"];
 /// ANV, with BRW, for Intel GPUs from Gen9. Ray tracing is left out: no
 /// Metal path the image serves builds acceleration structures, and NVK has
 /// none either. ELK compiles for Gen8 and older, which only hasvk drives.
@@ -117,7 +120,7 @@ const ANV: Driver = Driver {
     objects: "src/intel/vulkan/",
     whole: &["libanv_common_a", "libanv_per_hw_ver"],
     entry: "anv_icdGetInstanceProcAddr",
-    options: &["-Dintel-rt=disabled", "-Dintel-elk=false"],
+    options: &ANV_OPTIONS,
     host_tools: true,
     model: "anv_util.c",
     stand_ins: &["anv_nir_options"],
@@ -151,7 +154,7 @@ if "--depfile" in arguments:
 /// `.pc` files for what Mesa's configuration requires: libdrm's headers are
 /// vendored and its calls are `compat/mesa/drm.c`; the one user of libelf is
 /// `compat/mesa/nv_cubin.c`.
-const LIBDRM_VERSION: &str = "2.4.133";
+pub(super) const LIBDRM_VERSION: &str = "2.4.133";
 const LIBELF_VERSION: &str = "0.190";
 
 /// The libraries of Vulkan's runtime Meson links whole, by their objects'
