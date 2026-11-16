@@ -2180,6 +2180,7 @@ fn mount_and_start(
         time,
         deadline,
         &FIRST_TASKS,
+        true,
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
@@ -2199,9 +2200,16 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, &PROBE, || {
-        pending.status().joined
-    })?;
+    // The second turn follows only when GPUs wait for it.
+    wait_for_child(
+        runtime,
+        threads,
+        time,
+        deadline,
+        &PROBE,
+        !later.is_empty(),
+        || pending.status().joined,
+    )?;
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
@@ -2305,9 +2313,15 @@ fn probe_later(
             job.unbound.push((name, driver, dark));
         }
     };
-    match wait_for_child(runtime, threads, time, deadline, &PROBE_LATER, || {
-        pending.status().joined
-    }) {
+    match wait_for_child(
+        runtime,
+        threads,
+        time,
+        deadline,
+        &PROBE_LATER,
+        false,
+        || pending.status().joined,
+    ) {
         Ok(()) => {}
         Err(Error::Timeout) => {
             lost(
@@ -2351,13 +2365,18 @@ static PROBE_LATER: &str = "the probe of GPUs that only show frames";
 /// log: a start that never returns then shows whether this loop still
 /// runs, whether Linux's clock moves, and which stage it waits for. The
 /// counter ends the wait after [`START_SECONDS`] even when the clock
-/// stands still.
+/// stands still, and stores the log before the start is given up. A stage
+/// another follows (`then`) stores the log when it finishes, so a next stage
+/// that stops the machine within its first report leaves this one's lines on
+/// the stick; the last stage's are stored by `open_gpus` once the start
+/// returns, outside it.
 fn wait_for_child(
     runtime: Pin<&stela_drivers::platform::work::Runtime<SLOTS>>,
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
     stage: &'static &'static str,
+    then: bool,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
     struct Staged;
@@ -2376,7 +2395,9 @@ fn wait_for_child(
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
-            super::storage::store_usb_log_in_gpu_start();
+            if then {
+                super::storage::store_usb_log_in_gpu_start();
+            }
             return Ok(());
         }
         let now = time.now_ns().map_err(environment_error)?;

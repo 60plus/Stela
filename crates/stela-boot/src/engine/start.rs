@@ -1577,6 +1577,9 @@ fn open_gpus(
             false
         }
     };
+    // The start's last lines and its result go on the stick now, outside the
+    // start, rather than at the next periodic store: a stop in what follows
+    // keeps them.
     output::flush_log();
     ok
 }
