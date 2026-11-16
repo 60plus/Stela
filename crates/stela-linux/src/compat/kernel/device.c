@@ -296,6 +296,9 @@ void component_del(struct device *dev, const struct component_ops *ops)
 /* Runtime power dependencies, which only a bound audio component makes. */
 STELA_UNSUPPORTED(struct device_link *, device_link_add, struct device *, struct device *, u32)
 
+/* A link to delete is one device_link_add gave, and it gives none. */
+STELA_UNSUPPORTED(void, device_link_del, struct device_link *)
+
 /* No link exists to remove: adding one is what is unsupported. */
 void device_link_remove(void *consumer, struct device *supplier)
 {

@@ -29,5 +29,12 @@ STELA_UNSUPPORTED(int, single_open, struct file *, int (*)(struct seq_file *, vo
 STELA_UNSUPPORTED(int, single_release, struct inode *, struct file *)
 STELA_UNSUPPORTED(ssize_t, seq_read, struct file *, char __user *, size_t, loff_t *)
 STELA_UNSUPPORTED(loff_t, seq_lseek, struct file *, loff_t, int)
-/* Platform devices, of which only HDMI audio codecs reach DRM. */
+/* Platform devices, which need the platform bus: only HDMI audio codecs and
+ * the partitions of a partitioned accelerator reach DRM as such. */
+STELA_UNSUPPORTED(struct platform_device *, platform_device_register_full,
+		  const struct platform_device_info *)
 STELA_UNSUPPORTED(void, platform_device_unregister, struct platform_device *)
+/* Whether a frame is RAM is the answer of the firmware's memory map in
+ * iomem_resource, which holds no map here: Stela's owners hand Linux its
+ * pages. Only the NUMA placement of an accelerator's memory partitions asks. */
+STELA_UNSUPPORTED(int, page_is_ram, unsigned long)
