@@ -23,10 +23,11 @@ impl WireSpec {
     /// The image built from `wire`, the checked download.
     pub(super) fn extract(&self, wire: &[u8]) -> Result<Vec<u8>> {
         let chip = self.release.bindata_chip;
+        let limit = self.release.images[self.part as usize].image.length;
         match self.part {
             NvidiaPart::Bootloader => extract_bootloader(wire, chip),
             NvidiaPart::Fmc => extract_fmc(wire, chip),
-            NvidiaPart::Gsp => extract_gsp_from_zstd_tar(wire),
+            NvidiaPart::Gsp => extract_gsp_from_zstd_tar(wire, limit),
         }
     }
 }
@@ -51,28 +52,31 @@ pub(super) fn carried(artifact: &Artifact) -> Option<&'static [u8]> {
         .then_some(include_bytes!("notices/NVIDIA-Linux-x86_64-570.211.01-LICENSE").as_slice())
 }
 
+/// The value after `key` on the same line, in `header`.
+fn header_field<'a>(header: &'a str, key: &str) -> Option<&'a str> {
+    let at = header.rfind(key)? + key.len();
+    header[at..].lines().next().map(str::trim)
+}
+
 /// Extract one named `NvU8` array from an `open-gpu-kernel-modules` `bindata` C
-/// source file, decompressing raw DEFLATE payloads when `COMPRESSION: YES`.
+/// source file, inflating raw DEFLATE payloads when `COMPRESSION: YES`. The
+/// array may be no larger than its `DATA SIZE` header, which inflation may
+/// not exceed either.
 fn parse_bindata_array(source: &str, symbol: &str) -> Result<Vec<u8>> {
     let decl = format!("static BINDATA_CONST NvU8 {symbol}[]");
     let pos = source
         .find(&decl)
         .with_context(|| format!("missing bindata array {symbol}"))?;
-    let header_window = &source[pos.saturating_sub(256)..pos];
-    let compressed = header_window
-        .rfind("// COMPRESSION:")
-        .and_then(|i| header_window[i + "// COMPRESSION:".len()..].lines().next())
-        .map(str::trim)
-        .context("missing COMPRESSION header")?
-        == "YES";
-    let expected_size: usize = header_window
-        .rfind("// DATA SIZE (bytes):")
-        .and_then(|i| {
-            header_window[i + "// DATA SIZE (bytes):".len()..]
-                .lines()
-                .next()
-        })
-        .map(str::trim)
+    // The comment block above the array; byte offsets, so its start is moved
+    // to the first character boundary.
+    let mut start = pos.saturating_sub(256);
+    while !source.is_char_boundary(start) {
+        start += 1;
+    }
+    let header = &source[start..pos];
+    let compressed =
+        header_field(header, "// COMPRESSION:").context("missing COMPRESSION header")? == "YES";
+    let expected_size: usize = header_field(header, "// DATA SIZE (bytes):")
         .context("missing DATA SIZE header")?
         .parse()
         .context("invalid DATA SIZE header")?;
@@ -91,6 +95,10 @@ fn parse_bindata_array(source: &str, symbol: &str) -> Result<Vec<u8>> {
         {
             let byte = u8::from_str_radix(hex_digits, 16)
                 .with_context(|| format!("invalid hex byte in {symbol}"))?;
+            ensure!(
+                raw.len() < expected_size,
+                "bindata {symbol} is longer than its declared {expected_size} bytes"
+            );
             raw.push(byte);
         }
     }
@@ -106,7 +114,8 @@ fn parse_bindata_array(source: &str, symbol: &str) -> Result<Vec<u8>> {
 
     for offset in [0usize, 10] {
         if let Some(slice) = raw.get(offset..)
-            && let Ok(decoded) = miniz_oxide::inflate::decompress_to_vec(slice)
+            && let Ok(decoded) =
+                miniz_oxide::inflate::decompress_to_vec_with_limit(slice, expected_size)
             && decoded.len() == expected_size
         {
             return Ok(decoded);
@@ -134,7 +143,9 @@ fn extract_bootloader(wire: &[u8], chip: &str) -> Result<Vec<u8>> {
     let img_len = u32::try_from(img.len()).context("bootloader image too large")?;
     let data_off = hdr_off.checked_add(desc_len).context("offset overflow")?;
     let total_raw = data_off.checked_add(img_len).context("size overflow")?;
-    let total_aligned = (total_raw + 255) & !255;
+    let total_aligned = total_raw
+        .checked_next_multiple_of(256)
+        .context("size overflow")?;
 
     let mut out = Vec::with_capacity(24 + desc.len() + img.len());
     for word in [0x10de_u32, 1, total_aligned, hdr_off, data_off, img_len] {
@@ -244,7 +255,7 @@ fn extract_fmc(wire: &[u8], chip: &str) -> Result<Vec<u8>> {
         let pad = (4 - (cur_off % 4)) % 4;
         if pad != 0 && cur_off != 52 + 6 * 40 {
             payload.resize(payload.len() + pad as usize, 0);
-            cur_off += pad;
+            cur_off = cur_off.checked_add(pad).context("FMC offset overflow")?;
         }
         let size = u32::try_from(sec.data.len()).context("FMC section too large")?;
         let sh_info = if sec.with_crc {
@@ -277,15 +288,18 @@ fn extract_fmc(wire: &[u8], chip: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decompress `firmware/gsp_ga10x.bin` from the start of a `zstd`-compressed
-/// POSIX USTAR archive slice whose frame `Window_Size` (`128 MiB`) exceeds the
-/// `64.1 MiB` prefix we need.
-fn extract_gsp_from_zstd_tar(mut wire: &[u8]) -> Result<Vec<u8>> {
+/// Decompress `firmware/gsp_ga10x.bin`, at most `limit` bytes, from the
+/// start of a `zstd`-compressed POSIX USTAR archive slice whose frame
+/// `Window_Size` (`128 MiB`) exceeds the prefix needed. The decoder produces
+/// no more than the two tar headers and `limit` bytes of payload past them.
+fn extract_gsp_from_zstd_tar(mut wire: &[u8], limit: usize) -> Result<Vec<u8>> {
     use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
-    // `firmware/` + `firmware/gsp_ga10x.bin` headers (`1024` bytes) + `64,116,464`
-    // bytes of payload, with headroom for minor header variations.
-    const NEEDED_UNCOMPRESSED: usize = 64_200_000;
+    // The `firmware/` and `firmware/gsp_ga10x.bin` headers and the payload;
+    // the block that crosses this is decoded whole.
+    let needed = limit
+        .checked_add(2 * 512)
+        .context("GSP-RM image too large")?;
 
     let mut decoder = FrameDecoder::new();
     decoder
@@ -293,10 +307,7 @@ fn extract_gsp_from_zstd_tar(mut wire: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("invalid zstd header in NVIDIA archive: {e}"))?;
     if !decoder.is_finished() {
         decoder
-            .decode_blocks(
-                &mut wire,
-                BlockDecodingStrategy::UptoBytes(NEEDED_UNCOMPRESSED),
-            )
+            .decode_blocks(&mut wire, BlockDecodingStrategy::UptoBytes(needed))
             .map_err(|e| anyhow::anyhow!("failed decoding zstd prefix in NVIDIA archive: {e}"))?;
     }
     if !decoder.is_finished() {
@@ -325,6 +336,10 @@ fn extract_gsp_from_zstd_tar(mut wire: &[u8]) -> Result<Vec<u8>> {
             .trim_matches(|c: char| c == '\0' || c == ' ');
         let size = usize::from_str_radix(size_field, 8)
             .with_context(|| format!("invalid octal tar size for {name}"))?;
+        ensure!(
+            size <= limit,
+            "tar entry {name} of {size} bytes is larger than the GSP-RM image's {limit}"
+        );
         if name == "firmware/gsp_ga10x.bin" || name == "./firmware/gsp_ga10x.bin" {
             let mut out = vec![0_u8; size];
             decoder
@@ -332,7 +347,7 @@ fn extract_gsp_from_zstd_tar(mut wire: &[u8]) -> Result<Vec<u8>> {
                 .context("unexpected EOF reading firmware/gsp_ga10x.bin")?;
             return Ok(out);
         }
-        let padded = (size + 511) & !511;
+        let padded = size.next_multiple_of(512);
         std::io::copy(
             &mut (&mut decoder).take(padded as u64),
             &mut std::io::sink(),
@@ -391,5 +406,56 @@ mod tests {
         let sh2_info =
             u32::from_le_bytes(fmc[52 + 2 * 40 + 28..52 + 2 * 40 + 32].try_into().unwrap());
         assert_eq!(sh2_info, crc32fast::hash(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn bindata_and_archive_lengths_are_bounded_by_their_declarations() {
+        // More bytes than the header declares stops the parse at once.
+        let long = "// COMPRESSION: NO\n// DATA SIZE (bytes): 2\n\
+                    static BINDATA_CONST NvU8 a[] = { 0x01, 0x02, 0x03 };\n";
+        let error = parse_bindata_array(long, "a").unwrap_err().to_string();
+        assert!(
+            error.contains("longer than its declared 2 bytes"),
+            "{error}"
+        );
+        // Inflation stops at the declared size: 1 MiB of zeros declared as 16.
+        let bomb = miniz_oxide::deflate::compress_to_vec(&vec![0u8; 1 << 20], 9);
+        let hex: Vec<_> = bomb.iter().map(|b| format!("0x{b:02x}")).collect();
+        let source = format!(
+            "// COMPRESSION: YES\n// DATA SIZE (bytes): 16\n\
+             static BINDATA_CONST NvU8 a[] = {{ {} }};\n",
+            hex.join(", ")
+        );
+        assert!(parse_bindata_array(&source, "a").is_err());
+        // A multi-byte character just before the 256-byte header window.
+        let mut padded = format!("x{}", "é".repeat(200));
+        padded.push_str(
+            "// COMPRESSION: NO\n// DATA SIZE (bytes): 1\n\
+             static BINDATA_CONST NvU8 a[] = { 0x07 };\n",
+        );
+        let start = padded.find("static").unwrap();
+        assert!(!padded.is_char_boundary(start - 256));
+        assert_eq!(parse_bindata_array(&padded, "a").unwrap(), [7]);
+    }
+
+    #[test]
+    fn an_archive_entry_larger_than_the_image_is_refused_before_it_is_read() {
+        // A zstd frame of one raw block holding a tar header for a 1 GiB
+        // `firmware/gsp_ga10x.bin`.
+        let mut header = [0u8; 512];
+        header[..22].copy_from_slice(b"firmware/gsp_ga10x.bin");
+        header[124..136].copy_from_slice(b"10000000000\0");
+        let size = header.len();
+        // Frame header: single segment with a 2-byte content size field.
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x60];
+        frame.extend_from_slice(&((size - 256) as u16).to_le_bytes());
+        // One last raw block of `size` bytes.
+        let block = ((size as u32) << 3) | 1;
+        frame.extend_from_slice(&block.to_le_bytes()[..3]);
+        frame.extend_from_slice(&header);
+        let error = extract_gsp_from_zstd_tar(&frame, 64_116_464)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("larger than the GSP-RM image's"), "{error}");
     }
 }
