@@ -168,10 +168,12 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
 }
 
 /// Whether a mode of this size at `refresh` millihertz can be published to
-/// macOS: everything [`Advertised`] makes for it is made. A mode that cannot,
-/// as 2560x1440 from about 165 Hz or 3840x2160 at 120 Hz with their pixel
-/// clocks past a detailed timing's 655.35 MHz, is not taken: whoever picks
-/// the output's mode takes one that can.
+/// macOS: everything [`Advertised`] makes for it is made. A mode whose pixel
+/// clock passes a detailed timing's 655.35 MHz, as 2560x1440 from about
+/// 165 Hz or 3840x2160 from about 75 Hz, is published with its timing record
+/// built directly ([`fast_timing`]). A mode that cannot be published, as one
+/// wider than 4095 pixels or past the record's 32-bit pixel clock, is not
+/// taken: whoever picks the output's mode takes one that can.
 pub fn advertisable(width: u32, height: u32, refresh: u32) -> bool {
     let mode = Mode {
         width,
@@ -335,9 +337,71 @@ fn get(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().expect("4 bytes"))
 }
 
+/// A detailed timing's fields, as `IOAVVideoTimingElement::
+/// initWithDetailedTiming` decodes them: each axis `[total, active, sync
+/// width, back porch, front porch]` (field lines for an interlaced timing's
+/// vertical axis, already doubled), the pixel clock in Hz and each axis's
+/// sync polarity when the sync is digital.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Detailed {
+    interlaced: u32,
+    horizontal: [u32; 5],
+    vertical: [u32; 5],
+    clock_hz: u32,
+    polarity: Option<(u32, u32)>,
+}
+
+/// The timing of a `width` by `height` mode at `refresh` millihertz whose
+/// pixel clock passes a detailed timing's: CVT reduced blanking (VESA CVT
+/// 2.0 section 5.2: horizontal front porch 8, sync 32, back porch 40;
+/// vertical blanking of at least 460 us), digital separate sync, both
+/// polarities positive, the clock rounded to the nearest kilohertz, as
+/// DisplayID 2.0's type VII timing carries it. The AP reads a mode's timing
+/// only from its record (the model serves no EDID bytes: [`Advertised::
+/// edid`] gives the monitor's identity), so the record is built from these
+/// fields directly. A clock past the record's 32-bit hertz refuses.
+fn fast_timing(width: u32, height: u32, refresh: u32) -> Result<Detailed> {
+    if width == 0 || height == 0 || refresh == 0 {
+        return Err(refuse!("DCP mode has no active area or refresh"));
+    }
+    let k = RB_V_BLANK_NANOS * u64::from(refresh) / 1000;
+    if k >= 1_000_000_000 {
+        return Err(refuse!(
+            "DCP mode's refresh leaves no time for its vertical blanking"
+        ));
+    }
+    let lines = (k * u64::from(height)).div_ceil(1_000_000_000 - k);
+    let v_blank = u32::try_from(lines)
+        .map_err(|_| refuse!("DCP mode's vertical blanking overflows"))?
+        .max(V_FRONT + V_SYNC + 1);
+    let total =
+        (u64::from(width) + u64::from(RB_H_BLANK)) * (u64::from(height) + u64::from(v_blank));
+    let clock_khz = (total * u64::from(refresh) + 500_000) / 1_000_000;
+    let clock_hz = u32::try_from(clock_khz * 1000)
+        .ok()
+        .filter(|&clock| clock != 0)
+        .ok_or(refuse!(
+            "DCP mode's pixel clock does not fit the timing record's 32 bits"
+        ))?;
+    let h_back = RB_H_BLANK - RB_H_FRONT - H_SYNC;
+    let v_back = v_blank - V_FRONT - V_SYNC;
+    Ok(Detailed {
+        interlaced: 0,
+        horizontal: [width + RB_H_BLANK, width, H_SYNC, h_back, RB_H_FRONT],
+        vertical: [height + v_blank, height, V_SYNC, v_back, V_FRONT],
+        clock_hz,
+        polarity: Some((1, 1)),
+    })
+}
+
 /// The `IOAVVideoTimingData` of an EDID detailed timing, decoded as
 /// `IOAVVideoTimingElement::initWithDetailedTiming` does.
 pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
+    record(&decode(d)?)
+}
+
+/// The fields of an EDID detailed timing ([`timing_data`]).
+fn decode(d: &[u8; 18]) -> Result<Detailed> {
     let clock = u32::from(u16::from_le_bytes([d[0], d[1]]));
     let interlaced = u32::from(d[17] >> 7);
     let h_active = u32::from(d[2]) | u32::from(d[4] >> 4) << 8;
@@ -361,37 +425,42 @@ pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
     let v_back = v_blank.checked_sub(v_front + v_sync).ok_or(refuse!(
         "DCP detailed timing's vertical porches exceed its blanking"
     ))?;
-    let mut t = [0u8; TIMING_BYTES];
-    put(&mut t, 0x00, interlaced);
-    for (axis, [total, active, sync, back, front]) in [
-        (
-            0x04,
-            [h_active + h_blank, h_active, h_sync, h_back, h_front],
-        ),
-        (
-            0x24,
-            [v_active + v_blank, v_active, v_sync, v_back, v_front],
-        ),
-    ] {
-        put(&mut t, axis, total);
-        put(&mut t, axis + 0x4, active);
-        put(&mut t, axis + 0x8, sync);
-        put(&mut t, axis + 0xc, back);
-        put(&mut t, axis + 0x10, front);
-    }
     // Digital sync: bit 3 separate (vsync polarity bit 2) or composite.
-    if d[17] & 0x10 != 0 {
+    let polarity = (d[17] & 0x10 != 0).then(|| {
         let h = u32::from(d[17] >> 1 & 1);
         let v = if d[17] & 0x8 == 0 {
             h
         } else {
             u32::from(d[17] >> 2 & 1)
         };
+        (h, v)
+    });
+    Ok(Detailed {
+        interlaced,
+        horizontal: [h_active + h_blank, h_active, h_sync, h_back, h_front],
+        vertical: [v_active + v_blank, v_active, v_sync, v_back, v_front],
+        clock_hz: clock * 10_000,
+        polarity,
+    })
+}
+
+/// The `IOAVVideoTimingData` of a timing's fields.
+fn record(d: &Detailed) -> Result<[u8; TIMING_BYTES]> {
+    let mut t = [0u8; TIMING_BYTES];
+    put(&mut t, 0x00, d.interlaced);
+    for (axis, [total, active, sync, back, front]) in [(0x04, d.horizontal), (0x24, d.vertical)] {
+        put(&mut t, axis, total);
+        put(&mut t, axis + 0x4, active);
+        put(&mut t, axis + 0x8, sync);
+        put(&mut t, axis + 0xc, back);
+        put(&mut t, axis + 0x10, front);
+    }
+    if let Some((h, v)) = d.polarity {
         put(&mut t, 0x1c, h);
         put(&mut t, 0x3c, v);
     }
     // _IOAVVideoTimingSetPixelClock, then _IOAVVideoTimingUpdateSyncRates.
-    let pixel_clock = clock * 10_000;
+    let pixel_clock = d.clock_hz;
     put(&mut t, 0x44, pixel_clock);
     let line = u64::from(get(&t, 0x04)) * u64::from(get(&t, 0x20) + 1);
     let frame = u64::from(get(&t, 0x24)) * line;
@@ -401,12 +470,12 @@ pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
     let q16 = u64::from(pixel_clock) << 16;
     let h_rate = (q16 + line * 500) / (line * 1000);
     let mut v_rate = (q16 + frame / 2) / frame;
-    if interlaced != 0 {
+    if d.interlaced != 0 {
         v_rate *= 2;
     }
     put(&mut t, 0x18, h_rate as u32);
     put(&mut t, 0x38, v_rate as u32);
-    if v_rate == 0 || h_active == 0 || v_active == 0 {
+    if v_rate == 0 || d.horizontal[1] == 0 || d.vertical[1] == 0 {
         return Err(refuse!("DCP detailed timing has no active area or refresh"));
     }
     let ratio = aspect_ratio(precise_aspect_ratio(&t));
@@ -562,6 +631,8 @@ fn axis_dict(xml: &mut Xml, t: &[u8; TIMING_BYTES], axis: usize) {
 /// The advertised mode: its EDID, records and published properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertised {
+    /// The EDID base block, the monitor's identity: its detailed timing is
+    /// the mode's when the mode's clock fits one, else the size at 60 Hz.
     pub edid: [u8; 128],
     pub timing: [u8; TIMING_BYTES],
     pub color: [u8; COLOR_BYTES],
@@ -582,7 +653,22 @@ impl Advertised {
 
     /// [`Self::at`] for a monitor whose image is `size_mm` millimetres,
     /// when its own EDID said.
+    ///
+    /// A mode whose pixel clock passes a detailed timing's has its record
+    /// built from [`fast_timing`], and its EDID, which gives only the
+    /// monitor's identity ([`Self::display_attributes`]), holds the same
+    /// size at 60 Hz, as a monitor's base block often does for its fast
+    /// modes, which it lists in an extension.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
+        let (width, height) = (mode.width, mode.height);
+        if clock(width, height, blanking(width, height, refresh), refresh) > MAX_CLOCK {
+            let timing = record(&fast_timing(width, height, refresh)?)?;
+            return Ok(Self {
+                edid: edid_sized(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm)?,
+                timing,
+                color: color_data(),
+            });
+        }
         let edid = edid_sized(mode, refresh, size_mm)?;
         let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
         Ok(Self {
@@ -840,8 +926,11 @@ mod tests {
             );
         }
         assert!(advertisable(2560, 1440, 144_000));
-        assert!(!advertisable(2560, 1440, 180_000));
-        assert!(!advertisable(3840, 2160, 120_000));
+        assert!(advertisable(2560, 1440, 180_000));
+        assert!(advertisable(3840, 2160, 120_000));
+        assert!(advertisable(3840, 2160, 240_000));
+        assert!(!advertisable(5120, 2880, 60_000), "wider than 4095");
+        assert!(!advertisable(3840, 2160, 600_000), "past 4.29 GHz");
     }
 
     const FULL_HD: Mode = Mode {
@@ -978,15 +1067,67 @@ mod tests {
         assert_eq!(hertz(&a), 144);
         assert_eq!((get(&a.timing, 0x04), get(&a.timing, 0x24)), (2640, 1714));
         assert_eq!([get(&a.timing, 0x14), get(&a.timing, 0x10)], [8, 40]);
-        // Without it the clock would not fit, and 4K at 120 Hz does not even
-        // with it.
+        // Without it the clock would not fit. 4K at 120 Hz does not fit a
+        // detailed timing even with it, so its record is built directly.
         let uhd = Mode {
             width: 3840,
             height: 2160,
             ..FULL_HD
         };
         assert_eq!(hertz(&Advertised::at(uhd, 60_000).unwrap()), 60);
-        assert!(Advertised::at(uhd, 120_000).is_err());
+        assert_eq!(hertz(&Advertised::at(uhd, 120_000).unwrap()), 120);
+    }
+
+    #[test]
+    fn a_mode_past_a_detailed_timings_clock_gets_a_reduced_blanking_record() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let a = Advertised::at(uhd, 240_000).unwrap();
+        // 3920 by 2429: 80 pixels of blanking, and 269 lines for 460 us at
+        // 240 Hz (0.1104 of a frame: 2160 x 0.1104 / 0.8896 = 268.06, up).
+        assert_eq!((get(&a.timing, 0x04), get(&a.timing, 0x08)), (3920, 3840));
+        assert_eq!((get(&a.timing, 0x24), get(&a.timing, 0x28)), (2429, 2160));
+        // Front porch 8, sync 32, back porch 40; vertical 3, 10, the rest.
+        assert_eq!(
+            [
+                get(&a.timing, 0x14),
+                get(&a.timing, 0x0c),
+                get(&a.timing, 0x10)
+            ],
+            [8, 32, 40]
+        );
+        assert_eq!(
+            [
+                get(&a.timing, 0x34),
+                get(&a.timing, 0x2c),
+                get(&a.timing, 0x30)
+            ],
+            [3, 10, 256]
+        );
+        // 3920 x 2429 x 240 Hz = 2285.2 MHz, to the kilohertz.
+        assert_eq!(get(&a.timing, 0x44), 2_285_203_000);
+        assert_eq!(hertz(&a), 240);
+        assert_eq!([get(&a.timing, 0x1c), get(&a.timing, 0x3c)], [1, 1]);
+        assert_eq!(get(&a.timing, 0x48), aspect_ratio(0x1c71c), "16:9");
+        // The identity block holds the size at 60 Hz, which a detailed
+        // timing holds, and the published element carries the fast rate.
+        assert_eq!(&a.edid[..], &edid(uhd, 60_000).unwrap()[..]);
+        let elements = a.timing_elements();
+        assert!(elements.contains(&format!(
+            "<key>PreciseSyncRate</key><integer size=\"32\">{}</integer>",
+            get(&a.timing, 0x38)
+        )));
+        // 2560x1440 at 240 Hz and 1920x1080 at 500 Hz the same way.
+        let qhd = Mode {
+            width: 2560,
+            height: 1440,
+            ..FULL_HD
+        };
+        assert_eq!(hertz(&Advertised::at(qhd, 240_000).unwrap()), 240);
+        assert_eq!(hertz(&Advertised::at(FULL_HD, 500_000).unwrap()), 500);
     }
 
     #[test]
