@@ -227,7 +227,7 @@ unsafe extern "C" fn compile(
     // SAFETY: the compiler passes its target and specialization, whose
     // arrays and identifiers it keeps alive for the call.
     let (target, specialization) = unsafe { (&*target, &*specialization) };
-    assert!(!target.nir.is_null());
+    assert!(target.nir.iter().all(|options| !options.is_null()));
     // SAFETY: as above.
     let (lengths, varyings, constants) = unsafe {
         (
@@ -505,7 +505,7 @@ fn service() -> Service {
         decode_astc_kernel: kernel::<10>,
         release,
         buffer_reads,
-        nir_options: NonNull::dangling(),
+        nir_options: [NonNull::dangling(); super::NIR_STAGES],
     }
 }
 

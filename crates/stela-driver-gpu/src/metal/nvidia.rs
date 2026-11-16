@@ -122,7 +122,7 @@ pub const DRIVER: super::native::Driver = {
         ) -> vk::PFN_vkVoidFunction;
     }
     unsafe extern "C" {
-        fn stela_nvk_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
+        fn stela_nvk_nir_options(physical: vk::PhysicalDevice, stage: u32) -> *const c_void;
         fn stela_nvk_submit_thread(queue: vk::Queue) -> vk::Result;
         fn stela_nvk_submit_failure(
             queue: vk::Queue,

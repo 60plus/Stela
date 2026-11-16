@@ -100,8 +100,10 @@ pub struct Driver {
     /// The driver's own `vk_icdGetInstanceProcAddr`.
     pub get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     /// The `nir_shader_compiler_options` the driver builds a device's shaders
-    /// with, for the AIR compiler, lasting as long as the physical device.
-    pub nir_options: unsafe extern "C" fn(vk::PhysicalDevice) -> *const c_void,
+    /// of a stage (Mesa's `mesa_shader_stage`) with, for the AIR compiler,
+    /// lasting as long as the physical device; null for a stage it has none
+    /// for.
+    pub nir_options: unsafe extern "C" fn(vk::PhysicalDevice, u32) -> *const c_void,
     /// [`Loader::submit_thread`].
     pub submit_thread: Option<unsafe extern "C" fn(vk::Queue) -> vk::Result>,
     /// [`Loader::refusals`].

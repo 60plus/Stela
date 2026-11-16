@@ -1113,11 +1113,12 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
         "the GPU's stack drives displays only: it has no Vulkan driver",
     ))?;
     let compiler = |physical| {
-        // SAFETY: the driver's own physical device, whose options last as long.
-        let options = unsafe { (driver.nir_options)(physical) };
-        compiler::Service::linked(
-            NonNull::new(options.cast_mut()).expect("the Vulkan driver has NIR options"),
-        )
+        compiler::Service::linked(core::array::from_fn(|stage| {
+            // SAFETY: the driver's own physical device, whose options last
+            // as long.
+            let options = unsafe { (driver.nir_options)(physical, stage as u32) };
+            NonNull::new(options.cast_mut()).expect("the Vulkan driver has NIR options per stage")
+        }))
     };
     // An import's driver work after its turn may wait for Linux in `relax`.
     let loader: Loader = driver.loader(driver_message, relax);

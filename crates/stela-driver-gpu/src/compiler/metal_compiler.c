@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "metal_compiler.h"
 #include "threadgroup.h"
+#include "nir_serialize.h"
+#include "util/blob.h"
 #include "util/ralloc.h"
 #include "vulkan/vulkan_core.h"
 #include <assert.h>
@@ -12,6 +14,8 @@ static_assert(sizeof(struct stela_metal_reflection) == STELA_METAL_REFLECTION_BY
               "metal/compiler.rs mirrors the reflection");
 static_assert(sizeof(struct stela_metal_target) == STELA_METAL_TARGET_BYTES,
               "metal/compiler.rs mirrors the target");
+static_assert(MESA_SHADER_MESH + 1 == STELA_METAL_NIR_STAGES,
+              "the target holds options from the vertex to the mesh stage");
 static_assert(sizeof(struct stela_metal_linked_varying) == STELA_METAL_LINKED_VARYING_BYTES,
               "metal/compiler.rs mirrors the linked varyings");
 static_assert(sizeof(struct stela_metal_specialization) == STELA_METAL_SPECIALIZATION_BYTES,
@@ -985,6 +989,17 @@ helpers_read_mapped_memory(nir_shader *shader)
    nir_progress(true, impl, helper ? nir_metadata_control_flow : nir_metadata_all);
 }
 
+/* Whether the driver gave options for every stage. */
+static bool
+every_stage_has_options(const struct stela_metal_target *target)
+{
+   for (unsigned stage = 0; stage < STELA_METAL_NIR_STAGES; stage++) {
+      if (!target->nir[stage])
+         return false;
+   }
+   return true;
+}
+
 nir_shader *
 stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
                               const struct stela_metal_target *target,
@@ -996,7 +1011,7 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    if (!error)
       error = &local;
    *error = (struct stela_air_error){0};
-   if (!entry || !target || !target->nir || !specialization ||
+   if (!entry || !target || !every_stage_has_options(target) || !specialization ||
        (specialization->threadgroup_length_count && !specialization->threadgroup_lengths) ||
        (specialization->varying_count && !specialization->varyings) ||
        (specialization->constant_count && !specialization->constants) ||
@@ -1144,7 +1159,8 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       resources.tile = &tile;
    }
    if (stage == STELA_METAL_KERNEL) {
-      shader = stela_air_to_nir(air, size, entry, target->nir, &resources, error);
+      shader = stela_air_to_nir(air, size, entry, target->nir[MESA_SHADER_COMPUTE], &resources,
+                                error);
       goto done;
    }
    struct stela_air_varying_slot rows[STELA_METAL_VARYINGS];
@@ -1181,7 +1197,14 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       .vertex_input_words = fetches_words ? words : NULL,
       .decode_vertex_input = decode_vertex_input,
    };
-   shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
+   /* As stela_air_metal_stage_to_nir builds it: a post-tessellation vertex
+    * function is an evaluation shader. */
+   static const mesa_shader_stage nir_stages[] = {
+      [STELA_METAL_VERTEX] = MESA_SHADER_VERTEX, [STELA_METAL_FRAGMENT] = MESA_SHADER_FRAGMENT,
+      [STELA_METAL_MESH] = MESA_SHADER_MESH, [STELA_METAL_OBJECT] = MESA_SHADER_TASK,
+   };
+   mesa_shader_stage built = patch ? MESA_SHADER_TESS_EVAL : nir_stages[stage];
+   shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir[built], &options, error);
 done:
    if (shader) {
       thread_memory_to_registers(shader);
@@ -1205,14 +1228,35 @@ stela_metal_tessellation_stages(const struct stela_metal_target *target,
                                 const struct stela_metal_tessellation *tessellation,
                                 nir_shader *stages[2])
 {
-   stages[0] = stela_metal_tessellation_vertex(target->nir);
-   stages[1] = stela_metal_tessellation_control(target->nir, tessellation);
+   stages[0] = stela_metal_tessellation_vertex(target->nir[MESA_SHADER_VERTEX]);
+   stages[1] = stela_metal_tessellation_control(target->nir[MESA_SHADER_TESS_CTRL], tessellation);
 }
 
 void
 stela_metal_release(nir_shader *shader)
 {
    ralloc_free(shader);
+}
+
+nir_shader *
+stela_metal_deserialize(const void *data, size_t size, const struct stela_metal_target *target)
+{
+   if (!data || !target || !every_stage_has_options(target))
+      return NULL;
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   /* nir_deserialize takes the options before it reads the stage and only
+    * keeps them; the stage's replace them once the stage is known. */
+   nir_shader *shader = nir_deserialize(NULL, target->nir[MESA_SHADER_COMPUTE], &reader);
+   if (!shader)
+      return NULL;
+   if (reader.overrun || reader.current != reader.end ||
+       (unsigned)shader->info.stage >= STELA_METAL_NIR_STAGES) {
+      ralloc_free(shader);
+      return NULL;
+   }
+   shader->options = target->nir[shader->info.stage];
+   return shader;
 }
 
 /* The buffer slots def's address derives from, one bit each: loads of a

@@ -1031,7 +1031,8 @@ static const char *mesh =
    " !\"air.arg_name\", !\"tid\"}\n";
 
 static const struct stela_metal_target target = {
-   .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+   .nir = STELA_METAL_NIR_ALL(&nir_options),
+   .max_instructions = 10000, .max_threadgroup_bytes = 32768,
    .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
    .max_payload_bytes = 16384, .max_mesh_vertices = 256, .max_mesh_primitives = 256,
 };
@@ -1446,7 +1447,8 @@ framebuffer_reads_access_storage_attachments(void)
 {
    struct stela_air_error error;
    const struct stela_metal_target interlocked = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1,
    };
@@ -1551,7 +1553,8 @@ framebuffer_reads_run_their_own_fragment_tests(void)
 {
    struct stela_air_error error;
    const struct stela_metal_target interlocked = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1, .fragment_tests = 1,
    };
@@ -1568,7 +1571,8 @@ framebuffer_reads_run_their_own_fragment_tests(void)
    storage.fragment_tests = STELA_METAL_SELF_TESTS;
    /* A device without fragment tests of its own cannot run them. */
    const struct stela_metal_target untested = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1,
    };
@@ -1671,6 +1675,61 @@ patch_functions_compile_behind_their_tessellation_stages(void)
    stela_metal_tessellation_stages(&target, &tessellation, stages);
    assert(stages[0]->info.stage == MESA_SHADER_VERTEX);
    assert(stages[1]->info.stage == MESA_SHADER_TESS_CTRL);
+   for (unsigned i = 0; i < 2; i++)
+      stela_metal_release(stages[i]);
+}
+
+/* Each shader is built with its own stage's options, as a driver with a set
+ * per stage (BRW) builds it; a target missing a stage's is refused. */
+static void
+shaders_take_their_stages_options(void)
+{
+   static nir_shader_compiler_options staged[STELA_METAL_NIR_STAGES];
+   struct stela_metal_target own = target;
+   for (unsigned stage = 0; stage < STELA_METAL_NIR_STAGES; stage++) {
+      staged[stage] = nir_options;
+      own.nir[stage] = &staged[stage];
+   }
+   struct stela_air_error error;
+   /* As kernels_compile and the vertex and fragment test specialize them. */
+   const struct stela_metal_threadgroup_length lengths[] = {{0, 256}};
+   const struct stela_metal_specialization dispatched = {
+      .workgroup_size = {64, 1, 1}, .threadgroup_length_count = 1, .threadgroup_lengths = lengths,
+   };
+   const struct stela_metal_linked_varying linked[] = {
+      {"user(color)", 11, 0}, {"user(uv)", 8, 0},
+   };
+   const struct stela_metal_specialization rendered = {.varyings = linked, .varying_count = 2};
+   const struct {
+      const char *fixture, *entry;
+      const struct stela_metal_specialization *specialization;
+      mesa_shader_stage stage;
+   } shaders[] = {
+      {kernel, "kernel", &dispatched, MESA_SHADER_COMPUTE},
+      {vertex, "vertex", &rendered, MESA_SHADER_VERTEX},
+      {fragment, "fragment", &rendered, MESA_SHADER_FRAGMENT},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(shaders); i++) {
+      LLVMMemoryBufferRef input = bitcode(shaders[i].fixture);
+      nir_shader *shader =
+         stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input), shaders[i].entry,
+                             &own, shaders[i].specialization, &error);
+      assert(shader && shader->info.stage == shaders[i].stage);
+      assert(shader->options == &staged[shaders[i].stage]);
+      stela_metal_release(shader);
+      own.nir[shaders[i].stage] = NULL;
+      assert(!stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                  shaders[i].entry, &own, shaders[i].specialization, &error) &&
+             error.kind == STELA_AIR_INPUT);
+      own.nir[shaders[i].stage] = &staged[shaders[i].stage];
+      LLVMDisposeMemoryBuffer(input);
+   }
+   struct stela_metal_tessellation tessellation = {
+      .partition = STELA_METAL_PARTITION_INTEGER, .max_factor = 16};
+   nir_shader *stages[2];
+   stela_metal_tessellation_stages(&own, &tessellation, stages);
+   assert(stages[0]->options == &staged[MESA_SHADER_VERTEX]);
+   assert(stages[1]->options == &staged[MESA_SHADER_TESS_CTRL]);
    for (unsigned i = 0; i < 2; i++)
       stela_metal_release(stages[i]);
 }
@@ -5077,6 +5136,7 @@ main(void)
    null_pointer_phis_stay_among_phis();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
+   shaders_take_their_stages_options();
    kernels_compile_with_their_stage_in();
    vertex_inputs_decode_their_words();
    mesh_stages_compile_with_their_launch();

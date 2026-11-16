@@ -215,7 +215,7 @@ fn caching() -> (AirCompiler, u64) {
         decode_astc_kernel: kernel,
         release,
         buffer_reads,
-        nir_options: NonNull::dangling(),
+        nir_options: [NonNull::dangling(); super::NIR_STAGES],
     };
     // SAFETY: the fake service never reads the options.
     let mut compiler = unsafe { AirCompiler::new(service, &nvk(&CHIPS[0], 8 << 30)) };
