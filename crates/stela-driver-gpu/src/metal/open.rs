@@ -102,6 +102,8 @@ pub enum Refusal {
     Nvidia(nvidia::Refusal),
     #[cfg(feature = "amdgpu-port")]
     Amd(crate::metal::amd::Refusal),
+    #[cfg(feature = "xe-port")]
+    Intel(crate::metal::intel::Refusal),
 }
 
 /// The GPU the platform hands the Metal device.
@@ -365,6 +367,56 @@ mod tests {
             serve_on(radv(), &raphael).err(),
             Some(OpenError::Refused(Refusal::Amd(
                 amd::Refusal::UnknownFamily { family: 0 }
+            )))
+        );
+    }
+
+    /// A stack's admission is what serves its GPU: ANV's Tiger Lake device
+    /// through the Intel admission, with xe's platform name and a built-in
+    /// location, and refused by the NVIDIA one.
+    #[cfg(feature = "xe-port")]
+    #[test]
+    fn an_intel_gpu_is_served_through_its_stacks_admission() {
+        use crate::metal::{abi::DeviceLocation, intel, vulkan::PhysicalDeviceType};
+        static DRAWING_INTEL: GpuStack = GpuStack {
+            vendor: crate::Vendor::Intel,
+            kernel: crate::stack::Kernel {
+                driver: "xe",
+                admits: crate::xe::admits,
+                registers: 0,
+                dma_bits: crate::xe::dma_bits,
+                integrated: |_| false,
+                probed_integrated: None,
+                chip: crate::xe::query::chip,
+                memory_bytes: crate::xe::query::memory_bytes,
+            },
+            metal: Some(intel::ADMISSION),
+        };
+        let anv = || {
+            let mut backend = MockBackend::new();
+            let identity = &mut backend.physical.as_mut().unwrap().identity;
+            identity.vendor_id = intel::VENDOR_ID;
+            identity.driver_id = DriverId::IntelOpenSourceMesa;
+            identity.device_id = 0x9a49;
+            identity.device_type = PhysicalDeviceType::IntegratedGpu;
+            backend
+        };
+        let mut tiger_lake = gpu(0);
+        tiger_lake.stack = &DRAWING_INTEL;
+        tiger_lake.chip = 0x9a49;
+        let mut service = serve_on(anv(), &tiger_lake).unwrap();
+        let capabilities = service.device().capabilities();
+        assert_eq!(capabilities.architecture, "TIGERLAKE");
+        assert_eq!(capabilities.location, DeviceLocation::BuiltIn);
+        assert_eq!(capabilities.max_transfer_rate, 0);
+        let mut on_nvidia = tiger_lake;
+        on_nvidia.stack = &NVIDIA;
+        assert_eq!(
+            serve_on(anv(), &on_nvidia).err(),
+            Some(OpenError::Refused(Refusal::Nvidia(
+                nvidia::Refusal::NotNvidia {
+                    vendor_id: intel::VENDOR_ID
+                }
             )))
         );
     }

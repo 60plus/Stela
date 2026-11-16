@@ -131,8 +131,12 @@ pub static AMD: GpuStack = GpuStack {
     vulkan: None,
 };
 
-/// xe with the display code it shares with i915. No Vulkan driver yet: its
-/// GPU shows the frames another GPU draws, on the displays wired to it.
+/// xe with the display code it shares with i915, and ANV's admission. Its
+/// Vulkan driver is not given yet, even in an image that holds ANV: a PC
+/// with an Intel and another GPU would then serve a Metal device on each,
+/// which no rule chooses between yet, and ANV has run on no Intel GPU under
+/// Stela. Until then its GPU shows the frames another GPU draws, on the
+/// displays wired to it.
 #[cfg(feature = "xe-port")]
 pub static INTEL: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -150,7 +154,7 @@ pub static INTEL: GpuStack = GpuStack {
         memory_bytes: crate::xe::query::memory_bytes,
     },
     #[cfg(feature = "metal")]
-    metal: None,
+    metal: Some(crate::metal::intel::ADMISSION),
     #[cfg(all(feature = "metal-linked", not(test)))]
     vulkan: None,
 };
@@ -415,6 +419,8 @@ mod tests {
         assert_eq!(intel.kernel.driver, "xe");
         assert_eq!(intel.kernel.dma_limit(&tiger_lake), (1 << 39) - 1);
         assert!(!intel.draws());
+        #[cfg(feature = "metal")]
+        assert!(intel.metal.is_some());
         let unknown = adapter(0x8086);
         assert_eq!(
             GpuStack::select(&unknown).err(),
