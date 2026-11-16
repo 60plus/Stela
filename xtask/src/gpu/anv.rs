@@ -113,6 +113,7 @@ pub fn test(jobs: u16) -> Result<()> {
     );
     ensure!(!registered.is_empty(), "xe_device.c registers no ioctl");
     let mut failures = Vec::new();
+    let mut metal = 0;
     for (device, name, discrete) in PLATFORMS {
         let run = Command::new(&program)
             .args([device, if discrete { "discrete" } else { "integrated" }])
@@ -138,6 +139,7 @@ pub fn test(jobs: u16) -> Result<()> {
             unregistered.is_empty(),
         ) {
             (true, false, true) => {
+                metal += usize::from(stdout.contains(METAL_MET));
                 println!("{name}: {}", stdout.trim());
                 println!(
                     "  xe ioctls: {}",
@@ -165,11 +167,15 @@ pub fn test(jobs: u16) -> Result<()> {
         failures.join("\n")
     );
     println!(
-        "ANV ran on xe's ioctls for {} platforms, with no GPU",
+        "ANV ran on xe's ioctls for {} platforms, with no GPU; the Metal device's Vulkan \
+         requirements are met on {metal} of them",
         PLATFORMS.len()
     );
     Ok(())
 }
+
+/// What the test program prints for a device the Metal device admits.
+const METAL_MET: &str = "Metal device: every requirement met";
 
 /// Builds the shim and the test program; their paths.
 fn link_test(

@@ -10,8 +10,13 @@
  * instructions and code bytes), and records, submits and waits for one dispatch, which the
  * shim accepts without running it.
  *
+ * It also says which of the Metal device's Vulkan requirements ANV does not
+ * meet on the device, which is no failure of this test: the Metal device
+ * refuses such a device when it opens.
+ *
  * Usage: anv_device DEVICE-ID integrated|discrete
- * Prints one line "ANV on xe: ..." and exits 0, or names the failed check. */
+ * Prints a "Metal device: ..." line and a line "ANV on xe: ..." and exits 0,
+ * or names the failed check. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +68,124 @@ void stela_libc_drm_device(unsigned int index, struct stela_libc_drm_device *dev
 
 #define LOAD(instance, name) PFN_##name name = (PFN_##name)vk_icdGetInstanceProcAddr(instance, #name)
 
+/* Whether the device lists the extension `name`. */
+static int has_extension(VkInstance instance, VkPhysicalDevice physical, const char *name)
+{
+	LOAD(instance, vkEnumerateDeviceExtensionProperties);
+	uint32_t count = 0;
+	VK(vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL));
+	VkExtensionProperties *extensions = calloc(count, sizeof(*extensions));
+	CHECK(extensions);
+	VK(vkEnumerateDeviceExtensionProperties(physical, NULL, &count, extensions));
+	int found = 0;
+	for (uint32_t index = 0; index < count && !found; index++)
+		found = !strcmp(extensions[index].extensionName, name);
+	free(extensions);
+	return found;
+}
+
+/* The Metal device's Vulkan requirements (`metal::vulkan::backend::requirements`
+ * and the dma-buf import `metal::native` asks for) the device does not meet,
+ * printed as one line: "Metal device: refused, ANV lacks A, B" or "Metal device:
+ * every requirement met". The Metal device refuses a device that lacks any. */
+static void report_metal_requirements(VkInstance instance, VkPhysicalDevice physical)
+{
+	LOAD(instance, vkGetPhysicalDeviceFeatures2);
+	LOAD(instance, vkGetPhysicalDeviceProperties2);
+	VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
+	};
+	VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+		.pNext = &unused,
+	};
+	VkPhysicalDeviceRobustness2FeaturesEXT robustness = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+		.pNext = &conditional,
+	};
+	VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+		.pNext = &robustness,
+	};
+	VkPhysicalDeviceExtendedDynamicState2FeaturesEXT dynamic2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+		.pNext = &maintenance5,
+	};
+	VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+		.pNext = &dynamic2,
+	};
+	VkPhysicalDeviceVulkan13Features v13 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		.pNext = &dynamic,
+	};
+	VkPhysicalDeviceVulkan12Features v12 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+		.pNext = &v13,
+	};
+	VkPhysicalDeviceFeatures2 features = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+		.pNext = &v12,
+	};
+	vkGetPhysicalDeviceFeatures2(physical, &features);
+	VkPhysicalDeviceExtendedDynamicState3PropertiesEXT dynamic3 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT,
+	};
+	VkPhysicalDeviceProperties2 properties = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &dynamic3,
+	};
+	vkGetPhysicalDeviceProperties2(physical, &properties);
+	const VkPhysicalDeviceFeatures *core = &features.features;
+	const struct {
+		const char *name;
+		int present;
+	} requirements[] = {
+		{"bufferDeviceAddress", v12.bufferDeviceAddress},
+		{"timelineSemaphore", v12.timelineSemaphore},
+		{"synchronization2", v13.synchronization2},
+		{"shaderFloat16", v12.shaderFloat16},
+		{"dynamicRendering", v13.dynamicRendering},
+		{"descriptorIndexing", v12.descriptorIndexing && v12.runtimeDescriptorArray},
+		{"descriptorBindingPartiallyBound", v12.descriptorBindingPartiallyBound},
+		{"descriptorBindingUpdateAfterBind",
+		 v12.descriptorBindingSampledImageUpdateAfterBind &&
+			 v12.descriptorBindingStorageImageUpdateAfterBind &&
+			 v12.descriptorBindingUniformTexelBufferUpdateAfterBind &&
+			 v12.descriptorBindingStorageTexelBufferUpdateAfterBind &&
+			 v12.descriptorBindingUpdateUnusedWhilePending},
+		{"shaderImageArrayNonUniformIndexing",
+		 v12.shaderSampledImageArrayNonUniformIndexing &&
+			 v12.shaderStorageImageArrayNonUniformIndexing},
+		{"extendedDynamicState",
+		 dynamic.extendedDynamicState && dynamic2.extendedDynamicState2},
+		{"unifiedImageLayouts",
+		 has_extension(instance, physical, "VK_KHR_unified_image_layouts")},
+		{"maintenance5", v13.maintenance4 && maintenance5.maintenance5},
+		{"vulkanMemoryModel", v12.vulkanMemoryModel},
+		{"storageImageWithoutFormat",
+		 core->shaderStorageImageReadWithoutFormat && core->shaderStorageImageWriteWithoutFormat},
+		{"independentBlend", core->independentBlend},
+		{"nullDescriptor", robustness.nullDescriptor},
+		{"conditionalRendering", conditional.conditionalRendering},
+		{"dynamicRenderingUnusedAttachments", unused.dynamicRenderingUnusedAttachments},
+		{"dynamicPrimitiveTopologyUnrestricted", dynamic3.dynamicPrimitiveTopologyUnrestricted},
+		{"hostQueryReset", v12.hostQueryReset},
+		{"VK_EXT_external_memory_dma_buf",
+		 has_extension(instance, physical, "VK_KHR_external_memory_fd") &&
+			 has_extension(instance, physical, "VK_EXT_external_memory_dma_buf")},
+	};
+	int lacking = 0;
+	for (unsigned index = 0; index < sizeof(requirements) / sizeof(requirements[0]); index++) {
+		if (requirements[index].present)
+			continue;
+		printf("%s%s", lacking ? ", " : "Metal device: refused, ANV lacks ",
+		       requirements[index].name);
+		lacking = 1;
+	}
+	printf(lacking ? "\n" : "Metal device: every requirement met\n");
+}
+
 int main(int argc, char **argv)
 {
 	CHECK(argc == 3);
@@ -110,6 +233,7 @@ int main(int argc, char **argv)
 	CHECK(properties.properties.deviceID == expected_device);
 	CHECK(properties.properties.deviceType == expected_type);
 	CHECK(driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+	report_metal_requirements(instance, physical);
 
 	/* The hook answers one set per stage, and none past Mesa's stages. */
 	const void *options[STAGES];
