@@ -1162,9 +1162,10 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
 }
 
 /// Open a service over each bound GPU that [`metal_devices`] chooses, the
-/// PC's Metal device first. A drawing GPU it leaves display-only is
-/// reported once. What stops one is reported, and the Mac boots without
-/// Metal on that GPU.
+/// PC's Metal device first. What stops one is reported, and the Mac boots
+/// without Metal on that GPU. When none of them opens, the drawing GPUs it
+/// left display-only serve instead, with one line each; those that stay
+/// display-only are reported once, with the GPU that draws for Metal.
 ///
 /// [`metal_devices`]: stela_drivers::gpu::stack::metal_devices
 pub(in crate::engine) fn open_service() {
@@ -1173,30 +1174,42 @@ pub(in crate::engine) fn open_service() {
     };
     let bound = &gpu.start.bound;
     let chosen = metal_choice(bound, super::display::taken_index());
-    for &index in &chosen.display_only {
-        if let Some(&serving) = chosen.serve.first() {
+    let mut constructed = false;
+    let mut open = |indices: &[usize]| -> Vec<(usize, Arc<Shared>)> {
+        indices
+            .iter()
+            .filter_map(|&index| {
+                open_gpu(gpu, index, &bound[index], &mut constructed)
+                    .map(|service| (index, service))
+            })
+            .collect()
+    };
+    let mut opened = open(&chosen.serve);
+    if let Some(&(serving, _)) = opened.first() {
+        for &index in &chosen.display_only {
             output::arguments(format_args!(
                 "GPU {}: shows displays only: GPU {}, a discrete GPU, draws for Metal\n",
                 bound[index].name, bound[serving].name
             ));
         }
+    } else {
+        opened = open(&chosen.display_only);
+        for &(index, _) in &opened {
+            output::arguments(format_args!(
+                "GPU {}: draws for Metal, as no discrete GPU opened a Metal device\n",
+                bound[index].name
+            ));
+        }
     }
-    let mut constructed = false;
-    let (served, services): (Vec<_>, Vec<_>) = chosen
-        .serve
-        .iter()
-        .filter_map(|&index| {
-            open_gpu(gpu, index, &bound[index], &mut constructed).map(|service| (index, service))
-        })
-        .unzip();
+    let (served, services): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
     SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
 }
 
 /// The bound GPU, by its index, that service `service` runs on: services
 /// follow [`metal_choice`]'s order, which puts the GPU driving the display
-/// first and leaves out display-only and failed GPUs, so it is not the
-/// claims' order.
+/// first and leaves out failed GPUs and, while a chosen GPU opened,
+/// display-only ones, so it is not the claims' order.
 pub(super) fn served_gpu(service: usize) -> Option<usize> {
     // SAFETY: published once, before any service exists, and leaked.
     unsafe { SERVED.load(Ordering::Acquire).as_ref() }
@@ -1256,7 +1269,7 @@ fn construct(constructed: &mut bool) {
     }
 }
 
-/// The service of `bound`, at DRM minor `index`, whose failure is reported.
+/// The service of `bound`, the bound GPU at `index`, whose failure is reported.
 fn open_gpu(
     gpu: &Installed,
     index: usize,
