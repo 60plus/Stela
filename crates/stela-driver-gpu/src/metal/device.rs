@@ -36,6 +36,7 @@ const MARKER_MEMORY: MemoryRequest = MemoryRequest {
     mapped: true,
 };
 
+pub mod display;
 mod execution_sets;
 #[cfg(test)]
 pub(crate) mod fixture;

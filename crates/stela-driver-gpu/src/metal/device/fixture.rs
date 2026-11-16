@@ -211,6 +211,10 @@ pub(crate) struct MockBackend {
     pub(crate) invalidated: Vec<(Memory, u64, u64)>,
     /// Host memory each imported memory is, by memory.
     pub(crate) imports: BTreeMap<u64, (Vec<MemoryRange>, NonZeroU64)>,
+    /// Guest RAM the device imported for itself, by memory.
+    pub(crate) own_imports: BTreeMap<u64, Vec<MemoryRange>>,
+    /// Each dma-buf imported, by memory: its descriptor and bytes.
+    pub(crate) dma_bufs: BTreeMap<u64, (i32, u64)>,
     /// Driver work outside the service's turn, when a test gives it.
     pub(crate) outside: Option<alloc::sync::Arc<MockOutside>>,
     /// The word a test's GPU writes as the completion marker, when the
@@ -364,6 +368,16 @@ impl Backend for MockBackend {
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory> {
         let id = self.id();
         self.imports.insert(id, (ranges.to_vec(), token));
+        Ok(Memory(id))
+    }
+    fn import_own(&mut self, ranges: &[MemoryRange]) -> Result<Memory> {
+        let id = self.id();
+        self.own_imports.insert(id, ranges.to_vec());
+        Ok(Memory(id))
+    }
+    fn import_dma_buf(&mut self, fd: i32, bytes: u64) -> Result<Memory> {
+        let id = self.id();
+        self.dma_bufs.insert(id, (fd, bytes));
         Ok(Memory(id))
     }
     fn outside(&self) -> Option<alloc::sync::Arc<dyn Outside>> {

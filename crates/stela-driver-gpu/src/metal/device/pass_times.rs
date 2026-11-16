@@ -94,6 +94,7 @@ impl SpanKind {
             | Command::ResolveDispatches { .. }
             | Command::DecodeBlocks { .. }
             | Command::ReorderBlocks { .. }
+            | Command::Compose { .. }
             | Command::AverageSamples { .. } => Self::Internal,
             Command::CopyBuffer { .. }
             | Command::CopyBufferRegions { .. }

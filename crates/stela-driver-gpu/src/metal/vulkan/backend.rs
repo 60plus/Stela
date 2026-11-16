@@ -236,6 +236,18 @@ pub trait Backend {
     /// The wired guest RAM of `ranges`, which the GPU reaches where it is.
     /// Destroying the memory lets [`Self::retired`] answer `token`.
     fn import_memory(&mut self, ranges: &[MemoryRange], token: NonZeroU64) -> Result<Memory>;
+    /// [`Self::import_memory`] of guest RAM the device reads for itself, as
+    /// a display layer's, whose destruction retires no token.
+    fn import_own(&mut self, _ranges: &[MemoryRange]) -> Result<Memory> {
+        Err(Error::Unsupported("imports of guest RAM for the device"))
+    }
+    /// The memory of a dma-buf another driver made, `bytes` long, which the
+    /// device reaches and nothing maps: a display's scanout buffer. The
+    /// driver owns `fd` once this succeeds; the caller still does after an
+    /// error.
+    fn import_dma_buf(&mut self, _fd: i32, _bytes: u64) -> Result<Memory> {
+        Err(Error::Unsupported("dma-buf imports"))
+    }
     /// Whether an import of exactly `ranges` takes back memory kept from
     /// an earlier one, with no driver call.
     fn keeps_import(&self, _ranges: &[MemoryRange]) -> bool {

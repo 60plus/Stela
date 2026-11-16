@@ -421,6 +421,13 @@ pub enum Command {
         arguments: u64,
         count: u32,
     },
+    /// The backend's compose kernel over `count` pixels, with a
+    /// [`ComposeArguments`](crate::metal::binding::ComposeArguments)
+    /// upload's address: display layers blended into a scanout buffer.
+    Compose {
+        arguments: u64,
+        count: u32,
+    },
     /// The backend's average samples kernel, with `count` threads and the
     /// address of its `AverageArguments`: the resolve of an attachment
     /// rendered through its raw texels, which Vulkan's resolve modes

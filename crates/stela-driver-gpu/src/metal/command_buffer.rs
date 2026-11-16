@@ -352,7 +352,8 @@ impl Workload {
                 Command::StoreTexels { .. }
                 | Command::LoadTexels { .. }
                 | Command::DecodeBlocks { .. }
-                | Command::ReorderBlocks { .. } => self.transfers += 1,
+                | Command::ReorderBlocks { .. }
+                | Command::Compose { .. } => self.transfers += 1,
                 _ => {}
             }
         }

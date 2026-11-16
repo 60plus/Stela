@@ -6,8 +6,8 @@ use super::{
 };
 use crate::metal::{
     binding::{
-        AccumulateArguments, AverageArguments, PushConstants, ReorderArguments, ResolveArguments,
-        SelectArguments, TexelArguments,
+        AccumulateArguments, AverageArguments, ComposeArguments, PushConstants, ReorderArguments,
+        ResolveArguments, SelectArguments, TexelArguments,
     },
     command_buffer::Segment,
     error::{Error, Result},
@@ -846,6 +846,12 @@ impl Recorder<'_> {
                     arguments,
                     count,
                     ReorderArguments::WORKGROUP_SIZE,
+                ),
+                &Command::Compose { arguments, count } => self.internal(
+                    self.backend.compose,
+                    arguments,
+                    count,
+                    ComposeArguments::WORKGROUP_SIZE,
                 ),
                 &Command::AverageSamples { arguments, count } => self.internal(
                     self.backend.average_samples,
