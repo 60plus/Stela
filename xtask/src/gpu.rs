@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod clc;
 pub mod fetch;
 mod llvm;
 mod mesa;
@@ -93,7 +94,8 @@ pub enum Command {
         render_inputs: Vec<PathBuf>,
     },
     /// Compile NVK, NIR and NAK's C for `stela.efi` against Stela's C library,
-    /// and generate the sources of Mesa's Rust crates.
+    /// with ANV and BRW when this host has the tools their build runs, and
+    /// generate the sources of Mesa's Rust crates.
     Nvk {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]

@@ -1,4 +1,5 @@
-//! NVK, NIR and NAK for `stela.efi`.
+//! Mesa's Vulkan drivers for `stela.efi`: NVK with NAK, and ANV with BRW
+//! when the build host has the tools ANV's build runs (`clc.rs`).
 //!
 //! Meson configures Mesa for `sysroot`'s machine, the same from every build
 //! host, which leaves its generated sources and its compile plan. This task
@@ -27,14 +28,14 @@ use std::{
     time::SystemTime,
 };
 
-/// What NVK needs and nothing else: no window system, no cache on
-/// disk and no host compiler. NVK's OpenCL kernels are `compat/mesa/nvkcl.c`, so
-/// the tools that would build them are never run. A release build: NDEBUG drops
-/// NIR validation after every pass and NAK's debug assertions, which cost the
-/// image compile time and heap; the host compiler lane keeps them.
-pub(super) const OPTIONS: [&str; 21] = [
+/// What the drivers need and nothing else: no window system, no cache on
+/// disk and no compiler of its own for the host tools, which `clc.rs` builds
+/// when a driver needs them. `vulkan-drivers` is the drivers chosen. A
+/// release build: NDEBUG drops NIR validation after every pass and NAK's
+/// debug assertions, which cost the image compile time and heap; the host
+/// compiler lane keeps them.
+pub(super) const OPTIONS: [&str; 20] = [
     "-Dcpp_rtti=false",
-    "-Dvulkan-drivers=nouveau",
     "-Dgallium-drivers=",
     "-Dplatforms=",
     "-Dopengl=false",
@@ -59,14 +60,81 @@ pub(super) const OPTIONS: [&str; 21] = [
 /// size, which `ralloc_total_size` sums for the Metal compiler's NIR budget.
 /// The block header is private to the unit and its size is the same either way.
 const SIZED_UNIT: &str = "src/util/ralloc.c";
-/// The Vulkan drivers the image links, as Meson's targets.
-const DRIVERS: [&str; 1] = ["src/nouveau/vulkan/libvulkan_nouveau.so"];
-/// Tools the configuration asks for that nothing runs.
+/// A Vulkan driver the image may link.
+pub(super) struct Driver {
+    /// Its name in Meson's `vulkan-drivers`.
+    pub(super) name: &'static str,
+    /// Its Meson target.
+    target: &'static str,
+    /// Where Meson puts its own objects, under the build directory.
+    objects: &'static str,
+    /// The libraries Meson links whole into it, by their objects' names.
+    whole: &'static [&'static str],
+    /// The name its `vk_icdGetInstanceProcAddr` takes in the image. Every
+    /// Mesa driver defines that loader entry; one image holds them all, so
+    /// each but the first has its own compiled under this name.
+    pub(super) entry: &'static str,
+    /// Meson options only this driver reads.
+    options: &'static [&'static str],
+    /// Whether its build runs the host tools (`clc.rs`): its internal
+    /// kernels are OpenCL C and its libraries GLSL.
+    host_tools: bool,
+    /// One of its own units, whose flags its stand-ins compile with.
+    model: &'static str,
+    /// Its stand-ins and driver-internal calls, under `compat/mesa`.
+    stand_ins: &'static [&'static str],
+}
+
+/// The loader entry every Mesa Vulkan driver defines.
+const ENTRY: &str = "vk_icdGetInstanceProcAddr";
+/// NVK. Its OpenCL kernels are `compat/mesa/nvkcl.c`, so it needs no host
+/// tool.
+const NVK: Driver = Driver {
+    name: "nouveau",
+    target: "src/nouveau/vulkan/libvulkan_nouveau.so",
+    objects: "src/nouveau/vulkan/",
+    whole: &["libnvk_a"],
+    entry: ENTRY,
+    options: &[],
+    host_tools: false,
+    model: "nvk_query_pool.c",
+    stand_ins: &[
+        "nvkcl",
+        "build_id",
+        "nv_cubin",
+        "drm",
+        "soft_float",
+        "nir_options",
+        "submit_thread",
+    ],
+};
+/// ANV, with BRW, for Intel GPUs from Gen9. Ray tracing is left out: no
+/// Metal path the image serves builds acceleration structures, and NVK has
+/// none either. ELK compiles for Gen8 and older, which only hasvk drives.
+const ANV: Driver = Driver {
+    name: "intel",
+    target: "src/intel/vulkan/libvulkan_intel.so",
+    objects: "src/intel/vulkan/",
+    whole: &["libanv_common_a", "libanv_per_hw_ver"],
+    entry: "anv_icdGetInstanceProcAddr",
+    options: &["-Dintel-rt=disabled", "-Dintel-elk=false"],
+    host_tools: true,
+    model: "anv_util.c",
+    stand_ins: &["anv_nir_options"],
+};
+/// Every driver the image may link, the first keeping Mesa's entry name.
+pub(super) const DRIVERS: [&Driver; 2] = [&NVK, &ANV];
+/// Where the build lists the drivers it linked, beside the archives, for the
+/// crates that name their entries.
+pub(super) const LINKED: &str = "vulkan-drivers";
+/// Tools the configuration asks for that nothing runs when no driver needs
+/// the host tools.
 const UNUSED_TOOLS: [&str; 2] = ["mesa_clc", "vtn_bindgen2"];
-/// What Mesa's configuration asks of `glslangValidator`, only for the compute
-/// shaders that build acceleration structures and decode ASTC in Vulkan's
-/// runtime. The device enables neither, as no Metal path uses them, so they
-/// compile to an empty SPIR-V module.
+/// What Mesa's configuration asks of `glslangValidator` on a host that has
+/// none, only for the compute shaders that build acceleration structures and
+/// decode ASTC in Vulkan's runtime. The device enables neither, as no Metal
+/// path uses them, so they compile to an empty SPIR-V module. No driver that
+/// compiles a GLSL library it uses (ANV's software doubles) is built then.
 const GLSLANG: &str = r#"#!/usr/bin/env python3
 import sys
 arguments = sys.argv[1:]
@@ -86,21 +154,20 @@ if "--depfile" in arguments:
 const LIBDRM_VERSION: &str = "2.4.133";
 const LIBELF_VERSION: &str = "0.190";
 
-/// Units not built, by a part of their source path: each either has a stand-in
-/// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
-/// The libraries Meson links whole, by their objects' names.
-const WHOLE_LIBRARIES: [&str; 4] = [
+/// The libraries of Vulkan's runtime Meson links whole, by their objects'
+/// names; each driver names its own.
+const WHOLE_RUNTIME: [&str; 3] = [
     "libvulkan_lite_runtime_a",
     "libvulkan_runtime_a",
     "libvulkan_instance_a",
-    "libnvk_a",
 ];
 
-const SKIPPED: [&str; 11] = [
+/// Units not built, by a part of their source path: each either has a stand-in
+/// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
+const SKIPPED: [&str; 10] = [
     "nvkcl",
     "build_id",
     "nv_cubin.c",
-    "texcompress_astc",
     "u_qsort",
     "os_file_notify",
     "os_socket",
@@ -109,17 +176,8 @@ const SKIPPED: [&str; 11] = [
     "u_debug_stack",
     "wsi_common_display",
 ];
-/// Stela's stand-ins, under `compat/mesa`, built with an NVK unit's flags.
-const STAND_INS: [&str; 7] = [
-    "nvkcl",
-    "build_id",
-    "nv_cubin",
-    "drm",
-    "soft_float",
-    "nir_options",
-    "submit_thread",
-];
-/// The Metal compiler service, under `compiler`, built with an NVK unit's flags.
+/// The Metal compiler service, under `compiler`, built with the first
+/// driver's model unit's flags.
 const AIR: [&str; 16] = [
     "air_call",
     "air_calls",
@@ -138,7 +196,6 @@ const AIR: [&str; 16] = [
     "metal_compiler",
     "threadgroup",
 ];
-const MODEL_UNIT: &str = "nvk_query_pool.c";
 /// The C library, under `compat/libc`.
 pub(super) const LIBC: [&str; 6] = ["libc", "stdio", "pthread", "math", "system", "wchar"];
 /// Original LLVM units behind `compat/libc/regex.h`, also present in the
@@ -247,21 +304,101 @@ pub(super) struct Unit {
     pub(super) arguments: Vec<String>,
 }
 
-fn paths(directory: &Path) -> Result<(PathBuf, PathBuf)> {
+/// The directory of Mesa's tools for the image's configuration, the PATH it
+/// runs with, which finds those first, and the PATH without them, with which
+/// the host tools are found and built.
+fn paths(directory: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let stubs = directory.join("tools");
     let local = tools::root().join(".tools/gpu");
-    let path = std::env::join_paths(
-        [
-            stubs.clone(),
-            local.join(GENERATORS),
-            local.join("rust/bin"),
-        ]
+    let host: Vec<PathBuf> = [local.join(GENERATORS), local.join("rust/bin")]
         .into_iter()
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
-        )),
-    )?;
-    Ok((stubs, path.into()))
+        ))
+        .collect();
+    let path = std::env::join_paths(std::iter::once(stubs.clone()).chain(host.iter().cloned()))?;
+    Ok((stubs, path.into(), std::env::join_paths(host)?.into()))
+}
+
+/// The drivers this build links and the host tools they run: every driver
+/// when the host has the tools, else those that need none.
+pub(super) struct Choice {
+    pub(super) drivers: Vec<&'static Driver>,
+    tools: Option<super::clc::Tools>,
+}
+
+impl Choice {
+    /// Every driver, given what [`super::clc::tools`] found; the reason a
+    /// driver is left out is printed once.
+    fn new(tools: std::result::Result<super::clc::Tools, String>) -> Self {
+        let tools = match tools {
+            Ok(tools) => Some(tools),
+            Err(reason) => {
+                for driver in DRIVERS.iter().filter(|driver| driver.host_tools) {
+                    println!(
+                        "Vulkan driver {} is not built: {reason}. Its GPUs show only frames \
+                         another GPU draws.",
+                        driver.name
+                    );
+                }
+                None
+            }
+        };
+        let drivers = DRIVERS
+            .into_iter()
+            .filter(|driver| tools.is_some() || !driver.host_tools)
+            .collect();
+        Self { drivers, tools }
+    }
+
+    /// Mesa's Meson arguments for these drivers, after [`OPTIONS`].
+    fn arguments(&self) -> Vec<String> {
+        let names: Vec<&str> = self.drivers.iter().map(|driver| driver.name).collect();
+        let mut arguments: Vec<String> = OPTIONS.map(str::to_owned).into();
+        arguments.push(format!("-Dvulkan-drivers={}", names.join(",")));
+        for driver in &self.drivers {
+            arguments.extend(driver.options.iter().map(|option| (*option).to_owned()));
+        }
+        arguments
+    }
+
+    /// What Mesa's configuration record holds: its arguments and the host
+    /// tools it found.
+    fn record(&self) -> String {
+        let mut record = self.arguments().join("\n") + "\n";
+        if let Some(tools) = &self.tools {
+            record.push_str(&tools.identity());
+        }
+        record
+    }
+
+    /// Whether `output`, a unit of the drivers, is `driver`'s own.
+    fn owner(&self, output: &str) -> Option<&'static Driver> {
+        let output = output.replace('\\', "/");
+        self.drivers
+            .iter()
+            .copied()
+            .find(|driver| output.starts_with(driver.objects))
+    }
+
+    /// The driver whose own unit compiled the image object `object`.
+    fn owner_of_object(&self, object: &Path) -> Option<&'static Driver> {
+        let name = object.file_name()?.to_string_lossy();
+        self.drivers
+            .iter()
+            .copied()
+            .find(|driver| name.starts_with(&driver.objects.replace(['/', '.'], "_")))
+    }
+
+    /// Whether Meson links `object`'s library whole: its entry points are
+    /// reached only by weak reference, which pulls no member from an archive.
+    fn linked_whole(&self, object: &str) -> bool {
+        let name = object_name(object);
+        WHOLE_RUNTIME
+            .iter()
+            .chain(self.drivers.iter().flat_map(|driver| driver.whole))
+            .any(|library| name.contains(library))
+    }
 }
 
 /// Where Mesa's configuration records the Meson arguments it was made with.
@@ -292,12 +429,13 @@ fn setup(
     directory: &Path,
     build: &Path,
     path: &Path,
+    choice: &Choice,
 ) -> Result<()> {
     let packages = directory.join("pkgconfig");
     let machine = directory.join("machine.ini");
     let description = sysroot.machine_file(toolchain, &packages)?;
-    let arguments = OPTIONS.join("\n") + "\n";
-    if configured(directory, build, &sysroot.libc(), &description, &arguments) {
+    let record = choice.record();
+    if configured(directory, build, &sysroot.libc(), &description, &record) {
         return Ok(());
     }
     if build.is_dir() {
@@ -306,16 +444,33 @@ fn setup(
     // A configuration that fails leaves no record that it was made.
     let _ = fs::remove_file(directory.join(CONFIGURATION));
     fs::write(&machine, description)?;
-    let (stubs, _) = paths(directory)?;
+    let (stubs, _, _) = paths(directory)?;
+    if stubs.is_dir() {
+        fs::remove_dir_all(&stubs)?;
+    }
     fs::create_dir_all(&stubs)?;
-    let unused = UNUSED_TOOLS.map(|name| (name, "#!/usr/bin/env python3\nraise SystemExit(1)\n"));
-    for (name, script) in unused.into_iter().chain([("glslangValidator", GLSLANG)]) {
-        let stub = stubs.join(name);
-        fs::write(&stub, script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
+    match &choice.tools {
+        // The real tools, found first; glslang is found on PATH.
+        Some(tools) => {
+            for program in &tools.programs {
+                fs::copy(
+                    program,
+                    stubs.join(program.file_name().context("host tool")?),
+                )?;
+            }
+        }
+        None => {
+            let unused =
+                UNUSED_TOOLS.map(|name| (name, "#!/usr/bin/env python3\nraise SystemExit(1)\n"));
+            for (name, script) in unused.into_iter().chain([("glslangValidator", GLSLANG)]) {
+                let stub = stubs.join(name);
+                fs::write(&stub, script)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
+                }
+            }
         }
     }
     fs::create_dir_all(&packages)?;
@@ -339,8 +494,11 @@ fn setup(
         .arg(third_party("mesa"))
         .arg("--cross-file")
         .arg(machine)
-        .args(OPTIONS)
-        .env("PATH", path);
+        .args(choice.arguments())
+        .env("PATH", path)
+        // The image's packages are the machine file's only: a host's own,
+        // such as SPIRV-Tools for the host tools, must not be found.
+        .env_remove("PKG_CONFIG_PATH");
     // Rust on Windows does not link through the C compiler Meson finds.
     if cfg!(windows) {
         setup.env("RUSTC_LD_FOR_BUILD", "lld-link");
@@ -362,7 +520,7 @@ fn setup(
             kept.display()
         );
     }
-    fs::write(directory.join(CONFIGURATION), arguments)?;
+    fs::write(directory.join(CONFIGURATION), record)?;
     Ok(())
 }
 
@@ -452,7 +610,9 @@ fn generate(sysroot: &Sysroot, build: &Path, path: &Path, libclang: &Path) -> Re
             .current_dir(build)
             .env("BINDGEN_EXTRA_CLANG_ARGS", quoted.join(" "))
             .env("LIBCLANG_PATH", libclang)
-            .env("PATH", path),
+            .env("PATH", path)
+            // As in `setup`, should Ninja configure again.
+            .env_remove("PKG_CONFIG_PATH"),
     )
 }
 
@@ -610,11 +770,12 @@ fn units(
     path: &Path,
     common: &[String],
     cxx: &[String],
+    choice: &Choice,
 ) -> Result<Vec<Unit>> {
     let linked = capture(
         Command::new(ninja)
             .args(["-t", "inputs"])
-            .args(DRIVERS)
+            .args(choice.drivers.iter().map(|driver| driver.target))
             .current_dir(build)
             .env("PATH", path),
     )?;
@@ -625,12 +786,16 @@ fn units(
     let database: Value =
         serde_json::from_str(&fs::read_to_string(build.join("compile_commands.json"))?)?;
     let mut units = Vec::new();
-    let mut model = None;
+    let mut models = Vec::new();
     let entries = database.as_array().context("compile database")?;
     // A source two libraries compile is the one's that is linked whole.
     let whole: BTreeSet<&str> = entries
         .iter()
-        .filter(|entry| entry["output"].as_str().is_some_and(linked_whole))
+        .filter(|entry| {
+            entry["output"]
+                .as_str()
+                .is_some_and(|output| choice.linked_whole(output))
+        })
         .filter_map(|entry| entry["file"].as_str())
         .collect();
     for entry in entries {
@@ -641,11 +806,16 @@ fn units(
             continue;
         };
         let output = &words[at + 1];
-        if !linked.contains(output.as_str()) || (whole.contains(file) && !linked_whole(output)) {
+        if !linked.contains(output.as_str())
+            || (whole.contains(file) && !choice.linked_whole(output))
+        {
             continue;
         }
-        if file.ends_with(MODEL_UNIT) {
-            model = Some((file.to_owned(), words.clone()));
+        if let Some(driver) = choice
+            .owner(output)
+            .filter(|driver| file.ends_with(driver.model))
+        {
+            models.push((driver.name, file.to_owned(), words.clone()));
         }
         if file.ends_with(".S")
             || SKIPPED
@@ -654,7 +824,7 @@ fn units(
         {
             continue;
         }
-        let is_cxx = file.ends_with(".cpp");
+        let is_cxx = file.ends_with(".cpp") || file.ends_with(".cc");
         ensure!(
             is_cxx || file.ends_with(".c"),
             "{file} is neither C nor C++"
@@ -667,6 +837,9 @@ fn units(
                     .map(|name| format!("-D{name}__extern={name}__hard_float")),
             );
         }
+        if let Some(driver) = choice.owner(output).filter(|driver| driver.entry != ENTRY) {
+            arguments.push(format!("-D{ENTRY}={}", driver.entry));
+        }
         let mut name = object_name(output);
         if file.replace('\\', "/").ends_with(SIZED_UNIT) {
             arguments.push("-UNDEBUG".to_owned());
@@ -678,7 +851,6 @@ fn units(
             arguments,
         });
     }
-    let (file, words) = model.context("no model unit")?;
     let compat = gpu().join("compat");
     let like = |file: &str, words: &[String], source: &Path, name: &str, added: &[String]| {
         let words: Vec<_> = words
@@ -698,12 +870,23 @@ fn units(
             arguments,
         }
     };
-    let model_unit =
-        |source: &Path, name: &str, added: &[String]| like(&file, &words, source, name, added);
-    for name in STAND_INS {
-        let source = compat.join("mesa").join(format!("{name}.c"));
-        units.push(model_unit(&source, name, &[]));
+    let model = |driver: &Driver| {
+        models
+            .iter()
+            .find(|(name, _, _)| *name == driver.name)
+            .map(|(_, file, words)| (file, words))
+            .with_context(|| format!("{} has no unit {}", driver.name, driver.model))
+    };
+    for driver in &choice.drivers {
+        let (file, words) = model(driver)?;
+        for name in driver.stand_ins {
+            let source = compat.join("mesa").join(format!("{name}.c"));
+            units.push(like(file, words, &source, name, &[]));
+        }
     }
+    let (file, words) = model(choice.drivers.first().context("no Vulkan driver")?)?;
+    let model_unit =
+        |source: &Path, name: &str, added: &[String]| like(file, words, source, name, added);
     let compiler = gpu().join("compiler");
     let added = [
         compiler.clone(),
@@ -834,6 +1017,87 @@ fn rename_constructors(object: &mut [u8]) -> Option<bool> {
     Some(renamed)
 }
 
+/// The external symbols `object` defines.
+/// Weak definitions and those in a COMDAT group the linker keeps one copy of
+/// (COFF's `.refptr` indirections and C++'s inline functions) are left out:
+/// two drivers may each have one.
+fn definitions(object: &Path) -> Result<BTreeSet<String>> {
+    use object::{ComdatKind, Object, ObjectComdat, ObjectSymbol};
+    let data = fs::read(object)?;
+    let file = object::File::parse(&*data)
+        .with_context(|| format!("{} is no object", object.display()))?;
+    let merged: BTreeSet<_> = file
+        .comdats()
+        .filter(|comdat| comdat.kind() != ComdatKind::NoDuplicates)
+        .flat_map(|comdat| {
+            comdat
+                .sections()
+                .map(|section| section.0)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    Ok(file
+        .symbols()
+        .filter(|symbol| symbol.is_definition() && symbol.is_global() && !symbol.is_weak())
+        .filter(|symbol| {
+            symbol
+                .section_index()
+                .is_none_or(|section| !merged.contains(&section.0))
+        })
+        .filter_map(|symbol| symbol.name().ok().map(str::to_owned))
+        .collect())
+}
+
+/// Checks what the drivers' own units define, by driver: each defines its
+/// loader entry, and no symbol is defined by two, which one image could not
+/// link.
+fn check_definitions(defined: &[(&Driver, BTreeSet<String>)]) -> Result<()> {
+    for (index, (driver, symbols)) in defined.iter().enumerate() {
+        ensure!(
+            symbols.contains(driver.entry),
+            "Vulkan driver {}'s units define no {}",
+            driver.name,
+            driver.entry
+        );
+        for (other, theirs) in &defined[..index] {
+            let shared: Vec<&String> = symbols.intersection(theirs).collect();
+            ensure!(
+                shared.is_empty(),
+                "Vulkan drivers {} and {} both define {}",
+                other.name,
+                driver.name,
+                shared
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`check_definitions`] over the compiled units.
+fn check_entries(choice: &Choice, units: &[Unit]) -> Result<()> {
+    let mut defined: Vec<(&Driver, BTreeSet<String>)> = choice
+        .drivers
+        .iter()
+        .map(|driver| (*driver, BTreeSet::new()))
+        .collect();
+    for unit in units {
+        if let Some(driver) = choice.owner_of_object(&unit.output) {
+            let symbols = definitions(&unit.output)?;
+            if let Some((_, all)) = defined
+                .iter_mut()
+                .find(|(owner, _)| core::ptr::eq(*owner, driver))
+            {
+                all.extend(symbols);
+            }
+        }
+    }
+    check_definitions(&defined)
+}
+
 /// [`rename_constructors`] for every unit.
 pub(super) fn gather_constructors(units: &[Unit]) -> Result<()> {
     for unit in units {
@@ -847,22 +1111,19 @@ pub(super) fn gather_constructors(units: &[Unit]) -> Result<()> {
     Ok(())
 }
 
-/// Whether Meson links `unit`'s library whole: its entry points are reached
-/// only by weak reference, which pulls no member from an archive.
-fn linked_whole(object: &str) -> bool {
-    let name = object_name(object);
-    WHOLE_LIBRARIES.iter().any(|library| name.contains(library))
-}
-
 pub fn build(jobs: u16) -> Result<()> {
     let toolchain = super::toolchain::discover()?;
     let directory = build_directory("nvk");
     let build = directory.join("build");
-    let (_, path) = paths(&directory)?;
+    let (_, path, host) = paths(&directory)?;
     fs::create_dir_all(&directory)?;
+    // The list names what the archives hold, so it goes until they are made.
+    let linked = directory.join(LINKED);
+    let _ = fs::remove_file(&linked);
     super::llvm::build(&toolchain, jobs, false)?;
     let sysroot = Sysroot::build(&toolchain, &directory, jobs)?;
-    setup(&toolchain, &sysroot, &directory, &build, &path)?;
+    let choice = Choice::new(super::clc::tools(&host, jobs)?);
+    setup(&toolchain, &sysroot, &directory, &build, &path, &choice)?;
     generate(&sysroot, &build, &path, &toolchain.libclang)?;
     let libc = gpu().join("compat/libc");
     let includes = include_flags(&toolchain.clang, &libc)?;
@@ -877,12 +1138,13 @@ pub fn build(jobs: u16) -> Result<()> {
     common.push(format!("-I{}", gpu().join("compat/mesa").display()));
     let ninja = tool("ninja", GENERATORS)?;
     let cxx = super::llvm::cxx_flags(&common);
-    let units = units(&build, &objects, &ninja, &path, &common, &cxx)?;
+    let units = units(&build, &objects, &ninja, &path, &common, &cxx, &choice)?;
     compile(&toolchain.clang, &build, &units, jobs)?;
 
     gather_constructors(&units)?;
+    check_entries(&choice, &units)?;
     let (whole, lazy): (Vec<_>, Vec<_>) = units.iter().partition(|unit| {
-        linked_whole(
+        choice.linked_whole(
             &unit
                 .output
                 .file_name()
@@ -902,7 +1164,14 @@ pub fn build(jobs: u16) -> Result<()> {
             members.iter().map(|unit| &unit.output),
         )?;
     }
-    println!("{} objects in {}", units.len(), archive.display());
+    let names: Vec<&str> = choice.drivers.iter().map(|driver| driver.name).collect();
+    fs::write(&linked, names.join("\n") + "\n")?;
+    println!(
+        "{} objects of Vulkan drivers {} in {}",
+        units.len(),
+        names.join(", "),
+        archive.display()
+    );
     // The test is a static Linux program.
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         test_libc(&toolchain, &sysroot, &directory)?;
@@ -984,6 +1253,112 @@ mod tests {
         assert_eq!(
             retarget(&words, &common),
             ["--target=x", "-Iinclude", "-DMESA_DEBUG=0", "-c", "a.c"]
+        );
+    }
+
+    /// Without the host tools only NVK is built; with them ANV too, whose
+    /// own units compile its loader entry under its own name and whose
+    /// libraries Meson links whole are linked whole.
+    #[test]
+    fn the_drivers_follow_the_host_tools() {
+        let without = Choice::new(Err("no glslangValidator on PATH".to_owned()));
+        assert_eq!(without.drivers.len(), 1);
+        assert_eq!(without.drivers[0].name, "nouveau");
+        assert!(
+            without
+                .arguments()
+                .contains(&"-Dvulkan-drivers=nouveau".to_owned())
+        );
+        assert!(!without.record().contains("intel"));
+        assert!(
+            without
+                .owner("src/intel/vulkan/libanv_common.a.p/anv_instance.c.o")
+                .is_none()
+        );
+
+        let tools = super::super::clc::Tools {
+            programs: vec!["/build/mesa_clc".into(), "/build/vtn_bindgen2".into()],
+            glslang: ("/usr/bin/glslangValidator".into(), "16.2.0".to_owned()),
+        };
+        let with = Choice::new(Ok(tools));
+        assert_eq!(
+            with.drivers
+                .iter()
+                .map(|driver| driver.name)
+                .collect::<Vec<_>>(),
+            ["nouveau", "intel"]
+        );
+        let arguments = with.arguments();
+        assert!(arguments.contains(&"-Dvulkan-drivers=nouveau,intel".to_owned()));
+        assert!(arguments.contains(&"-Dintel-rt=disabled".to_owned()));
+        assert!(
+            with.record()
+                .contains("glslang /usr/bin/glslangValidator 16.2.0")
+        );
+        let anv = with
+            .owner("src/intel/vulkan/libanv_common.a.p/anv_instance.c.o")
+            .unwrap();
+        assert_eq!(anv.entry, "anv_icdGetInstanceProcAddr");
+        assert_eq!(
+            with.owner("src/nouveau/vulkan/libnvk.a.p/nvk_instance.c.o")
+                .unwrap()
+                .entry,
+            ENTRY
+        );
+        assert!(with.owner("src/compiler/nir/libnir.a.p/nir.c.o").is_none());
+        for whole in [
+            "src/intel/vulkan/libanv_common.a.p/anv_device.c.o",
+            "src/intel/vulkan/libanv_per_hw_ver120.a.p/genX_cmd_buffer.c.o",
+            "src/vulkan/runtime/libvulkan_runtime.a.p/vk_device.c.o",
+        ] {
+            assert!(with.linked_whole(whole), "{whole}");
+            assert_eq!(
+                without.linked_whole(whole),
+                !whole.contains("anv"),
+                "{whole}"
+            );
+        }
+        assert!(!with.linked_whole("src/intel/vulkan/libvulkan_intel.so.p/anv_gem.c.o"));
+    }
+
+    /// Two drivers' units defining one symbol, or a driver without its
+    /// entry, stop the build with the names.
+    #[test]
+    fn colliding_or_missing_entries_are_named() {
+        let set = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        let good = [
+            (&NVK, set(&[ENTRY, "nvk_create_device"])),
+            (
+                &ANV,
+                set(&["anv_icdGetInstanceProcAddr", "anv_create_device"]),
+            ),
+        ];
+        check_definitions(&good).unwrap();
+        let collide = [
+            (&NVK, set(&[ENTRY])),
+            (&ANV, set(&["anv_icdGetInstanceProcAddr", ENTRY])),
+        ];
+        let error = check_definitions(&collide).unwrap_err().to_string();
+        assert!(
+            error.contains("both define vk_icdGetInstanceProcAddr"),
+            "{error}"
+        );
+        let missing = [(&NVK, set(&[ENTRY])), (&ANV, set(&[ENTRY]))];
+        let error = check_definitions(&missing).unwrap_err().to_string();
+        assert!(
+            error.contains("define no anv_icdGetInstanceProcAddr"),
+            "{error}"
+        );
+        let choice = Choice::new(Ok(super::super::clc::Tools {
+            programs: Vec::new(),
+            glslang: ("glslangValidator".into(), "16.2.0".to_owned()),
+        }));
+        let object = Path::new("/o/src_intel_vulkan_libanv_common_a_p_anv_instance_c_o.o");
+        assert_eq!(choice.owner_of_object(object).unwrap().name, "intel");
+        assert!(
+            choice
+                .owner_of_object(Path::new("/o/stela_anv_nir_options.o"))
+                .is_none()
         );
     }
 

@@ -24,6 +24,8 @@ pub mod error;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;
+#[cfg(feature = "xe-port")]
+pub mod intel;
 pub mod kms;
 pub mod library;
 #[cfg(feature = "metal-vulkan")]
