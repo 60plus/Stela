@@ -2056,6 +2056,151 @@ static nir_def *signed_field(nir_builder *b, nir_def *x, unsigned offset, unsign
    return nir_ishr_imm(b, nir_ishl_imm(b, x, 32 - offset - count), 32 - count);
 }
 
+/* (value * weight + 127) / 255: an 8-bit channel weighted by an 8-bit
+ * alpha, rounded as the display model rounds. */
+static nir_def *compose_scale(nir_builder *b, nir_def *value, nir_def *weight)
+{
+   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul(b, value, weight), 127), 255);
+}
+
+/* An extended-range code's 8-bit display value: (2 code - 768) 255 + 510
+ * over 1020, clamped to [0, 255]. */
+static nir_def *compose_xr10(nir_builder *b, nir_def *code)
+{
+   nir_def *scaled = nir_iadd_imm(b, nir_imul_imm(b, nir_iadd_imm(b, nir_ishl_imm(b, code, 1), -768), 255), 510);
+   return nir_umin(b, nir_udiv_imm(b, nir_imax(b, scaled, nir_imm_int(b, 0)), 1020),
+                   nir_imm_int(b, 255));
+}
+
+/* A 10-bit component rescaled to 8 bits, rounded. */
+static nir_def *compose_ten(nir_builder *b, nir_def *value)
+{
+   return nir_udiv_imm(b, nir_iadd_imm(b, nir_imul_imm(b, value, 255), 511), 1023);
+}
+
+/* The 8-bit red, green, blue and alpha of the layer's source pixel at sx,
+ * sy. */
+static nir_def *compose_source(nir_builder *b, nir_def *layer, nir_def *sx, nir_def *sy)
+{
+   nir_def *format = load(b, layer, STELA_METAL_COMPOSE_LAYER_FORMAT, 32);
+   nir_def *row = nir_imul(b, nir_u2u64(b, sy),
+                           nir_u2u64(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_STRIDE, 32)));
+   nir_def *at = nir_iadd(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_COLOR, 64),
+                          nir_iadd(b, row, nir_u2u64(b, nir_ishl_imm(b, sx, 2))));
+   nir_def *word = nir_load_global(b, 1, 32, at, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER,
+                                   .align_mul = 4);
+   nir_def *byte0 = field(b, word, 0, 8), *byte1 = field(b, word, 8, 8);
+   nir_def *byte2 = field(b, word, 16, 8), *byte3 = field(b, word, 24, 8);
+   nir_def *bgra = nir_vec4(b, byte2, byte1, byte0, byte3);
+   nir_def *rgba = nir_vec4(b, byte0, byte1, byte2, byte3);
+   nir_def *wide = nir_vec4(b, compose_ten(b, field(b, word, 20, 10)),
+                            compose_ten(b, field(b, word, 10, 10)),
+                            compose_ten(b, field(b, word, 0, 10)),
+                            nir_imul_imm(b, field(b, word, 30, 2), 85));
+   /* The alpha plane is read only for its format. */
+   nir_variable *alpha = nir_local_variable_create(b->impl, glsl_uint_type(), "alpha");
+   nir_store_var(b, alpha, nir_imm_int(b, 255), 1);
+   nir_def *extended = nir_ieq_imm(b, format, STELA_METAL_COMPOSE_XR10A8);
+   nir_push_if(b, extended);
+   {
+      nir_def *alpha_row =
+         nir_imul(b, nir_u2u64(b, sy),
+                  nir_u2u64(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_ALPHA_STRIDE, 32)));
+      nir_def *byte_at = nir_iadd(b, load(b, layer, STELA_METAL_COMPOSE_LAYER_ALPHA, 64),
+                                  nir_iadd(b, alpha_row, nir_u2u64(b, sx)));
+      /* The byte's aligned word: rows of bytes start anywhere. */
+      nir_def *word_at = nir_iand_imm(b, byte_at, ~(int64_t)3);
+      nir_def *shift = nir_ishl_imm(b, nir_u2u32(b, nir_iand_imm(b, byte_at, 3)), 3);
+      nir_def *alpha_word = nir_load_global(b, 1, 32, word_at,
+                                            .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER,
+                                            .align_mul = 4);
+      nir_store_var(b, alpha, nir_iand_imm(b, nir_ushr(b, alpha_word, shift), 0xff), 1);
+   }
+   nir_pop_if(b, NULL);
+   nir_def *xr10 = nir_vec4(b, compose_xr10(b, field(b, word, 20, 10)),
+                            compose_xr10(b, field(b, word, 10, 10)),
+                            compose_xr10(b, field(b, word, 0, 10)), nir_load_var(b, alpha));
+   nir_def *pixel = nir_bcsel(b, extended, xr10, wide);
+   pixel = nir_bcsel(b, nir_ieq_imm(b, format, STELA_METAL_COMPOSE_RGBA8), rgba, pixel);
+   return nir_bcsel(b, nir_ieq_imm(b, format, STELA_METAL_COMPOSE_BGRA8), bgra, pixel);
+}
+
+nir_shader *stela_metal_compose_kernel(const nir_shader_compiler_options *options)
+{
+   nir_def *arguments, *thread;
+   nir_builder b =
+      kernel(options, "stela_metal_compose", STELA_METAL_COMPOSE_COUNT, &arguments, &thread);
+   nir_def *width = load(&b, arguments, STELA_METAL_COMPOSE_WIDTH, 32);
+   nir_def *down = nir_udiv(&b, thread, width);
+   nir_def *x = nir_isub(&b, thread, nir_imul(&b, down, width));
+   nir_def *y = nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_FIRST_ROW, 32), down);
+   nir_def *count = load(&b, arguments, STELA_METAL_COMPOSE_LAYER_COUNT, 32);
+   /* Red, green and blue over the black background. */
+   nir_variable *color = nir_local_variable_create(b.impl, glsl_uvec_type(3), "color");
+   nir_store_var(&b, color, nir_imm_ivec3(&b, 0, 0, 0), 0x7);
+   for (unsigned i = 0; i < STELA_METAL_COMPOSE_MAX_LAYERS; i++) {
+      nir_def *layer = nir_iadd_imm(&b, arguments,
+                                    STELA_METAL_COMPOSE_LAYERS + i * STELA_METAL_COMPOSE_LAYER_BYTES);
+      nir_push_if(&b, nir_ult(&b, nir_imm_int(&b, i), count));
+      {
+         const unsigned source = STELA_METAL_COMPOSE_LAYER_SOURCE;
+         const unsigned destination = STELA_METAL_COMPOSE_LAYER_DESTINATION;
+         nir_def *dx = load(&b, layer, destination, 32);
+         nir_def *dy = load(&b, layer, destination + 4, 32);
+         nir_def *dw = load(&b, layer, destination + 8, 32);
+         nir_def *dh = load(&b, layer, destination + 12, 32);
+         nir_def *inside = nir_iand(&b, nir_iand(&b, nir_uge(&b, x, dx), nir_ult(&b, x, nir_iadd(&b, dx, dw))),
+                                    nir_iand(&b, nir_uge(&b, y, dy), nir_ult(&b, y, nir_iadd(&b, dy, dh))));
+         nir_push_if(&b, inside);
+         {
+            /* The source pixel under the centre: (2 (x - dx) + 1) sw / 2 dw. */
+            nir_def *sx = nir_iadd(
+               &b, load(&b, layer, source, 32),
+               nir_udiv(&b,
+                        nir_imul(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, nir_isub(&b, x, dx), 1), 1),
+                                 load(&b, layer, source + 8, 32)),
+                        nir_ishl_imm(&b, dw, 1)));
+            nir_def *sy = nir_iadd(
+               &b, load(&b, layer, source + 4, 32),
+               nir_udiv(&b,
+                        nir_imul(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, nir_isub(&b, y, dy), 1), 1),
+                                 load(&b, layer, source + 12, 32)),
+                        nir_ishl_imm(&b, dh, 1)));
+            nir_def *pixel = compose_source(&b, layer, sx, sy);
+            nir_def *alpha = nir_channel(&b, pixel, 3);
+            nir_def *premultiplied = nir_ine_imm(
+               &b, nir_iand_imm(&b, load(&b, layer, STELA_METAL_COMPOSE_LAYER_FLAGS, 32),
+                                STELA_METAL_COMPOSE_PREMULTIPLIED),
+               0);
+            nir_def *below = nir_load_var(&b, color);
+            nir_def *rest = nir_isub(&b, nir_imm_int(&b, 255), alpha);
+            nir_def *channels[3];
+            for (unsigned c = 0; c < 3; c++) {
+               nir_def *value = nir_channel(&b, pixel, c);
+               value = nir_bcsel(&b, premultiplied, value, compose_scale(&b, value, alpha));
+               nir_def *sum = nir_iadd(&b, value, compose_scale(&b, nir_channel(&b, below, c), rest));
+               channels[c] = nir_umin(&b, sum, nir_imm_int(&b, 255));
+            }
+            nir_store_var(&b, color, nir_vec(&b, channels, 3), 0x7);
+         }
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_def *rgb = nir_load_var(&b, color);
+   nir_def *value = nir_ior(&b, nir_ior_imm(&b, nir_channel(&b, rgb, 2), 0xff000000u),
+                            nir_ior(&b, nir_ishl_imm(&b, nir_channel(&b, rgb, 1), 8),
+                                    nir_ishl_imm(&b, nir_channel(&b, rgb, 0), 16)));
+   nir_def *offset =
+      nir_iadd(&b, nir_imul(&b, nir_u2u64(&b, y),
+                            nir_u2u64(&b, load(&b, arguments, STELA_METAL_COMPOSE_PITCH, 32))),
+               nir_u2u64(&b, nir_ishl_imm(&b, x, 2)));
+   nir_store_global(&b, value,
+                    nir_iadd(&b, load(&b, arguments, STELA_METAL_COMPOSE_DESTINATION, 64), offset),
+                    .align_mul = 4);
+   return finish(&b);
+}
+
 /* A word's bytes in the other order: ETC and EAC blocks are big-endian. */
 static nir_def *byte_swap(nir_builder *b, nir_def *x)
 {
