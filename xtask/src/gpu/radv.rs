@@ -7,8 +7,9 @@
 //! answers amdgpu's queries from real devices' records and accepts buffers,
 //! binds and submissions without running them. For each device the test
 //! names, the program creates RADV's device, builds a compute pipeline
-//! through ACO and submits one dispatch (`amd/tests/radv_device.c`); every
-//! amdgpu ioctl RADV made must be one Stela's amdgpu registers.
+//! through ACO and submits one dispatch, then builds one from NIR given as
+//! the Metal device gives it (`amd/tests/radv_device.c`); every amdgpu ioctl
+//! RADV made must be one Stela's amdgpu registers.
 //!
 //! Needs what RADV's image build needs (`clc.rs`: glslang, and mesa_clc
 //! for Mesa's configuration) and the host's `libdrm.so.2`.
