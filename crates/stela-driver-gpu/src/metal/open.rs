@@ -385,7 +385,7 @@ mod tests {
                 admits: crate::xe::admits,
                 registers: 0,
                 dma_bits: crate::xe::dma_bits,
-                integrated: |_| false,
+                integrated: crate::xe::integrated,
                 probed_integrated: None,
                 chip: crate::xe::query::chip,
                 memory_bytes: crate::xe::query::memory_bytes,

@@ -132,11 +132,9 @@ pub static AMD: GpuStack = GpuStack {
 };
 
 /// xe with the display code it shares with i915, and ANV's admission. Its
-/// Vulkan driver is not given yet, even in an image that holds ANV: a PC
-/// with an Intel and another GPU would then serve a Metal device on each,
-/// which no rule chooses between yet, and ANV has run on no Intel GPU under
-/// Stela. Until then its GPU shows the frames another GPU draws, on the
-/// displays wired to it.
+/// Vulkan driver is not given yet, even in an image that holds ANV: ANV has
+/// run on no Intel GPU under Stela. Until then its GPU shows the frames
+/// another GPU draws, on the displays wired to it.
 #[cfg(feature = "xe-port")]
 pub static INTEL: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -148,7 +146,8 @@ pub static INTEL: GpuStack = GpuStack {
         // The platform's `dma_mask_size` (`xe_pci.c`), which
         // `xe_set_dma_info` sets as the mask.
         dma_bits: crate::xe::dma_bits,
-        integrated: |_| false,
+        // The platform's `is_dgfx`.
+        integrated: crate::xe::integrated,
         probed_integrated: None,
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
@@ -418,6 +417,7 @@ mod tests {
         assert!(core::ptr::eq(intel, &INTEL));
         assert_eq!(intel.kernel.driver, "xe");
         assert_eq!(intel.kernel.dma_limit(&tiger_lake), (1 << 39) - 1);
+        assert!((intel.kernel.integrated)(&tiger_lake));
         assert!(!intel.draws());
         #[cfg(feature = "metal")]
         assert!(intel.metal.is_some());

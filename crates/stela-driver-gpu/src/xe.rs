@@ -50,17 +50,27 @@ pub struct Platform {
     pub name: &'static str,
     /// Whether it has a display engine (`has_display`).
     pub display: bool,
+    /// Whether it is a discrete GPU with memory of its own (`is_dgfx`),
+    /// rather than one built into the processor.
+    pub discrete: bool,
 }
 
 /// What xe's table says of `device`'s platform, if it holds the device.
 pub fn platform(device: u16) -> Option<Platform> {
     PLATFORMS
-        .binary_search_by_key(&device, |(id, _, _)| *id)
+        .binary_search_by_key(&device, |(id, ..)| *id)
         .ok()
         .map(|index| Platform {
             name: PLATFORMS[index].1,
             display: PLATFORMS[index].2,
+            discrete: PLATFORMS[index].3,
         })
+}
+
+/// Whether xe's table describes the adapter as built into the processor.
+/// One outside the table is never presented to xe ([`admits`]).
+pub fn integrated(adapter: &Adapter) -> bool {
+    platform(adapter.device).is_some_and(|platform| !platform.discrete)
 }
 
 /// xe's device query (`DRM_IOCTL_XE_DEVICE_QUERY`, `uapi/drm/xe_drm.h`).
@@ -171,6 +181,35 @@ mod tests {
         assert!(platform(0x9a49).unwrap().display);
         // The Data Center GPU Flex 170 (ATS-M) has no display engine.
         assert!(!platform(0x56c0).unwrap().display);
+    }
+
+    #[test]
+    fn discrete_is_the_descriptors_is_dgfx_through_its_macros() {
+        // DG1 sets it through `DGFX_FEATURES`, the Arc A-series and Flex
+        // through `DG2_FEATURES`, which includes that, and Battlemage
+        // directly; Tiger Lake, Alder Lake P, Meteor Lake and Lunar Lake are
+        // built into the processor.
+        for device in [0x4905, 0x56a0, 0x56c0, 0xe20b] {
+            assert!(platform(device).unwrap().discrete, "{device:04x}");
+        }
+        for device in [0x9a49, 0x46a6, 0x7d55, 0x64a0] {
+            assert!(!platform(device).unwrap().discrete, "{device:04x}");
+        }
+        let adapter = |device| Adapter {
+            address: crate::bus::pci::Address {
+                segment: 0,
+                bus: 0,
+                device: 2,
+                function: 0,
+            },
+            vendor: crate::Vendor::Intel,
+            device,
+            class: [3, 0, 0],
+        };
+        assert!(integrated(&adapter(0x9a49)));
+        assert!(!integrated(&adapter(0x56a0)));
+        // Outside the table: no claim that it is built in.
+        assert!(!integrated(&adapter(0x8a56)));
     }
 
     /// A driver answering `DRM_IOCTL_XE_DEVICE_QUERY` with `words` for the

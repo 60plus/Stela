@@ -4,7 +4,7 @@
 use super::kbuild::{Config, Kbuild, Rule};
 use super::native::{self, Linux};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -386,15 +386,18 @@ pub fn tables() {
          /// and `require_force_probe`.\n\
          pub(crate) const DEVICES: &[(u16, u8, bool)] = &[\n",
     );
-    for (device, (bits, forced, _, _)) in &devices {
+    for (device, (bits, forced, _, _, _)) in &devices {
         text.push_str(&format!("    ({device:#06x}, {bits}, {forced}),\n"));
     }
     text.push_str(
-        "];\n/// Each device ID's platform name (`PLATFORM()`) and `has_display`.\n\
-         pub(crate) const PLATFORMS: &[(u16, &str, bool)] = &[\n",
+        "];\n/// Each device ID's platform name (`PLATFORM()`), `has_display` and\n\
+         /// `is_dgfx`.\n\
+         pub(crate) const PLATFORMS: &[(u16, &str, bool, bool)] = &[\n",
     );
-    for (device, (_, _, platform, display)) in &devices {
-        text.push_str(&format!("    ({device:#06x}, {platform:?}, {display}),\n"));
+    for (device, (_, _, platform, display, discrete)) in &devices {
+        text.push_str(&format!(
+            "    ({device:#06x}, {platform:?}, {display}, {discrete}),\n"
+        ));
     }
     text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
@@ -402,10 +405,10 @@ pub fn tables() {
 }
 
 /// Each device ID of `pciidlist` in `table` with the mask bits, the
-/// force-probe requirement, the platform name and whether it has a display
-/// engine, of the descriptor its entry names, the ID lists expanded from
-/// `ids`.
-type Described = (u8, bool, String, bool);
+/// force-probe requirement, the platform name, whether it has a display
+/// engine and whether it is a discrete GPU (`is_dgfx`), of the descriptor
+/// its entry names, the ID lists expanded from `ids`.
+type Described = (u8, bool, String, bool, bool);
 fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
     // Each list macro's own IDs and the list macros it includes.
     let mut lists = BTreeMap::new();
@@ -459,13 +462,24 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
             continue;
         }
         let mut body = body.split("};").next().unwrap_or("").to_owned();
-        let included: Vec<&str> = body
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter_map(|word| macros.get(word).copied())
-            .collect();
-        for definition in included {
-            body.push_str(",\n");
-            body.push_str(definition);
+        // Included macros may include others (`DG2_FEATURES` names
+        // `DGFX_FEATURES`); each is expanded once.
+        let mut expanded = BTreeSet::new();
+        loop {
+            let included: Vec<(&str, &str)> = body
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter_map(|word| macros.get_key_value(word).map(|(n, d)| (*n, *d)))
+                .filter(|(name, _)| !expanded.contains(name))
+                .collect();
+            if included.is_empty() {
+                break;
+            }
+            for (name, definition) in included {
+                if expanded.insert(name) {
+                    body.push_str(",\n");
+                    body.push_str(definition);
+                }
+            }
         }
         if let Some(bits) = body.split(".dma_mask_size = ").nth(1) {
             let bits = bits.split(',').next().unwrap_or("").trim();
@@ -484,6 +498,9 @@ fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
                     body.contains(".require_force_probe = true"),
                     platform.to_owned(),
                     body.contains(".has_display = true"),
+                    [".is_dgfx = 1", ".is_dgfx = true"]
+                        .iter()
+                        .any(|mark| body.contains(mark)),
                 ),
             );
         }
