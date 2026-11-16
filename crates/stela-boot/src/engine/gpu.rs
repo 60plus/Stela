@@ -1643,7 +1643,40 @@ struct Bound {
 struct Start {
     kernel: &'static LinuxKernel,
     claimed: ManuallyDrop<Vec<Claimed>>,
+    /// What the first start runs before any probe; a later one has none.
+    setup: Option<Setup>,
     completed: Rc<Cell<Option<ManuallyDrop<Started>>>>,
+}
+
+/// What Linux needs of every claimed GPU before the first probe: the words
+/// of its command line each GPU's driver needs set before it registers, and
+/// the functions a probe searches for, each once.
+struct Setup {
+    command_line: String,
+    searched: Vec<stela_linux::function::Identity>,
+}
+
+impl Setup {
+    fn of(claimed: &[Claimed]) -> Self {
+        let command_line = claimed
+            .iter()
+            .filter_map(|claimed| claimed.parameters.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
+        for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
+            if !searched
+                .iter()
+                .any(|seen| (seen.bus, seen.devfn) == (identity.bus, identity.devfn))
+            {
+                searched.push(*identity);
+            }
+        }
+        Self {
+            command_line,
+            searched,
+        }
+    }
 }
 
 struct Started {
@@ -1663,12 +1696,13 @@ struct Started {
 unsafe impl ManagedJob for Start {
     fn run(mut self: Pin<&mut Self>) {
         let claimed = core::mem::take(&mut *self.claimed);
+        let setup = self.setup.take();
         self.completed
-            .set(Some(ManuallyDrop::new(start(self.kernel, claimed))));
+            .set(Some(ManuallyDrop::new(start(self.kernel, claimed, setup))));
     }
 }
 
-fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
+fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> Started {
     #[cfg(feature = "nvk")]
     stela_boot_core::heap::set_peak_hook(gate::peak_passed);
     let mut job = Started {
@@ -1679,45 +1713,35 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         bound: Vec::new(),
         result: Ok(()),
     };
-    // Linux's command line: the words each claimed GPU's driver needs set
-    // before it registers.
-    let command_line = claimed
-        .iter()
-        .filter_map(|claimed| claimed.parameters.as_deref())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !command_line.is_empty() {
-        output::arguments(format_args!("GPU: Linux starts with \"{command_line}\"\n"));
-    }
-    // SAFETY: entered, on a task.
-    job.result = unsafe { gpu::stack::start_kernel(&command_line) };
-    if job.result.is_err() {
-        // No source-specific device return was acknowledged.
-        core::mem::forget(claimed);
-        return job;
-    }
-    // What the drivers search for, each function once, before any driver's
-    // probe: a probe looks for them (`intel_pch.c` for the chipset).
-    let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
-    for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
-        if searched
-            .iter()
-            .any(|seen| (seen.bus, seen.devfn) == (identity.bus, identity.devfn))
-        {
-            continue;
+    if let Some(setup) = setup {
+        if !setup.command_line.is_empty() {
+            output::arguments(format_args!(
+                "GPU: Linux starts with \"{}\"\n",
+                setup.command_line
+            ));
         }
-        searched.push(*identity);
-        // SAFETY: entered, on the canonical kernel task; the publication is
-        // kept for the boot.
-        match unsafe { stela_linux::function::Published::new(*identity) } {
-            Ok(published) => job._searched.push(published),
-            Err(error) => output::arguments(format_args!(
-                "GPU: PCI function {:02x}:{:02x}.{} could not be published for searches: \
-                 Linux error {error}\n",
-                identity.bus,
-                identity.devfn >> 3,
-                identity.devfn & 7
-            )),
+        // SAFETY: entered, on a task.
+        job.result = unsafe { gpu::stack::start_kernel(&setup.command_line) };
+        if job.result.is_err() {
+            // No source-specific device return was acknowledged.
+            core::mem::forget(claimed);
+            return job;
+        }
+        // What the drivers search for, before any driver's probe: a probe
+        // looks for them (`intel_pch.c` for the chipset).
+        for identity in setup.searched {
+            // SAFETY: entered, on the canonical kernel task; the publication
+            // is kept for the boot.
+            match unsafe { stela_linux::function::Published::new(identity) } {
+                Ok(published) => job._searched.push(published),
+                Err(error) => output::arguments(format_args!(
+                    "GPU: PCI function {:02x}:{:02x}.{} could not be published for searches: \
+                     Linux error {error}\n",
+                    identity.bus,
+                    identity.devfn >> 3,
+                    identity.devfn & 7
+                )),
+            }
         }
     }
     for claimed in claimed {
@@ -2153,10 +2177,13 @@ fn mount_and_start(
     let ready = unsafe { srcu.join() }.map_err(|failure| Error::Srcu(failure.error))?;
     let probing = host::rdtsc();
     START_TICKS[0].store(probing.wrapping_sub(started), Ordering::Relaxed);
+    let setup = Setup::of(&claimed);
+    let (claimed, later) = by_probe_turn(claimed);
     let completed = Rc::new(Cell::new(None));
     let job = Box::pin(Start {
         kernel: owner.as_ref(),
         claimed,
+        setup: Some(setup),
         completed: completed.clone(),
     });
     // SAFETY: the ready original task broker keeps the callback and all
@@ -2168,21 +2195,140 @@ fn mount_and_start(
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
-    START_TICKS[1].store(host::rdtsc().wrapping_sub(probing), Ordering::Relaxed);
     if joined.outcome() != Outcome::CallbackReturned {
         return Err(Error::Child(joined.outcome()));
     }
-    let job = completed
+    let mut job = completed
         .take()
         .ok_or_else(|| environment_error(WorkError::corrupt()))?;
     drop(joined.into_job());
+    if !later.is_empty() {
+        probe_later(owner.as_ref(), runtime, threads, time, later, &mut job)?;
+    }
+    START_TICKS[1].store(host::rdtsc().wrapping_sub(probing), Ordering::Relaxed);
     drop(ready);
     Ok((owner, threads, job))
+}
+
+/// The claimed GPUs in the two turns of their probes: first those that may
+/// serve the Metal device, then those that would only show the frames
+/// another draws ([`stela_drivers::gpu::stack::shows_frames_of`]), each in
+/// the claims' order. A probe of the second turn that hangs or fails then
+/// costs its own GPU, not the one macOS draws on.
+fn by_probe_turn(
+    claimed: ManuallyDrop<Vec<Claimed>>,
+) -> (ManuallyDrop<Vec<Claimed>>, ManuallyDrop<Vec<Claimed>>) {
+    #[cfg(feature = "nvk")]
+    {
+        let mut drawing = Vec::new();
+        let (first, later): (Vec<_>, Vec<_>) = ManuallyDrop::into_inner(claimed)
+            .into_iter()
+            .partition(|claimed| {
+                let draws = claimed.stack.draws();
+                let first =
+                    stela_drivers::gpu::stack::shows_frames_of(&drawing, draws, claimed.integrated)
+                        .is_none();
+                if first && draws {
+                    drawing.push(claimed.integrated);
+                }
+                first
+            });
+        (ManuallyDrop::new(first), ManuallyDrop::new(later))
+    }
+    #[cfg(not(feature = "nvk"))]
+    (claimed, ManuallyDrop::new(Vec::new()))
+}
+
+/// Probes `later`, the GPUs that would only show another's frames, after the
+/// first turn bound the others, within a deadline of its own. One that does
+/// not finish in time is reported with its GPUs as unbound, and its task and
+/// devices stay held; the GPUs of the first turn go on.
+fn probe_later(
+    kernel: &'static LinuxKernel,
+    runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>,
+    threads: &LinuxThreads,
+    time: &dyn Clock,
+    later: ManuallyDrop<Vec<Claimed>>,
+    job: &mut Started,
+) -> Result<(), Error> {
+    if job.result.is_err() {
+        // Linux did not start; nothing can bind them.
+        return Ok(());
+    }
+    let mut names: Vec<(String, &'static str, bool)> = later
+        .iter()
+        .map(|claimed| {
+            (
+                claimed.name.clone(),
+                claimed.stack.kernel.driver,
+                claimed.shows_screen,
+            )
+        })
+        .collect();
+    let deadline = time
+        .now_ns()
+        .and_then(|now| {
+            now.checked_add(START_SECONDS * 1_000_000_000)
+                .ok_or(WorkError::Exhausted)
+        })
+        .map_err(environment_error)?;
+    let completed = Rc::new(Cell::new(None));
+    let later_job = Box::pin(Start {
+        kernel,
+        claimed: later,
+        setup: None,
+        completed: completed.clone(),
+    });
+    // SAFETY: as for the first turn's job; Linux and its drivers started.
+    let pending =
+        unsafe { threads.submit(later_job) }.map_err(|refusal| Error::Submit(refusal.error))?;
+    // Their GPUs are reported unbound with why, and the first turn's go on.
+    let mut lost = |job: &mut Started, why: &dyn core::fmt::Display| {
+        for (name, driver, dark) in names.drain(..) {
+            output::arguments(format_args!(
+                "GPU {name}: {driver}'s probe {why}; the GPUs that started go on without it\n"
+            ));
+            job.unbound.push((name, driver, dark));
+        }
+    };
+    match wait_for_child(runtime, threads, time, deadline, &PROBE_LATER, || {
+        pending.status().joined
+    }) {
+        Ok(()) => {}
+        Err(Error::Timeout) => {
+            lost(
+                job,
+                &format_args!("did not finish in {START_SECONDS} s, and its task stays held"),
+            );
+            // The child still runs and owns these devices; its handle
+            // holds nothing of them and goes out of scope here.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    // SAFETY: physical return on the same dispatcher with the joined status.
+    let joined =
+        unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
+    if joined.outcome() != Outcome::CallbackReturned {
+        lost(job, &format_args!("ended: {:?}", joined.outcome()));
+        core::mem::forget(joined);
+        return Ok(());
+    }
+    let mut later = completed
+        .take()
+        .ok_or_else(|| environment_error(WorkError::corrupt()))?;
+    drop(joined.into_job());
+    job._attached.append(&mut later._attached);
+    job.unbound.append(&mut later.unbound);
+    #[cfg(feature = "nvk")]
+    job.bound.append(&mut later.bound);
+    Ok(())
 }
 
 /// The start's stages [`wait_for_child`] names.
 static FIRST_TASKS: &str = "Linux's first tasks";
 static PROBE: &str = "the GPU's probe";
+static PROBE_LATER: &str = "the probe of GPUs that only show frames";
 
 /// Wait for `stage` of the start, which Linux's tasks run, until `finished`
 /// or `deadline` on `time`. A long wait says every
