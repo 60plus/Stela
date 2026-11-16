@@ -119,18 +119,6 @@ const OPEN: super::image::Open = &[
         "PCI: a BAR's resize",
         &["pci_assign_unassigned_bus_resources"],
     ),
-    // Traps behind a refusal: no interrupt line can be made for a discrete
-    // GPU's MEI function, so none is set up, raised or freed.
-    (
-        "interrupt lines a driver makes: after one was made",
-        &[
-            "generic_handle_irq_safe",
-            "handle_simple_irq",
-            "irq_free_descs",
-            "irq_set_chip_and_handler_name",
-            "irq_set_chip_data",
-        ],
-    ),
     // Traps behind a refusal: a discrete GPU's management controller gets
     // no register map, so its platform device and I2C client never exist.
     (
