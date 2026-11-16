@@ -966,10 +966,11 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         ));
     }
     // The host's Linux work the calls asked the boot CPU for, by ioctl.
-    let (shootdowns, shot, ranged, nmis, spare) = crate::native_mmio::shootdown::take_waits();
+    let (shootdowns, shot, ranged, nmis, [owed, held]) =
+        crate::native_mmio::shootdown::take_waits();
     output::arguments(format_args!(
         "\nGPU POSTED shootdowns={shootdowns}/{}us ranged={ranged} nmis={nmis} \
-         spare_nmis={spare} request:count/waited_us",
+         owed_nmis={owed}/{held} request:count/waited_us",
         micros(shot)
     ));
     for &(request, count, waited) in posted.iter().take(SHOWN) {

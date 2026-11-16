@@ -374,22 +374,21 @@ stela_nmi_gate:
     answer = sym nmi_answer,
 );
 
-/// Whether the NMI at `rip`, the interrupted stack at `rsp`, was a
-/// `--profile` sample's ([`host::sampling::overflow`]), a shootdown's, now
-/// answered, or the second NMI of two such sources one gate already
-/// claimed (`native_mmio::shootdown::gate`): the gate then returns. The
-/// step watchdog's keeps its stop even when a shootdown's came with it. On
-/// a processor already in a terminal handler, which no retirement sends
-/// one to, an NMI (a platform's, or the step watchdog's for the step the
-/// handler interrupted) returns too: that handler's stop goes on and keeps
-/// its reason, where the NMI's terminal stub would find the terminal entry
-/// slot in use and halt.
+/// Whether the NMI at `rip`, the interrupted stack at `rsp`, was owed by a
+/// `--profile` counter overflow ([`host::sampling::overflow`]), now
+/// sampled, or by a retirement's NMI, now answered
+/// (`native_mmio::shootdown::gate`): the gate then returns. The step
+/// watchdog's keeps its stop. On a processor already in a terminal handler,
+/// which no retirement sends one to, an NMI (a platform's, or the step
+/// watchdog's for the step the handler interrupted) returns too: that
+/// handler's stop goes on and keeps its reason, where the NMI's terminal
+/// stub would find the terminal entry slot in use and halt.
 extern "sysv64" fn nmi_answer(rip: u64, rsp: u64) -> bool {
-    let sampled = host::sampling::overflow(rip, rsp);
+    let fired = host::sampling::overflow(rip, rsp);
     if crate::native_mmio::shootdown::terminal_here() {
         return true;
     }
-    crate::native_mmio::shootdown::gate(sampled, rip, super::step_watchdog::nmi_is_watchdog)
+    crate::native_mmio::shootdown::gate(fired, rip, super::step_watchdog::nmi_is_watchdog)
 }
 
 // One stub per vector: push a zero error code when the CPU pushes none,
@@ -810,6 +809,13 @@ pub fn fatal(frame: &Frame) -> ! {
     };
     let machine_check = match frame.vector {
         18 => machine_check(),
+        // What this processor's NMI gate found owed when nothing claimed
+        // the NMI.
+        2 => crate::native_mmio::shootdown::nmi_owed()
+            .map(|(owed, held, marked)| {
+                alloc::format!(" nmi=owed:{owed}/held:{held}/marked:{}", u8::from(marked))
+            })
+            .unwrap_or_default(),
         _ => alloc::string::String::new(),
     };
     // An NMI from the step watchdog's counter: the step it names never

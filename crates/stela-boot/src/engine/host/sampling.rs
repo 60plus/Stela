@@ -310,20 +310,21 @@ fn slot(offset: usize) -> u64 {
     value
 }
 
-/// The NMI gate's first question: whether a sampling counter overflowed,
-/// now sampled at `rip` with the interrupted stack at `rsp` and reloaded.
-/// Soft-float, lock-free and allocation-free, as the gate requires.
-pub(crate) fn overflow(rip: u64, rsp: u64) -> bool {
+/// The NMI gate's first question: how many sampling counters overflowed,
+/// each owing one NMI, now sampled at `rip` with the interrupted stack at
+/// `rsp` and reloaded. Soft-float, lock-free and allocation-free, as the
+/// gate requires.
+pub(crate) fn overflow(rip: u64, rsp: u64) -> u64 {
     if !ACTIVE.load(Relaxed) {
-        return false;
+        return 0;
     }
     let Some(sampler) = sampler() else {
-        return false;
+        return 0;
     };
     let entered = crate::apic::rdtsc();
     let fired = [0, 1].map(|counter| rdpmc(counter) & TOP == 0);
     if fired == [false; SAMPLED] {
-        return false;
+        return 0;
     }
     let top = slot(local::RECOVERY_RSP_OFFSET);
     let class = match top {
@@ -352,7 +353,7 @@ pub(crate) fn overflow(rip: u64, rsp: u64) -> bool {
         &sampler.spent,
         crate::apic::rdtsc().wrapping_sub(entered) + sampler.entry,
     );
-    true
+    u64::from(bits.count_ones())
 }
 
 /// Counter `counter` read with `read` and what reloads took off it added
@@ -431,6 +432,8 @@ pub(crate) fn host_service() {
         if value & TOP == 0 && value & MASK > sampler.armed[counter].load(Relaxed) {
             add(&sampler.lost, 1);
             sampler.reload(counter);
+            // Its NMI may only be late: the gate it reaches finds it owed.
+            crate::native_mmio::shootdown::owe_samples(1);
         }
     }
     add(&sampler.spent, crate::apic::rdtsc().wrapping_sub(now));
