@@ -1551,7 +1551,20 @@ pub(super) fn claim_all(
             return (claimed, refused);
         }
     };
+    // The claimed GPUs that draw, each with whether it is integrated.
+    let mut drawing: Vec<(String, bool)> = Vec::new();
     for (stack, adapter) in driven {
+        let integrated = (stack.kernel.integrated)(adapter);
+        if let Some(drawer) = shows_frames_only(&drawing, stack.draws(), integrated)
+            && !may_show_screen(source, adapter.address)
+        {
+            output::arguments(format_args!(
+                "GPU {} left with firmware: it would only show the frames GPU {drawer} draws, \
+                 and the firmware's picture is not on it, so no display needs it\n",
+                adapter.address
+            ));
+            continue;
+        }
         let result = catalog
             .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
             .and_then(|catalog| {
@@ -1566,7 +1579,12 @@ pub(super) fn claim_all(
                 )
             });
         match result {
-            Ok(function) => claimed.push(function),
+            Ok(function) => {
+                if stack.draws() {
+                    drawing.push((function.name.clone(), integrated));
+                }
+                claimed.push(function);
+            }
             Err(error) => {
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
                 let reason = match error {
@@ -1578,6 +1596,34 @@ pub(super) fn claim_all(
         }
     }
     (claimed, refused)
+}
+
+/// The claimed drawing GPU whose frames a GPU would only show
+/// ([`stela_drivers::gpu::stack::shows_frames_of`]). `drawing` holds each
+/// claimed drawing GPU's name and whether it is integrated.
+fn shows_frames_only(drawing: &[(String, bool)], draws: bool, integrated: bool) -> Option<&str> {
+    let kinds: Vec<bool> = drawing.iter().map(|(_, integrated)| *integrated).collect();
+    stela_drivers::gpu::stack::shows_frames_of(&kinds, draws, integrated)
+        .map(|index| drawing[index].0.as_str())
+}
+
+/// Whether the firmware's picture may be on the function at `address`, as
+/// [`claim`] decides it, without its reads: Stela shows one display, which a
+/// drawing GPU's outputs take first, so a GPU that only shows another's
+/// frames is started only where the panel or monitor the firmware lit may
+/// hang on it.
+fn may_show_screen(
+    gop: crate::pci_io::ScreenOwner,
+    address: stela_drivers::bus::pci::Address,
+) -> bool {
+    use crate::pci_io::ScreenOwner;
+    match gop {
+        ScreenOwner::Function(source) => source.address == address,
+        ScreenOwner::Unknown(apart) => {
+            stela_boot_core::firmware_screen::gpu_may_show(&apart, address.segment, address.bus)
+        }
+        ScreenOwner::NoScreen => false,
+    }
 }
 
 /// A GPU its stack's kernel driver bound.

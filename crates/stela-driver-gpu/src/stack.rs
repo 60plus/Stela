@@ -283,11 +283,42 @@ pub fn metal_devices(candidates: &[Candidate]) -> MetalDevices {
     }
 }
 
+/// The drawing GPU, among those already claimed, whose frames a GPU would
+/// only show, if any, as [`metal_devices`] will choose: any drawing GPU for
+/// one whose stack draws nothing, a discrete one for an integrated one.
+/// `drawing` says of each claimed drawing GPU whether it is integrated;
+/// claims take drawing GPUs first ([`GpuStack::claim_order`]). Stela shows
+/// one display and a drawing GPU's outputs take it first, so such a GPU is
+/// worth starting only where the firmware's picture may be on it.
+pub fn shows_frames_of(drawing: &[bool], draws: bool, integrated: bool) -> Option<usize> {
+    drawing
+        .iter()
+        .position(|&other_integrated| !draws || (integrated && !other_integrated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bus::pci::Address;
     use alloc::vec;
+
+    #[test]
+    fn a_gpu_shows_frames_only_beside_a_more_capable_drawing_gpu() {
+        // Nothing claimed before it: it may be the only GPU.
+        assert_eq!(shows_frames_of(&[], false, true), None);
+        assert_eq!(shows_frames_of(&[], true, true), None);
+        // An integrated GPU beside a drawing discrete one, drawing or not.
+        assert_eq!(shows_frames_of(&[false], true, true), Some(0));
+        assert_eq!(shows_frames_of(&[false], false, true), Some(0));
+        // A display-only stack beside any drawing GPU, the first one.
+        assert_eq!(shows_frames_of(&[true, false], false, false), Some(0));
+        // Two drawing integrated GPUs, or a drawing discrete GPU beside
+        // another: both serve Metal.
+        assert_eq!(shows_frames_of(&[true], true, true), None);
+        assert_eq!(shows_frames_of(&[false], true, false), None);
+        // The discrete one is found behind an integrated one.
+        assert_eq!(shows_frames_of(&[true, false], true, true), Some(1));
+    }
 
     fn candidate(draws: bool, integrated: bool, drives_display: bool) -> Candidate {
         Candidate {
