@@ -756,3 +756,109 @@ fn a_boot_s_record_costs_one_write_and_no_line_more() {
     assert!(log.starts[0].last.len() > LAST_BYTES as usize - 80);
     assert!(log.stream.ends_with(b"=== STELA BOOT 2 ===\n"));
 }
+
+/// The blocks of record `index`'s room in the small layout.
+fn record_blocks(index: usize, block: u32) -> core::ops::Range<u64> {
+    let at = SMALL.record_at(index) / u64::from(block);
+    at..at + SMALL.record_bytes() / u64::from(block)
+}
+
+/// A boot that takes the oldest boot's record writes its first lines
+/// there only once the header on the device names the record as its own:
+/// a store interrupted before its header leaves the older boot's record
+/// whole, never the older boot's lengths over the new boot's bytes.
+#[test]
+fn a_record_s_room_is_written_only_once_the_header_names_its_boot() {
+    for block in [512, 4096] {
+        let mut disk = small_disk(block);
+        let mut first = open_small(&mut disk, true);
+        first.append(&lines(0, 400));
+        first.flush(&mut disk).unwrap();
+        first.append(b"more\n");
+        first.flush(&mut disk).unwrap();
+        for _ in 2..4 {
+            open_small(&mut disk, true).flush(&mut disk).unwrap();
+        }
+        let kept = disk.log().unwrap().starts[0].clone();
+        assert_eq!((kept.boot, kept.first.len() > 4000), (1, true));
+        // Boot 4 takes boot 1's record; its first store fills the room
+        // and dies before its header.
+        let mut fourth = open_small(&mut disk, true);
+        assert_eq!(fourth.boots(), 4);
+        fourth.append(&lines(1000, 400));
+        disk.events.clear();
+        let header = disk.disk.bytes[..HEADER_BYTES as usize].to_vec();
+        fourth.flush(&mut disk).unwrap();
+        let room = record_blocks(1, block);
+        assert!(
+            disk.events.iter().flatten().all(|lba| !room.contains(lba)),
+            "{block}: {:?}",
+            disk.events
+        );
+        // The same store with its header lost: boot 1's record is intact.
+        let mut lost = disk.disk.bytes.clone();
+        lost[..HEADER_BYTES as usize].copy_from_slice(&header);
+        let log = read(&lost).unwrap();
+        assert_eq!(log.starts.iter().find(|start| start.boot == 1), Some(&kept));
+        // The next store writes the record, before its header.
+        fourth.append(b"more\n");
+        disk.events.clear();
+        fourth.flush(&mut disk).unwrap();
+        let writes: Vec<u64> = disk.events.iter().flatten().copied().collect();
+        let at = writes.iter().position(|lba| room.contains(lba)).unwrap();
+        assert_eq!(writes.last(), Some(&0));
+        assert!(at < writes.len() - 1);
+        let log = disk.log().unwrap();
+        let start = log.starts.iter().find(|start| start.boot == 4).unwrap();
+        assert!(
+            start
+                .first
+                .starts_with(b"=== STELA BOOT 4 ===\nline 001000\n")
+        );
+        assert!(log.starts.iter().all(|start| start.boot != 1));
+    }
+}
+
+/// A store that fails before or during its record's write writes the
+/// record in the next store, before the header that names its length.
+#[test]
+fn a_failed_store_writes_its_record_in_the_next() {
+    for block in [512, 4096] {
+        // Fail at the ring's write, then at the record's.
+        for allowed in [0, 1] {
+            let mut disk = small_disk(block);
+            let mut writer = open_small(&mut disk, true);
+            writer.flush(&mut disk).unwrap();
+            writer.append(&lines(0, 400));
+            disk.writes_left = Some(allowed);
+            assert_eq!(writer.flush(&mut disk), Err(BlockError::Timeout));
+            assert!(disk.log().unwrap().starts[0].first.is_empty());
+            disk.writes_left = None;
+            writer.flush(&mut disk).unwrap();
+            let log = disk.log().unwrap();
+            let mut stream = b"=== STELA BOOT 1 ===\n".to_vec();
+            stream.extend_from_slice(&lines(0, 400));
+            assert_eq!(
+                log.starts[0].first,
+                whole_lines(&stream[..4096]),
+                "{block} {allowed}"
+            );
+        }
+    }
+}
+
+/// A record whose room does not start with its boot's marker, as one a
+/// write left half done, is not read as that boot's lines.
+#[test]
+fn a_record_that_does_not_start_with_its_boot_is_not_read() {
+    let mut disk = small_disk(512);
+    let mut writer = open_small(&mut disk, true);
+    writer.append(&lines(0, 400));
+    writer.flush(&mut disk).unwrap();
+    writer.append(b"more\n");
+    writer.flush(&mut disk).unwrap();
+    assert_eq!(disk.log().unwrap().starts.len(), 1);
+    let at = SMALL.record_at(1) as usize;
+    disk.disk.bytes[at..at + 12].copy_from_slice(b"line 000999\n");
+    assert!(disk.log().unwrap().starts.is_empty());
+}

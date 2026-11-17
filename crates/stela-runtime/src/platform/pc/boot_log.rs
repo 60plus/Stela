@@ -813,6 +813,11 @@ pub struct Writer {
     /// Record blocks the next store writes before its header, which names
     /// their lengths.
     record_writes: Vec<(u64, Vec<u8>)>,
+    /// The header on the device names this boot's record as this boot's.
+    /// Until it does, the record's room may still be named as an older
+    /// boot's, or hold the bytes a version 1 log's conversion moves, and
+    /// this boot's first lines wait.
+    claimed: bool,
     /// The head the header on the device records.
     durable: Option<u64>,
     fresh: Option<HeaderError>,
@@ -924,6 +929,8 @@ impl Writer {
             records: header.records,
             capture: None,
             record_writes: Vec::new(),
+            // A resumed boot's record is named by the header it found.
+            claimed: !new_boot,
             // A converted log's header is still to be written.
             durable: (fresh.is_none() && !converted).then_some(head),
             fresh,
@@ -1040,9 +1047,13 @@ impl Writer {
         Ok(())
     }
 
-    /// Once this boot's first lines fill its record's room, queue them,
-    /// cut at a line's end, and stop collecting.
+    /// Once this boot's first lines fill its record's room and the header
+    /// on the device names the record as this boot's, queue them, cut at a
+    /// line's end, and stop collecting.
     fn close_full_record(&mut self) {
+        if !self.claimed {
+            return;
+        }
         let room = self.layout.first_bytes as usize;
         let Some(capture) = self.capture.take_if(|capture| capture.bytes.len() >= room) else {
             return;
@@ -1127,6 +1138,7 @@ impl Writer {
         if self.storing() {
             return true;
         }
+        self.close_full_record();
         let mut remaining = self.pending.bytes();
         if remaining == 0 && self.durable == Some(self.ring.head) && self.record_writes.is_empty() {
             return false;
@@ -1209,16 +1221,14 @@ impl Writer {
                 },
                 Step::Tail,
             ),
+            // The step keeps its data: a failed store queues it again.
             Step::Record { lba, data } => (
                 Request::Write {
                     lba,
-                    data,
+                    data: data.clone(),
                     durable: true,
                 },
-                Step::Record {
-                    lba,
-                    data: Vec::new(),
-                },
+                Step::Record { lba, data },
             ),
             Step::Header => {
                 let mut block = vec![0; ring.block];
@@ -1243,13 +1253,22 @@ impl Writer {
     }
 
     /// The running request finished with `finished`. A failure ends the
-    /// store: the next starts over from what the device then holds.
+    /// store: the next starts over from what the device then holds, and
+    /// writes the boot records this one did not, before the header that
+    /// names their lengths.
     pub fn completed(&mut self, finished: Finished) -> Result<(), BlockError> {
         let step = self.running.take();
         let data = match finished {
             Ok(data) => data,
             Err(error) => {
-                self.steps.clear();
+                let unwritten = step.into_iter().chain(self.steps.drain(..));
+                let records: Vec<_> = unwritten
+                    .filter_map(|step| match step {
+                        Step::Record { lba, data } => Some((lba, data)),
+                        _ => None,
+                    })
+                    .collect();
+                self.record_writes.splice(0..0, records);
                 return Err(error);
             }
         };
@@ -1264,7 +1283,10 @@ impl Writer {
                 ring.tail[offset..].copy_from_slice(&old[offset..]);
                 ring.unread = false;
             }
-            Some(Step::Header) => self.durable = Some(ring.head),
+            Some(Step::Header) => {
+                self.durable = Some(ring.head);
+                self.claimed = true;
+            }
             Some(Step::Blocks { .. }) | Some(Step::Record { .. }) | None => {}
         }
         Ok(())
@@ -1346,15 +1368,19 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
         .iter()
         .enumerate()
         .filter(|(_, record)| record.boot != 0 && record.boot <= header.boots)
-        .map(|(index, record)| {
+        .filter_map(|(index, record)| {
             let at = layout.record_at(index) as usize;
             let last = at + layout.first_bytes as usize;
-            BootStart {
+            let first = &region[at..at + record.first as usize];
+            // First lines start with their boot's marker: other bytes are
+            // a record a write did not finish, never another boot's lines.
+            let marker = format!("=== STELA BOOT {} ===\n", record.boot);
+            (first.is_empty() || first.starts_with(marker.as_bytes())).then(|| BootStart {
                 boot: record.boot,
                 start: record.start,
-                first: region[at..at + record.first as usize].to_vec(),
+                first: first.to_vec(),
                 last: region[last..last + record.last as usize].to_vec(),
-            }
+            })
         })
         .collect();
     starts.sort_by_key(|start| start.boot);
