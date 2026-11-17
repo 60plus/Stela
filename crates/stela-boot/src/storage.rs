@@ -40,9 +40,14 @@ use uefi::{
     table::cfg::ConfigTableEntry,
 };
 
-/// 16 MiB below 4 GiB: NVMe's bounce buffers, the USB and SATA rings, and
-/// each Ethernet controller's 256-descriptor rings.
-const DMA_PAGES: usize = 4096;
+/// 24 MiB below 4 GiB: NVMe's bounce buffers, the USB and SATA rings, and
+/// each Ethernet controller's 256-descriptor rings, among them up to two
+/// Realtek receive rings of Linux's 16 KiB buffers (4 MiB each).
+const DMA_PAGES: usize = 6144;
+/// The pool where the firmware has no room for [`DMA_PAGES`]: 16 MiB, in
+/// which a Realtek receive ring that finds no room for Linux's buffers
+/// runs on packed 2 KiB ones.
+const DMA_PAGES_LEAST: usize = 4096;
 /// `max_host_mem_size_mb`: the most host memory buffer one NVMe controller
 /// gets.
 const HOST_MEMORY_MAXIMUM: u64 = 128 << 20;
@@ -393,15 +398,18 @@ pub fn discover() -> Result<Handoff> {
         .map(|pages| pages.as_ptr() as u64)
     };
     // Without room for the host memory buffers the controllers run without
-    // them, as Linux's do when that allocation fails.
+    // them, as Linux's do when that allocation fails. They come before the
+    // larger pool, whose lack only packs a Realtek ring's buffers.
     let extra = host_memory_pages();
-    let (dma, pages) = match allocate(DMA_PAGES + extra) {
-        Ok(dma) => (dma, DMA_PAGES + extra),
-        Err(_) => (
-            allocate(DMA_PAGES).map_err(|_| refuse!("firmware has no DMA pages below 4 GiB"))?,
-            DMA_PAGES,
-        ),
-    };
+    let (dma, pages) = [
+        DMA_PAGES + extra,
+        DMA_PAGES_LEAST + extra,
+        DMA_PAGES,
+        DMA_PAGES_LEAST,
+    ]
+    .into_iter()
+    .find_map(|pages| allocate(pages).ok().map(|dma| (dma, pages)))
+    .ok_or_else(|| refuse!("firmware has no DMA pages below 4 GiB"))?;
     let mut mapped: Vec<_> = ecam.iter().map(|window| window.range()).collect();
     match crate::pci_io::capture() {
         Ok(census) => {
