@@ -240,8 +240,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         ));
     }
 
-    /// The driver's heaps as it counts them now, for a note.
+    /// The driver's heaps as it counts them now, for a note. Not asked
+    /// once the platform withdrew a host call of the call served now: the
+    /// driver's count is a host call too, which would hold the caller's
+    /// processor as long again.
     fn driver_heaps(&mut self) -> String {
+        if self.host_call_withdrawn() {
+            return String::from("the driver's heaps were not asked, as a host call waited");
+        }
         let heaps = self.backend.memory_heaps();
         if heaps.is_empty() {
             return String::from("the driver does not say what its heaps hold");

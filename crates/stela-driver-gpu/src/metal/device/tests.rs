@@ -3717,6 +3717,15 @@ fn a_withdrawn_host_call_frees_nothing_and_is_not_made_again() {
     assert_eq!(device.memory().recycled.bytes, recycled);
     assert_eq!(device.memory().out_of_memory, 0);
     assert_eq!(device.take_memory_note(), None);
+    // The call's note of the device's memory asks the driver nothing more,
+    // where its count of its heaps was a host call of its own.
+    device.note_memory_step();
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.ends_with("the driver's heaps were not asked, as a host call waited"),
+        "{note}"
+    );
+    assert_eq!(device.backend().heap_queries, 0);
     // The service clears the mark for the next call, which allocates.
     lock.clear_withdrawn();
     device.new_buffer(1 << 20, private).unwrap();
