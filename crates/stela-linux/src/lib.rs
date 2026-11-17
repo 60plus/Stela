@@ -10,7 +10,7 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 #[cfg(feature = "kernel")]
 use core::{alloc::Layout, ffi::c_void, ptr};
 
-#[cfg(feature = "kernel")]
+#[cfg(any(feature = "kernel", test))]
 pub mod backlight;
 #[cfg(all(feature = "kernel", target_arch = "x86_64"))]
 pub mod catalogue;

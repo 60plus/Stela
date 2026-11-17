@@ -1469,9 +1469,10 @@ fn open_gpus(
     acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    (adapters, isa_bridges): (
+    (adapters, isa_bridges, companions): (
         Vec<stela_drivers::gpu::Adapter>,
         Vec<stela_drivers::probe::IsaBridge>,
+        Vec<(stela_drivers::bus::pci::Address, String)>,
     ),
 ) -> bool {
     let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;
@@ -1503,6 +1504,20 @@ fn open_gpus(
     let firmware = firmware.clone();
     // Named on the screen when no GPU starts; the claim takes `adapters`.
     let found = adapters.clone();
+    // GSP-RM takes the GPU's ACPI data at its start: it is read first, in a
+    // bounded firmware call.
+    #[cfg(feature = "nvk")]
+    if let Some(acpi) = acpi {
+        let adapters = adapters.clone();
+        acpi.firmware(
+            "GPU ACPI data",
+            "GSP-RM gets none of it",
+            false,
+            move |session| gpu::acpi_backlight::load(session, &adapters, &companions),
+        );
+    }
+    #[cfg(not(feature = "nvk"))]
+    let _ = companions;
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
         // The firmware's memory is read through the ACPI owner: a GPU's
@@ -1512,14 +1527,6 @@ fn open_gpus(
         let random = stela_drivers::probe::NativeServices::entropy(&services)
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
-        // GSP-RM takes the backlight table at display init, which the
-        // GPU's start runs; read it from ACPI first.
-        #[cfg(feature = "nvk")]
-        if let Some(acpi) = acpi {
-            gpu::acpi_backlight::load(acpi.session(), &adapters);
-        }
-        #[cfg(not(feature = "nvk"))]
-        let _ = acpi;
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
             gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
         });
@@ -3116,6 +3123,7 @@ fn start_devices(
                 mut links,
                 network_account,
                 gpus,
+                gpu_companions,
                 isa_bridges,
                 usb,
                 bluetooth: host_controller,
@@ -3174,7 +3182,7 @@ fn start_devices(
                     host_acpi,
                     handoff,
                     host_firmware,
-                    (gpus, isa_bridges),
+                    (gpus, isa_bridges, gpu_companions),
                 )
             {
                 let firmware = handoff

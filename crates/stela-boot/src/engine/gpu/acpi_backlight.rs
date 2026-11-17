@@ -6,12 +6,15 @@
 //! function 0x14 at display init. Stela's Linux has no ACPI, so this
 //! evaluates them on the GPU's ACPI companion with the host's own
 //! interpreter before the GPU starts and hands them to
-//! `stela_linux::backlight`. Without them GSP-RM knows no internal panel and
+//! `stela_linux::backlight`. The companion is the one Linux's
+//! `acpi_pci_find_companion` gives the GPU (probe's `gpu_companions`), as
+//! `ACPI_HANDLE` names it to nouveau. Without them GSP-RM knows no internal panel and
 //! refuses every brightness control (NV_ERR_NOT_SUPPORTED), and a laptop
 //! panel the discrete GPU drives, as on a MUX switched to it, stays dark.
 use crate::output;
 use alloc::{format, string::String, vec::Vec};
 use stela_drivers::{
+    bus::pci::Address,
     gpu::{Adapter, Vendor},
     platform::acpi::{Argument, Handle, Session, Value},
 };
@@ -40,18 +43,25 @@ const LIMIT: usize = 0x1000;
 /// `NV0073_CTRL_SYSTEM_ACPI_ID_MAP_MAX_DISPLAYS`.
 const DISPLAYS: usize = 16;
 
-/// Read and keep the ACPI data of each NVIDIA adapter's companion, logging
-/// one line for each.
-pub(in crate::engine) fn load(session: &'static Session, adapters: &[Adapter]) {
+/// Read and keep the ACPI data of each NVIDIA adapter's companion, of the
+/// `companions` probe found, logging one line for each.
+pub(in crate::engine) fn load(
+    session: &'static Session,
+    adapters: &[Adapter],
+    companions: &[(Address, String)],
+) {
     for adapter in adapters.iter().filter(|a| a.vendor == Vendor::Nvidia) {
         let address = adapter.address;
-        let Some(device) = companion(session, adapter) else {
+        let found = companions
+            .iter()
+            .find(|(function, _)| *function == address)
+            .and_then(|(_, path)| Some((path, session.handle(path).ok()?)));
+        let Some((path, device)) = found else {
             output::arguments(format_args!(
-                "GPU {address}: no ACPI companion with an NVIDIA _DSM; GSP-RM gets no ACPI data\n"
+                "GPU {address}: no ACPI companion; GSP-RM gets no ACPI data\n"
             ));
             continue;
         };
-        let path = device.path().unwrap_or_default();
         let (backlight, from) = match table(device) {
             Ok(found) => found,
             Err(why) => (Vec::new(), why),
@@ -70,31 +80,26 @@ pub(in crate::engine) fn load(session: &'static Session, adapters: &[Adapter]) {
             acpi.jt,
             acpi.nvop
         ));
-        stela_linux::backlight::provide(
+        if !stela_linux::backlight::provide(
             address.segment,
             address.bus,
             address.device,
             address.function,
             acpi,
-        );
+        ) {
+            output::arguments(format_args!(
+                "GPU {address}: ACPI data not kept: every GPU's place is taken\n"
+            ));
+        }
     }
 }
 
-/// The first device whose `_ADR` names the adapter's device and function
-/// and whose `_DSM` offers NVIDIA's backlight or Optimus functions.
-fn companion(session: &'static Session, adapter: &Adapter) -> Option<Handle<'static>> {
-    let adr = (u64::from(adapter.address.device) << 16) | u64::from(adapter.address.function);
-    session.all_devices().ok()?.into_iter().find(|&device| {
-        device.child("_DSM").is_ok()
-            && integer(device, "_ADR") == Some(adr)
-            && (offers(device, &NBCI, 0x102, BACKLIGHT)
-                || offers(device, &NVHG, 0x102, BACKLIGHT)
-                || offers(device, &NVOP, 0x100, 0x1a))
-    })
-}
-
 /// The backlight table and which GUID gave it, or why there is none.
+/// nouveau asks only a companion with a `_DSM`.
 fn table(device: Handle<'static>) -> Result<(Vec<u8>, String), String> {
+    if device.child("_DSM").is_err() {
+        return Err(String::from("no _DSM"));
+    }
     for (name, guid) in [("NBCI", &NBCI), ("NVHG", &NVHG)] {
         if !offers(device, guid, 0x102, BACKLIGHT) {
             continue;
@@ -202,13 +207,6 @@ fn flatten(value: &Value<'_>) -> Option<Vec<u8>> {
             }
             Some(bytes)
         }
-        _ => None,
-    }
-}
-
-fn integer(device: Handle<'static>, name: &str) -> Option<u64> {
-    match device.evaluate(Some(name), &[]) {
-        Ok(Some(Value::Integer(value))) => Some(value),
         _ => None,
     }
 }

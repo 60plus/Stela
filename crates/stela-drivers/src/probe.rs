@@ -744,6 +744,10 @@ pub struct Devices {
     /// Display controllers, inventoried without changing firmware scanout.
     /// These are not initialized accelerators; each records its missing port.
     pub gpus: Vec<gpu::Adapter>,
+    /// The ACPI path of each display controller's companion, found as
+    /// Linux's `acpi_pci_find_companion` finds it ([`native::companion`]):
+    /// a GPU's kernel driver reads its firmware's methods there.
+    pub gpu_companions: Vec<(Address, String)>,
     /// PCI-to-ISA bridges as their configuration reads, which no driver
     /// here takes: a GPU's kernel driver names the chipset by them.
     pub isa_bridges: Vec<IsaBridge>,
@@ -2305,6 +2309,19 @@ pub unsafe fn probe_observed(
         }
     }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
+    // Each display controller's companion, once every bridge above it is
+    // known.
+    #[cfg(feature = "native-acpi")]
+    if let Some(session) = services.and_then(NativeServices::acpi) {
+        devices.gpu_companions = devices
+            .gpus
+            .iter()
+            .filter_map(|gpu| {
+                let companion = native::companion(session, gpu.address, &bridges)?;
+                Some((gpu.address, companion.path().ok()?))
+            })
+            .collect();
+    }
     attach_broadcom_bluetooth(
         broadcom_bluetooth,
         services,

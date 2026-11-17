@@ -2370,6 +2370,7 @@ pub unsafe fn open(
             root,
         ),
         gpus: core::mem::take(&mut devices.gpus),
+        gpu_companions: core::mem::take(&mut devices.gpu_companions),
         isa_bridges: core::mem::take(&mut devices.isa_bridges),
         usb,
         usb_disks,
@@ -2712,6 +2713,8 @@ pub struct Opened {
     pub bluetooth: Option<super::bluetooth::HostBluetooth>,
     /// The display controllers probe left for their own drivers.
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
+    /// Each display controller's ACPI companion path, where probe found one.
+    pub gpu_companions: alloc::vec::Vec<(stela_drivers::bus::pci::Address, alloc::string::String)>,
     /// The PCI-to-ISA bridges probe read, which a GPU's kernel driver may
     /// name the chipset by.
     pub isa_bridges: alloc::vec::Vec<stela_drivers::probe::IsaBridge>,

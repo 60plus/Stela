@@ -13,9 +13,9 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
-mod before;
 #[cfg(feature = "nvk")]
 pub(super) mod acpi_backlight;
+mod before;
 #[cfg(feature = "nvk")]
 pub(super) mod client;
 #[cfg(feature = "nvk")]

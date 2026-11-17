@@ -31,9 +31,12 @@ pub struct Acpi {
 
 /// No address: `u32::MAX` is not a PCI key [`key`] makes.
 const NONE: u32 = u32::MAX;
+/// The GPUs whose data is kept, each in its own place.
+const PLACES: usize = 8;
 
-static KEY: AtomicU32 = AtomicU32::new(NONE);
-static DATA: AtomicPtr<Acpi> = AtomicPtr::new(ptr::null_mut());
+/// Each place's function and its data; a key is stored after its data.
+static KEYS: [AtomicU32; PLACES] = [const { AtomicU32::new(NONE) }; PLACES];
+static DATA: [AtomicPtr<Acpi>; PLACES] = [const { AtomicPtr::new(ptr::null_mut()) }; PLACES];
 
 /// The segment, bus and devfn of a function as one word.
 fn key(segment: u16, bus: u8, devfn: u8) -> u32 {
@@ -41,16 +44,24 @@ fn key(segment: u16, bus: u8, devfn: u8) -> u32 {
 }
 
 /// Keep `acpi` for the function at `segment`, `bus`, `device`, `function`,
-/// the one GPU whose start reads it. Called before that GPU starts; a later
-/// call replaces it (the earlier data stays allocated, as C may hold it).
-pub fn provide(segment: u16, bus: u8, device: u8, function: u8, acpi: Acpi) {
+/// whose start reads it, beside each other GPU's. Called on one processor
+/// before that GPU starts; a later call for the same function replaces its
+/// data (the earlier stays allocated, as C may hold it). `false` when every
+/// place holds another GPU's.
+pub fn provide(segment: u16, bus: u8, device: u8, function: u8, acpi: Acpi) -> bool {
+    let wanted = key(segment, bus, (device << 3) | (function & 7));
+    let keys = || KEYS.iter().map(|key| key.load(Ordering::Acquire));
+    let Some(place) = keys()
+        .position(|key| key == wanted)
+        .or_else(|| keys().position(|key| key == NONE))
+    else {
+        return false;
+    };
     let acpi: &'static mut Acpi = Box::leak(Box::new(acpi));
-    KEY.store(NONE, Ordering::Release);
-    DATA.store(acpi, Ordering::Release);
-    KEY.store(
-        key(segment, bus, (device << 3) | (function & 7)),
-        Ordering::Release,
-    );
+    KEYS[place].store(NONE, Ordering::Release);
+    DATA[place].store(acpi, Ordering::Release);
+    KEYS[place].store(wanted, Ordering::Release);
+    true
 }
 
 fn lookup(domain: u32, bus: u32, devfn: u32) -> Option<&'static Acpi> {
@@ -59,11 +70,11 @@ fn lookup(domain: u32, bus: u32, devfn: u32) -> Option<&'static Acpi> {
         u8::try_from(bus).ok()?,
         u8::try_from(devfn).ok()?,
     );
-    if KEY.load(Ordering::Acquire) != wanted {
-        return None;
-    }
+    let place = KEYS
+        .iter()
+        .position(|key| key.load(Ordering::Acquire) == wanted)?;
     // SAFETY: a pointer `provide` leaked, alive for the boot.
-    unsafe { DATA.load(Ordering::Acquire).as_ref() }
+    unsafe { DATA[place].load(Ordering::Acquire).as_ref() }
 }
 
 /// The backlight table boot kept for the function at `domain`, `bus`,
@@ -163,5 +174,60 @@ pub unsafe extern "C" fn stela_linux_gpu_acpi_caps(
             0
         }
         None => -2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn caps(domain: u32, bus: u32, devfn: u32, which: u32) -> Option<u32> {
+        let mut value = 0;
+        // SAFETY: a valid writable word.
+        let found = unsafe { stela_linux_gpu_acpi_caps(domain, bus, devfn, which, &mut value) };
+        (found == 0).then_some(value)
+    }
+
+    /// Each GPU reads back its own companion's data, a second GPU's
+    /// leaving the first's in place, and a function given none reads none.
+    #[test]
+    fn each_gpu_keeps_its_own_acpi_data() {
+        let first = Acpi {
+            backlight: vec![1, 2, 3, 4],
+            dod: Some(vec![0x8000_a450]),
+            jt: Some(0x2001_6003),
+            nvop: None,
+        };
+        let second = Acpi {
+            jt: Some(7),
+            ..Acpi::default()
+        };
+        assert!(provide(0, 0x41, 0, 0, first));
+        assert!(provide(0, 0x42, 0, 0, second));
+        assert_eq!(caps(0, 0x41, 0, 0), Some(0x2001_6003));
+        assert_eq!(caps(0, 0x41, 0, 1), None);
+        assert_eq!(caps(0, 0x42, 0, 0), Some(7));
+        assert_eq!(caps(0, 0x43, 0, 0), None);
+        let (mut data, mut size) = (ptr::null(), 0);
+        // SAFETY: valid writable slots.
+        let found = unsafe { stela_linux_gpu_backlight_data(0, 0x41, 0, &mut data, &mut size) };
+        assert_eq!((found, size), (0, 4));
+        // SAFETY: the kept table's four bytes.
+        let table = unsafe { core::slice::from_raw_parts(data, size) };
+        assert_eq!(table, [1, 2, 3, 4]);
+        // SAFETY: valid writable slots.
+        let found = unsafe { stela_linux_gpu_backlight_data(0, 0x42, 0, &mut data, &mut size) };
+        assert_eq!((found, size), (-2, 0));
+        let mut ids = [0u32; 16];
+        let mut count = 0;
+        // SAFETY: sixteen writable words and a writable count.
+        let found =
+            unsafe { stela_linux_gpu_acpi_dod(0, 0x41, 0, ids.as_mut_ptr(), 16, &mut count) };
+        assert_eq!((found, count, ids[0]), (0, 1, 0x8000_a450));
+        // Data given again for the same function replaces its own.
+        assert!(provide(0, 0x41, 0, 0, Acpi::default()));
+        assert_eq!(caps(0, 0x41, 0, 0), None);
+        assert_eq!(caps(0, 0x42, 0, 0), Some(7));
     }
 }
