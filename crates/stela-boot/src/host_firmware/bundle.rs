@@ -10,11 +10,11 @@
 //! the boot without it, as the log says; the devices that needed its files
 //! stay off and their drivers say so.
 use super::{open, read_file};
-use crate::{handoff::Region, output, pci_io};
+use crate::{firmware, handoff::Region, output, paging::PAGE, pci_io};
 use alloc::{format, string::String, vec::Vec};
 use stela_loader::host_firmware::{
     MAX_IMAGE_BYTES, MAX_MANIFEST_BYTES,
-    bundle::{self, Bundle, Object, Pci, Room},
+    bundle::{self, Bundle, Held, Object, Pci, Room},
 };
 use uefi::{
     boot,
@@ -26,6 +26,9 @@ pub struct Bundled {
     bundle: Bundle<'static>,
     selected: Vec<usize>,
     pub regions: Vec<Region>,
+    /// What became of each of the bundle's files (`bundle::held_record`),
+    /// for the engine's words about a driver that lacks one.
+    pub record: Region,
 }
 
 impl Bundled {
@@ -134,7 +137,8 @@ fn load_from(
             late.why
         ));
     }
-    for left in selection.take_late(room) {
+    let left = selection.take_late(room);
+    for left in &left {
         output::arguments(format_args!(
             "HOST FIRMWARE BUNDLE LATE {} not read: its {} files of {} bytes do not fit beside \
              the files above in the firmware handoff's {} files and {} bytes; a GPU that \
@@ -156,8 +160,10 @@ fn load_from(
         selected: Vec::new(),
         regions: Vec::new(),
         bundle: parsed,
+        record: Region::default(),
     };
     let mut lacking = 0;
+    let mut failed: Vec<&str> = Vec::new();
     for (artifact, why) in &selection.wanted {
         let Some(index) = bundled
             .bundle
@@ -190,6 +196,7 @@ fn load_from(
             }
             Err(error) => {
                 lacking += 1;
+                failed.push(artifact.sha256);
                 output::arguments(format_args!(
                     "HOST FIRMWARE BUNDLE LACKS {} for {why}: {error}\n",
                     object.member
@@ -197,6 +204,28 @@ fn load_from(
             }
         }
     }
+    let record = {
+        let bundled = &bundled;
+        bundle::held_record(&bundled.bundle, |sha256| {
+            if bundled
+                .objects()
+                .iter()
+                .any(|object| object.sha256 == sha256)
+            {
+                Held::Read
+            } else if failed.contains(&sha256) {
+                Held::Failed
+            } else if left
+                .iter()
+                .any(|late| late.files.iter().any(|file| file.sha256 == sha256))
+            {
+                Held::NoRoom
+            } else {
+                Held::Unread
+            }
+        })
+    };
+    bundled.record = keep(&record)?;
     let read_bytes: usize = bundled.objects().iter().map(|object| object.length).sum();
     output::arguments(format_args!(
         "HOST FIRMWARE BUNDLE {place} files={} pci={} used={} lacking={lacking} bytes={read_bytes} \
@@ -207,4 +236,21 @@ fn load_from(
         output::millis_since(started)
     ));
     Ok(bundled)
+}
+
+/// `bytes` in fresh reserved pages the engine reads after the exit; an
+/// empty region for none.
+fn keep(bytes: &[u8]) -> Result<Region, String> {
+    if bytes.is_empty() {
+        return Ok(Region::default());
+    }
+    let physical =
+        firmware::pages(bytes.len().div_ceil(PAGE)).map_err(|error| format!("{error}"))?;
+    // SAFETY: fresh reserved LOADER_DATA pages, written once here before
+    // any immutable view is published; never freed or given to a guest.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), physical as *mut u8, bytes.len()) };
+    Ok(Region {
+        physical: physical as u64,
+        bytes: bytes.len() as u64,
+    })
 }

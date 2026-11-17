@@ -1606,6 +1606,10 @@ pub(super) fn claim_all(
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
                 let reason = match error {
                     ServiceError::Refused(before::NO_FIRMWARE) => Reason::MissingFirmware,
+                    ServiceError::Refused(before::FIRMWARE_READ_FAILED) => {
+                        Reason::FirmwareReadFailed
+                    }
+                    ServiceError::Refused(before::FIRMWARE_NOT_READ) => Reason::FirmwareNotRead,
                     _ => Reason::Other,
                 };
                 refused.push(refused_as(adapter, reason, &error));

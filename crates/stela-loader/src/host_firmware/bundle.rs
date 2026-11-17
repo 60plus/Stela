@@ -641,6 +641,102 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
     selection
 }
 
+/// What became of a file of the USB's bundle before the firmware's exit,
+/// for the engine's words about a driver that lacks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// The USB has no bundle that a boot could read.
+    NoBundle,
+    /// The USB's bundle does not hold it.
+    Lacks,
+    /// Read, and handed to the engine.
+    Read,
+    /// Reading it failed.
+    Failed,
+    /// Selected for a GPU that may answer late, and left out for want of
+    /// room in the firmware handoff.
+    NoRoom,
+    /// Not selected: no PCI function the firmware showed needed it.
+    Unread,
+}
+
+impl Held {
+    const STATES: [(Self, u8); 4] = [
+        (Self::Read, b'r'),
+        (Self::Failed, b'f'),
+        (Self::NoRoom, b'b'),
+        (Self::Unread, b'n'),
+    ];
+}
+
+/// The record the engine reads with [`held`]: one line per file of
+/// `bundle`, its digest and what `state` says became of it.
+pub fn held_record(bundle: &Bundle<'_>, state: impl Fn(&str) -> Held) -> Vec<u8> {
+    let mut record = Vec::with_capacity(bundle.objects.len() * 67);
+    for object in &bundle.objects {
+        let held = state(object.sha256);
+        let Some(&(_, code)) = Held::STATES.iter().find(|(state, _)| *state == held) else {
+            continue;
+        };
+        record.extend_from_slice(object.sha256.as_bytes());
+        record.extend_from_slice(&[b' ', code, b'\n']);
+    }
+    record
+}
+
+/// What became of the file with `sha256` by `record` ([`held_record`]),
+/// `None` when the boot found no bundle.
+pub fn held(record: Option<&[u8]>, sha256: &str) -> Held {
+    let Some(record) = record else {
+        return Held::NoBundle;
+    };
+    record
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| {
+            let (digest, code) = line.split_at_checked(64)?;
+            if digest != sha256.as_bytes() {
+                return None;
+            }
+            let &[b' ', code] = code else {
+                return None;
+            };
+            Held::STATES
+                .iter()
+                .find(|(_, known)| *known == code)
+                .map(|&(state, _)| state)
+        })
+        .unwrap_or(Held::Lacks)
+}
+
+/// Why a driver lacks files after the firmware's exit, from what became of
+/// each ([`held`]): the USB lacking any comes first, as `stela repair`
+/// fixes it; then a failed read; else every one is on the USB and was not
+/// read because its GPU answered only after the firmware's exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Absent {
+    /// The USB lacks some.
+    NotOnUsb,
+    /// Reading some failed.
+    ReadFailed,
+    /// All on the USB, not read: their GPU answered too late, or the
+    /// handoff had no room for them.
+    AnsweredLate,
+}
+
+impl Absent {
+    pub fn of(states: impl IntoIterator<Item = Held>) -> Self {
+        let mut absent = Self::AnsweredLate;
+        for state in states {
+            match state {
+                Held::NoBundle | Held::Lacks => return Self::NotOnUsb,
+                Held::Failed | Held::Read => absent = Self::ReadFailed,
+                Held::NoRoom | Held::Unread => {}
+            }
+        }
+        absent
+    }
+}
+
 /// Gives a driver's exact request the bundle file its recipe pins, when the
 /// catalog has no exact binding for it: the file, found by digest, is bound
 /// once to the request's own name and target, so the driver sees the image

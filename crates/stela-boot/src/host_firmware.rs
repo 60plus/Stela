@@ -4,11 +4,12 @@
 use crate::Result;
 use crate::{firmware, handoff::Region, layout, output, paging::PAGE};
 use alloc::{format, string::ToString, sync::Arc};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub use stela_boot_core::host_resources::Resources;
 use stela_boot_core::host_resources::report;
 use stela_contracts::refuse;
 use stela_drivers::firmware::Catalog;
-use stela_loader::host_firmware::{self as manifest, MAX_MANIFEST_BYTES, Manifest};
+use stela_loader::host_firmware::{self as manifest, MAX_MANIFEST_BYTES, Manifest, bundle::Held};
 use uefi::{
     CString16,
     proto::media::file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
@@ -33,11 +34,41 @@ pub unsafe fn identity_catalog(resources: &Resources) -> Result<Option<Arc<Catal
     unsafe { resources.catalog(|physical| physical, None, output::arguments) }
 }
 
+/// The bundle's record (`bundle::held_record`) the engine took from the
+/// handoff: its address and length, 0 without one.
+static RECORD: (AtomicU64, AtomicUsize) = (AtomicU64::new(0), AtomicUsize::new(0));
+
+/// What became of the USB bundle's file with `sha256` before the
+/// firmware's exit, by the record the loader handed off.
+pub fn bundle_held(sha256: &str) -> Held {
+    let (address, length) = (
+        RECORD.0.load(Ordering::Acquire),
+        RECORD.1.load(Ordering::Acquire),
+    );
+    // SAFETY: `after_ebs` stored the record's permanent mapped alias, its
+    // reserved pages never written again.
+    let record = (address != 0)
+        .then(|| unsafe { core::slice::from_raw_parts(address as *const u8, length) });
+    manifest::bundle::held(record, sha256)
+}
+
 /// # Safety
 /// The loader supplied this validated wire handoff. Its LOADER_DATA pages
 /// are reserved, and the engine maps them in its permanent shared physmap.
 pub unsafe fn after_ebs(resources: &Resources) -> Result<Option<Arc<Catalog>>> {
     let started = output::now();
+    // SAFETY: the caller's handoff and permanent physmap.
+    match unsafe { resources.bundle_record(layout::physical) } {
+        Ok(Some(record)) => {
+            RECORD.1.store(record.len(), Ordering::Release);
+            RECORD.0.store(record.as_ptr() as u64, Ordering::Release);
+        }
+        Ok(None) => {}
+        Err(error) => output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE record unreadable after the exit ({error}): a GPU that lacks \
+             files is told the USB lacks them\n"
+        )),
+    }
     // SAFETY: the caller's validated loader handoff and permanent physmap.
     let catalog =
         unsafe { resources.catalog(layout::physical, Some("after-ebs"), output::arguments) }?;
@@ -244,6 +275,9 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
         count: regions.len(),
         wifi,
         smbios,
+        bundle: bundled
+            .as_ref()
+            .map_or(Region::default(), |bundled| bundled.record),
         ..Resources::absent()
     };
     resources.images[..regions.len()].copy_from_slice(&regions);

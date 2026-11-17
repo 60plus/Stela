@@ -20,9 +20,27 @@ pub const SHOWN_BY_COPY: &str = "No screen is connected to the NVIDIA GPU, so St
 pub enum Reason {
     /// The USB holds no firmware for its chip.
     MissingFirmware,
+    /// The USB holds its chip's firmware, and reading it before the
+    /// firmware's exit failed.
+    FirmwareReadFailed,
+    /// The USB holds its chip's firmware, and it was not read: the GPU
+    /// answered only after the firmware's exit, as a GPU the firmware left
+    /// without power does once Stela powers its port.
+    FirmwareNotRead,
     /// Anything else; the boot log names it.
     Other,
 }
+
+/// The start of the screen line for a GPU whose files are on the USB and
+/// not in memory.
+const HOLDS: &str = "the USB holds the firmware for";
+/// Its end when reading them before the firmware's exit failed.
+const READ_FAILED: &str = ", but reading it from the USB failed. The boot log on this USB \
+    says why; `stela repair` on another computer writes the files again";
+/// Its end when they were not read because the GPU answered only after the
+/// firmware's exit.
+const NOT_READ: &str = ", but it was not read: the GPU answered only after the PC's firmware \
+    handed over to Stela. The boot log on this USB says why";
 
 /// The screen line for the GPU `device` of `vendor` at PCI `address` that
 /// did not start for `reason`, `why` the refusal's own words (empty without
@@ -39,6 +57,8 @@ pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason, why: 
                 "the USB has no firmware for {gpu}. On another computer, plug in this USB and \
                  run `stela repair`"
             ),
+            (Reason::FirmwareReadFailed, _) => format!("{HOLDS} {gpu}{READ_FAILED}"),
+            (Reason::FirmwareNotRead, _) => format!("{HOLDS} {gpu}{NOT_READ}"),
             (Reason::Other, true) => {
                 format!("{gpu} did not start; the boot log on this USB says why")
             }
@@ -56,6 +76,12 @@ pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason, why: 
             "the USB has no firmware for this PC's NVIDIA {chip} GPU. On another computer, plug \
              in this USB and run `stela repair`"
         ),
+        (Some(chip), Reason::FirmwareReadFailed) => {
+            format!("{HOLDS} this PC's NVIDIA {chip} GPU at {address}{READ_FAILED}")
+        }
+        (Some(chip), Reason::FirmwareNotRead) => {
+            format!("{HOLDS} this PC's NVIDIA {chip} GPU at {address}{NOT_READ}")
+        }
         (Some(chip), Reason::Other) if why.is_empty() => format!(
             "the NVIDIA {chip} GPU at {address} did not start; the boot log on this USB says why"
         ),
@@ -365,6 +391,40 @@ mod tests {
         );
         assert!(missing.contains("NVIDIA ga104 GPU"), "{missing}");
         assert!(missing.ends_with("run `stela repair`"), "{missing}");
+        // The files are on the USB: no `stela repair` for a GPU that
+        // answered late, and the USB is not said to lack them.
+        let late = refused(
+            Vendor::Nvidia,
+            "01:00.0",
+            0x28a0,
+            Reason::FirmwareNotRead,
+            "",
+        );
+        assert_eq!(
+            late,
+            "the USB holds the firmware for this PC's NVIDIA ad107 GPU at 01:00.0, but it was \
+             not read: the GPU answered only after the PC's firmware handed over to Stela. The \
+             boot log on this USB says why"
+        );
+        let failed = refused(
+            Vendor::Nvidia,
+            "01:00.0",
+            0x28a0,
+            Reason::FirmwareReadFailed,
+            "",
+        );
+        assert!(
+            failed.starts_with(
+                "the USB holds the firmware for this PC's NVIDIA ad107 GPU at 01:00.0, but \
+                 reading it from the USB failed."
+            ),
+            "{failed}"
+        );
+        let amd = refused(Vendor::Amd, "03:00.0", 0x7550, Reason::FirmwareNotRead, "");
+        assert!(
+            amd.starts_with("the USB holds the firmware for the AMD GPU at 03:00.0 (device 7550)"),
+            "{amd}"
+        );
         let other = refused(Vendor::Nvidia, "03:00.0", 0x2b85, Reason::Other, "");
         assert_eq!(
             other,

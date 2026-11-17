@@ -348,8 +348,9 @@ fn find<'a>(
 }
 
 /// Whether every file of `inventory` the driver needs is in `catalog`,
-/// before anything of the GPU `name` changes: one line naming the files the
-/// USB lacks, and the refusal [`select_firmware`] would give for them later.
+/// before anything of the GPU `name` changes: one line naming the files
+/// missing and why ([`lacks`]), and the refusal [`select_firmware`] would
+/// give for them later.
 /// A file the driver starts without (`recipes::optional`) may be missing.
 fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), ServiceError> {
     use stela_loader::host_firmware::recipes;
@@ -362,23 +363,66 @@ fn on_usb(inventory: &Inventory, name: &str, catalog: &Catalog) -> Result<(), Se
             !recipes::optional(&selection.request)
                 && find(catalog, selection).is_err_and(|error| error.kind == FirmwareError::Missing)
         })
-        .map(|selection| selection.request.name.clone())
+        .map(|selection| {
+            (
+                selection.request.name.clone(),
+                selection.recipe.image.sha256,
+            )
+        })
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
-    lacks(name, &missing, plan.selections().len());
-    Err(ServiceError::Refused(NO_FIRMWARE))
+    Err(lacks(name, &missing, plan.selections().len()))
 }
 
-/// Says which of the `files` files of the GPU `name` the USB lacks.
-fn lacks(name: &str, missing: &[String], files: usize) {
-    output::arguments(format_args!(
-        "GPU {name}: the USB's firmware bundle lacks {} of this chip's {files} files ({}); \
-         `stela repair` completes it\n",
-        missing.len(),
-        missing.join(", ")
-    ));
+/// Says which of the `files` files of the GPU `name` are `missing`, each
+/// named with its digest, and why, by what the loader recorded of the USB's
+/// bundle ([`crate::host_firmware::bundle_held`]); the refusal that says it
+/// on the screen.
+fn lacks(name: &str, missing: &[(String, &str)], files: usize) -> ServiceError {
+    use stela_loader::host_firmware::bundle::{Absent, Held};
+    let held: Vec<Held> = missing
+        .iter()
+        .map(|(_, sha256)| crate::host_firmware::bundle_held(sha256))
+        .collect();
+    let names = missing
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = missing.len();
+    match Absent::of(held.iter().copied()) {
+        Absent::NotOnUsb => {
+            output::arguments(format_args!(
+                "GPU {name}: the USB's firmware bundle lacks {count} of this chip's {files} files \
+                 ({names}); `stela repair` completes it\n"
+            ));
+            ServiceError::Refused(NO_FIRMWARE)
+        }
+        Absent::ReadFailed => {
+            output::arguments(format_args!(
+                "GPU {name}: the USB's firmware bundle holds {count} of this chip's {files} files \
+                 ({names}) that were not in memory: reading them before the firmware's exit \
+                 failed, as the HOST FIRMWARE BUNDLE LACKS lines say\n"
+            ));
+            ServiceError::Refused(FIRMWARE_READ_FAILED)
+        }
+        Absent::AnsweredLate => {
+            let why = if held.contains(&Held::NoRoom) {
+                "the files read for such a GPU did not fit the firmware handoff"
+            } else {
+                "the firmware showed a GPU of this family Stela drives or no PCI port with \
+                 nothing below it, so none was expected"
+            };
+            output::arguments(format_args!(
+                "GPU {name}: the USB's firmware bundle holds {count} of this chip's {files} files \
+                 ({names}), but they were not read: the firmware did not show this GPU before \
+                 its exit, so it answered only after that, and {why}\n"
+            ));
+            ServiceError::Refused(FIRMWARE_NOT_READ)
+        }
+    }
 }
 
 /// The firmware of every request in `inventory`, each file bound under the
@@ -444,7 +488,7 @@ fn select_firmware(
                 ));
             }
             Err(error) if error.kind == FirmwareError::Missing => {
-                missing.push(request.name.clone());
+                missing.push((request.name.clone(), selection.recipe.image.sha256));
             }
             Err(error) => {
                 output::arguments(format_args!(
@@ -459,8 +503,7 @@ fn select_firmware(
         names.push(request.name.clone());
     }
     if !missing.is_empty() {
-        lacks(name, &missing, names.len());
-        return Err(ServiceError::Refused(NO_FIRMWARE));
+        return Err(lacks(name, &missing, names.len()));
     }
     names.extend(read.iter().map(|(_, name)| String::from(*name)));
     // Each file under the exact name and target the driver asks for.
@@ -595,3 +638,11 @@ fn wait_for_firmware_boot(
 
 /// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 pub(super) const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
+/// Why a GPU was refused when the USB holds its chip's files and reading
+/// some of them before the firmware's exit failed.
+pub(super) const FIRMWARE_READ_FAILED: &str =
+    "the USB holds the GPU's firmware, but reading it before the firmware's exit failed";
+/// Why a GPU was refused when the USB holds its chip's files and they were
+/// not read, the GPU having answered only after the firmware's exit.
+pub(super) const FIRMWARE_NOT_READ: &str = "the USB holds the GPU's firmware, but it was not read: the GPU answered only after the \
+     firmware's exit";

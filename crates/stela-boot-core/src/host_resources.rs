@@ -25,6 +25,10 @@ pub struct Resources {
     pub count: usize,
     pub wifi: [wifi::Capture; VARIABLE_DESCRIPTORS.len()],
     pub smbios: smbios::Capture,
+    /// What became of each file of the USB's bundle before the firmware's
+    /// exit (`stela_loader::host_firmware::bundle::held_record`); empty
+    /// when the boot found no bundle.
+    pub bundle: Region,
 }
 impl Resources {
     pub const fn absent() -> Self {
@@ -40,6 +44,10 @@ impl Resources {
                 bytes: 0,
             }; MAX_IMAGES],
             count: 0,
+            bundle: Region {
+                physical: 0,
+                bytes: 0,
+            },
             wifi: [wifi::Capture {
                 observation: Observation::NotCaptured,
                 region: Region {
@@ -72,6 +80,20 @@ impl Resources {
         observations
     }
 
+    /// The bundle's record ([`Self::bundle`]), `None` when the boot found no
+    /// bundle.
+    ///
+    /// # Safety
+    /// As [`Self::catalog`]'s: the record's reserved immutable pages and a
+    /// permanent alias of them through `map`.
+    pub unsafe fn bundle_record(&self, map: impl Fn(u64) -> u64) -> Result<Option<&'static [u8]>> {
+        if self.bundle.bytes == 0 {
+            return Ok(None);
+        }
+        // SAFETY: the caller's contract.
+        unsafe { mapped(self.bundle, &map) }.map(Some)
+    }
+
     /// # Safety
     /// Every region came from this module's reserved LOADER_DATA pages and is
     /// immutable for the boot. `map` must return a permanent mapped alias of the
@@ -91,25 +113,8 @@ impl Resources {
         {
             return Err(refuse!("invalid host firmware wire handoff"));
         }
-        let view = |region: Region| -> Result<&'static [u8]> {
-            let end = region
-                .physical
-                .checked_add(region.bytes)
-                .ok_or(refuse!("host firmware region overflow"))?;
-            if region.physical == 0
-                || region.bytes == 0
-                || map(end - 1) != map(region.physical) + region.bytes - 1
-            {
-                return Err(refuse!("invalid host firmware mapped range"));
-            }
-            // SAFETY: caller's reserved immutable pages and permanent alias.
-            Ok(unsafe {
-                core::slice::from_raw_parts(
-                    map(region.physical) as *const u8,
-                    region.bytes as usize,
-                )
-            })
-        };
+        // SAFETY: caller's reserved immutable pages and permanent alias.
+        let view = |region: Region| unsafe { mapped(region, &map) };
         let manifest_bytes = if self.present {
             Some(view(self.manifest)?)
         } else {
@@ -392,6 +397,28 @@ fn record(
     Ok(())
 }
 
+/// The bytes of `region` through `map`.
+///
+/// # Safety
+/// `region` is reserved immutable pages and `map` gives a permanent alias of
+/// all of them.
+unsafe fn mapped(region: Region, map: &impl Fn(u64) -> u64) -> Result<&'static [u8]> {
+    let end = region
+        .physical
+        .checked_add(region.bytes)
+        .ok_or(refuse!("host firmware region overflow"))?;
+    if region.physical == 0
+        || region.bytes == 0
+        || map(end - 1) != map(region.physical) + region.bytes - 1
+    {
+        return Err(refuse!("invalid host firmware mapped range"));
+    }
+    // SAFETY: the caller's reserved immutable pages and permanent alias.
+    Ok(unsafe {
+        core::slice::from_raw_parts(map(region.physical) as *const u8, region.bytes as usize)
+    })
+}
+
 pub fn report(error: manifest::Error, log: fn(fmt::Arguments<'_>)) -> &'static str {
     log(format_args!("HOST FIRMWARE refused: {error}\n"));
     "invalid host firmware resources"
@@ -401,6 +428,29 @@ pub fn report(error: manifest::Error, log: fn(fmt::Arguments<'_>)) -> &'static s
 mod tests {
     use super::*;
     use stela_drivers::net::wifi::intel::platform::Variable;
+
+    #[test]
+    fn the_bundle_record_is_read_through_the_map_or_is_absent() {
+        static RECORD: [u8; 67] = [b'a'; 67];
+        let mut resources = Resources::absent();
+        // SAFETY: no region.
+        let absent = unsafe { resources.bundle_record(|physical| physical) };
+        assert!(absent.unwrap().is_none());
+        resources.bundle = Region {
+            physical: RECORD.as_ptr() as u64,
+            bytes: RECORD.len() as u64,
+        };
+        // SAFETY: a static's bytes, identity mapped.
+        let record = unsafe { resources.bundle_record(|physical| physical) }.unwrap();
+        assert_eq!(record, Some(&RECORD[..]));
+        // A map that splits the range is refused.
+        let start = RECORD.as_ptr() as u64;
+        // SAFETY: refused before any byte is read.
+        let split = unsafe {
+            resources.bundle_record(|physical| if physical == start { physical } else { 0 })
+        };
+        assert!(split.is_err());
+    }
 
     #[test]
     fn absent_wifi_variables_take_one_line() {
