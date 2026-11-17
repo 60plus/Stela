@@ -2,6 +2,7 @@
 //! reports the running PEs.
 
 use super::*;
+use stela_boot_core::beat_pace;
 
 /// Exit kinds by `ExitKind` value, then native faults by cause
 /// (`step_timing::fault_slot`), then System exits at device sites, then the
@@ -855,8 +856,17 @@ pub(super) const WAIT_POLLS_PER_SECOND: u64 = 20;
 /// waits (`start`).
 pub(super) const HOME_SLICES_PER_SECOND: u64 = 250;
 
-/// Seconds between heartbeats, which locate a guest that runs without output.
-pub(super) const BEAT_SECONDS: u64 = 10;
+/// Seconds between heartbeat lines, which locate a guest that runs without
+/// output: every one a full beat for a boot's first ten minutes and under
+/// `--profile`, then a full beat once a minute and a short line between
+/// (`stela_boot_core::beat_pace`).
+pub(super) const BEAT_SECONDS: u64 = beat_pace::BEAT_SECONDS;
+
+/// The counter when the guest first ran in this boot, which the beat's
+/// pace and the identity line count from; 0 before.
+static RAN_SINCE: AtomicU64 = AtomicU64::new(0);
+/// The counter at the boot's last `BOOT IDENT` line, or at its first run.
+static IDENT_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Run up to `budget` blocks (0: no limit), showing what macOS prints last
 /// as the running step's detail, reporting the PE's position
@@ -871,6 +881,14 @@ pub(super) fn run<H: Host>(
     mut execute: impl FnMut(&mut Machine<H, parallel::Board>, u64) -> Stop,
 ) -> Stop {
     let mut heartbeat = Heartbeat::new(machine, host::rdtsc());
+    // The first run of the boot starts both counts; a later one keeps them.
+    let began = heartbeat.beat.at.max(1);
+    let _ = IDENT_AT.compare_exchange(0, began, Ordering::Relaxed, Ordering::Relaxed);
+    let ran_since = match RAN_SINCE.compare_exchange(0, began, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        Ok(_) => began,
+        Err(since) => since,
+    };
     let mut service = ServiceTimes::new(heartbeat.beat.at);
     boot_progress.start(heartbeat.beat.at, machine.statistics.blocks);
     let mut drained_at = host::rdtsc();
@@ -1015,11 +1033,38 @@ pub(super) fn run<H: Host>(
             host_work(machine, "beat step", |machine| {
                 heartbeat.step(machine, tsc_hz)
             });
-        } else if due >= BEAT_SECONDS * tsc_hz && (quiet || due >= 2 * BEAT_SECONDS * tsc_hz) {
-            host_work(machine, "beat", |machine| {
-                heartbeat.beat(machine, &mut service, now, tsc_hz)
-            });
-            output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
+            continue;
+        }
+        match beat_pace::due(
+            now.wrapping_sub(ran_since),
+            due,
+            now - heartbeat.line.at,
+            tsc_hz,
+            machine.step_timing().is_some(),
+            quiet,
+        ) {
+            beat_pace::Due::Full => {
+                host_work(machine, "beat", |machine| {
+                    heartbeat.beat(machine, &mut service, now, tsc_hz)
+                });
+                output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
+            }
+            beat_pace::Due::Short => {
+                host_work(machine, "beat", |machine| {
+                    heartbeat.short_beat(machine, now)
+                });
+            }
+            beat_pace::Due::Nothing => {}
+        }
+        // What this boot runs on, again, for a log read long after its
+        // first lines.
+        let ident_at = IDENT_AT.load(Ordering::Relaxed);
+        if now.wrapping_sub(ident_at) >= beat_pace::IDENT_SECONDS * tsc_hz
+            && IDENT_AT
+                .compare_exchange(ident_at, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            super::ident::report();
         }
     }
 }
@@ -1375,6 +1420,8 @@ impl Beat {
 /// What the heartbeat compares against and samples between beats.
 pub(super) struct Heartbeat {
     pub(super) beat: Beat,
+    /// The counts at the last beat line, full or short.
+    pub(super) line: Beat,
     /// Guest instructions retired by the last beat.
     pub(super) retired: u128,
     /// Each PE's counts at the last beat.
@@ -1459,6 +1506,7 @@ impl Heartbeat {
     pub(super) fn new<H: Host>(machine: &Machine<H, parallel::Board>, now: u64) -> Self {
         Self {
             beat: Beat::at(machine, now),
+            line: Beat::at(machine, now),
             retired: machine.retired_instructions(),
             pe_counts: parallel::counts(machine),
             clock_count: 0,
@@ -1558,6 +1606,7 @@ impl Heartbeat {
         service.restart();
         let compiled = next.compiled - self.beat.compiled;
         self.beat = next;
+        self.line = next;
         mark(&mut cost, "performance");
         self.translation = translation_report(machine, self.translation, compiled);
         mark(&mut cost, "translation");
@@ -1565,6 +1614,14 @@ impl Heartbeat {
         self.cost = cost;
         self.beats += 1;
         self.stage = Some(BeatStage::Profile(0));
+    }
+
+    /// The line between two full beats: where the boot PE is and what it
+    /// did since the last beat line, which is enough to say the guest runs.
+    pub(super) fn short_beat<H: Host>(&mut self, machine: &Machine<H, parallel::Board>, now: u64) {
+        let next = Beat::at(machine, now);
+        short_report(machine, &self.line, &next, now - self.line.at);
+        self.line = next;
     }
 
     /// Run the beat's next stage, or the next step of its walk, for about
@@ -2682,6 +2739,36 @@ pub(super) fn beat_report<H: Host>(
         cpu.state.x[22],
         cpu.state.x[23],
         cpu.state.x[30],
+    ));
+}
+
+/// `BEAT SHORT …`: the fields of the `BEAT` line that say the guest runs,
+/// with the same names, over the interval since the last beat line.
+pub(super) fn short_report<H: Host>(
+    machine: &Machine<H, parallel::Board>,
+    last: &Beat,
+    next: &Beat,
+    elapsed: u64,
+) {
+    let cpu = &machine.cpu;
+    let blocks = (next.blocks - last.blocks).max(1);
+    let heap = crate::ALLOCATOR.usage();
+    output::arguments(format_args!(
+        "BEAT SHORT blocks={} pc={:#x} {}{} lr={:#x} ticks/block={} native={}% compiled={} \
+         exceptions={} interrupts={} waits={} heap={}M/{}M\n",
+        next.blocks,
+        cpu.pc,
+        level_name(cpu.pstate.guarded),
+        cpu.pstate.el,
+        cpu.state.x[30],
+        elapsed / blocks,
+        (next.native - last.native) * 100 / elapsed.max(1),
+        next.compiled - last.compiled,
+        next.events.0 - last.events.0,
+        next.events.1 - last.events.1,
+        next.events.2 - last.events.2,
+        heap.live >> 20,
+        heap.total >> 20,
     ));
 }
 

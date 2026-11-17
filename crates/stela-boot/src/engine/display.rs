@@ -473,6 +473,13 @@ impl GopScanout {
             self.refresh_millihertz
         ));
         crate::status::info(stela_boot_core::gpu_status::SHOWN_BY_COPY);
+        super::ident::set(
+            super::ident::Kind::Display,
+            format_args!(
+                "{width}x{height} at {} mHz, copied to the firmware's framebuffer",
+                self.refresh_millihertz
+            ),
+        );
         self
     }
 }

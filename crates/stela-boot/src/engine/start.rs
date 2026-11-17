@@ -3297,6 +3297,13 @@ fn start_devices(
                     network::GuestNetwork::open(&mut links)
                         .inspect_err(|error| {
                             output::arguments(format_args!("guest network refusal: {error}\n"));
+                            ident::set(
+                                ident::Kind::Network,
+                                format_args!(
+                                    "none: {}",
+                                    error.to_string().lines().next().unwrap_or_default()
+                                ),
+                            );
                             // Optional: macOS boots without it.
                             crate::status::info(
                                 "macOS starts without a network: no supported network \

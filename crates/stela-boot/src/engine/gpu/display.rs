@@ -583,6 +583,13 @@ pub(in crate::engine) fn take(
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                crate::engine::ident::set(
+                    crate::engine::ident::Kind::Display,
+                    format_args!(
+                        "{width}x{height} at {} mHz on an output of GPU {name}",
+                        display.refresh_millihertz()
+                    ),
+                );
                 if size.is_none() && !display.preferred_listed() {
                     output::arguments(format_args!(
                         "GPU {name}: the output lists no preferred mode (its EDID marks none, or \

@@ -769,6 +769,10 @@ impl GuestNetwork {
             device.location(),
             device.mac()
         ));
+        super::ident::set(
+            super::ident::Kind::Network,
+            format_args!("{}", device.location()),
+        );
         Ok(Self {
             link: RootLink::new(device, links.root),
             up: None,

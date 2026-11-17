@@ -26,6 +26,7 @@ pub(crate) mod fdr;
 mod firmware_requests;
 mod gpu;
 pub(crate) mod host;
+mod ident;
 mod input;
 pub(crate) mod install;
 pub(crate) mod interrupts;

@@ -1921,6 +1921,36 @@ fn environment_error(error: WorkError) -> kernel_work::Error {
     kernel_work::Error::Work(error)
 }
 
+/// The GPUs that started and whether each draws, and whether macOS has a
+/// Metal device on them, for the boot's identity line (`ident`).
+pub(super) fn ident() -> String {
+    #[cfg(feature = "nvk")]
+    {
+        let bound = installed().map_or(&[][..], |gpu| gpu.start.bound.as_slice());
+        if bound.is_empty() {
+            return String::from("none started");
+        }
+        let mut text = String::new();
+        for gpu in bound {
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(&gpu.name);
+            text.push_str(match gpu.stack.draws() {
+                true => " draws",
+                false => " shows only",
+            });
+        }
+        text.push_str(match gate::shared().is_empty() {
+            true => "; no Metal device open",
+            false => "; Metal device open",
+        });
+        text
+    }
+    #[cfg(not(feature = "nvk"))]
+    String::from("no GPU driver in this build")
+}
+
 /// Why this boot gives macOS no Metal device, if it does not. WindowServer
 /// aborts without one and watchdogd
 /// then panics the system, so a boot of macOS stops here instead.

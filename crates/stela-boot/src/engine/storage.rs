@@ -1928,6 +1928,10 @@ pub unsafe fn open(
             partition.identity().block_size,
             partition.disk().features.rotation
         ));
+        super::ident::add(
+            super::ident::Kind::Disk,
+            &format!("{:?}", partition.disk().transport),
+        );
         Box::new(Service {
             inner: Box::new(partition),
             root,
