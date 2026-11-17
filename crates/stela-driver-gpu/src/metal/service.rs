@@ -354,6 +354,9 @@ pub struct Loss {
     pub lost: bool,
     /// The reopens that failed in a row since the loss.
     pub failed_reopens: u32,
+    /// The platform's ticks from the first to the last of them: a GPU
+    /// whose reset is still running may refuse reopens for a while.
+    pub failing_ticks: u64,
     /// The last such reopen's error.
     pub error: Option<String>,
 }
@@ -374,6 +377,9 @@ pub struct Service<B: Backend, C: Compiler> {
     /// one's error, for the platform to end a session no GPU serves.
     failed_reopens: u32,
     reopen_error: Option<String>,
+    /// The platform's ticks at the first and the last of those reopens.
+    failed_from: u64,
+    failed_at: u64,
     /// What the last call made, for the platform's log: a render pipeline's
     /// stages and vertex fetch.
     noted: Option<String>,
@@ -423,6 +429,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             refused: Vec::new(),
             failed_reopens: 0,
             reopen_error: None,
+            failed_from: 0,
+            failed_at: 0,
             noted: None,
             served: (0, Status::Ok),
             loss_described: false,
@@ -573,6 +581,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 self.reopen_error = None;
             }
             Err(error) => {
+                let now = (self.device.clock())();
+                if self.failed_reopens == 0 {
+                    self.failed_from = now;
+                }
+                self.failed_at = now;
                 self.failed_reopens = self.failed_reopens.saturating_add(1);
                 self.reopen_error = Some(format!("{error:?}"));
                 self.refused.push(format!("{REOPEN_FAILED}{error:?}"));
@@ -581,11 +594,16 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     }
 
     /// How the device stands after a loss: whether it is lost, and the
-    /// reopens that failed in a row since.
+    /// reopens that failed in a row since and over how long.
     pub fn loss(&self) -> Loss {
         Loss {
             lost: self.device.is_lost(),
             failed_reopens: self.failed_reopens,
+            failing_ticks: if self.failed_reopens == 0 {
+                0
+            } else {
+                self.failed_at.wrapping_sub(self.failed_from)
+            },
             error: self.reopen_error.clone(),
         }
     }
