@@ -398,10 +398,14 @@ impl Provider {
         }
         handled
     }
+    /// AML's Sleep. The running step's marker and seconds keep moving
+    /// through it, as through the drivers' own waits: a table load that
+    /// sleeps for seconds showed a still screen, which reads as a hang.
     fn milliseconds(&self, milliseconds: u64) {
         let start = host::rdtsc();
         let ticks = self.tsc_hz / 1000 * milliseconds;
         while host::rdtsc().wrapping_sub(start) < ticks {
+            crate::status::tick();
             core::hint::spin_loop();
         }
     }
@@ -705,6 +709,9 @@ unsafe extern "C" fn stall(context: *mut c_void, microseconds: u32) {
     while host::rdtsc().wrapping_sub(start) < ticks {
         core::hint::spin_loop();
     }
+    // After the stall, whose length AML chose: a loop of short stalls
+    // keeps the running step's marker moving.
+    crate::status::tick();
 }
 
 unsafe extern "C" fn read_port(
@@ -1002,8 +1009,11 @@ unsafe extern "C" fn write_pci(
     AE_OK
 }
 
-/// 100 ns units, from the TSC.
+/// 100 ns units, from the TSC. Every AML loop and wait reads it for its
+/// bound, so the running step's marker moves from here through a long
+/// method that neither sleeps nor stalls.
 unsafe extern "C" fn timer(context: *mut c_void) -> u64 {
+    crate::status::tick();
     // SAFETY: ACPICA passes the session's provider.
     let hz = unsafe { provider(context) }.tsc_hz;
     (u128::from(host::rdtsc()) * 10_000_000 / u128::from(hz)) as u64
