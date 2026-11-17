@@ -59,7 +59,7 @@ use crate::metal::{
         MAP_INDIRECT_ARGUMENTS_BYTES, MAP_INDIRECT_MAPPINGS, Mapping, MappingRequest, MappingUpdate,
     },
     timing::{Detail, Phase},
-    upload::{Chunk, ChunkPool, ChunkReport, ChunkSource},
+    upload::{Chunk, ChunkPool, ChunkReport, ChunkSource, GivenUp},
     vulkan::{
         AttachmentLoadOp, AttachmentStoreOp, BufferCreate, BufferUsage, MemoryProperties,
         PipelineStages, PipelineStatistics,
@@ -1210,7 +1210,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// never submitted, so its queries are still reset.
     fn recycle(&mut self, uploads: Vec<(Chunk, Vec<u8>)>, pools: Vec<(QueryType, QueryPool)>) {
         let chunks = uploads.into_iter().map(|(chunk, _)| chunk);
-        self.queue.chunks.give(chunks);
+        self.queue.chunks.give(chunks, self.submitted);
         self.queue
             .free_pools
             .extend(pools.into_iter().map(|(query_type, pool)| FreeQueryPool {
@@ -1628,13 +1628,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     /// Destroys upload chunks the pool gave up, once no command buffer in
-    /// flight may reach their memory; answers their bytes.
-    pub(super) fn destroy_chunks(&mut self, chunks: Vec<(Chunk, Memory)>) -> u64 {
+    /// flight may reach their memory; answers their bytes. A chunk is free
+    /// since the serial it was returned at, so only command buffers through
+    /// that serial keep it, and one free for a while is destroyed at once.
+    pub(super) fn destroy_chunks(&mut self, chunks: Vec<GivenUp>) -> u64 {
         let mut bytes = 0;
-        for (chunk, memory) in chunks {
+        for (chunk, memory, serial) in chunks {
             bytes += chunk.size;
-            self.defer(Object::Buffer(chunk.buffer));
-            self.defer(Object::Memory(memory));
+            self.release_as_of(super::pins::Release::device(serial), |device| {
+                device.defer(Object::Buffer(chunk.buffer));
+                device.defer(Object::Memory(memory));
+            });
         }
         bytes
     }
@@ -2160,7 +2164,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
                 self.retire_query_pool(pool, QueryType::Timestamp, marks.queries);
             }
-            self.queue.chunks.give(flight.chunks);
+            self.queue.chunks.give(flight.chunks, self.submitted);
             retired += 1;
             for (query_type, pool) in flight.pools {
                 self.retire_query_pool(pool, query_type, POOL_QUERIES);

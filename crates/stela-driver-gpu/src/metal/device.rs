@@ -165,6 +165,9 @@ pub struct Device<B: Backend, C: Compiler> {
     destruction_left: bool,
     /// Who may read what is released now ([`Self::release_for`]).
     scope: pins::Scope,
+    /// The serial what is released now was last in use at
+    /// ([`Self::release_as_of`]); the newest submitted when none.
+    release_serial: Option<u64>,
     /// The most deferred bytes that only held work kept ([`DeviceMemory`]).
     peak_pinned: u64,
     allocated: u64,
@@ -384,6 +387,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             destruction_budget: 0,
             destruction_left: false,
             scope: pins::Scope::DEVICE,
+            release_serial: None,
             peak_pinned: 0,
             allocated: 0,
             shortage: reclaim::Shortage::default(),
@@ -495,10 +499,20 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         result
     }
 
+    /// Runs `release` as of the earlier release `at`: what it releases was
+    /// out of use since then, so it waits only for the command buffers that
+    /// may have read it at `at`, not for every one submitted since.
+    fn release_as_of<T>(&mut self, at: pins::Release, release: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.release_serial.replace(at.serial);
+        let result = self.release_for(at.scope, release);
+        self.release_serial = outer;
+        result
+    }
+
     /// A release now, by the current scope.
     fn release_now(&self) -> pins::Release {
         pins::Release {
-            serial: self.submitted,
+            serial: self.release_serial.unwrap_or(self.submitted),
             scope: self.scope.clone(),
         }
     }

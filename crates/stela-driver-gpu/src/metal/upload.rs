@@ -48,10 +48,15 @@ pub struct ChunkReport {
 #[derive(Debug, Default)]
 pub struct ChunkPool {
     chunks: Vec<(Chunk, Memory)>,
-    /// Free chunks with the retirement count each was returned at.
-    free: Vec<(Chunk, u64)>,
+    /// Free chunks with the retirement count each was returned at and the
+    /// newest submitted serial then.
+    free: Vec<(Chunk, u64, u64)>,
     retirements: u64,
 }
+
+/// A chunk the pool gave up, with the newest serial submitted when it was
+/// returned: only command buffers through that serial may still reach it.
+pub type GivenUp = (Chunk, Memory, u64);
 
 impl ChunkPool {
     /// Adds a new chunk, in use.
@@ -75,30 +80,31 @@ impl ChunkPool {
             .free
             .iter()
             .enumerate()
-            .filter(|(_, (chunk, _))| (bytes..=most).contains(&chunk.size))
-            .min_by_key(|(_, (chunk, _))| chunk.size)
+            .filter(|(_, (chunk, ..))| (bytes..=most).contains(&chunk.size))
+            .min_by_key(|(_, (chunk, ..))| chunk.size)
             .map(|(index, _)| index)?;
         Some(self.free.swap_remove(index).0)
     }
 
-    /// Returns chunks no command buffer uses any longer.
-    pub fn give(&mut self, chunks: impl IntoIterator<Item = Chunk>) {
+    /// Returns chunks no command buffer uses any longer, `serial` being the
+    /// newest submitted.
+    pub fn give(&mut self, chunks: impl IntoIterator<Item = Chunk>, serial: u64) {
         let now = self.retirements;
         self.free
-            .extend(chunks.into_iter().map(|chunk| (chunk, now)));
+            .extend(chunks.into_iter().map(|chunk| (chunk, now, serial)));
     }
 
     /// Counts `retired` command buffers and gives up the free chunks that
     /// went unused through [`IDLE_RETIREMENTS`], the largest first, down to
     /// [`KEPT_FREE_BYTES`] of them. The caller destroys what it answers.
-    pub fn retire(&mut self, retired: u64) -> Vec<(Chunk, Memory)> {
+    pub fn retire(&mut self, retired: u64) -> Vec<GivenUp> {
         self.retirements += retired;
         let now = self.retirements;
         let mut idle: Vec<(u64, Buffer)> = self
             .free
             .iter()
-            .filter(|&&(_, returned)| now - returned >= IDLE_RETIREMENTS)
-            .map(|&(chunk, _)| (chunk.size, chunk.buffer))
+            .filter(|&&(_, returned, _)| now - returned >= IDLE_RETIREMENTS)
+            .map(|&(chunk, ..)| (chunk.size, chunk.buffer))
             .collect();
         let mut idle_bytes: u64 = idle.iter().map(|&(size, _)| size).sum();
         if idle_bytes <= KEPT_FREE_BYTES {
@@ -117,22 +123,37 @@ impl ChunkPool {
     }
 
     /// Gives up every free chunk, as a device out of memory does.
-    pub fn drain_free(&mut self) -> Vec<(Chunk, Memory)> {
-        let all: Vec<Buffer> = self.free.iter().map(|(chunk, _)| chunk.buffer).collect();
+    pub fn drain_free(&mut self) -> Vec<GivenUp> {
+        let all: Vec<Buffer> = self.free.iter().map(|(chunk, ..)| chunk.buffer).collect();
         self.remove(&all)
     }
 
-    fn remove(&mut self, buffers: &[Buffer]) -> Vec<(Chunk, Memory)> {
+    fn remove(&mut self, buffers: &[Buffer]) -> Vec<GivenUp> {
         if buffers.is_empty() {
             return Vec::new();
         }
-        self.free
-            .retain(|(chunk, _)| !buffers.contains(&chunk.buffer));
-        let (given, kept) = core::mem::take(&mut self.chunks)
+        let mut serials = Vec::with_capacity(buffers.len());
+        self.free.retain(|&(chunk, _, serial)| {
+            let kept = !buffers.contains(&chunk.buffer);
+            if !kept {
+                serials.push((chunk.buffer, serial));
+            }
+            kept
+        });
+        let (given, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut self.chunks)
             .into_iter()
             .partition(|(chunk, _)| buffers.contains(&chunk.buffer));
         self.chunks = kept;
         given
+            .into_iter()
+            .map(|(chunk, memory)| {
+                let serial = serials
+                    .iter()
+                    .find(|&&(buffer, _)| buffer == chunk.buffer)
+                    .map_or(0, |&(_, serial)| serial);
+                (chunk, memory, serial)
+            })
+            .collect()
     }
 
     pub fn report(&self) -> ChunkReport {
@@ -140,7 +161,7 @@ impl ChunkPool {
             chunks: self.chunks.len(),
             bytes: self.chunks.iter().map(|(chunk, _)| chunk.size).sum(),
             free: self.free.len(),
-            free_bytes: self.free.iter().map(|(chunk, _)| chunk.size).sum(),
+            free_bytes: self.free.iter().map(|(chunk, ..)| chunk.size).sum(),
         }
     }
 }
@@ -317,7 +338,7 @@ mod tests {
         for (id, size) in (1..).zip(sizes) {
             pool.insert(chunk(id, size), Memory(id));
         }
-        pool.give((1..).zip(sizes).map(|(id, size)| chunk(id, size)));
+        pool.give((1..).zip(sizes).map(|(id, size)| chunk(id, size)), 0);
         assert_eq!(pool.take(CHUNK_BYTES).unwrap().buffer, Buffer(2));
         assert_eq!(pool.take(CHUNK_BYTES).unwrap().buffer, Buffer(4));
         assert_eq!(
@@ -343,18 +364,19 @@ mod tests {
         for id in 3..=10 {
             pool.insert(chunk(id, CHUNK_BYTES), Memory(id));
         }
-        pool.give([scratch, burst]);
-        pool.give((3..=10).map(|id| chunk(id, CHUNK_BYTES)));
+        pool.give([scratch, burst], 1);
+        pool.give((3..=10).map(|id| chunk(id, CHUNK_BYTES)), 1);
         for _ in 0..IDLE_RETIREMENTS - 1 {
             // Each frame's pass takes the scratch chunk and returns it.
             let taken = pool.take(64 << 20).unwrap();
             assert_eq!(pool.retire(1), Vec::new());
-            pool.give([taken]);
+            pool.give([taken], 2);
         }
-        assert_eq!(pool.retire(1), [(burst, Memory(2))]);
+        assert_eq!(pool.retire(1), [(burst, Memory(2), 1)]);
         assert_eq!(pool.memory(Buffer(2)), None);
         // The default chunks are as old, and under the kept stock.
-        assert_eq!(pool.retire(IDLE_RETIREMENTS), [(scratch, Memory(1))]);
+        // Each answers the serial it was returned at.
+        assert_eq!(pool.retire(IDLE_RETIREMENTS), [(scratch, Memory(1), 2)]);
         assert_eq!(pool.retire(IDLE_RETIREMENTS), Vec::new());
         let report = pool.report();
         assert_eq!((report.chunks, report.free), (8, 8));

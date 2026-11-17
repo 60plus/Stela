@@ -2188,9 +2188,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             self.resources.recycled_bytes -= entry.bytes;
             // Its bytes left `allocated` when it was recycled.
             self.allocated += entry.bytes;
-            // Read by whoever could read it when it was destroyed.
-            let scope = entry.ready.scope;
-            self.release_for(scope, |device| device.free_texture(entry.texture))?;
+            // Read only by what could read it when it was destroyed: once
+            // that is done, its memory is freed at once.
+            self.release_as_of(entry.ready, |device| device.free_texture(entry.texture))?;
         }
         Ok(())
     }

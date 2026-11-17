@@ -3541,6 +3541,56 @@ fn a_device_out_of_memory_frees_what_it_keeps_for_reuse_and_tries_again() {
     }
 }
 
+/// With a command buffer in flight that never read them, recycled textures
+/// and free upload chunks are freed at once when memory runs out, and the
+/// allocation made again finds their room, where they waited for that
+/// command buffer and the second allocation failed as the first had.
+#[test]
+fn a_device_out_of_memory_frees_at_once_what_work_in_flight_never_read() {
+    let mut backend = MockBackend::new();
+    backend.memory_limit = Some(1 << 30);
+    let mut device = device_on(backend);
+    let pass = imageblock_pass(&mut device);
+    complete(&mut device, pass);
+    let large = TextureDescriptor {
+        width: 4096,
+        height: 4096,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let mut textures = Vec::new();
+    while let Ok(texture) = device.new_texture(&large) {
+        textures.push(texture);
+    }
+    while device.take_memory_note().is_some() {}
+    // The note's first failure gave up the scratch chunk; take it back.
+    let pass = imageblock_pass(&mut device);
+    complete(&mut device, pass);
+    for texture in textures.drain(..2) {
+        device.destroy_texture(texture).unwrap();
+    }
+    assert_eq!(device.memory().recycled.bytes, 128 << 20);
+    // Work that never read them, still running.
+    let mut commands = device.new_command_buffer();
+    commands.begin_compute(DispatchType::Serial).unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    let running = device.commit(commands).unwrap();
+    let free = device.memory().chunks.free_bytes;
+    assert_eq!(free, 16 << 20);
+    // More than the driver has left without the recycled textures and the
+    // free scratch chunk, less than with them.
+    device
+        .new_buffer(96 << 20, options(StorageMode::Private))
+        .unwrap();
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.contains(
+            "it freed recycled=128M chunks=16M released=0M and tried again, which succeeded"
+        ),
+        "{note}"
+    );
+    complete(&mut device, running);
+}
+
 /// A test build's cap makes the device's allocations run out of memory at
 /// that many bytes held, with the same freeing and the same notes as a
 /// driver that is full.
