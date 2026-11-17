@@ -78,6 +78,9 @@ pub(super) const CONFIG_LOCKED: u8 = 0;
 pub(super) const RX_FIFO_THRESHOLD: u32 = 7 << 13;
 pub(super) const RX_DMA_BURST: u32 = 7 << 8;
 pub(super) const RX_128_INTERRUPTS: u32 = 1 << 15;
+/// Linux `RX_MULTI_EN`: the receive descriptor fetch mode Linux and the
+/// vendor's drivers run versions 18..24, 34..36, 38 and 40..52 in.
+pub(super) const RX_MULTI_EN: u32 = 1 << 14;
 pub(super) const RX_EARLY_OFF: u32 = 1 << 11;
 pub(super) const RX_FETCH_8125: u32 = 8 << 27;
 /// Accept broadcast, multicast and frames to the station address only.
@@ -120,7 +123,16 @@ pub(super) const RXDV_GATED: u32 = 1 << 19;
 /// Linux r8169's `NUM_RX_DESC` and `NUM_TX_DESC`.
 pub(super) const DESCRIPTORS: usize = 256;
 pub(super) const DESCRIPTOR: usize = 16;
+/// A transmit buffer, and a receive buffer where the DMA memory has no
+/// room for Linux's ([`RECEIVE_BUFFER`]).
 pub(super) const BUFFER: usize = 2048;
+/// Linux r8169's receive buffer (`R8169_RX_BUF_SIZE + 1`): one 16 KiB
+/// block per descriptor, on its own 16 KiB boundary, as `alloc_pages`
+/// gives it.
+pub(super) const RECEIVE_BUFFER: usize = 16 * 1024;
+/// Both descriptor rings start on a page, as Linux's `dma_alloc_coherent`
+/// rings do: a ring is 4096 bytes, so none crosses a page.
+pub(super) const RING_ALIGN: usize = 4096;
 pub(super) const OWN: u32 = 1 << 31;
 pub(super) const END: u32 = 1 << 30;
 pub(super) const FIRST: u32 = 1 << 29;

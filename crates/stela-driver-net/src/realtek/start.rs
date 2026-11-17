@@ -249,8 +249,6 @@ impl<R: Registers, T: Timer> Hardware<'_, R, T> {
             if !self.revision.nbase() {
                 r.write16(INTERRUPT_MITIGATION, 0);
             }
-            // Restrict receive size to one allocated buffer, allowing the FCS.
-            r.write16(RX_MAXIMUM, BUFFER as u16);
             Ok(())
         })();
         r.write8(CONFIG_LOCK, CONFIG_LOCKED);

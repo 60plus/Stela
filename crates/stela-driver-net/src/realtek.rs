@@ -258,6 +258,9 @@ pub struct Realtek {
     signalled: bool,
     /// The receive events acknowledged so far, for [`Link::diagnostic`].
     events: Events,
+    /// Whether Linux's fetch mode was left for a frame that missed its
+    /// buffer ([`Realtek::leave_multiple_fetch`]).
+    fetch_left: bool,
 }
 
 /// How often each receive event was among those acknowledged.
@@ -280,8 +283,9 @@ impl Events {
 
 /// The diagnostic line ([`Link::diagnostic`]): the link, command, interrupt
 /// and configuration registers, whether the station address registers
-/// still hold `mac` (never the address itself), both rings' positions and
-/// ownership, and what the receive path took and saw.
+/// still hold `mac` (never the address itself), the receive buffers' size,
+/// both rings' positions and ownership, and what the receive path took,
+/// dropped and found missing from its own buffer.
 fn diagnostic_line<R: Registers>(
     r: &R,
     revision: Revision,
@@ -310,8 +314,8 @@ fn diagnostic_line<R: Registers>(
         .collect();
     format!(
         "phystatus={:#04x} chipcmd={:#04x} isr={status:#x} imr={mask:#x} rxconfig={:#010x} \
-         txconfig={:#010x} cpcmd={:#06x} rxmax={} station={} rx next={} own={own} \
-         taken={} dropped={} device_owned={} tx next={} device_owned={} events \
+         txconfig={:#010x} cpcmd={:#06x} rxmax={} station={} rx buffers={} next={} own={own} \
+         taken={} dropped={} misplaced={} device_owned={} tx next={} device_owned={} events \
          descriptors_empty={} fifo_overflow={} receive_error={} link_change={} signalled={signalled}",
         r.read8(PHY_STATUS),
         r.read8(COMMAND),
@@ -320,9 +324,11 @@ fn diagnostic_line<R: Registers>(
         r.read16(CPLUS),
         r.read16(RX_MAXIMUM),
         if station { "kept" } else { "differs" },
+        receive.stride(),
         receive.next(),
         receive.taken,
         receive.dropped,
+        receive.misplaced,
         receive.device_owned(),
         transmit.next(),
         transmit.device_owned(),
@@ -434,7 +440,7 @@ impl Realtek {
         let mut net = Self {
             device,
             clock,
-            receive: ManuallyDrop::new(Ring::new(dma, revision.version >= 18)?),
+            receive: ManuallyDrop::new(Ring::receive_ring(dma, revision.version >= 18)?),
             transmit: ManuallyDrop::new(Ring::new(dma, revision.version >= 18)?),
             mac,
             link: RuntimeLink::default(),
@@ -447,6 +453,7 @@ impl Realtek {
             ),
             signalled,
             events: Events::default(),
+            fetch_left: false,
         };
         net.receive.initialize(true);
         net.transmit.initialize(false);
@@ -828,27 +835,43 @@ fn station(low: u32, high: u32) -> Option<Mac> {
     let mac = Mac([a[0], a[1], a[2], a[3], b[0], b[1]]);
     (!mac.is_multicast() && mac.0 != [0; 6]).then_some(mac)
 }
-/// RxConfig's FIFO, DMA and fetch bits per MAC version, from Linux
-/// `rtl_init_rxcfg`, without its `RX_MULTI_EN` (bit 14).
-///
-/// Linux sets that bit on versions 18..24, 34..38 and 40..53. It lets the
-/// chip fetch several receive descriptors at once, and Linux gives each
-/// descriptor its own 16 KiB buffer, where this driver packs its buffers
-/// 2 KiB apart in one allocation. With this layout an RTL8168H (version 46)
-/// with the bit set wrote frames into the buffers of other descriptors: the
-/// descriptors it returned were complete and error-free, but their own
-/// buffers stayed zero, so every frame arrived empty. With the bit clear it
-/// received every frame. The bit is only a fetch optimization, so it stays
-/// clear on every version rather than on that one.
+/// RxConfig's FIFO, DMA and fetch bits per MAC version: Linux
+/// `rtl_init_rxcfg`.
 fn receive_config(version: u8) -> u32 {
     match version {
         2..=17 => RX_FIFO_THRESHOLD | RX_DMA_BURST,
-        40..=53 => RX_128_INTERRUPTS | RX_DMA_BURST | RX_EARLY_OFF,
+        18..=24 | 34..=36 | 38 => RX_128_INTERRUPTS | RX_MULTI_EN | RX_DMA_BURST,
+        40..=53 => RX_128_INTERRUPTS | RX_MULTI_EN | RX_DMA_BURST | RX_EARLY_OFF,
         61 => RX_FETCH_8125 | RX_DMA_BURST,
         // Bit 11 is RX_PAUSE_SLOT_ON on these: the same bit as RX_EARLY_OFF.
         63..=66 | 70 => RX_FETCH_8125 | RX_DMA_BURST | RX_EARLY_OFF,
         _ => RX_128_INTERRUPTS | RX_DMA_BURST,
     }
+}
+
+/// [`receive_config`] for `receive`'s layout and what it has seen.
+///
+/// Linux and the vendor's drivers run versions 18..24, 34..36, 38 and
+/// 40..52 with `RX_MULTI_EN` set, and no driver runs them without it. Both
+/// give each descriptor a buffer of its own on a page boundary. An RTL8168H
+/// (version 46) with the bit set and 2 KiB buffers packed in one allocation
+/// wrote runs of frames into one slot's buffer: the descriptors came back
+/// complete and error-free and their own buffers were never written. With
+/// the bit clear on that layout it received, but the same chip on other
+/// PCs then lost its place in the ring: it reported the ring exhausted
+/// during the first pass, left one slot unwritten and wrote the others
+/// again, so DHCP, DNS and large transfers got no answer.
+///
+/// So a ring laid out as Linux's runs Linux's value. The packed layout,
+/// used only where the DMA memory has no room for Linux's, and a ring in
+/// which a frame missed its own buffer run with the bit clear. On the
+/// 8169 family (through 17) the bit is part of the FIFO threshold.
+fn receive_config_for(version: u8, receive: &Ring) -> u32 {
+    let config = receive_config(version);
+    if version >= 18 && (!receive.linux_layout() || receive.misplaced != 0) {
+        return config & !RX_MULTI_EN;
+    }
+    config
 }
 
 fn publish<R: Registers, T: Timer>(
@@ -883,6 +906,9 @@ fn publish<R: Registers, T: Timer>(
                 u32::from_le_bytes(mac.0[2..].try_into().expect("MAC upper word")),
             )?;
         }
+        // Linux rtl_set_rx_max_size, where rtl_hw_start writes it: no frame
+        // passes one receive buffer.
+        r.write16(RX_MAXIMUM, rx.receive_maximum());
         // Linux requires high-before-low descriptor base writes on some systems.
         r.write32(TX_HIGH, (tx.descriptors.physical() >> 32) as u32);
         r.write32(TX_LOW, tx.descriptors.physical() as u32);
@@ -896,7 +922,10 @@ fn publish<R: Registers, T: Timer>(
     fence(Ordering::SeqCst);
     r.write8(COMMAND, ENABLE);
     // No promiscuous, error, runt or VLAN-stripping acceptance.
-    r.write32(RX_CONFIG, receive_config(revision.version) | RX_ACCEPT);
+    r.write32(
+        RX_CONFIG,
+        receive_config_for(revision.version, rx) | RX_ACCEPT,
+    );
     r.write32(MAR0, u32::MAX);
     r.write32(MAR0 + 4, u32::MAX);
     let auto_fifo = match (34..=52).contains(&revision.version) {
@@ -1002,6 +1031,7 @@ impl Realtek {
     ) -> Result<Option<T>, LinkError> {
         self.update_link()?;
         let frame = self.receive.receive_with(&mut take);
+        self.leave_multiple_fetch();
         if frame.is_some() {
             return Ok(frame);
         }
@@ -1018,7 +1048,26 @@ impl Realtek {
             self.link.last_phy_poll = None;
             self.update_link()?;
         }
-        Ok(self.receive.receive_with(take))
+        let frame = self.receive.receive_with(take);
+        self.leave_multiple_fetch();
+        Ok(frame)
+    }
+
+    /// Clears `RX_MULTI_EN` once, after the first completed descriptor
+    /// whose own buffer the chip left unwritten ([`receive_config_for`]):
+    /// the frames that follow arrive in the mode that received on such a
+    /// chip. The receiver takes the change while it runs. The diagnostic
+    /// line shows it as `rxconfig` and `misplaced`.
+    fn leave_multiple_fetch(&mut self) {
+        if self.fetch_left || self.receive.misplaced == 0 {
+            return;
+        }
+        self.fetch_left = true;
+        let config = self.device.read32(RX_CONFIG);
+        let wanted = receive_config_for(self.revision.version, &self.receive);
+        if config != u32::MAX && config & RX_MULTI_EN != wanted & RX_MULTI_EN {
+            self.device.write32(RX_CONFIG, config & !RX_MULTI_EN);
+        }
     }
 }
 

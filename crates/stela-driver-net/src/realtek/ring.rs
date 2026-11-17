@@ -11,18 +11,54 @@ use crate::{
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
+/// What an offered receive buffer starts with: an Ethernet header from the
+/// broadcast address, which no frame is sent from. A completed descriptor
+/// whose buffer still starts with it did not get its frame.
+const UNWRITTEN: [u8; 12] = [
+    0x02, 0x53, 0x74, 0x65, 0x6c, 0x61, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
 pub(super) struct Ring {
     pub descriptors: DmaBuffer,
     buffers: DmaBuffer,
+    /// Bytes from one slot's buffer to the next: [`BUFFER`], or a receive
+    /// ring's [`RECEIVE_BUFFER`].
+    stride: usize,
     next: usize,
     /// Completed receive descriptors taken, and those of them dropped.
     pub taken: u64,
     pub dropped: u64,
+    /// Dropped receive descriptors that came back complete and error-free
+    /// while their own buffer was left as offered ([`UNWRITTEN`]).
+    pub misplaced: u64,
 }
 impl Ring {
+    /// A ring of [`BUFFER`]-sized buffers packed in one allocation: every
+    /// transmit ring.
     pub fn new(dma: &mut dyn DmaAllocator, wide: bool) -> Result<Self, BlockError> {
-        let descriptors = dma.allocate(DESCRIPTORS * DESCRIPTOR, 256)?;
+        let descriptors = dma.allocate(DESCRIPTORS * DESCRIPTOR, RING_ALIGN)?;
         let buffers = dma.allocate(DESCRIPTORS * BUFFER, 256)?;
+        Self::over(descriptors, buffers, BUFFER, wide)
+    }
+    /// A receive ring laid out as Linux r8169's: each descriptor's buffer
+    /// is [`RECEIVE_BUFFER`] bytes on a boundary of that size. Where the
+    /// DMA memory has no room for that, the packed layout of [`Self::new`].
+    pub fn receive_ring(dma: &mut dyn DmaAllocator, wide: bool) -> Result<Self, BlockError> {
+        let descriptors = dma.allocate(DESCRIPTORS * DESCRIPTOR, RING_ALIGN)?;
+        match dma.allocate(DESCRIPTORS * RECEIVE_BUFFER, RECEIVE_BUFFER) {
+            Ok(buffers) => Self::over(descriptors, buffers, RECEIVE_BUFFER, wide),
+            Err(_) => {
+                let buffers = dma.allocate(DESCRIPTORS * BUFFER, 256)?;
+                Self::over(descriptors, buffers, BUFFER, wide)
+            }
+        }
+    }
+    fn over(
+        descriptors: DmaBuffer,
+        buffers: DmaBuffer,
+        stride: usize,
+        wide: bool,
+    ) -> Result<Self, BlockError> {
         for allocation in [&descriptors, &buffers] {
             if !wide && !fits32(allocation.bus_address(), allocation.len()) {
                 return Err(BlockError::Unsupported(
@@ -33,17 +69,44 @@ impl Ring {
         Ok(Self {
             descriptors,
             buffers,
+            stride,
             next: 0,
             taken: 0,
             dropped: 0,
+            misplaced: 0,
         })
+    }
+    /// Whether the receive buffers are laid out as Linux's
+    /// ([`Self::receive_ring`]).
+    pub fn linux_layout(&self) -> bool {
+        self.stride == RECEIVE_BUFFER
+    }
+    /// A receive descriptor's buffer size field: Linux's
+    /// `R8169_RX_BUF_SIZE` for its layout, else the packed buffer's size.
+    fn offered(&self) -> u32 {
+        match self.linux_layout() {
+            true => (RECEIVE_BUFFER - 1) as u32,
+            false => BUFFER as u32,
+        }
+    }
+    /// RxMaxSize for this ring: Linux's `R8169_RX_BUF_SIZE + 1` for its
+    /// layout, else one packed buffer, so no frame passes its own buffer.
+    pub fn receive_maximum(&self) -> u16 {
+        match self.linux_layout() {
+            true => RECEIVE_BUFFER as u16,
+            false => BUFFER as u16,
+        }
+    }
+    /// Bytes from one slot's buffer to the next.
+    pub fn stride(&self) -> usize {
+        self.stride
     }
     pub fn initialize(&mut self, receive: bool) {
         for index in 0..DESCRIPTORS {
             let offset = index * DESCRIPTOR;
             self.descriptors.write(
                 offset + 8,
-                self.buffers.bus_address() + (index * BUFFER) as u64,
+                self.buffers.bus_address() + (index * self.stride) as u64,
             );
             self.descriptors.write(offset + 4, 0u32);
             self.descriptors.write(offset, end(index));
@@ -53,10 +116,12 @@ impl Ring {
         }
     }
     fn offer(&mut self, index: usize) {
+        let start = index * self.stride;
+        self.buffers.bytes_mut()[start..start + UNWRITTEN.len()].copy_from_slice(&UNWRITTEN);
         self.descriptors.write(index * DESCRIPTOR + 4, 0u32);
         fence(Ordering::Release);
         self.descriptors
-            .write(index * DESCRIPTOR, OWN | end(index) | BUFFER as u32);
+            .write(index * DESCRIPTOR, OWN | end(index) | self.offered());
     }
     /// The next slot the driver looks at.
     pub fn next(&self) -> usize {
@@ -87,7 +152,8 @@ impl Ring {
         }
         fence(Ordering::Acquire);
         let length = frame.len().max(MIN_FRAME);
-        let data = &mut self.buffers.bytes_mut()[self.next * BUFFER..self.next * BUFFER + length];
+        let start = self.next * self.stride;
+        let data = &mut self.buffers.bytes_mut()[start..start + length];
         write_transmit_frame(data, frame, length);
         let offset = self.next * DESCRIPTOR;
         self.descriptors.write(offset + 4, 0u32);
@@ -106,13 +172,18 @@ impl Ring {
     /// as the controller would.
     #[cfg(test)]
     pub fn deliver(&mut self, frame: &[u8]) {
-        let start = self.next * BUFFER;
+        self.deliver_at(self.next, frame);
+    }
+    /// [`Self::deliver`] into slot `index`.
+    #[cfg(test)]
+    pub fn deliver_at(&mut self, index: usize, frame: &[u8]) {
+        let start = index * self.stride;
         let bytes = self.buffers.bytes_mut();
         bytes[start..start + frame.len()].copy_from_slice(frame);
         bytes[start + frame.len()..start + frame.len() + 4].fill(0xcd);
         self.descriptors.write(
-            self.next * DESCRIPTOR,
-            FIRST | LAST | end(self.next) | (frame.len() + 4) as u32,
+            index * DESCRIPTOR,
+            FIRST | LAST | end(index) | (frame.len() + 4) as u32,
         );
     }
     /// The next good frame, passed to `take` while its buffer is still
@@ -124,9 +195,20 @@ impl Ring {
                 return None;
             }
             fence(Ordering::Acquire);
-            let frame = received_length(status).map(|length| {
-                take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length])
-            });
+            let start = self.next * self.stride;
+            let frame = match received_length(status) {
+                Some(length) => {
+                    let bytes = &self.buffers.bytes()[start..start + length];
+                    match bytes.starts_with(&UNWRITTEN) {
+                        true => {
+                            self.misplaced += 1;
+                            None
+                        }
+                        false => Some(take(bytes)),
+                    }
+                }
+                None => None,
+            };
             self.taken += 1;
             self.dropped += u64::from(frame.is_none());
             self.offer(self.next);
@@ -200,6 +282,64 @@ mod tests {
         // Fragments of a frame over one buffer are dropped, as Linux does.
         for fragment in [FIRST, LAST, 0] {
             assert_eq!(received_length(fragment | 64), None);
+        }
+    }
+    /// The receive ring is laid out as Linux r8169's where the DMA memory
+    /// has room: the ring on a page, each buffer 16 KiB on a 16 KiB
+    /// boundary, offered with `R8169_RX_BUF_SIZE`. Where it has not, the
+    /// packed 2 KiB layout is used.
+    #[test]
+    fn the_receive_ring_is_laid_out_as_linux_where_memory_allows() {
+        let mut dma = TestRegion::new(DESCRIPTORS * RECEIVE_BUFFER + (1 << 16));
+        let mut rx = Ring::receive_ring(&mut dma, true).unwrap();
+        rx.initialize(true);
+        assert!(rx.linux_layout());
+        assert_eq!(rx.receive_maximum(), 16384);
+        assert_eq!(rx.descriptors.bus_address() % 4096, 0);
+        for index in 0..DESCRIPTORS {
+            let offset = index * DESCRIPTOR;
+            let address = rx.descriptors.read::<u64>(offset + 8);
+            assert_eq!(address % RECEIVE_BUFFER as u64, 0);
+            assert_eq!(
+                address,
+                rx.buffers.bus_address() + (index * RECEIVE_BUFFER) as u64
+            );
+            assert_eq!(
+                rx.descriptors.read::<u32>(offset),
+                OWN | end(index) | 0x3fff
+            );
+        }
+        rx.deliver(&[0x5a; MAX_FRAME]);
+        assert_eq!(rx.receive().unwrap(), [0x5a; MAX_FRAME]);
+        assert_eq!(rx.descriptors.read::<u32>(0), OWN | 0x3fff);
+        // Room for the ring and packed buffers only.
+        let mut dma = TestRegion::new(DESCRIPTORS * (DESCRIPTOR + BUFFER) + 4096);
+        let mut rx = Ring::receive_ring(&mut dma, true).unwrap();
+        rx.initialize(true);
+        assert!(!rx.linux_layout());
+        assert_eq!(rx.receive_maximum(), 2048);
+        assert_eq!(rx.descriptors.bus_address() % 4096, 0);
+        assert_eq!(rx.descriptors.read::<u32>(0), OWN | BUFFER as u32);
+    }
+    /// A completed, error-free descriptor whose own buffer still holds
+    /// what it was offered with did not get its frame: it is dropped and
+    /// counted, where it was handed on as a frame of stale bytes.
+    #[test]
+    fn a_completed_descriptor_with_an_unwritten_buffer_is_dropped_and_counted() {
+        let mut dma = TestRegion::new(DESCRIPTORS * (DESCRIPTOR + BUFFER) + 4096);
+        let mut rx = Ring::new(&mut dma, true).unwrap();
+        rx.initialize(true);
+        rx.descriptors.write(0, FIRST | LAST | 64);
+        rx.deliver_at(1, &[0x77; 60]);
+        assert_eq!(rx.receive().unwrap(), [0x77; 60]);
+        assert_eq!((rx.taken, rx.dropped, rx.misplaced), (2, 1, 1));
+        // Both slots are offered again, unwritten.
+        for index in [0, 1] {
+            assert_eq!(
+                rx.descriptors.read::<u32>(index * DESCRIPTOR),
+                OWN | BUFFER as u32
+            );
+            assert!(rx.buffers.bytes()[index * BUFFER..].starts_with(&UNWRITTEN));
         }
     }
     #[test]

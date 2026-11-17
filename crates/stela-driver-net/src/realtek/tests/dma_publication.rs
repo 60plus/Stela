@@ -139,7 +139,7 @@ fn the_diagnostic_line_names_registers_rings_and_events_without_the_address() {
         "isr=0x11 ",
         "imr=0x0 ",
         "station=kept",
-        "rx next=2 own=dddd taken=2 dropped=1 device_owned=256",
+        "rx buffers=2048 next=2 own=dddd taken=2 dropped=1 misplaced=0 device_owned=256",
         "tx next=1 device_owned=1",
         "descriptors_empty=2 fifo_overflow=1 receive_error=0 link_change=1",
         "signalled=true",
@@ -150,4 +150,39 @@ fn the_diagnostic_line_names_registers_rings_and_events_without_the_address() {
     let other = Mac([2, 3, 4, 5, 6, 8]);
     let line = diagnostic_line(&model, revision(46), other, &rx, &tx, events, false);
     assert!(line.contains("station=differs"), "{line}");
+}
+
+/// The publication writes RxMaxSize where Linux's `rtl_hw_start` does,
+/// before the descriptor bases, and RxConfig for the receive ring's
+/// layout: Linux's own values (16384 and `RX_MULTI_EN`) for Linux's
+/// layout, one packed buffer and the bit clear for the packed one.
+#[test]
+fn publication_sets_the_receive_size_and_fetch_mode_for_the_ring_layout() {
+    use crate::bus::dma::TestRegion;
+    for linux in [true, false] {
+        let mut dma = TestRegion::new(DESCRIPTORS * (RECEIVE_BUFFER + BUFFER) + (1 << 16));
+        let mut rx = match linux {
+            true => Ring::receive_ring(&mut dma, true),
+            false => Ring::new(&mut dma, true),
+        }
+        .unwrap();
+        let mut tx = Ring::new(&mut dma, true).unwrap();
+        rx.initialize(true);
+        tx.initialize(false);
+        assert_eq!(rx.linux_layout(), linux);
+        let time = Time::default();
+        let model = Model::ready(&time);
+        let hw = Hardware::new(&model, &time, revision(46), 0);
+        publish(&hw, &rx, &tx, Mac([2, 3, 4, 5, 6, 7])).unwrap();
+        let s = model.state.borrow();
+        let at = |reg| s.writes.iter().position(|(r, _, _)| *r == reg).unwrap();
+        assert!(at(RX_MAXIMUM) < at(TX_HIGH));
+        drop(s);
+        let (maximum, config) = match linux {
+            true => (16384, 0xcf0e),
+            false => (2048, 0x8f0e),
+        };
+        assert_eq!(model.read16(RX_MAXIMUM), maximum);
+        assert_eq!(model.read32(RX_CONFIG), config);
+    }
 }

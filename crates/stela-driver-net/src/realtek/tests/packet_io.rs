@@ -5,6 +5,19 @@ use super::*;
 
 /// An RTL8169S over `registers` and `memory`, its rings in `memory`.
 fn modelled(registers: &mut [u32], memory: &mut [u64], signalled: bool) -> Realtek {
+    modelled_as(0x0080_0000, false, registers, memory, signalled)
+}
+
+/// The chip TxConfig `identity` names over `registers` and `memory`, its
+/// rings in `memory`: the receive ring as the start lays it out
+/// (`Ring::receive_ring`) when `started`, else packed.
+fn modelled_as(
+    identity: u32,
+    started: bool,
+    registers: &mut [u32],
+    memory: &mut [u64],
+    signalled: bool,
+) -> Realtek {
     use crate::bus::dma::RegionAllocator;
     let start = memory.as_mut_ptr() as u64;
     // SAFETY: the caller owns both allocations for the driver's lifetime.
@@ -14,13 +27,17 @@ fn modelled(registers: &mut [u32], memory: &mut [u64], signalled: bool) -> Realt
             RegionAllocator::new(start..start + (memory.len() * 8) as u64),
         )
     };
-    let revision = revision::detect(0x0080_0000).unwrap();
+    let revision = revision::detect(identity).unwrap();
+    let receive = match started {
+        true => Ring::receive_ring(&mut dma, true),
+        false => Ring::new(&mut dma, true),
+    };
     Realtek {
         device,
         clock: crate::timing::model(Clock {
             ticks_per_microsecond: 1,
         }),
-        receive: ManuallyDrop::new(Ring::new(&mut dma, true).unwrap()),
+        receive: ManuallyDrop::new(receive.unwrap()),
         transmit: ManuallyDrop::new(Ring::new(&mut dma, true).unwrap()),
         mac: Mac([2, 0, 0, 0, 0, 1]),
         link: RuntimeLink::default(),
@@ -30,6 +47,7 @@ fn modelled(registers: &mut [u32], memory: &mut [u64], signalled: bool) -> Realt
         location: "model".into(),
         signalled,
         events: Events::default(),
+        fetch_left: false,
     }
 }
 
@@ -49,7 +67,7 @@ fn the_diagnostic_counts_the_receive_events_an_empty_receive_acknowledged() {
     let line = net.diagnostic().unwrap();
     for part in [
         "isr=0x50 ",
-        "rx next=0 own=dddd taken=0 dropped=0 device_owned=256",
+        "rx buffers=2048 next=0 own=dddd taken=0 dropped=0 misplaced=0 device_owned=256",
         "tx next=0 device_owned=0",
         "descriptors_empty=1 fifo_overflow=1 receive_error=0 link_change=0",
         "signalled=true",
@@ -173,4 +191,50 @@ fn receive_reusing_refills_the_callers_buffer_across_the_wrap() {
     net.link.failure = Some(BlockError::Timeout);
     assert!(net.receive_reusing(&mut reused).is_err());
     assert_eq!(reused, last);
+}
+
+/// An RTL8168H (XID 541) starts in Linux's fetch mode on Linux's receive
+/// layout. A descriptor that comes back complete and error-free while its
+/// own buffer was never written is dropped and counted, and the driver
+/// then clears `RX_MULTI_EN` once: the frames after it arrive in the mode
+/// that received on a chip that misplaced them. A frame that did reach
+/// its buffer changes nothing.
+#[test]
+fn a_frame_that_missed_its_buffer_is_dropped_and_ends_multiple_fetch() {
+    let mut registers = vec![0u32; 64];
+    let mut memory = vec![0u64; (DESCRIPTORS * (RECEIVE_BUFFER + BUFFER) + (1 << 16)) / 8];
+    let linux = receive_config(46) | RX_ACCEPT;
+    assert_eq!(linux, 0xcf0e);
+    registers[RX_CONFIG / 4] = linux;
+    let mut net = modelled_as(0x5410_0000, true, &mut registers, &mut memory, false);
+    assert_eq!(net.revision.version, 46);
+    assert!(net.receive.linux_layout());
+    net.receive.initialize(true);
+    net.receive.deliver(&[0x55; 60]);
+    assert_eq!(net.receive(), Ok(Some(vec![0x55; 60])));
+    assert_eq!(registers[RX_CONFIG / 4], linux);
+    // Complete, error-free, 60 bytes and the FCS: the buffer as offered.
+    let index = net.receive.next();
+    net.receive
+        .descriptors
+        .write(index * DESCRIPTOR, FIRST | LAST | 64);
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!((net.receive.misplaced, net.receive.dropped), (1, 1));
+    assert_eq!(registers[RX_CONFIG / 4], linux & !RX_MULTI_EN);
+    // The switch is made once: a later write of the register stays.
+    registers[RX_CONFIG / 4] = linux;
+    net.receive.deliver(&[0x66; 60]);
+    assert_eq!(net.receive(), Ok(Some(vec![0x66; 60])));
+    let index = net.receive.next();
+    net.receive
+        .descriptors
+        .write(index * DESCRIPTOR, FIRST | LAST | 64);
+    assert_eq!(net.receive(), Ok(None));
+    assert_eq!(net.receive.misplaced, 2);
+    assert_eq!(registers[RX_CONFIG / 4], linux);
+    let line = net.diagnostic().unwrap();
+    assert!(
+        line.contains("rx buffers=16384 next=4 own=dddd taken=4 dropped=2 misplaced=2"),
+        "{line}"
+    );
 }

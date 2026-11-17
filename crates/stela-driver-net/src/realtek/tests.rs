@@ -236,27 +236,30 @@ fn revision(version: u8) -> Revision {
 }
 
 #[test]
-fn receive_config_follows_linux_per_version_without_multiple_fetch() {
+fn receive_config_follows_linux_per_version_and_the_ring_layout() {
+    use crate::bus::dma::TestRegion;
     let fifo = (7 << 13) | (7 << 8);
     let interrupt = (1 << 15) | (7 << 8);
-    let early = interrupt | (1 << 11);
+    let multiple = interrupt | (1 << 14);
+    let early = multiple | (1 << 11);
     let fetch = (8 << 27) | (7 << 8);
     let expected = [
         (2, fifo),
         (6, fifo),
         (17, fifo),
-        (18, interrupt),
-        (24, interrupt),
+        (18, multiple),
+        (24, multiple),
         (25, interrupt),
         (28, interrupt),
         (33, interrupt),
-        (34, interrupt),
-        (36, interrupt),
-        (38, interrupt),
+        (34, multiple),
+        (36, multiple),
+        (38, multiple),
         (40, early),
         (42, early),
         (44, early),
-        // RTL8168H (XID 541): Linux's 0x2cf0e less RX_MULTI_EN is 0x8f0e.
+        // RTL8168H (XID 541): 0xcf0e with the accept bits, as Linux reads
+        // it back below the chip's own bit 17.
         (46, early),
         (51, early),
         (52, early),
@@ -265,14 +268,26 @@ fn receive_config_follows_linux_per_version_without_multiple_fetch() {
         (66, fetch | (1 << 11)),
         (70, fetch | (1 << 11)),
     ];
+    let mut dma = TestRegion::new(DESCRIPTORS * (RECEIVE_BUFFER + 2 * BUFFER) + (1 << 16));
+    let linux = Ring::receive_ring(&mut dma, true).unwrap();
+    let packed = Ring::new(&mut dma, true).unwrap();
+    let mut missed = Ring::new(&mut dma, true).unwrap();
+    missed.misplaced = 1;
     for (version, value) in expected {
         assert_eq!(receive_config(version), value, "version {version}");
-        // On the 8169 family (through 17) bit 14 is part of the FIFO threshold.
-        if version >= 18 {
-            assert_eq!(receive_config(version) & (1 << 14), 0, "version {version}");
+        assert_eq!(receive_config_for(version, &linux), value, "{version}");
+        // On the 8169 family (through 17) bit 14 is part of the FIFO
+        // threshold and stays; later it is the fetch mode.
+        let single = match version {
+            ..18 => value,
+            _ => value & !(1 << 14),
+        };
+        for ring in [&packed, &missed] {
+            assert_eq!(receive_config_for(version, ring), single, "{version}");
         }
     }
-    assert_eq!(receive_config(46) | RX_ACCEPT, 0x8f0e);
+    assert_eq!(receive_config(46) | RX_ACCEPT, 0xcf0e);
+    assert_eq!(receive_config_for(46, &packed) | RX_ACCEPT, 0x8f0e);
 }
 
 mod admission;
