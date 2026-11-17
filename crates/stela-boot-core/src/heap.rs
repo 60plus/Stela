@@ -37,7 +37,10 @@ use core::{
 // Explicit, so the NVIDIA LUT fixture can compile this file by path.
 #[path = "heap/failure.rs"]
 mod failure;
+#[path = "heap/stop.rs"]
+mod stop;
 pub use failure::{FailedHeap, Failure};
+pub use stop::StopCounts;
 #[path = "heap/tally.rs"]
 pub mod tally;
 
@@ -622,10 +625,14 @@ pub struct Heap {
     /// The heap's bytes not carved, the reserve's with the main bins'.
     room: AtomicUsize,
     waits: AtomicU64,
+    /// The processors that stop, and what they allocate from ([`stop`]).
+    stop: stop::Stop,
 }
 // SAFETY: all list/header mutations use the real acquire/release exclusion.
 // UEFI callers mask local interrupts before acquiring the lock. Critical
-// sections cannot migrate/block; NMI and fault handlers never reenter the heap.
+// sections cannot migrate/block. NMI and fault handlers reenter the heap only
+// on the way to a stop, after `Heap::stop_on`: they then skip their core's
+// cache and never wait for the lock without bound (`stop`).
 unsafe impl Sync for Heap {}
 impl Default for Heap {
     fn default() -> Self {
@@ -664,6 +671,7 @@ impl Heap {
             carved: AtomicUsize::new(0),
             room: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
+            stop: stop::Stop::new(),
             state: UnsafeCell::new(State {
                 start: 0,
                 end: 0,
@@ -927,7 +935,9 @@ impl Heap {
         {
             return ptr::null_mut();
         }
-        let guard = self.lock();
+        let Some(guard) = self.lock_or_stop() else {
+            return ptr::null_mut();
+        };
         // SAFETY: acquire/release exclusion, as for ordinary allocation.
         let state = unsafe { &mut *self.state.get() };
         if !state.ready {
@@ -1151,7 +1161,9 @@ impl Heap {
     /// Adjacent frames may need an intervening allocation header when
     /// allocated separately, so this is not a reservation or allocation count.
     pub fn available_page_frames_in(&self, allowed: Range<usize>) -> usize {
-        let _guard = self.lock();
+        let Some(_guard) = self.lock_or_stop() else {
+            return 0;
+        };
         // SAFETY: the guard keeps the free blocks and their bins stable.
         let state = unsafe { &*self.state.get() };
         let (first_level, _) = bin(PAGE_BYTES + HEADER_BYTES);
@@ -1175,7 +1187,9 @@ impl Heap {
     /// Start a new high-water mark of the carved bytes, for
     /// [`Self::marked_peak`]: the bytes carved now.
     pub fn mark(&self) -> usize {
-        let _guard = self.lock();
+        let Some(_guard) = self.lock_or_stop() else {
+            return self.carved.load(Ordering::Relaxed);
+        };
         // SAFETY: the guard excludes every other state access.
         let state = unsafe { &mut *self.state.get() };
         state.marked_peak = state.carved;
@@ -1184,14 +1198,20 @@ impl Heap {
 
     /// The most bytes carved at once since the last [`Self::mark`].
     pub fn marked_peak(&self) -> usize {
-        let _guard = self.lock();
+        let Some(_guard) = self.lock_or_stop() else {
+            return 0;
+        };
         // SAFETY: the guard excludes metadata writers.
         unsafe { (*self.state.get()).marked_peak }
     }
 
-    /// The heap's usage, walking the free list for its largest extent.
+    /// The heap's usage, walking the free list for its largest extent; on
+    /// a stopping processor that cannot have the lock, the counts the lock
+    /// last left.
     pub fn usage(&self) -> Usage {
-        let _guard = self.lock();
+        let Some(_guard) = self.lock_or_stop() else {
+            return self.usage_unlocked();
+        };
         // SAFETY: the guard excludes metadata writers throughout; no state
         // reference escapes it.
         let state = unsafe { &*self.state.get() };
@@ -1317,6 +1337,15 @@ unsafe fn allocate_locked(state: &mut State, layout: Layout, class: Option<usize
 // the single matching deallocation.
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.stopping() {
+            // SAFETY: the caller's GlobalAlloc contract.
+            let block = unsafe { self.stop_alloc(layout) };
+            if block.is_null() {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                failure::report(self, layout);
+            }
+            return block;
+        }
         allocation_begins();
         let class = class(layout);
         let cpu = self.cpu();
@@ -1348,6 +1377,10 @@ unsafe impl GlobalAlloc for Heap {
         block
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if self.stopping() {
+            // SAFETY: the caller's GlobalAlloc contract.
+            return unsafe { self.stop_dealloc(pointer, layout) };
+        }
         let class = class(layout);
         if let Some(cpu) = self.cpu() {
             self.count_own(cpu, layout, class, false);
@@ -1382,6 +1415,10 @@ unsafe impl GlobalAlloc for Heap {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if self.stopping() {
+            // SAFETY: the caller's GlobalAlloc contract.
+            return unsafe { self.stop_realloc(pointer, layout, new_size) };
+        }
         // SAFETY: GlobalAlloc's realloc contract guarantees that this size
         // rounded to the original alignment fits in isize.
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
