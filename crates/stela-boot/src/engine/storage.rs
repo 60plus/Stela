@@ -2100,6 +2100,9 @@ pub unsafe fn open(
     for (location, error) in &devices.platform_failures {
         output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
     }
+    for (location, why) in &devices.platform_unsupported {
+        output::arguments(format_args!("PLATFORM UNSUPPORTED {location}: {why}\n"));
+    }
     match &devices.regulatory {
         Some(Ok(_)) => output::arguments(format_args!("HOST Wi-Fi regulatory database loaded\n")),
         Some(Err(error)) => output::arguments(format_args!(

@@ -498,6 +498,9 @@ impl Prepared {
         for (location, error) in &devices.platform_failures {
             output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
         }
+        for (location, why) in &devices.platform_unsupported {
+            output::arguments(format_args!("PLATFORM UNSUPPORTED {location}: {why}\n"));
+        }
         for (address, warning) in &devices.warnings {
             output::arguments(format_args!("HOST WARNING pci={address}: {warning}\n"));
         }

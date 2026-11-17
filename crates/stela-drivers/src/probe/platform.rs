@@ -211,6 +211,17 @@ pub(super) fn attach_i8042(
     let Some(controller) = attached else {
         return;
     };
+    for command in controller.refused_commands() {
+        let name = match command {
+            ps2::Command::Device { byte, .. } | ps2::Command::Controller(byte) => {
+                alloc::format!("i8042 keyboard command {byte:#04x}")
+            }
+        };
+        devices.platform_unsupported.push((
+            name,
+            "not acknowledged by the keyboard, which is used without it as Linux's atkbd uses it",
+        ));
+    }
     let companion = controller.smbus_companion();
     let shared = alloc::rc::Rc::new(core::cell::RefCell::new(controller));
     devices
