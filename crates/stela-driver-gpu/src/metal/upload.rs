@@ -9,7 +9,7 @@
 //! buffer completes.
 use super::{
     error::{Error, Result},
-    vulkan::object::Buffer,
+    vulkan::object::{Buffer, Memory},
 };
 use alloc::vec::Vec;
 
@@ -22,6 +22,127 @@ pub struct Chunk {
     pub buffer: Buffer,
     pub address: u64,
     pub size: u64,
+}
+
+/// Unused free chunks the pool keeps whatever their age: the stock of
+/// default chunks every command buffer takes from.
+const KEPT_FREE_BYTES: u64 = 4 << 20;
+/// How many command buffers may retire while a free chunk goes unused
+/// before the pool gives it up.
+const IDLE_RETIREMENTS: u64 = 64;
+
+/// What a device's chunk pool holds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChunkReport {
+    pub chunks: usize,
+    pub bytes: u64,
+    pub free: usize,
+    pub free_bytes: u64,
+}
+
+/// A device's upload chunks, each with its memory. A chunk no command
+/// buffer uses is free: the next upload of about its size takes it, and one
+/// that stays unused while [`IDLE_RETIREMENTS`] command buffers retire is
+/// given up, so a pass's large scratch memory (imageblock data of a whole
+/// attachment) is held only while passes of that size keep coming.
+#[derive(Debug, Default)]
+pub struct ChunkPool {
+    chunks: Vec<(Chunk, Memory)>,
+    /// Free chunks with the retirement count each was returned at.
+    free: Vec<(Chunk, u64)>,
+    retirements: u64,
+}
+
+impl ChunkPool {
+    /// Adds a new chunk, in use.
+    pub fn insert(&mut self, chunk: Chunk, memory: Memory) {
+        self.chunks.push((chunk, memory));
+    }
+
+    /// The memory of the chunk whose buffer is `buffer`.
+    pub fn memory(&self, buffer: Buffer) -> Option<Memory> {
+        self.chunks
+            .iter()
+            .find(|(chunk, _)| chunk.buffer == buffer)
+            .map(|(_, memory)| *memory)
+    }
+
+    /// The smallest free chunk of `bytes` to twice that: a small upload
+    /// never takes a large chunk away from the uploads it was made for.
+    pub fn take(&mut self, bytes: u64) -> Option<Chunk> {
+        let most = bytes.saturating_mul(2);
+        let index = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, (chunk, _))| (bytes..=most).contains(&chunk.size))
+            .min_by_key(|(_, (chunk, _))| chunk.size)
+            .map(|(index, _)| index)?;
+        Some(self.free.swap_remove(index).0)
+    }
+
+    /// Returns chunks no command buffer uses any longer.
+    pub fn give(&mut self, chunks: impl IntoIterator<Item = Chunk>) {
+        let now = self.retirements;
+        self.free
+            .extend(chunks.into_iter().map(|chunk| (chunk, now)));
+    }
+
+    /// Counts `retired` command buffers and gives up the free chunks that
+    /// went unused through [`IDLE_RETIREMENTS`], the largest first, down to
+    /// [`KEPT_FREE_BYTES`] of them. The caller destroys what it answers.
+    pub fn retire(&mut self, retired: u64) -> Vec<(Chunk, Memory)> {
+        self.retirements += retired;
+        let now = self.retirements;
+        let mut idle: Vec<(u64, Buffer)> = self
+            .free
+            .iter()
+            .filter(|&&(_, returned)| now - returned >= IDLE_RETIREMENTS)
+            .map(|&(chunk, _)| (chunk.size, chunk.buffer))
+            .collect();
+        let mut idle_bytes: u64 = idle.iter().map(|&(size, _)| size).sum();
+        if idle_bytes <= KEPT_FREE_BYTES {
+            return Vec::new();
+        }
+        idle.sort_unstable_by_key(|&(size, _)| core::cmp::Reverse(size));
+        let mut given = Vec::new();
+        for (size, buffer) in idle {
+            if idle_bytes <= KEPT_FREE_BYTES {
+                break;
+            }
+            idle_bytes -= size;
+            given.push(buffer);
+        }
+        self.remove(&given)
+    }
+
+    /// Gives up every free chunk, as a device out of memory does.
+    pub fn drain_free(&mut self) -> Vec<(Chunk, Memory)> {
+        let all: Vec<Buffer> = self.free.iter().map(|(chunk, _)| chunk.buffer).collect();
+        self.remove(&all)
+    }
+
+    fn remove(&mut self, buffers: &[Buffer]) -> Vec<(Chunk, Memory)> {
+        if buffers.is_empty() {
+            return Vec::new();
+        }
+        self.free
+            .retain(|(chunk, _)| !buffers.contains(&chunk.buffer));
+        let (given, kept) = core::mem::take(&mut self.chunks)
+            .into_iter()
+            .partition(|(chunk, _)| buffers.contains(&chunk.buffer));
+        self.chunks = kept;
+        given
+    }
+
+    pub fn report(&self) -> ChunkReport {
+        ChunkReport {
+            chunks: self.chunks.len(),
+            bytes: self.chunks.iter().map(|(chunk, _)| chunk.size).sum(),
+            free: self.free.len(),
+            free_bytes: self.free.iter().map(|(chunk, _)| chunk.size).sum(),
+        }
+    }
 }
 
 /// The device's chunk pool.
@@ -175,6 +296,72 @@ mod tests {
             &chunks[0].1[..],
             &[[1; 10].as_slice(), &[0; 6], &[2; 4]].concat()[..]
         );
+    }
+
+    fn chunk(id: u64, size: u64) -> Chunk {
+        Chunk {
+            buffer: Buffer(id),
+            address: id << 32,
+            size,
+        }
+    }
+
+    /// A small upload takes the smallest chunk that holds it, and none of
+    /// more than twice its size: a pass's scratch chunk stays for the next
+    /// pass of its size, where the first free chunk in the list was taken
+    /// whatever its size.
+    #[test]
+    fn an_upload_takes_the_smallest_free_chunk_of_about_its_size() {
+        let mut pool = ChunkPool::default();
+        let sizes = [64 << 20, CHUNK_BYTES, 3 * CHUNK_BYTES, 2 * CHUNK_BYTES];
+        for (id, size) in (1..).zip(sizes) {
+            pool.insert(chunk(id, size), Memory(id));
+        }
+        pool.give((1..).zip(sizes).map(|(id, size)| chunk(id, size)));
+        assert_eq!(pool.take(CHUNK_BYTES).unwrap().buffer, Buffer(2));
+        assert_eq!(pool.take(CHUNK_BYTES).unwrap().buffer, Buffer(4));
+        assert_eq!(
+            pool.take(CHUNK_BYTES),
+            None,
+            "three and a thousand times the size are left"
+        );
+        assert_eq!(pool.take(40 << 20).unwrap().buffer, Buffer(1));
+        assert_eq!(pool.memory(Buffer(3)), Some(Memory(3)));
+        let report = pool.report();
+        assert_eq!((report.chunks, report.free), (4, 1));
+        assert_eq!(report.free_bytes, 3 * CHUNK_BYTES);
+    }
+
+    /// A large chunk nothing takes while command buffers retire is given
+    /// up; one taken again in time, and the stock of default chunks, stay.
+    #[test]
+    fn idle_chunks_are_given_up_and_used_ones_kept() {
+        let mut pool = ChunkPool::default();
+        let (scratch, burst) = (chunk(1, 64 << 20), chunk(2, 32 << 20));
+        pool.insert(scratch, Memory(1));
+        pool.insert(burst, Memory(2));
+        for id in 3..=10 {
+            pool.insert(chunk(id, CHUNK_BYTES), Memory(id));
+        }
+        pool.give([scratch, burst]);
+        pool.give((3..=10).map(|id| chunk(id, CHUNK_BYTES)));
+        for _ in 0..IDLE_RETIREMENTS - 1 {
+            // Each frame's pass takes the scratch chunk and returns it.
+            let taken = pool.take(64 << 20).unwrap();
+            assert_eq!(pool.retire(1), Vec::new());
+            pool.give([taken]);
+        }
+        assert_eq!(pool.retire(1), [(burst, Memory(2))]);
+        assert_eq!(pool.memory(Buffer(2)), None);
+        // The default chunks are as old, and under the kept stock.
+        assert_eq!(pool.retire(IDLE_RETIREMENTS), [(scratch, Memory(1))]);
+        assert_eq!(pool.retire(IDLE_RETIREMENTS), Vec::new());
+        let report = pool.report();
+        assert_eq!((report.chunks, report.free), (8, 8));
+        assert_eq!(report.bytes, 8 * CHUNK_BYTES);
+        // Out of memory, the device gives up the stock too.
+        assert_eq!(pool.drain_free().len(), 8);
+        assert_eq!(pool.report(), ChunkReport::default());
     }
 
     /// Scratch memory has a chunk of its own that no later upload shares,

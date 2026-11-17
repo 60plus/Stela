@@ -3364,6 +3364,95 @@ fn completion_recycles_upload_chunks() {
     );
 }
 
+/// The scratch chunk of a pass's imageblock data is destroyed once command
+/// buffers keep retiring without a pass of its size, and small uploads
+/// meanwhile take a default chunk, where the pool kept every chunk it ever
+/// made and gave the first free one, whatever its size, to the next upload.
+#[test]
+fn idle_upload_chunks_are_destroyed() {
+    use crate::metal::{pass::TileMemory, upload::CHUNK_BYTES};
+    let mut device = device();
+    let target = device
+        .new_texture(&TextureDescriptor {
+            width: 1024,
+            height: 1024,
+            ..texture(PixelFormat::Rgba8Unorm, TextureUsage::RENDER_TARGET)
+        })
+        .unwrap();
+    let request = RenderPassRequest {
+        color_attachments: {
+            let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+            colors[0] = Some(AttachmentRequest {
+                texture: target,
+                level: 0,
+                slice: 0,
+                depth_plane: 0,
+                resolve: None,
+                load_action: LoadAction::Clear,
+                store_action: StoreAction::Store,
+                store_action_options: StoreActionOptions::EMPTY,
+                clear: [0.0; 4],
+                surface: None,
+            });
+            colors
+        },
+        depth_attachment: None,
+        depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+        stencil_attachment: None,
+        stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+        visibility_result_buffer: None,
+        visibility_result_type: VisibilityResultType::Reset,
+        render_target_array_length: 0,
+        render_target_width: 0,
+        render_target_height: 0,
+        default_raster_sample_count: 0,
+        tile_memory: TileMemory {
+            imageblock_sample_length: 16,
+            ..Default::default()
+        },
+        sample_positions: Vec::new(),
+        rasterization_rate_map: false,
+        counter_samples: Vec::new(),
+    };
+    let mut commands = device.new_command_buffer();
+    device.begin_render(&mut commands, &request).unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    let pass = device.commit(commands).unwrap();
+    // Sixteen bytes for each of the attachment's samples.
+    let imageblocks = 16 << 20;
+    let held = device.memory().chunks;
+    assert_eq!((held.chunks, held.bytes), (1, imageblocks));
+    complete(&mut device, pass);
+    assert_eq!(device.memory().chunks.free_bytes, imageblocks);
+    let before = device.backend().destroyed.len();
+    for _ in 0..64 {
+        let mut commands = device.new_command_buffer();
+        commands.begin_compute(DispatchType::Serial).unwrap();
+        commands
+            .set_compute_bytes(&mut device.resolver(), &[7; 64], 0)
+            .unwrap();
+        commands.end_encoding(&mut device.resolver()).unwrap();
+        let serial = device.commit(commands).unwrap();
+        complete(&mut device, serial);
+    }
+    let held = device.memory().chunks;
+    assert_eq!(
+        (held.chunks, held.bytes, held.free),
+        (1, CHUNK_BYTES, 1),
+        "only the default chunk the small uploads share is left"
+    );
+    let destroyed = &device.backend().destroyed[before..];
+    let count = |wanted: fn(&Object) -> bool| destroyed.iter().filter(|o| wanted(o)).count();
+    assert_eq!(
+        (
+            count(|object| matches!(object, Object::Buffer(_))),
+            count(|object| matches!(object, Object::Memory(_)))
+        ),
+        (1, 1),
+        "the scratch chunk and its memory"
+    );
+}
+
 #[test]
 fn shared_events_and_counters() {
     let mut device = device();

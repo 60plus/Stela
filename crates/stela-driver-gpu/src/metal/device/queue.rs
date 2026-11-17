@@ -59,7 +59,7 @@ use crate::metal::{
         MAP_INDIRECT_ARGUMENTS_BYTES, MAP_INDIRECT_MAPPINGS, Mapping, MappingRequest, MappingUpdate,
     },
     timing::{Detail, Phase},
-    upload::{Chunk, ChunkSource},
+    upload::{Chunk, ChunkPool, ChunkReport, ChunkSource},
     vulkan::{
         AttachmentLoadOp, AttachmentStoreOp, BufferCreate, BufferUsage, MemoryProperties,
         PipelineStages, PipelineStatistics,
@@ -333,8 +333,7 @@ impl HeldBatch {
 #[derive(Debug, Default)]
 pub(super) struct Queue {
     /// Upload chunks with their memory; free ones are reused.
-    chunks: Vec<(Chunk, Memory)>,
-    free_chunks: Vec<Chunk>,
+    chunks: ChunkPool,
     free_pools: Vec<FreeQueryPool>,
     in_flight: VecDeque<InFlight>,
     events: Slab<Semaphore>,
@@ -1211,7 +1210,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// never submitted, so its queries are still reset.
     fn recycle(&mut self, uploads: Vec<(Chunk, Vec<u8>)>, pools: Vec<(QueryType, QueryPool)>) {
         let chunks = uploads.into_iter().map(|(chunk, _)| chunk);
-        self.queue.free_chunks.extend(chunks);
+        self.queue.chunks.give(chunks);
         self.queue
             .free_pools
             .extend(pools.into_iter().map(|(query_type, pool)| FreeQueryPool {
@@ -1610,14 +1609,27 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     fn chunk_memory(&self, buffer: crate::metal::vulkan::object::Buffer) -> Result<Memory> {
-        let found = self
-            .queue
+        self.queue
             .chunks
-            .iter()
-            .find(|(chunk, _)| chunk.buffer == buffer);
-        found
-            .map(|(_, memory)| *memory)
+            .memory(buffer)
             .ok_or(Error::Invalid("unknown upload chunk"))
+    }
+
+    /// The upload chunks the device holds, free ones among them.
+    pub fn upload_chunks(&self) -> ChunkReport {
+        self.queue.chunks.report()
+    }
+
+    /// Destroys upload chunks the pool gave up, once no command buffer in
+    /// flight may reach their memory; answers their bytes.
+    pub(super) fn destroy_chunks(&mut self, chunks: Vec<(Chunk, Memory)>) -> u64 {
+        let mut bytes = 0;
+        for (chunk, memory) in chunks {
+            bytes += chunk.size;
+            self.defer(Object::Buffer(chunk.buffer));
+            self.defer(Object::Memory(memory));
+        }
+        bytes
     }
 
     /// The work in flight, oldest first: each command buffer's workload and
@@ -2044,6 +2056,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 self.queue.early.push((flight.key, flight.serial));
             }
         }
+        let mut retired = 0;
         while let Some(flight) = flights.pop_front() {
             // Before deferred destruction, which may free the memory.
             for range in flight.invalidations {
@@ -2140,11 +2153,16 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
                 self.retire_query_pool(pool, QueryType::Timestamp, marks.queries);
             }
-            self.queue.free_chunks.extend(flight.chunks);
+            self.queue.chunks.give(flight.chunks);
+            retired += 1;
             for (query_type, pool) in flight.pools {
                 self.retire_query_pool(pool, query_type, POOL_QUERIES);
             }
         }
+        // Chunks nothing took while these retired, before the destruction
+        // below, which frees them with the rest.
+        let idle = self.queue.chunks.retire(retired);
+        self.destroy_chunks(idle);
         // A held command buffer that finished frees what waited for it even
         // when `completed` passed it while it was held.
         self.completed = self.completed.max(completed);
@@ -2632,13 +2650,8 @@ const CHUNK_MEMORY: MemoryRequest = MemoryRequest {
 
 impl<B: Backend, C: Compiler> ChunkSource for DeviceResolver<'_, B, C> {
     fn acquire(&mut self, bytes: u64) -> Result<Chunk> {
-        let queue = &mut self.device.queue;
-        if let Some(index) = queue
-            .free_chunks
-            .iter()
-            .position(|chunk| chunk.size >= bytes)
-        {
-            return Ok(queue.free_chunks.swap_remove(index));
+        if let Some(chunk) = self.device.queue.chunks.take(bytes) {
+            return Ok(chunk);
         }
         // Generated commands preprocess into chunks too.
         let generated = self
@@ -2659,7 +2672,7 @@ impl<B: Backend, C: Compiler> ChunkSource for DeviceResolver<'_, B, C> {
             address: allocation.address,
             size: bytes,
         };
-        self.device.queue.chunks.push((chunk, allocation.memory));
+        self.device.queue.chunks.insert(chunk, allocation.memory);
         Ok(chunk)
     }
 }

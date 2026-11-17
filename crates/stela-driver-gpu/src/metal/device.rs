@@ -217,6 +217,8 @@ pub struct DeviceMemory {
     pub heap_refusals: resources::HeapRefusals,
     /// The backend's memory blocks and the resources placed in them.
     pub blocks: crate::metal::vulkan::backend::MemoryBlocks,
+    /// The upload chunks, which `allocated` does not count.
+    pub chunks: crate::metal::upload::ChunkReport,
     /// Each descriptor array's use, in [`HeapArray`] order.
     pub descriptors: [DescriptorUse; 5],
 }
@@ -301,6 +303,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             recycled: self.recycled(),
             heap_refusals: self.heap_refusals(),
             blocks: self.backend.memory_blocks(),
+            chunks: self.upload_chunks(),
             descriptors: core::array::from_fn(|index| {
                 let array = HeapArray::ALL[index];
                 DescriptorUse {
