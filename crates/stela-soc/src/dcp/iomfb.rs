@@ -969,14 +969,15 @@ impl Methods {
         // the usual rate instead, at which macOS then draws.
         let mut reported = Vec::new();
         let size_mm = scanout.physical_size_mm();
-        let advertised = Advertised::sized(scanout.mode(), refresh, size_mm)
+        let monitor = scanout.monitor();
+        let advertised = Advertised::of_monitor(scanout.mode(), refresh, size_mm, monitor)
             .map(|advertised| advertised.with_rates(&scanout.refresh_rates(), size_mm))
             .or_else(|refusal| {
                 let usual = super::super::scanout::DEFAULT_REFRESH_MILLIHERTZ;
                 reported.push(format!(
                     "IOMFB a {refresh} mHz display is advertised at {usual} mHz: {refusal}"
                 ));
-                Advertised::sized(scanout.mode(), usual, scanout.physical_size_mm())
+                Advertised::of_monitor(scanout.mode(), usual, size_mm, monitor)
             });
         Self {
             interface,
@@ -1830,6 +1831,7 @@ impl Methods {
             height,
             image_cm: (advertised.edid[21], advertised.edid[22]),
             uuid: advertised.display_uuid(),
+            from_monitor: advertised.from_monitor(),
         };
         for (key, xml) in properties {
             self.publish_property(key, xml)?;

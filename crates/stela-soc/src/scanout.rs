@@ -151,6 +151,58 @@ pub struct Mode {
     pub format: PixelFormat,
 }
 
+/// A monitor's identity as its EDID gives it, kept only as a hash: the
+/// base block's manufacturer, product code, serial number, week and year of
+/// manufacture, and its serial-number and name descriptors where present.
+/// Two monitors that differ in any of them, a serial alone included, have
+/// different identities; the same monitor has the same one on every boot.
+/// It holds no field itself, so printing it shows none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MonitorId(u64);
+
+impl core::fmt::Debug for MonitorId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MonitorId(..)")
+    }
+}
+
+impl MonitorId {
+    /// The identity in `edid`, whose first 128 bytes are an EDID base
+    /// block; `None` when they are not one (no fixed header). The checksum
+    /// is not required: the identity bytes are read as they are.
+    pub fn from_edid(edid: &[u8]) -> Option<Self> {
+        const HEADER: [u8; 8] = [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
+        /// Display descriptor tags: product serial number and name.
+        const SERIAL: u8 = 0xff;
+        const NAME: u8 = 0xfc;
+        let base = edid.get(..128)?;
+        if base[..8] != HEADER {
+            return None;
+        }
+        // FNV-1a, 64-bit.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        feed(&base[8..18]);
+        let (descriptors, _) = base[54..126].as_chunks::<18>();
+        for descriptor in descriptors {
+            if descriptor[..3] == [0, 0, 0] && matches!(descriptor[3], SERIAL | NAME) {
+                feed(&descriptor[3..4]);
+                feed(&descriptor[5..18]);
+            }
+        }
+        Some(Self(hash))
+    }
+
+    /// The hash, to derive the identity the guest is shown from.
+    pub fn hash(self) -> u64 {
+        self.0
+    }
+}
+
 /// The refresh of a scanout that reports none: 60 Hz, in millihertz.
 pub const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 
@@ -169,6 +221,12 @@ pub trait Scanout {
     /// `None` when unknown, and the model's EDID assumes a usual one
     /// (`dcp::modes::assumed_size_mm`).
     fn physical_size_mm(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// The identity of the monitor on the output this scanout shows on,
+    /// from its EDID; `None` when it has none, and the model's display is
+    /// then known by its size alone.
+    fn monitor(&self) -> Option<MonitorId> {
         None
     }
     /// Present one completed frame: `rows` are its pixels top to bottom, each

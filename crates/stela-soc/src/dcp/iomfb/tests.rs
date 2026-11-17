@@ -1,4 +1,4 @@
-use super::super::super::scanout::{Mode, PixelFormat};
+use super::super::super::scanout::{Mode, MonitorId, PixelFormat};
 use super::super::swap::tests::{fenced_submission, submission};
 use super::*;
 use crate::Result;
@@ -620,10 +620,57 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
     assert_eq!(
         published.to_string(),
         format!(
-            "DCP display published at 1920x1080, image 54x30 cm, as display {}",
+            "DCP display published at 1920x1080, image 54x30 cm, as display {} \
+             (identity from the size: no monitor EDID)",
             advertised.display_uuid()
         )
     );
+}
+
+#[test]
+fn each_scanouts_monitor_names_its_own_published_display() {
+    struct Known(Option<MonitorId>);
+    impl Scanout for Known {
+        fn mode(&self) -> Mode {
+            FULL_HD
+        }
+        fn monitor(&self) -> Option<MonitorId> {
+            self.0
+        }
+        fn present(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+    let monitor = |serial: u32| {
+        let mut edid = modes::edid(FULL_HD, 60_000).unwrap();
+        edid[12..16].copy_from_slice(&serial.to_le_bytes());
+        MonitorId::from_edid(&edid)
+    };
+    let mut seen = Vec::new();
+    for known in [monitor(5), monitor(6), None] {
+        let mut methods = Methods::new(Box::new(Known(known)), interface());
+        started(&mut methods);
+        let made = drain(&mut methods, &[1, 0, 0, 0]);
+        let uuid = published(&made)
+            .into_iter()
+            .find(|(key, _)| key == "IOMFBUUID")
+            .unwrap()
+            .1;
+        let expected = Advertised::of_monitor(FULL_HD, 60_000, None, known).unwrap();
+        assert_eq!(uuid, expected.uuid());
+        let logged = core::iter::from_fn(|| methods.take_log())
+            .find_map(|entry| match entry {
+                Log::Published {
+                    uuid, from_monitor, ..
+                } => Some((uuid, from_monitor)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(logged, (expected.display_uuid(), known.is_some()));
+        seen.push(uuid);
+    }
+    // Each output's monitor is its own display.
+    assert!(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2]);
 }
 
 /// The properties `made` published, as `(key, text)` in order, each

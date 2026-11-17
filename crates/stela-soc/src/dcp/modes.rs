@@ -46,7 +46,7 @@
 //! extension), its being preferred and the color's sRGB colorimetry (the EDID
 //! declares sRGB its default color space) are Inferred from the EDID the
 //! model serves.
-use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode};
+use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode, MonitorId};
 use crate::Result;
 use alloc::format;
 use alloc::string::String;
@@ -323,6 +323,17 @@ pub fn edid(mode: Mode, refresh: u32) -> Result<[u8; 128]> {
 /// [`edid`] for a monitor whose image is `size_mm` millimetres, as its own
 /// EDID reported, when known.
 pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<[u8; 128]> {
+    edid_of(mode, refresh, size_mm, None)
+}
+
+/// [`edid_sized`] for the monitor `monitor`, when its EDID is known: its
+/// identity goes into the product and serial ([`identity`]).
+fn edid_of(
+    mode: Mode,
+    refresh: u32,
+    size_mm: Option<(u32, u32)>,
+    monitor: Option<MonitorId>,
+) -> Result<[u8; 128]> {
     let size_mm = size_mm.unwrap_or_else(|| assumed_size_mm(mode.width, mode.height));
     let mut e = [0u8; 128];
     e[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
@@ -330,7 +341,7 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     // it is presented, week 1, year 2026.
     let man = ((b'S' as u16 - 64) << 10) | ((b'T' as u16 - 64) << 5) | (b'E' as u16 - 64);
     e[8..10].copy_from_slice(&man.to_be_bytes());
-    let (product, serial) = identity(mode, size_mm);
+    let (product, serial) = identity(mode, size_mm, monitor);
     e[10..12].copy_from_slice(&product.to_le_bytes());
     e[12..16].copy_from_slice(&serial.to_le_bytes());
     e[16] = 1;
@@ -360,10 +371,12 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     Ok(e)
 }
 
-/// The EDID product code and serial number of a monitor presented at
+/// The EDID product code and serial number of `monitor` presented at
 /// native `mode` with an image of `size_mm` millimetres: the same for the
-/// same presentation on every boot, whatever its refresh, and different
-/// for a different native size or image size.
+/// same monitor and presentation on every boot, whatever its refresh, and
+/// different for another monitor ([`MonitorId`]: its own EDID's identity,
+/// a serial alone included), a different native size or a different image
+/// size. Without the monitor's EDID the size alone decides.
 ///
 /// macOS keeps each display's chosen mode under its identity
 /// (`/Library/Preferences/com.apple.windowserver.displays.plist`, written
@@ -376,13 +389,24 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
 /// surface stretched over 3840 x 2160, instead of the larger display's
 /// default scaled mode. Serial 1 with product 1, the identity before this
 /// one, is never produced, so a mode saved under it is not restored either.
-fn identity(mode: Mode, (width_mm, height_mm): (u32, u32)) -> (u16, u32) {
+fn identity(
+    mode: Mode,
+    (width_mm, height_mm): (u32, u32),
+    monitor: Option<MonitorId>,
+) -> (u16, u32) {
     // FNV-1a, 64-bit.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for word in [mode.width, mode.height, width_mm, height_mm] {
-        for byte in word.to_le_bytes() {
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
+    };
+    for word in [mode.width, mode.height, width_mm, height_mm] {
+        feed(&word.to_le_bytes());
+    }
+    if let Some(monitor) = monitor {
+        feed(&[1]);
+        feed(&monitor.hash().to_le_bytes());
     }
     let product = (hash >> 48) as u16;
     let serial = hash as u32;
@@ -702,6 +726,9 @@ pub struct Advertised {
     /// The same size at the monitor's other rates: each one's refresh and
     /// timing record, IDs from [`OTHER_TIMING_IDS`] on.
     others: Vec<(u32, [u8; TIMING_BYTES])>,
+    /// The identity is the monitor's own EDID's with the size, not the
+    /// size alone.
+    from_monitor: bool,
 }
 
 impl Advertised {
@@ -726,16 +753,30 @@ impl Advertised {
     /// size at 60 Hz, as a monitor's base block often does for its fast
     /// modes, which it lists in an extension.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
+        Self::of_monitor(mode, refresh, size_mm, None)
+    }
+
+    /// [`Self::sized`] for `monitor`, the identity of the real monitor
+    /// the scanout shows on, when its EDID is known: the published product,
+    /// serial and UUID follow it as well as the size ([`identity`]).
+    pub fn of_monitor(
+        mode: Mode,
+        refresh: u32,
+        size_mm: Option<(u32, u32)>,
+        monitor: Option<MonitorId>,
+    ) -> Result<Self> {
+        let from_monitor = monitor.is_some();
         if fast(mode, refresh) {
             return Ok(Self {
-                edid: edid_sized(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm)?,
+                edid: edid_of(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm, monitor)?,
                 timing: timing_record(mode, refresh, size_mm)?,
                 color: color_data(),
                 refresh,
                 others: Vec::new(),
+                from_monitor,
             });
         }
-        let edid = edid_sized(mode, refresh, size_mm)?;
+        let edid = edid_of(mode, refresh, size_mm, monitor)?;
         let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
         Ok(Self {
             edid,
@@ -743,7 +784,14 @@ impl Advertised {
             color: color_data(),
             refresh,
             others: Vec::new(),
+            from_monitor,
         })
+    }
+
+    /// Whether the identity follows the monitor's own EDID
+    /// ([`Self::of_monitor`]) rather than the size alone.
+    pub fn from_monitor(&self) -> bool {
+        self.from_monitor
     }
 
     /// This mode also at each of `rates` (millihertz) other than its own
@@ -1526,6 +1574,77 @@ mod tests {
                 .unwrap()
                 .uuid()
         );
+    }
+
+    /// A real monitor's EDID base block: manufacturer, product, `serial`,
+    /// week and year, and a serial-number descriptor `text` and a name.
+    fn monitor_edid(serial: u32, text: &[u8]) -> [u8; 128] {
+        let mut e = [0u8; 128];
+        e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        e[8..12].copy_from_slice(&[0x10, 0xac, 0x34, 0x12]);
+        e[12..16].copy_from_slice(&serial.to_le_bytes());
+        e[16..18].copy_from_slice(&[12, 33]);
+        e[72 + 3] = 0xff;
+        e[72 + 5..72 + 5 + text.len()].copy_from_slice(text);
+        e[90 + 3] = 0xfc;
+        e[90 + 5..90 + 12].copy_from_slice(b"Monitor");
+        e
+    }
+
+    #[test]
+    fn a_monitors_own_edid_identity_reaches_the_published_identity() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let size = Some((699, 395));
+        let one = MonitorId::from_edid(&monitor_edid(7, b"AB01\n")).unwrap();
+        let shown =
+            |mode, refresh, monitor| Advertised::of_monitor(mode, refresh, size, monitor).unwrap();
+        let native = shown(uhd, 60_000, Some(one));
+        assert!(native.from_monitor());
+        // The same monitor on the same path: the same identity on every
+        // boot and at every refresh.
+        assert_eq!(shown(uhd, 60_000, Some(one)), native);
+        let fast = shown(uhd, 120_000, Some(one)).with_rates(&[120_000, 60_000], size);
+        assert_eq!(fast.uuid(), native.uuid());
+        assert_eq!(
+            product_and_serial(&fast.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        // Two monitors that differ only in their serial number, in the
+        // base block or in the serial descriptor, are two displays.
+        for other in [monitor_edid(8, b"AB01\n"), monitor_edid(7, b"AB02\n")] {
+            let other = MonitorId::from_edid(&other).unwrap();
+            assert_ne!(other, one);
+            assert_ne!(shown(uhd, 60_000, Some(other)).uuid(), native.uuid());
+        }
+        // The same monitor at another native size stays another display.
+        assert_ne!(shown(FULL_HD, 60_000, Some(one)).uuid(), native.uuid());
+        // Without its EDID the size alone decides, exactly as before, and
+        // that identity is not the monitor's.
+        let unknown = shown(uhd, 60_000, None);
+        assert!(!unknown.from_monitor());
+        assert_eq!(unknown, Advertised::sized(uhd, 60_000, size).unwrap());
+        assert_ne!(unknown.uuid(), native.uuid());
+        // What is not an EDID base block gives no identity.
+        let mut broken = monitor_edid(7, b"AB01\n");
+        broken[1] = 0;
+        assert_eq!(MonitorId::from_edid(&broken), None);
+        assert_eq!(MonitorId::from_edid(&monitor_edid(7, b"")[..127]), None);
+        // A bad checksum is tolerated: the identity bytes are read as they are.
+        let mut unsealed = monitor_edid(7, b"AB01\n");
+        unsealed[127] ^= 1;
+        assert_eq!(MonitorId::from_edid(&unsealed), Some(one));
+        // Bytes outside the identity fields do not change it.
+        let mut resized = monitor_edid(7, b"AB01\n");
+        resized[21] = 70;
+        assert_eq!(MonitorId::from_edid(&resized), Some(one));
+        // Printing the identity shows none of its fields.
+        assert_eq!(format!("{one:?}"), "MonitorId(..)");
+        // The published EDID stays well formed.
+        assert_eq!(native.edid.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0);
     }
 
     #[test]
