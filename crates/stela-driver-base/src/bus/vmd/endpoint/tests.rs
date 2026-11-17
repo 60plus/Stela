@@ -495,9 +495,24 @@ fn a_child_that_keeps_mastering_or_signalling_is_refused_and_the_host_poisoned()
             state.stuck = Some((offset, bits));
         }
         let (mut host, bar) = fixture(model);
+        // The refusal names the child, the register and what it still reads.
+        let (register, value) = if offset == NVME + 4 {
+            (
+                regs::COMMAND,
+                regs::COMMAND_INTX_DISABLE | regs::COMMAND_MASTER,
+            )
+        } else {
+            (0x82, 1)
+        };
         assert_eq!(
             Hierarchy::discover(&mut host, &bar, NVME_CLASS).err(),
-            Some(Error::UnstoppedChild(2, 0, 0))
+            Some(Error::UnstoppedChild {
+                bus: 2,
+                device: 0,
+                function: 0,
+                register,
+                value,
+            })
         );
         assert_eq!(
             Hierarchy::discover(&mut host, &bar, NVME_CLASS).err(),

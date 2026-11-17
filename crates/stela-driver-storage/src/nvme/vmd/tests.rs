@@ -576,7 +576,6 @@ fn every_hierarchy_refusal_names_its_own_cause() {
         Error::Suspended,
         Error::Quarantined,
         Error::ActiveChild,
-        Error::UnstoppedChild(1, 2, 3),
     ];
     let mut messages: Vec<_> = errors
         .into_iter()
@@ -588,6 +587,24 @@ fn every_hierarchy_refusal_names_its_own_cause() {
     messages.sort_unstable();
     messages.dedup();
     assert_eq!(messages.len(), errors.len());
+}
+
+/// A child that could not be stopped keeps its location, the register and
+/// the value read in the refusal the screen and the boot log show.
+#[test]
+fn an_unstopped_child_refusal_names_the_child_the_register_and_its_value() {
+    let refusal = block(Error::UnstoppedChild {
+        bus: 0xe1,
+        device: 0,
+        function: 0,
+        register: 0x52,
+        value: 0x8001,
+    });
+    assert_eq!(
+        alloc::format!("{refusal}"),
+        "VMD: child e1:00.0 behind VMD kept DMA or interrupts on after a stop: its register \
+         0x52 still reads 0x8001"
+    );
 }
 
 /// One of two controllers' view of the shared configuration model: its own

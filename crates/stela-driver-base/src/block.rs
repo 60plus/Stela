@@ -61,6 +61,9 @@ pub enum BlockError {
     Config(crate::bus::pci::ConfigError),
     PciCapability(crate::bus::pci::CapabilityError),
     PciPower(crate::bus::pci::power::Error),
+    /// A VMD hierarchy refusal whose detail the report keeps, as a child
+    /// that could not be stopped: its location, register and value.
+    Vmd(crate::bus::vmd::Error),
     /// The device needs something these drivers do not implement.
     Unsupported(&'static str),
     /// `error`, met at this named step of a device's start: the command
@@ -280,6 +283,7 @@ impl fmt::Display for BlockError {
             Self::Config(error) => write!(f, "PCI configuration: {error}"),
             Self::PciCapability(error) => write!(f, "PCI capability: {error}"),
             Self::PciPower(error) => write!(f, "PCI power/timing: {error}"),
+            Self::Vmd(error) => write!(f, "VMD: {error}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Step { step, error } => write!(f, "{step}: {error}"),
             Self::Expired(expired) => expired.fmt(f),

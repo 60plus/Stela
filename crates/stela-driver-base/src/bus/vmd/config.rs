@@ -90,17 +90,23 @@ impl<R: Registers> Host<R> {
                 .then_some(value)
                 .ok_or(Error::ReadFailed)
         };
-        let unstopped = Error::UnstoppedChild(child.bus, child.device, child.function);
+        let unstopped = |register: u16, value: u16| Error::UnstoppedChild {
+            bus: child.bus,
+            device: child.device,
+            function: child.function,
+            register,
+            value,
+        };
         let result = (|| {
             let command = word(&mut config, regs::COMMAND)?;
             let stopped = command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE;
             if command != stopped {
                 config.write(regs::COMMAND, 2, u32::from(stopped))?;
-                if word(&mut config, regs::COMMAND)?
-                    & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
+                let observed = word(&mut config, regs::COMMAND)?;
+                if observed & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
                     != regs::COMMAND_INTX_DISABLE
                 {
-                    return Err(unstopped);
+                    return Err(unstopped(regs::COMMAND, observed));
                 }
             }
             let entries = Capabilities::new(Transport(|offset, bytes| config.read(offset, bytes)))
@@ -126,14 +132,15 @@ impl<R: Registers> Host<R> {
                 let control = word(&mut config, entry.offset + relative)?;
                 if control & enable != 0 {
                     config.write(entry.offset + relative, 2, u32::from(control & !clear))?;
-                    if word(&mut config, entry.offset + relative)? & enable != 0 {
-                        return Err(unstopped);
+                    let observed = word(&mut config, entry.offset + relative)?;
+                    if observed & enable != 0 {
+                        return Err(unstopped(entry.offset + relative, observed));
                     }
                 }
             }
             Ok(())
         })();
-        if result == Err(unstopped) {
+        if matches!(result, Err(Error::UnstoppedChild { .. })) {
             self.poisoned = true;
         }
         result

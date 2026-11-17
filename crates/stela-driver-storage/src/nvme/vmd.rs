@@ -48,9 +48,8 @@ pub fn block(error: Error) -> BlockError {
         Error::Readback => Protocol("VMD hierarchy register did not read back as written"),
         Error::Mapping => Protocol("VMD hierarchy register window not mapped"),
         Error::Quarantined => Protocol("VMD hierarchy quarantined after a fault"),
-        Error::UnstoppedChild(..) => {
-            Protocol("a child behind VMD kept DMA or interrupts on after a stop")
-        }
+        // Kept whole: which child, which register and what it still reads.
+        Error::UnstoppedChild { .. } => BlockError::Vmd(error),
         Error::UnsupportedDevice => {
             Unsupported("VMD endpoint or a function on its path is not one this driver takes")
         }
