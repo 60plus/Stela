@@ -468,8 +468,9 @@ impl Service {
             {
                 output::arguments(format_args!("{line}\n"));
             }
-            if let Some(network) = network.as_mut() {
-                network.report();
+            match network.as_mut() {
+                Some(network) => network.report(),
+                None => network::report_absent(),
             }
             power.disks().report(*tsc_hz);
             *reported = stamp;

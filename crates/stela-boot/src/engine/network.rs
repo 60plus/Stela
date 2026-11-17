@@ -742,6 +742,52 @@ pub struct GuestNetwork {
 /// nothing: one a minute at the ten-second report.
 const SILENT_REPORTS: u32 = 6;
 
+/// Why the guest has no network adapter, with what each host adapter is
+/// and why it is not the guest's ([`guest_absent`]), and the reports since
+/// the line was last logged ([`report_absent`]).
+static ABSENT: output::Global<Option<(String, u32)>> = output::Global(RefCell::new(None));
+
+/// One host adapter's part of the guest-less line: `what` it is (its
+/// location and chip, or the probe's own line for one that did not start)
+/// and its `state`.
+pub(super) fn adapter_account(what: &str, state: &str) -> String {
+    format!("{what} ({state})")
+}
+
+/// Keep, for [`report_absent`], that the guest has no network adapter:
+/// `why` (the refusal, or that the guest network is off) and the host's
+/// adapters as [`adapter_account`] gives them.
+pub(super) fn guest_absent(why: &str, adapters: &[String]) {
+    let adapters = match adapters.is_empty() {
+        true => String::from("none found"),
+        false => adapters.join("; "),
+    };
+    let line = guest_absent_line(why, &adapters);
+    if let Ok(mut absent) = ABSENT.0.try_borrow_mut() {
+        *absent = Some((line, 0));
+    }
+}
+
+fn guest_absent_line(why: &str, adapters: &str) -> String {
+    format!("GUEST NETWORK none: {why}; host adapters: {adapters}\n")
+}
+
+/// The beat report's line for a guest without a network adapter, once a
+/// minute: a log that kept no early lines still says why macOS has no
+/// network and what the host's adapters were, where it said nothing after
+/// the start.
+pub(super) fn report_absent() {
+    let Ok(mut absent) = ABSENT.0.try_borrow_mut() else {
+        return;
+    };
+    if let Some((line, reports)) = absent.as_mut() {
+        if reports.is_multiple_of(SILENT_REPORTS) {
+            output::arguments(format_args!("{line}"));
+        }
+        *reports = reports.wrapping_add(1);
+    }
+}
+
 /// How often the host adapter's carrier is looked at for the guest's link.
 const CARRIER_MILLIS: u64 = 100;
 
