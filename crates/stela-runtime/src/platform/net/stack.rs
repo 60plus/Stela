@@ -575,10 +575,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
 
     fn lookup(&mut self, lookup: &mut Lookup, now: u64) -> Result<Option<IpAddress>, NetError> {
         let Some((query, kind)) = lookup.query else {
-            let kind = if !lookup.ipv4_only && self.ipv6_ready() {
+            // IPv6 first where it reaches the internet; from a unique local
+            // address alone only when there is no IPv4 at all.
+            let kind = if !lookup.ipv4_only && self.ipv6_global_ready() {
                 DnsQueryType::Aaaa
             } else if self.config.is_some() {
                 DnsQueryType::A
+            } else if !lookup.ipv4_only && self.ipv6_ready() {
+                DnsQueryType::Aaaa
             } else if now >= lookup.deadline {
                 return Err(NetError::Dns(alloc::format!(
                     "{}: no reachable address family",
