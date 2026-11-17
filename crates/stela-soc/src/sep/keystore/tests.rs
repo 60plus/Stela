@@ -446,6 +446,25 @@ fn unsupported_system_metadata_is_sanitized_and_keeps_failure_semantics() {
     assert!(!diagnostics[0].contains("DO-NOT-LOG"));
     assert!(!diagnostics[0].contains("1311768467463790320")); // session
     assert_eq!(keystore.diagnostics().count(), 0);
+    // A parameter the model does not know is shown by its shape: the
+    // name's length and the value's DER tag and length, so the request a
+    // refusal names can be told from another, with no byte of either.
+    let query = b"\x31\x19\x30\x0b\x0c\x03zzq\x04\x04SECR\x30\x0a\x0c\x01o\x0c\x05oskgp";
+    let request = system_request_with_operation(2, 0, query);
+    let (reply, _) = ask(
+        &mut keystore,
+        frame(system_key::PERFORM_OPERATION, 22, request.len()),
+        request,
+    );
+    assert!(reply.is_err());
+    let diagnostics = keystore.diagnostics().collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0].contains("keys=?3:4/4,o parsed=true"),
+        "{}",
+        diagnostics[0]
+    );
+    assert!(!diagnostics[0].contains("zzq") && !diagnostics[0].contains("SECR"));
 }
 
 #[test]

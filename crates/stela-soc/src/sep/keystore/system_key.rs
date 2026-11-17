@@ -382,8 +382,9 @@ struct ParameterDiagnostic {
     generation: Option<u32>,
     reference_key_class: Option<u32>,
     reference_key_options: Option<u32>,
-    /// Allowlisted key names in arrival order, `?` for any other key: the
-    /// encoder's pair order, which the strict parser requires ascending.
+    /// Allowlisted key names in arrival order: the encoder's pair order,
+    /// which the strict parser requires ascending. Any other key is `?`
+    /// with its name's length and its value's DER tag and length.
     keys: String,
 }
 
@@ -420,17 +421,28 @@ impl ParameterDiagnostic {
             if !result.keys.is_empty() {
                 result.keys.push(',');
             }
-            result.keys.push_str(match key {
-                b"o" => "o",
-                b"skt" => "skt",
-                b"kt" => "kt",
-                b"skg" => "skg",
-                b"bc" => "bc",
-                b"rko" => "rko",
-                b"rk" => "rk",
-                b"d" => "d",
-                _ => "?",
-            });
+            match key {
+                b"o" => result.keys.push('o'),
+                b"skt" => result.keys.push_str("skt"),
+                b"kt" => result.keys.push_str("kt"),
+                b"skg" => result.keys.push_str("skg"),
+                b"bc" => result.keys.push_str("bc"),
+                b"rko" => result.keys.push_str("rko"),
+                b"rk" => result.keys.push_str("rk"),
+                b"d" => result.keys.push('d'),
+                // Its shape only: the name's length and the value's DER tag
+                // and length, which tell the parameters of a refused
+                // request apart without a byte of either.
+                _ => {
+                    let value = Cursor(entry.0).next_element()?;
+                    result.keys.push_str(&format!(
+                        "?{}:{}/{}",
+                        key.len(),
+                        value.tag,
+                        value.value.len()
+                    ));
+                }
+            }
             match key {
                 b"o" => {
                     if has_operation {
