@@ -1008,6 +1008,7 @@ pub(crate) mod tests {
         let mut bytes = vec![0u8; disk_bytes as usize];
         let table = Table {
             disk_guid: Guid([7; 16]),
+            slots: Default::default(),
             partitions: vec![Partition {
                 type_guid: "0FC63DAF-8483-4772-8E79-3D69D8477DE4".parse().unwrap(),
                 unique_guid: GUID.parse().unwrap(),
@@ -1285,6 +1286,7 @@ pub(crate) mod tests {
         let mut first = 2048u64;
         let mut table = Table {
             disk_guid: Guid([9; 16]),
+            slots: Default::default(),
             partitions: Vec::new(),
         };
         let mut writes = Vec::new();
