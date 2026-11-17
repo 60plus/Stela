@@ -130,6 +130,13 @@ impl RootLink {
         Some(self.send(frame))
     }
 
+    /// [`Link::carrier`] for a service turn, as [`Self::transmit_now`].
+    fn carrier_now(&mut self) -> Option<bool> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.carrier())
+    }
+
     /// The adapter's own state line (`Link::diagnostic`) for a service
     /// turn, as [`Self::transmit_now`]: `None` while another processor is
     /// inside the host drivers.
@@ -664,11 +671,19 @@ pub struct GuestNetwork {
     /// Reports since the host adapter's state was last logged for a guest
     /// that sends and receives nothing ([`Self::report`]).
     silent_reports: u32,
+    /// The host adapter's carrier when last looked at, `None` before the
+    /// first look ([`Self::carrier`]).
+    carrier: Option<bool>,
+    /// When the carrier was last looked at (`output::now`).
+    carrier_checked: u64,
 }
 
 /// Reports between two host adapter state lines while the guest receives
 /// nothing: one a minute at the ten-second report.
 const SILENT_REPORTS: u32 = 6;
+
+/// How often the host adapter's carrier is looked at for the guest's link.
+const CARRIER_MILLIS: u64 = 100;
 
 /// The APIC ID of the core the guest network's receive signal goes to once
 /// the guest's link is up ([`set_receive_core`]); none past 254.
@@ -713,11 +728,37 @@ impl GuestNetwork {
             unsent: alloc::collections::VecDeque::new(),
             retargeted: false,
             silent_reports: 0,
+            carrier: None,
+            carrier_checked: 0,
         })
     }
 
     pub fn mac(&self) -> Mac {
         self.link.mac()
+    }
+
+    /// The host adapter's carrier, looked at once per [`CARRIER_MILLIS`],
+    /// for the guest adapter's link (`AppleDevices::network_carrier`):
+    /// macOS sees a host link without carrier as an unplugged cable, and
+    /// asks for an address again when it comes up. Each change is logged,
+    /// so a log tells a host link that never came up from one whose frames
+    /// went missing. `None` between looks, or while another processor is
+    /// inside the host drivers.
+    pub fn carrier(&mut self) -> Option<bool> {
+        if self.carrier.is_some() && output::millis_since(self.carrier_checked) < CARRIER_MILLIS
+        {
+            return None;
+        }
+        let carrier = self.link.carrier_now()?;
+        self.carrier_checked = output::now();
+        if self.carrier.replace(carrier) != Some(carrier) {
+            output::arguments(format_args!(
+                "GUEST NETWORK host adapter {} link {}\n",
+                self.link.device.location(),
+                if carrier { "up" } else { "down" }
+            ));
+        }
+        Some(carrier)
     }
 
     /// Report the guest's link state as `status` gives it.
@@ -762,9 +803,14 @@ impl GuestNetwork {
     pub fn report(&mut self) {
         let counters = self.counters;
         output::arguments(format_args!(
-            "GUEST NETWORK frames link={} to_host={} to_guest={} drops={} oversized={} \
-             filtered={} overflowed={} malformed={}\n",
+            "GUEST NETWORK frames link={} host_link={} to_host={} to_guest={} drops={} \
+             oversized={} filtered={} overflowed={} malformed={}\n",
             match self.up {
+                Some(true) => "up",
+                Some(false) => "down",
+                None => "unknown",
+            },
+            match self.carrier {
                 Some(true) => "up",
                 Some(false) => "down",
                 None => "unknown",
@@ -847,7 +893,9 @@ impl GuestNetwork {
     /// storage. A full host ring keeps that frame and the ones after it for
     /// the next turn, as Linux requeues a `NETDEV_TX_BUSY` frame, and so
     /// does another processor inside the host drivers, whose lock a turn
-    /// does not wait for.
+    /// does not wait for. A frame sent while the host link has no carrier
+    /// is dropped, as a NIC without a cable drops it: the guest sees the
+    /// link down ([`Self::carrier`]), and that is no refusal.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
         self.unsent.extend(frames);
         let mut reusable = None;
@@ -855,6 +903,7 @@ impl GuestNetwork {
             match self.link.transmit_now(frame) {
                 Some(Ok(())) => {}
                 None | Some(Err(LinkError::Busy)) => break,
+                Some(Err(LinkError::NoCarrier)) => {}
                 Some(Err(error)) => self.refuse(error.into()),
             }
             reusable = self.unsent.pop_front();
