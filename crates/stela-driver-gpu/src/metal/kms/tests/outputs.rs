@@ -360,3 +360,20 @@ fn a_wide_panel_whose_native_size_cannot_be_told_runs_the_largest_of_its_shape()
     assert!(same_shape((1366, 768), (1920, 1080)));
     assert!(!same_shape((2560, 1440), (5120, 1440)));
 }
+
+/// The outputs shown are named as Linux names them, the pacing one first,
+/// and a laptop's built-in panel is told apart.
+#[test]
+fn the_outputs_shown_are_named_and_a_built_in_panel_is_known() {
+    let mut card = two_monitors();
+    // An eDP panel on the first connector, HDMI on the second.
+    card.ports = [(14, 1), (11, 1)];
+    let display = Display::take(&mut card, (6, 4)).unwrap();
+    let ports: Vec<_> = display.ports().collect();
+    let names: Vec<_> = ports.iter().map(|port| alloc::format!("{port}")).collect();
+    assert_eq!(names, ["eDP-1", "HDMI-A-1"]);
+    assert_eq!(
+        ports.iter().map(|port| port.panel()).collect::<Vec<_>>(),
+        [true, false]
+    );
+}

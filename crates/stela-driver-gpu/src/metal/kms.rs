@@ -328,6 +328,8 @@ struct Buffer {
 struct Head {
     crtc: u32,
     connector: u32,
+    /// The connector's kind and number among its kind.
+    port: Port,
     /// The encoder counted as this head's: one of its connector's, which no
     /// other head is given ([`free_encoder`]).
     encoder: u32,
@@ -551,7 +553,26 @@ pub struct Seen {
     pub encoders: usize,
 }
 
-impl core::fmt::Display for Seen {
+/// A connector's kind (`DRM_MODE_CONNECTOR_*`) and its number among its
+/// kind, shown as Linux names it, as `eDP-1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Port {
+    kind: u32,
+    index: u32,
+}
+
+/// `DRM_MODE_CONNECTOR_LVDS`, `_eDP` and `_DSI`: a built-in panel.
+const PANELS: [u32; 3] = [7, 14, 16];
+
+impl Port {
+    /// A laptop's built-in panel, whose backlight its firmware or driver
+    /// controls apart from the picture.
+    pub fn panel(self) -> bool {
+        PANELS.contains(&self.kind)
+    }
+}
+
+impl core::fmt::Display for Port {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Linux's `drm_connector_enum_list` names.
         const KINDS: [&str; 21] = [
@@ -578,14 +599,24 @@ impl core::fmt::Display for Seen {
             "USB",
         ];
         let kind = KINDS.get(self.kind as usize).copied().unwrap_or(KINDS[0]);
+        write!(f, "{kind}-{}", self.index)
+    }
+}
+
+impl core::fmt::Display for Seen {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let port = Port {
+            kind: self.kind,
+            index: self.index,
+        };
         let state = match self.connected {
             true => "connected",
             false => "not connected",
         };
         write!(
             f,
-            "{kind}-{} {state} modes={} encoders={}",
-            self.index, self.modes, self.encoders
+            "{port} {state} modes={} encoders={}",
+            self.modes, self.encoders
         )
     }
 }
@@ -1219,6 +1250,10 @@ impl<D: Drm> Display<D> {
                 Some((mode, scaling)) => heads.push(Head {
                     crtc,
                     connector: id,
+                    port: Port {
+                        kind: found.kind,
+                        index: found.index,
+                    },
                     encoder,
                     mode,
                     scaling,
@@ -1589,6 +1624,10 @@ impl<D: Drm> Display<D> {
         self.heads.push(Head {
             crtc,
             connector: id,
+            port: Port {
+                kind: found.kind,
+                index: found.index,
+            },
             encoder,
             mode,
             scaling,
@@ -1628,6 +1667,11 @@ impl<D: Drm> Display<D> {
     /// How many outputs show the picture.
     pub fn outputs(&self) -> usize {
         self.heads.len()
+    }
+
+    /// The connectors that show the picture, the one that paces it first.
+    pub fn ports(&self) -> impl Iterator<Item = Port> + '_ {
+        self.heads.iter().map(|head| head.port)
     }
 
     /// The outputs that show the picture scaled into their native mode.

@@ -294,6 +294,7 @@ impl KmsScanout {
             ) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
+                    report_ports(name, &display);
                     report_outputs(name, &display);
                     let screen = screen(&display);
                     match self.presented {
@@ -378,6 +379,22 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
             ));
         }
     }
+}
+
+/// The connectors `display` shows on, the one that paces it first, which
+/// tells a laptop panel on this GPU (eDP) from an external monitor.
+fn report_ports(name: &str, display: &Display<Node>) {
+    let mut ports = String::new();
+    for port in display.ports() {
+        if !ports.is_empty() {
+            ports.push_str(", ");
+        }
+        let _ = core::fmt::write(&mut ports, format_args!("{port}"));
+        if port.panel() {
+            ports.push_str(" (built-in panel)");
+        }
+    }
+    output::arguments(format_args!("GPU {name}: display shows on {ports}\n"));
 }
 
 /// How many outputs show `display` and how many connected ones cannot,
@@ -540,6 +557,7 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                report_ports(name, &display);
                 // A GPU that serves no Metal device shows what another
                 // draws: the display is wired to it (a laptop's panel on its
                 // integrated GPU), and each frame is copied into its buffer.

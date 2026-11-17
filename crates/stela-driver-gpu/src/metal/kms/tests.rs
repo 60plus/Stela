@@ -56,6 +56,8 @@ struct Card {
     /// Both connectors are a DisplayPort hub's outputs (MST): each lists
     /// encoders 62 and 63, one a controller, each reaching both.
     mst: bool,
+    /// Connector 50's and 51's kind and number among their kind.
+    ports: [(u32, u32); 2],
     /// The connector the driver read back as lit, with a current encoder.
     lit: u32,
     /// Controller 40's mode and framebuffer, its flips, and the requests to
@@ -121,6 +123,7 @@ impl Card {
             first_crtcs: 0b11,
             shared_encoder: false,
             mst: false,
+            ports: [(0, 0); 2],
             lit: 0,
             set_40: None,
             flips_40: Vec::new(),
@@ -201,6 +204,8 @@ unsafe impl Drm for &mut Card {
                         _ => (self.connected, &self.modes, 60),
                     };
                     connector.connection = if connected { CONNECTED } else { 2 };
+                    let port = self.ports.get(connector.id.wrapping_sub(50) as usize);
+                    (connector.kind, connector.kind_id) = port.copied().unwrap_or_default();
                     connector.encoder = if connector.id == self.lit { encoder } else { 0 };
                     let modes: &[ModeInfo] = if connected { listed } else { &[] };
                     self.probes += u32::from(connector.mode_count == 0);
