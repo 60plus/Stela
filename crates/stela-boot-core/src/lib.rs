@@ -43,6 +43,7 @@ pub mod firmware_screen;
 pub mod firmware_state;
 pub mod firmware_time;
 pub mod first_stop;
+pub mod gpu_loss;
 pub mod gpu_requests;
 pub mod gpu_status;
 pub mod guarded_stacks;
