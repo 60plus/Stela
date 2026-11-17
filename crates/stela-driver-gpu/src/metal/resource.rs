@@ -301,14 +301,16 @@ pub fn texture(capabilities: &Capabilities, descriptor: &TextureDescriptor) -> R
             ));
         }
         StorageMode::Managed => CpuAccess::Staged,
-        StorageMode::Shared if descriptor.sample_count > 1 => {
-            return Err(super::error::Error::Unsupported(
-                "shared storage of multisample textures",
-            ));
+        // Metal copies no multisample texture's texels to or from the CPU
+        // (replaceRegion and getBytes take one sample), and no CPU call
+        // reaches a combined depth-stencil texture's: blits copy each
+        // aspect. Both are device images whose CPU copies answer
+        // Unsupported.
+        StorageMode::Shared
+            if descriptor.sample_count > 1 || matches!(description.kind, Kind::DepthStencil) =>
+        {
+            CpuAccess::None
         }
-        // No CPU call reaches a combined depth-stencil texture's texels:
-        // blits copy each aspect.
-        StorageMode::Shared if matches!(description.kind, Kind::DepthStencil) => CpuAccess::None,
         StorageMode::Shared if !description.encoding().is_exact() => {
             return Err(super::error::Error::Unsupported(
                 "shared storage of an extended-range format without host image copy",

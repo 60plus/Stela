@@ -194,12 +194,13 @@ fn shape_rules_follow_metal() {
     let mut shared = descriptor(TextureType::D2, PixelFormat::Rgba8Unorm);
     shared.options.storage_mode = StorageMode::Shared;
     assert!(texture(&capabilities, &shared).is_ok());
+    // Multisample too, with no CPU copies (Metal copies no samples).
     shared.texture_type = TextureType::D2Multisample;
     shared.sample_count = 4;
-    assert!(matches!(
-        texture(&capabilities, &shared),
-        Err(Error::Unsupported(_))
-    ));
+    assert_eq!(
+        texture(&capabilities, &shared).unwrap().cpu_access,
+        CpuAccess::None
+    );
 
     let mut huge = descriptor(TextureType::D2, PixelFormat::Rgba8Unorm);
     huge.width = 65536;
@@ -412,11 +413,14 @@ fn shared_textures_without_host_image_copy_are_made() {
             .cpu_access,
         CpuAccess::None
     );
-    // Multisample textures stay private.
-    assert!(matches!(
-        plan(PixelFormat::Depth32Float, 4),
-        Err(Error::Unsupported(_))
-    ));
+    // Nor does any CPU call reach a multisample texture's, as Chess's
+    // shared 4x Depth32Float attachment and a shared multisample color
+    // target are made.
+    for format in [PixelFormat::Depth32Float, PixelFormat::Rgba8Unorm] {
+        let made = plan(format, 4).unwrap();
+        assert_eq!(made.cpu_access, CpuAccess::None, "{format:?}");
+        assert!(!made.image.usage.contains(ImageUsage::HOST_TRANSFER));
+    }
 }
 
 #[test]
