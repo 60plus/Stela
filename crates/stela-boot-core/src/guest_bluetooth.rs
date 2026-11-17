@@ -3,7 +3,15 @@
 //! bluetoothd never configures the guest's USB one and Setup waits for it;
 //! without one, because there is nothing to lend and no built-in controller.
 //! Either way bluetoothd's chip boot fails, it exits and launchd starts it
-//! again about every 10 s (its KeepAlive restarts a failed exit).
+//! again about every 12 s (its KeepAlive restarts a failed exit).
+//!
+//! Setup's first screen (Language Chooser) asks bluetoothd for the paired
+//! devices on its main thread before it draws, with its black background
+//! windows already up, and each such call ends only when bluetoothd next
+//! exits. The screen is black with a pointer for that long: about 25 s on
+//! a later boot and one to two minutes on the first boot after an install,
+//! which makes more calls. The line says so, as a log of that black screen
+//! shows nothing else of it.
 
 /// The line for a boot that gives macOS host input, by whether the host
 /// lends a Bluetooth controller; `None` for a boot without host input.
@@ -17,7 +25,8 @@ pub fn unsupported_line(host_controller: bool, input: bool) -> Option<&'static s
     } else {
         "BLUETOOTH UNSUPPORTED the guest gets no controller: this computer has none to \
          lend and Stela has no built-in one, so macOS's Bluetooth daemon restarts about \
-         every 10 s\n"
+         every 12 s and Setup's first screen stays black, with a pointer, for up to about \
+         two minutes while it waits for that daemon\n"
     })
 }
 
@@ -30,6 +39,7 @@ mod tests {
         let line = unsupported_line(false, true).expect("reported");
         assert!(line.starts_with("BLUETOOTH UNSUPPORTED the guest gets no controller: "));
         assert!(line.contains("Bluetooth daemon restarts"));
+        assert!(line.contains("Setup's first screen stays black, with a pointer"));
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
     }
 
