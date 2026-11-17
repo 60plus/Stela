@@ -325,11 +325,13 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     let size_mm = size_mm.unwrap_or_else(|| assumed_size_mm(mode.width, mode.height));
     let mut e = [0u8; 128];
     e[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
-    // Manufacturer "STE" (Stela), product 1, serial 1, week 1, year 2026.
+    // Manufacturer "STE" (Stela), the product and serial of the monitor as
+    // it is presented, week 1, year 2026.
     let man = ((b'S' as u16 - 64) << 10) | ((b'T' as u16 - 64) << 5) | (b'E' as u16 - 64);
     e[8..10].copy_from_slice(&man.to_be_bytes());
-    e[10..12].copy_from_slice(&1u16.to_le_bytes());
-    e[12..16].copy_from_slice(&1u32.to_le_bytes());
+    let (product, serial) = identity(mode, size_mm);
+    e[10..12].copy_from_slice(&product.to_le_bytes());
+    e[12..16].copy_from_slice(&serial.to_le_bytes());
     e[16] = 1;
     e[17] = 2026u16.wrapping_sub(1990) as u8;
     e[18] = 1; // EDID 1.4
@@ -355,6 +357,38 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     let sum = e[0..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
     e[127] = 0u8.wrapping_sub(sum);
     Ok(e)
+}
+
+/// The EDID product code and serial number of a monitor presented at
+/// native `mode` with an image of `size_mm` millimetres: the same for the
+/// same presentation on every boot, whatever its refresh, and different
+/// for a different native size or image size.
+///
+/// macOS keeps each display's chosen mode under its identity
+/// (`/Library/Preferences/com.apple.windowserver.displays.plist`, written
+/// by SkyLight's `CAWSPersistence.mm`: a config's `UUID` and its
+/// `CurrentInfo` `Wide`/`High`/`Scale`) and restores that mode when a display
+/// of that identity offers it again. One fixed identity made a monitor run
+/// at a smaller native size (the firmware framebuffer's 1920 x 1080 on a 4K
+/// panel) and the same monitor at its own native size one display to
+/// macOS, which then restored the small size's 1x mode, a 1920 x 1080
+/// surface stretched over 3840 x 2160, instead of the larger display's
+/// default scaled mode. Serial 1 with product 1, the identity before this
+/// one, is never produced, so a mode saved under it is not restored either.
+fn identity(mode: Mode, (width_mm, height_mm): (u32, u32)) -> (u16, u32) {
+    // FNV-1a, 64-bit.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for word in [mode.width, mode.height, width_mm, height_mm] {
+        for byte in word.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let product = (hash >> 48) as u16;
+    let serial = hash as u32;
+    (
+        if product <= 1 { product + 2 } else { product },
+        serial.max(2),
+    )
 }
 
 fn put(data: &mut [u8], at: usize, value: u32) {
@@ -557,8 +591,6 @@ const COLOR_SCORE: u32 = (200 + 40 + 2) * 1000 + 999;
 
 /// The manufacturer the EDID encodes.
 const MANUFACTURER: &str = "STE";
-/// `IOMFBUUID`: one fixed monitor, so its settings persist across boots.
-const UUID: &str = "53544c41-0001-4000-8000-000000000001";
 
 /// An OSUnserializeXML document under construction.
 struct Xml(String);
@@ -827,10 +859,19 @@ impl Advertised {
         xml.0
     }
 
-    /// The display's fixed identity across boots, as a plist string.
-    pub fn uuid() -> String {
+    /// `IOMFBUUID`, the display's identity as a plist string: its EDID
+    /// product and serial ([`identity`]), so the same monitor presented the
+    /// same way keeps its settings across boots and a different
+    /// presentation is a different display.
+    pub fn uuid(&self) -> String {
+        let e = &self.edid;
+        let product = u16::from_le_bytes([e[10], e[11]]);
+        let serial = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
         let mut xml = Xml(String::new());
-        let _ = write!(xml.0, "<string>{UUID}</string>");
+        let _ = write!(
+            xml.0,
+            "<string>53544c41-{product:04x}-4000-8000-0000{serial:08x}</string>"
+        );
         xml.0
     }
 
@@ -1369,6 +1410,11 @@ mod tests {
             (qhd, None, 1),
             (FULL_HD, None, 1),
             (uhd, None, 2),
+            // A 27" 4K monitor (EDID 699 x 395 mm) at its native size, and
+            // at the firmware framebuffer's 1920 x 1080 when it hangs off
+            // another display adapter.
+            (uhd, Some((699, 395)), 2),
+            (FULL_HD, Some((699, 395)), 1),
         ] {
             let a = Advertised::sized(mode, 60_000, size).unwrap();
             let attributes = a.display_attributes();
@@ -1413,6 +1459,67 @@ mod tests {
             // them depends on when they are asked.
             assert_eq!(Advertised::sized(mode, 60_000, size).unwrap(), a);
         }
+    }
+
+    fn product_and_serial(xml: &str) -> (u64, u64) {
+        (integer(xml, "ProductID"), integer(xml, "SerialNumber"))
+    }
+
+    #[test]
+    fn a_monitor_at_another_native_size_is_another_display_to_macos() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let size = Some((699, 395));
+        // The same 4K monitor shown through the firmware framebuffer at
+        // 1920 x 1080 and on its own GPU output at 3840 x 2160: macOS must
+        // not restore the first one's 1x 1920 x 1080 on the second.
+        let copied = Advertised::sized(FULL_HD, 60_000, size).unwrap();
+        let native = Advertised::sized(uhd, 60_000, size).unwrap();
+        assert_ne!(copied.uuid(), native.uuid());
+        assert_ne!(
+            product_and_serial(&copied.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        // Another image size at the same resolution is another monitor.
+        let smaller = Advertised::sized(uhd, 60_000, Some((597, 336))).unwrap();
+        assert_ne!(smaller.uuid(), native.uuid());
+        // The identity before this one is never given again.
+        let old = "<string>53544c41-0001-4000-8000-000000000001</string>";
+        for a in [&copied, &native, &smaller] {
+            assert_ne!(a.uuid(), old);
+            let (product, serial) = product_and_serial(&a.display_attributes());
+            assert!(product > 1 && serial > 1);
+            // The UUID names the EDID's product and serial.
+            assert_eq!(
+                a.uuid(),
+                format!("<string>53544c41-{product:04x}-4000-8000-0000{serial:08x}</string>")
+            );
+            assert_eq!(a.edid.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0);
+        }
+        // The same presentation keeps its identity, whatever its refresh, so
+        // a mode chosen for it is kept across boots and rate changes.
+        let fast = Advertised::sized(uhd, 120_000, size)
+            .unwrap()
+            .with_rates(&[120_000, 60_000], size);
+        assert_eq!(fast.uuid(), native.uuid());
+        assert_eq!(
+            product_and_serial(&fast.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        assert_eq!(
+            Advertised::sized(uhd, 60_000, size).unwrap().uuid(),
+            native.uuid()
+        );
+        // An unreported size is the assumed one, consistently.
+        assert_eq!(
+            Advertised::sized(uhd, 60_000, None).unwrap().uuid(),
+            Advertised::sized(uhd, 60_000, Some(assumed_size_mm(3840, 2160)))
+                .unwrap()
+                .uuid()
+        );
     }
 
     #[test]

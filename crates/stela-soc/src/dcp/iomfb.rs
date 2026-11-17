@@ -1822,7 +1822,7 @@ impl Methods {
             ("ColorElements", advertised.color_elements()),
             ("DisplayAttributes", advertised.display_attributes()),
             ("Transport", Advertised::transport()),
-            ("IOMFBUUID", Advertised::uuid()),
+            ("IOMFBUUID", advertised.uuid()),
         ];
         for (key, xml) in properties {
             self.publish_property(key, xml)?;

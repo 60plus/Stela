@@ -586,6 +586,10 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
                 if key == b"DisplayAttributes" {
                     assert!(text.contains("<key>ProductName</key><string>Stela</string>"));
                 }
+                // The identity is the advertised monitor's, as presented.
+                if key == b"IOMFBUUID" {
+                    assert_eq!(text, Advertised::new(FULL_HD).unwrap().uuid());
+                }
             }
             &HOTPLUG => {
                 assert_eq!(input.len(), 0x58);
