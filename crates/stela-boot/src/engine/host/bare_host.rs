@@ -354,6 +354,10 @@ impl Host for BareHost<'_> {
         crate::ALLOCATOR.low()
     }
 
+    fn native_ticks(&self) -> u64 {
+        state().native_ticks
+    }
+
     unsafe fn execute(&mut self, code: NativeCode, guest: &mut GuestState) -> NativeExit {
         assert!(!state().native, "nested native block entry");
         state().native = true;

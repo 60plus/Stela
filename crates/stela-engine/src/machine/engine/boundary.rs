@@ -415,6 +415,13 @@ pub trait Host {
     fn tsc_counter(&self) -> Option<(u64, u64)> {
         None
     }
+    /// TSC ticks this host's core has spent in compiled code
+    /// ([`Self::execute`]) so far, counted with or without `--profile`: the
+    /// heartbeat's share of each PE's time in guest code. A host that does
+    /// not count them answers 0.
+    fn native_ticks(&self) -> u64 {
+        0
+    }
     /// A cycle count for `--profile`'s phase timing ([`step_timing`]); a
     /// host without one answers 0.
     fn profile_ticks(&mut self) -> u64 {

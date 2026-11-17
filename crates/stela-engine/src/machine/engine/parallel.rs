@@ -551,6 +551,8 @@ pub struct Counts {
     pub transfer_ticks: u64,
     pub line_queries: u64,
     pub line_ticks: u64,
+    /// TSC ticks its host core spent in compiled code ([`Host::native_ticks`]).
+    pub native_ticks: u64,
     /// Counter ticks its host core halted or spun on a monitored granule
     /// ([`super::Statistics::sleep_ticks`], `spin_ticks`) and spent waiting
     /// on other PEs ([`super::Statistics::sync_ticks`]), and its waits.
@@ -2658,6 +2660,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             transfer_ticks: statistics.transfer_ticks,
             line_queries: statistics.line_queries,
             line_ticks: statistics.line_ticks,
+            native_ticks: self.host.native_ticks(),
             sleep_ticks: statistics.sleep_ticks,
             spin_ticks: statistics.spin_ticks,
             halt_ticks: statistics.halt_ticks,

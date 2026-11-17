@@ -2111,7 +2111,35 @@ impl Heartbeat {
                 "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns",
             );
             let mut totals = parallel::Counts::default();
+            // Per PE in any boot: its shares of the interval idle, in guest
+            // code, translating, waiting on other PEs and in the rest of the
+            // engine, and its runs of guest code
+            // (`stela_boot_core::load_lines`).
+            let mut pe_times = Vec::with_capacity(per_pe.len());
+            let counter_ticks = |tsc: u64| {
+                (u128::from(tsc) * u128::from(host::COUNTER_HZ) / u128::from(tsc_hz.max(1))) as u64
+            };
             for (pe, (now, before)) in per_pe.iter().zip(&mut self.pe_counts).enumerate() {
+                let translate = |counts: &parallel::Counts| {
+                    counts.compile_ticks
+                        + counts.page_ticks
+                        + counts.shared_ticks
+                        + counts.install_ticks
+                        + counts.walk_ticks
+                        + counts.refill_ticks
+                };
+                pe_times.push(stela_boot_core::load_lines::PeTime {
+                    idle: (now.sleep_ticks + now.spin_ticks)
+                        .saturating_sub(before.sleep_ticks + before.spin_ticks),
+                    guest: counter_ticks(now.native_ticks.saturating_sub(before.native_ticks)),
+                    translate: translate(now).saturating_sub(translate(before)),
+                    sync: now.sync_ticks.saturating_sub(before.sync_ticks),
+                    runs: now
+                        .fetches
+                        .iter()
+                        .sum::<u64>()
+                        .saturating_sub(before.fetches.iter().sum()),
+                });
                 let rate = u128::from(now.retired.saturating_sub(before.retired))
                     .saturating_mul(u128::from(tsc_hz))
                     / u128::from(elapsed.max(1))
@@ -2381,12 +2409,21 @@ impl Heartbeat {
             output::arguments(format_args!("{releases}\n"));
             self.lock_waits = waits;
             output::arguments(format_args!("{shares}\n"));
+            output::arguments(format_args!(
+                "{}\n",
+                stela_boot_core::load_lines::pes_share(interval_ticks as u64, &pe_times)
+            ));
             output::arguments(format_args!("{fetches}\n"));
+            let mut cache = None;
             if let Some(board) = machine.devices.hub().code_report() {
                 code.push_str(&board_code(&board, &self.board, tsc_hz));
+                cache = Some(code_cache(&board, &self.board, per_pe[0].live_blocks));
                 self.board = board;
             }
             output::arguments(format_args!("{code}\n"));
+            if let Some(cache) = cache {
+                output::arguments(format_args!("{cache}\n"));
+            }
             output::arguments(format_args!("{device_work}\n"));
             output::arguments(format_args!("{lookups}\n"));
             output::arguments(format_args!("{paths}\n"));
@@ -2484,6 +2521,30 @@ impl Heartbeat {
         ));
         self.retired = retired;
     }
+}
+
+/// The board's code cache since `was`, holding `blocks`, in the plain terms
+/// of `CODE CACHE` (`stela_boot_core::load_lines`): its size, fill, turns
+/// and whole flushes, and what the beat took away and installed again.
+fn code_cache(
+    now: &stela_engine::machine::engine::CodeReport,
+    was: &stela_engine::machine::engine::CodeReport,
+    blocks: u64,
+) -> String {
+    let churn = now.churn.since(&was.churn);
+    let again: u64 = churn.again.iter().sum();
+    stela_boot_core::load_lines::code_cache(&stela_boot_core::load_lines::CodeCache {
+        window: now.window as u64,
+        parts: now.parts as u32,
+        held: now.generations.iter().sum(),
+        blocks,
+        opened: now.generation,
+        flushes: now.flushes,
+        taken: now.retired.saturating_sub(was.retired),
+        forced: now.forced.saturating_sub(was.forced),
+        installs: churn.new + again,
+        again,
+    })
 }
 
 /// The board's shared code since `was`, for `PES CODE`: the window in MiB,

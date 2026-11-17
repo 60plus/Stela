@@ -199,3 +199,34 @@ fn kept_counts_reach_the_board() {
     assert_eq!(words.get(&B8), Some(&exits));
     assert_eq!(words.get(&RET), Some(&exits));
 }
+
+/// A discard of every block on a shared board counts as one flush in the
+/// board's report, whichever PE makes it, and takes every block out of
+/// reach: the heartbeat's `CODE CACHE flushes=` then says how often the
+/// whole window had to be compiled again.
+#[test]
+fn a_flush_of_every_block_counts_on_the_board() {
+    let mut memory = vec![0u8; 16 * 4096];
+    let board = Board::new(2, &mut memory);
+    let base = board.machine(0).cpu.pc;
+    let mut machines = [board.machine(0), board.machine(1)];
+    for machine in &mut machines {
+        round(machine, base, false);
+    }
+    assert_eq!(board.code.report().flushes, 0);
+    let compiled = machines[0].statistics.compiled + machines[1].statistics.compiled;
+    assert_ne!(compiled, 0);
+    // The second PE's rounds find the first's blocks: nothing new.
+    round(&mut machines[1], base, false);
+    assert_eq!(
+        machines[0].statistics.compiled + machines[1].statistics.compiled,
+        compiled
+    );
+    machines[0].discard_code(Discard::Maintenance);
+    assert_eq!(board.code.report().flushes, 1);
+    // The other PE applying the same maintenance forgets them again.
+    machines[1].discard_code(Discard::Maintenance);
+    assert_eq!(board.code.report().flushes, 2);
+    round(&mut machines[1], base, false);
+    assert!(machines[0].statistics.compiled + machines[1].statistics.compiled > compiled);
+}

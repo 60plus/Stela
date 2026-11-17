@@ -64,6 +64,7 @@ pub mod interrupt_image;
 pub mod ioapic;
 pub mod irq_context;
 pub mod linux_pump;
+pub mod load_lines;
 pub mod loader_lines;
 pub mod log_sinks;
 pub mod machine_check;

@@ -530,6 +530,9 @@ pub struct CodeReport {
     /// Installs relocated from an entry proven during the boot, entries
     /// proven and refused, and the bytes kept ([`super::rebase`]).
     pub rebases: super::RebaseCounts,
+    /// Times its machines forgot every block at once ([`Code::epoch`]):
+    /// each leaves the whole window to be compiled again.
+    pub flushes: u64,
 }
 
 /// What [`CodeReport::targets`] counts.
@@ -778,6 +781,7 @@ impl Code {
                 .as_ref()
                 .map_or([0; 4], |arena| arena.ring.outs()),
             rebases: self.rebases.counts(),
+            flushes: self.epoch.load(Ordering::Relaxed),
         }
     }
 
