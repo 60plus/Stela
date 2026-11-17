@@ -79,7 +79,11 @@ impl ConfigSpace for Unclaimed {
     }
 }
 
-/// Wait `microseconds` on the TSC, in slices of at most [`SLICE_US`].
+/// Wait `microseconds` on the TSC, in slices of at most [`SLICE_US`]. Each
+/// slice that ends starts the step watchdog's limit again and moves the
+/// running step's marker: Linux's bound for a function below a powered
+/// port is 60 s, longer than the watchdog's limit, and it is a wait that
+/// ends, not a stuck step.
 fn wait(tsc_hz: u64, microseconds: u64) -> Result<(), BlockError> {
     let mut left = microseconds;
     while left != 0 {
@@ -90,6 +94,8 @@ fn wait(tsc_hz: u64, microseconds: u64) -> Result<(), BlockError> {
             core::hint::spin_loop();
         }
         left -= slice;
+        super::step_watchdog::progress();
+        crate::status::tick();
     }
     Ok(())
 }

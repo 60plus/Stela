@@ -89,6 +89,10 @@ const AML_BOUND_MS: u32 = 10_000;
 /// ([`Bound`]), and one line names `what` did not finish, where AML was
 /// then, and `then`, what follows.
 fn bounded<T>(what: &str, then: &str, call: impl FnOnce() -> T) -> (T, bool) {
+    // Each call has its own bound, so each starts the step watchdog's limit
+    // again while the boot processor runs alone: many calls that each end
+    // are no stuck step, whatever they add up to.
+    super::step_watchdog::progress();
     let bound = Bound::begin(AML_BOUND_MS);
     IN_AML.store(true, Ordering::Relaxed);
     let value = call();

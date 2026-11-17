@@ -1491,6 +1491,7 @@ impl Source {
 
     /// Contain the captured fabric once and park each original configuration.
     /// The return value qualifies PCI-level controls for remapper takeover.
+    /// `progress` is called as each function's stop ends.
     ///
     /// # Safety
     /// Firmware and APs are stopped. The caller keeps all captured buses and
@@ -1498,6 +1499,7 @@ impl Source {
     pub(crate) unsafe fn contain_pci(
         &self,
         tsc_hz: u64,
+        progress: impl Fn(),
     ) -> Result<ContainedPci<'_>, ContainmentError> {
         {
             let mut cohort = self.pci_slots.0.borrow_mut();
@@ -1570,6 +1572,8 @@ impl Source {
                     (None, Some(cause)) => Err(SlotRefusal::left(cause, parked)),
                     (None, None) => Ok(parked),
                 });
+            // One function's stop ended, within its own bound.
+            progress();
             let mut cohort = self.pci_slots.0.borrow_mut();
             let Cohort::Incomplete(fabric) = &mut *cohort else {
                 unreachable!("exclusive containment owns the incomplete fabric");

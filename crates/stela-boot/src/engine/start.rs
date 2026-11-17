@@ -2558,6 +2558,15 @@ unsafe fn service_clock(
     }
 }
 
+/// One part of the firmware takeover begins: the screen names it, a step
+/// watchdog stop inside it would name `stage`, and the watchdog's limit
+/// starts again when a second has passed since it last did.
+fn takeover_part(detail: &str, stage: &'static &'static str) {
+    crate::status::progress(detail);
+    super::step_watchdog::stage(stage);
+    super::step_watchdog::progress();
+}
+
 fn start_platform(
     handoff: &'static Handoff,
     host_owner: &mut host::HostOwner,
@@ -2570,7 +2579,24 @@ fn start_platform(
     // A freeze here was a screen that stopped after the step before with
     // nothing named (issue 36), so this is a step and names its parts.
     crate::status::begin("Taking over the PC's devices from the firmware");
-    crate::status::progress("memory-mapped registers");
+    // The step watchdog runs for this whole step, each part named for its
+    // stop. It was armed only inside the kernel work's own calls (the
+    // firmware's AML), so a part outside them that never returned, the PCI
+    // function census or a remapping unit's takeover, hung with no stop.
+    // SAFETY: the BSP in the engine's root with its own tables installed,
+    // before the APs start and before any producer uses its counters or
+    // its APIC's entry.
+    unsafe { super::step_watchdog::install(handoff.tsc_hz) };
+    super::step_watchdog::enter();
+    static REGISTERS: &str = "taking over the PC's devices: memory-mapped registers";
+    static VECTORS: &str = "taking over the PC's devices: interrupt vectors";
+    static CLOCKS: &str = "taking over the PC's devices: clocks and kernel work";
+    static ACPI_TABLES: &str = "the firmware's ACPI tables";
+    static PCI_PORTS: &str = "powering on PCI ports through ACPI";
+    static PCI_FUNCTIONS: &str = "taking over the PC's devices: stopping its PCI functions";
+    static CONTROLLERS: &str =
+        "taking over the PC's devices: DMA remapping units and interrupt controllers";
+    takeover_part("memory-mapped registers", &REGISTERS);
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before
     // the other host processors start.
@@ -2615,7 +2641,7 @@ fn start_platform(
             Err(error) => output::arguments(format_args!("NATIVE PCI HPET unavailable: {error}\n")),
         }
     }
-    crate::status::progress("interrupt vectors");
+    takeover_part("interrupt vectors", &VECTORS);
     match host_owner
         .root_identity()
         .map_err(|_| stela_drivers::bus::irq::IrqError::WrongCpu)
@@ -2633,7 +2659,7 @@ fn start_platform(
         Ok(()) => output::arguments(format_args!("NATIVE IRQ device vectors attached\n")),
         Err(error) => output::arguments(format_args!("NATIVE IRQ unavailable: {error:?}\n")),
     }
-    crate::status::progress("clocks");
+    takeover_part("clocks", &CLOCKS);
     let clock = if options.boots_macos() {
         // SAFETY: this BSP owns the existing timer/IDT before any driver,
         // and the HPET only after its whole-controller handoff above.
@@ -2651,9 +2677,6 @@ fn start_platform(
     // SAFETY: validated BSP handoff, before AP/driver producers.
     let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
         Ok(work) => {
-            // SAFETY: the BSP in the engine's root, before the APs start and
-            // before any producer uses its counters or its APIC's entry.
-            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
             #[cfg(feature = "diagnostics")]
             output::arguments(format_args!(
                 "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
@@ -2667,11 +2690,9 @@ fn start_platform(
             Err(error.reason())
         }
     };
-    crate::status::progress("ACPI tables");
     // The step watchdog's stop names this step: its AML calls are bounded
     // (`aml::bounded`), but an access that never completes is not.
-    static ACPI_TABLES: &str = "the firmware's ACPI tables";
-    super::step_watchdog::stage(&ACPI_TABLES);
+    takeover_part("ACPI tables", &ACPI_TABLES);
     // Loaded before the PCI census, so PCI ports whose slot power firmware
     // left off are powered on before it (`pci_power`) and the census sees
     // what lies below them; hardware mode follows the census.
@@ -2691,19 +2712,19 @@ fn start_platform(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
     );
     if let (Some(acpi), Some(mmio)) = (host_acpi, native_mmio) {
-        crate::status::progress("PCI ports");
-        static PCI_PORTS: &str = "powering on PCI ports through ACPI";
-        super::step_watchdog::stage(&PCI_PORTS);
+        takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
-    super::step_watchdog::clear_stage();
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
-    crate::status::progress("PCI functions");
+    takeover_part("PCI functions", &PCI_FUNCTIONS);
     let contained_pci = native_mmio.and_then(|mmio| {
+        // Each function's stop is bounded on its own (a pending transaction
+        // wait of 700 ms at most), and each one that ends starts the
+        // watchdog's limit again: many slow functions are no stuck step.
         // SAFETY: firmware is stopped, APs have not started, and native
         // probing has not published any PCI/controller owner yet.
-        match unsafe { mmio.contain_pci(handoff.tsc_hz) } {
+        match unsafe { mmio.contain_pci(handoff.tsc_hz, super::step_watchdog::progress) } {
             Ok(contained) => {
                 output::arguments(format_args!(
                     "HOST PCI contained: {} functions\n",
@@ -2775,7 +2796,7 @@ fn start_platform(
             mmio.refuse_framebuffer(refusal);
         }
     }
-    crate::status::progress("DMA remapping and interrupt controllers");
+    takeover_part("DMA remapping and interrupt controllers", &CONTROLLERS);
     // The remapping units, taken before any host driver starts DMA.
     let mut remappers = match (&contained_pci, handoff.storage.handoff()) {
         // SAFETY: no host driver has started; the loader root maps the ACPI
@@ -2828,6 +2849,8 @@ fn start_platform(
     if let Some(acpi) = host_acpi {
         acpi.activate(prepared_sci);
     }
+    super::step_watchdog::clear_stage();
+    super::step_watchdog::leave();
     crate::status::done("");
     Platform {
         acpi: host_acpi,
