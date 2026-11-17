@@ -1824,9 +1824,17 @@ impl Methods {
             ("Transport", Advertised::transport()),
             ("IOMFBUUID", advertised.uuid()),
         ];
+        let (width, height) = advertised.native();
+        let published = Log::Published {
+            width,
+            height,
+            image_cm: (advertised.edid[21], advertised.edid[22]),
+            uuid: advertised.display_uuid(),
+        };
         for (key, xml) in properties {
             self.publish_property(key, xml)?;
         }
+        self.record_log(published);
         // A single, untiled display: a zero IOMFB_TiledDisplayInfo, present
         // (its null flag clear); the trailing bool is not read by
         // IOMobileFramebufferShim::hotPlug_notify_gated.

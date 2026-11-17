@@ -134,6 +134,14 @@ pub enum Log {
     Pacing(Box<iomfb::Pacing>),
     /// A named refusal, with the call's interface row.
     Refused(String),
+    /// The monitor was published to macOS: its native size, its image size
+    /// in centimetres and the identity macOS keeps its settings under.
+    Published {
+        width: u32,
+        height: u32,
+        image_cm: (u8, u8),
+        uuid: String,
+    },
     /// A swap shown before `io_fence_notify` named every surface it waited
     /// for: those layers may still have been drawing.
     FenceTimeout {
@@ -262,6 +270,16 @@ impl core::fmt::Display for Log {
             }
             Log::Pacing(pacing) => write!(f, "{pacing}"),
             Log::Refused(text) => write!(f, "DCP refused {text}"),
+            Log::Published {
+                width,
+                height,
+                image_cm,
+                uuid,
+            } => write!(
+                f,
+                "DCP display published at {width}x{height}, image {}x{} cm, as display {uuid}",
+                image_cm.0, image_cm.1
+            ),
             Log::FenceTimeout {
                 swap_id,
                 fenced,

@@ -611,6 +611,19 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
         ]
     );
     assert!(!methods.callback_pending());
+    // The boot log names what macOS was given and the identity it keeps the
+    // display's settings under.
+    let advertised = Advertised::new(FULL_HD).unwrap();
+    let published = core::iter::from_fn(|| methods.take_log())
+        .find(|entry| matches!(entry, Log::Published { .. }))
+        .unwrap();
+    assert_eq!(
+        published.to_string(),
+        format!(
+            "DCP display published at 1920x1080, image 54x30 cm, as display {}",
+            advertised.display_uuid()
+        )
+    );
 }
 
 /// The properties `made` published, as `(key, text)` in order, each

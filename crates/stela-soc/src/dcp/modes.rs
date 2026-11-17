@@ -48,6 +48,7 @@
 //! model serves.
 use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode};
 use crate::Result;
+use alloc::format;
 use alloc::string::String;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -864,15 +865,20 @@ impl Advertised {
     /// same way keeps its settings across boots and a different
     /// presentation is a different display.
     pub fn uuid(&self) -> String {
+        format!("<string>{}</string>", self.display_uuid())
+    }
+
+    /// The UUID [`Self::uuid`] publishes.
+    pub fn display_uuid(&self) -> String {
         let e = &self.edid;
         let product = u16::from_le_bytes([e[10], e[11]]);
         let serial = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
-        let mut xml = Xml(String::new());
-        let _ = write!(
-            xml.0,
-            "<string>53544c41-{product:04x}-4000-8000-0000{serial:08x}</string>"
-        );
-        xml.0
+        format!("53544c41-{product:04x}-4000-8000-0000{serial:08x}")
+    }
+
+    /// The native size, the size of the preferred timing.
+    pub fn native(&self) -> (u32, u32) {
+        (get(&self.timing, 0x08), get(&self.timing, 0x28))
     }
 
     /// The `TimingElements` array (`IOAVVideoTimingElement::copyProperties`
