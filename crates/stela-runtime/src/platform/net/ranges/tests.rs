@@ -22,6 +22,7 @@ struct Mock {
     chunk: usize,
     stalled: bool,
     opens: Vec<u64>,
+    waits: usize,
     live: usize,
     open_errors: VecDeque<NetError>,
     read_errors: VecDeque<NetError>,
@@ -34,6 +35,7 @@ impl Mock {
             chunk: 1 << 20,
             stalled: false,
             opens: Vec::new(),
+            waits: 0,
             live: 0,
             open_errors: VecDeque::new(),
             read_errors: VecDeque::new(),
@@ -74,6 +76,7 @@ impl RangeSource for Mock {
 
     fn wait(&mut self, micros: u64) -> Result<(), NetError> {
         self.now += (micros / 1000).max(1);
+        self.waits += 1;
         Ok(())
     }
 
@@ -266,4 +269,25 @@ fn reads_past_the_end_are_refused() {
         Err(NetError::Invalid(_))
     ));
     read(&mut reader, LEN - 10, 10).unwrap();
+}
+
+/// An unbounded read waits out the backoff after a failed range through
+/// the transport, which serves the network meanwhile (the other stream's
+/// connection, the link's own traffic), where it spun without a look at
+/// the network for up to 32 s.
+#[test]
+fn an_unbounded_reads_backoff_serves_the_network() {
+    let mut reader = ranges();
+    reader.source_mut().chunk = 4096;
+    read(&mut reader, 0, 6000).unwrap();
+    reader
+        .source_mut()
+        .read_errors
+        .push_back(NetError::Timeout("TCP transfer"));
+    let waits = reader.source().waits;
+    read(&mut reader, 6000, 6000).unwrap();
+    let source = reader.source();
+    // A second of backoff in waits of at most 100 ms.
+    assert!(source.waits - waits >= 10, "{}", source.waits - waits);
+    assert_eq!(source.opens, [0, 8192]);
 }

@@ -304,8 +304,14 @@ impl<S: RangeSource> Ranges<S> {
                     if self.bounded {
                         return Err(self.block("the range waits before it is asked again"));
                     }
-                    while self.source.millis().saturating_sub(failed_at) < backoff {
-                        core::hint::spin_loop();
+                    // The network is served through the wait: the other
+                    // stream's connection and the link's own traffic go on.
+                    loop {
+                        let waited = self.source.millis().saturating_sub(failed_at);
+                        if waited >= backoff {
+                            break;
+                        }
+                        self.source.wait(((backoff - waited) * 1000).min(WAIT_US))?;
                     }
                 }
             }
