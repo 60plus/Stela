@@ -352,6 +352,68 @@ fn shared_cores_mix_kinds_on_one_core_at_most() {
     }
 }
 
+/// Hybrid hosts whose performance cores have two threads and whose
+/// efficiency cores one, in either location order, with the boot processor
+/// on a performance core and the roster [`select`]'s prefix; guests as the
+/// selected source keeps them (the boot complex's efficiency PEs first, at
+/// least one performance PE). Every worker runs one PE, the boot PE stays on
+/// worker zero, each PE keeps the host class it had without the cores, and
+/// no more performance PEs share a core with an efficiency PE than without.
+#[test]
+fn hybrid_hosts_keep_classes_and_pair_no_more_kinds_than_before() {
+    use CoreClass::{Efficiency as E, Performance as P};
+    for performance in 1..=4usize {
+        for efficiency in 0..=8usize {
+            for efficiency_first in [false, true] {
+                // (class, core) of every thread in select's order: the boot
+                // core's first thread, the other cores' first threads by
+                // location, then the performance cores' second threads.
+                let mut cores: Vec<(CoreClass, u32)> = Vec::new();
+                let p_cores = (0..performance).map(|core| (P, core as u32));
+                let e_cores = (0..efficiency).map(|core| (E, (performance + core) as u32));
+                cores.push((P, 0));
+                if efficiency_first {
+                    cores.extend(e_cores.clone().chain(p_cores.clone().skip(1)));
+                } else {
+                    cores.extend(p_cores.clone().skip(1).chain(e_cores.clone()));
+                }
+                cores.extend(p_cores);
+                let workers = cores.len().min(8);
+                if workers < 2 {
+                    continue;
+                }
+                let host: Vec<_> = cores[..workers].iter().map(|&(class, _)| class).collect();
+                let ids: Vec<_> = cores[..workers].iter().map(|&(_, core)| core).collect();
+                let other = workers.saturating_sub(4).max(1);
+                let guest: Vec<_> = (0..workers)
+                    .map(|slot| if slot < workers - other { E } else { P })
+                    .collect();
+                let apart = placement(&guest, &host, 0).unwrap();
+                let paired = super::placement(&guest, &host, &ids, 0).unwrap();
+                let shape = format!("{performance}P {efficiency}E first={efficiency_first}");
+                assert_eq!(paired[0], 0, "{shape}");
+                let mut sorted = paired.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..workers).collect::<Vec<_>>(), "{shape}");
+                for slot in 0..workers {
+                    assert_eq!(host[paired[slot]], host[apart[slot]], "{shape}");
+                }
+                let mixed = |assigned: &[usize]| {
+                    (0..workers)
+                        .filter(|&slot| {
+                            guest[slot] == P
+                                && (0..workers).any(|other| {
+                                    guest[other] == E && ids[assigned[other]] == ids[assigned[slot]]
+                                })
+                        })
+                        .count()
+                };
+                assert!(mixed(&paired) <= mixed(&apart), "{shape}: {paired:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn placement_rejects_invalid_rosters() {
     use CoreClass::Unknown as U;
