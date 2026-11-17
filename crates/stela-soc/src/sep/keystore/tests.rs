@@ -465,6 +465,24 @@ fn unsupported_system_metadata_is_sanitized_and_keeps_failure_semantics() {
         diagnostics[0]
     );
     assert!(!diagnostics[0].contains("zzq") && !diagnostics[0].contains("SECR"));
+    // A name from the AP library's parameter table is shown by name, with
+    // its value's shape and no byte of the value.
+    let query = b"\x31\x26\x30\x0c\x0c\x04acmh\x04\x04SECR\x30\x0a\x0c\x02ad\x04\x04DATA\x30\x0a\x0c\x01o\x0c\x05oskgp";
+    let request = system_request_with_operation(2, 0, query);
+    let (reply, _) = ask(
+        &mut keystore,
+        frame(system_key::PERFORM_OPERATION, 23, request.len()),
+        request,
+    );
+    assert!(reply.is_err());
+    let diagnostics = keystore.diagnostics().collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0].contains("keys=acmh:4/4,ad:4/4,o parsed=true"),
+        "{}",
+        diagnostics[0]
+    );
+    assert!(!diagnostics[0].contains("SECR") && !diagnostics[0].contains("DATA"));
 }
 
 #[test]

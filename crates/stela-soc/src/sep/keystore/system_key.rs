@@ -375,6 +375,20 @@ pub(super) fn diagnostic(variant: u32, fields: &mut Fields<'_>) -> String {
     )
 }
 
+/// The parameter and operation names of the AP's keystore library
+/// (`libaks`), in the order of its constant string table in the guest's
+/// shared cache. They are the library's fixed protocol words, not guest
+/// data, so a refused request names its parameters by them.
+const LIBRARY_NAMES: [&str; 89] = [
+    "skck", "osks", "oskgp", "sko", "osko", "oska", "skg", "skt", "oskc2", "ocww", "ocwe", "ovk",
+    "rko", "kv", "kid", "ad", "ed", "rk", "oa", "okd", "oke", "oect", "oecd", "oece", "pub", "ock",
+    "dbh", "orwk", "ouw", "ow", "oskc", "odel", "od", "oe", "d", "ro", "osgn", "kt", "bc", "o",
+    "oc", "ag", "ecdhs", "ecdhi", "prsn", "si", "si2", "tsi", "tsi2", "tecdhs", "srkt", "skcs",
+    "skos", "skni", "rskt", "rsct", "grko", "spka", "vuid", "seed", "tf", "bk", "acmh", "p", "oam",
+    "ire", "etp", "epp", "cpg", "cmpg", "mbe", "ms", "rf", "rti", "ri", "guuid", "uuuid", "cf",
+    "mua", "bd", "gp", "sms", "srcd", "sgs", "sfa", "sb", "sls", "ss", "ses",
+];
+
 struct ParameterDiagnostic {
     operation: &'static str,
     system_key_type: Option<u32>,
@@ -383,8 +397,9 @@ struct ParameterDiagnostic {
     reference_key_class: Option<u32>,
     reference_key_options: Option<u32>,
     /// Allowlisted key names in arrival order: the encoder's pair order,
-    /// which the strict parser requires ascending. Any other key is `?`
-    /// with its name's length and its value's DER tag and length.
+    /// which the strict parser requires ascending. Any other key is a
+    /// [`LIBRARY_NAMES`] name or `?` with its name's length, then its
+    /// value's DER tag and length.
     keys: String,
 }
 
@@ -430,17 +445,19 @@ impl ParameterDiagnostic {
                 b"rko" => result.keys.push_str("rko"),
                 b"rk" => result.keys.push_str("rk"),
                 b"d" => result.keys.push('d'),
-                // Its shape only: the name's length and the value's DER tag
-                // and length, which tell the parameters of a refused
-                // request apart without a byte of either.
+                // A name from the AP library's own parameter table, with
+                // its value's DER tag and length; any other name by its
+                // shape only: its length and the value's tag and length.
+                // Neither shows a byte of the value or of a guest string.
                 _ => {
                     let value = Cursor(entry.0).next_element()?;
-                    result.keys.push_str(&format!(
-                        "?{}:{}/{}",
-                        key.len(),
-                        value.tag,
-                        value.value.len()
-                    ));
+                    match LIBRARY_NAMES.iter().find(|name| name.as_bytes() == key) {
+                        Some(name) => result.keys.push_str(name),
+                        None => result.keys.push_str(&format!("?{}", key.len())),
+                    }
+                    result
+                        .keys
+                        .push_str(&format!(":{}/{}", value.tag, value.value.len()));
                 }
             }
             match key {
