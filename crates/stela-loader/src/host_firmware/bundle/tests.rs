@@ -22,8 +22,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
     // do, and amdgpu's `mec` and `mec2` of Raphael and of Navi 21.
     assert_eq!(count + 4, recipes().count());
-    // The recipes' recorded lengths: 119 files, 184.4 MiB.
-    assert_eq!((count, bytes), (119, 193_405_004), "{count} {bytes}");
+    // The recipes' recorded lengths: 121 files, 184.9 MiB.
+    assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
     let manifest = manifest(&complete()).unwrap();

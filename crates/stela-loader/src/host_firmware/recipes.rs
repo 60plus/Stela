@@ -1247,6 +1247,12 @@ pub const AMDGPU: &[Recipe] = &[
         440400,
         "9a0ab35bf157c835cbbc4a207ba819ea0111e2a65fe7f8c20910ffff3122f903",
     ),
+    // DCN 4.0.1's DMCUB, which the display core asks for (`amdgpu_dm.c`).
+    amdgpu(
+        "amdgpu/dcn_4_0_1_dmcub.bin",
+        368288,
+        "74b567655ac89bfe03389b660e973dc3c067aebd464c6389a071662cfbe6237f",
+    ),
     // Navi 21 (Sienna Cichlid): amdgpu names these files after the chip,
     // not its IP versions. MEC2 is byte for byte MEC.
     amdgpu(
@@ -1304,6 +1310,12 @@ pub const AMDGPU: &[Recipe] = &[
         582800,
         "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
     ),
+    // DCN 3.0's DMCUB, which the display core asks for (`amdgpu_dm.c`).
+    amdgpu(
+        "amdgpu/sienna_cichlid_dmcub.bin",
+        114164,
+        "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
+    ),
 ];
 
 /// A GPU family's name, PCI device IDs and files.
@@ -1351,6 +1363,7 @@ const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
             "amdgpu/sdma_7_0_1.bin",
             "amdgpu/smu_14_0_3.bin",
             "amdgpu/vcn_5_0_0.bin",
+            "amdgpu/dcn_4_0_1_dmcub.bin",
         ],
     ),
     (
@@ -1373,6 +1386,7 @@ const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
             "amdgpu/sienna_cichlid_sos.bin",
             "amdgpu/sienna_cichlid_ta.bin",
             "amdgpu/sienna_cichlid_vcn.bin",
+            "amdgpu/sienna_cichlid_dmcub.bin",
         ],
     ),
 ];
@@ -2667,7 +2681,7 @@ mod tests {
         let mut inventory = Inventory::default();
         require_amdgpu(&mut inventory, 0x7550).unwrap();
         let plan = Plan::select(&inventory).unwrap();
-        assert_eq!(plan.selections().len(), 11);
+        assert_eq!(plan.selections().len(), 12);
         for selection in plan.selections() {
             assert_eq!(selection.request.name, selection.recipe.image.member);
             assert!(
@@ -2675,13 +2689,14 @@ mod tests {
                     || selection.request.name.contains("_14_0_3")
                     || selection.request.name.contains("_7_0_1")
                     || selection.request.name.contains("_5_0_0")
+                    || selection.request.name.contains("_4_0_1")
             );
             assert_eq!(selection.request.target.driver, "amdgpu");
             assert!(selection.recipe.image.url().contains(GSP_REVISION));
             assert_eq!(selection.recipe.license.member, "LICENSES/LICENSE.amdgpu");
         }
-        // One shared notice beside the eleven images.
-        assert_eq!(plan.artifacts().len(), 12);
+        // One shared notice beside the twelve images.
+        assert_eq!(plan.artifacts().len(), 13);
     }
 
     #[test]
