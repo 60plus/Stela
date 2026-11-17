@@ -15,6 +15,8 @@
 //! environment with nothing to do costs the boot PE one comparison a slice.
 mod before;
 #[cfg(feature = "nvk")]
+pub(super) mod acpi_backlight;
+#[cfg(feature = "nvk")]
 pub(super) mod client;
 #[cfg(feature = "nvk")]
 pub(super) mod display;

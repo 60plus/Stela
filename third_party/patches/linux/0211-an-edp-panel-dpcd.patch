@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kiki <duarduar707@gmail.com>
+Date: Tue, 17 Nov 2026 07:25:31 +0700
+Subject: [PATCH] fix(nouveau): an eDP panel whose backlight GSP-RM refuses is
+ lit through its DPCD, at its AUX maximum or by its AUX enable bit, with its
+ capability bytes logged, where it stayed dark
+
+---
+ drivers/gpu/drm/nouveau/dispnv50/disp.c | 44 +++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/dispnv50/disp.c b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+index 95185e5334f47df17245fecd999d5a1fe80ed5ba..f9fbbe4658b77277bc85b62a7c48d312f3b444ef 100644
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@ -1740,6 +1740,48 @@ nv50_sor_dp_watermark_sst(struct nouveau_encoder *outp,
+ 	return nvif_outp_dp_sst(&outp->outp, head->base.index, waterMark, hBlankSym, vBlankSym);
+ }
+ 
++#ifndef CONFIG_DRM_NOUVEAU_BACKLIGHT
++/*
++ * A panel whose backlight GSP-RM does not drive may take it through its
++ * DPCD (VESA eDP backlight control), as nv50_backlight_init would set it up
++ * with the backlight class: raise it to its maximum through AUX where the
++ * panel takes its brightness there, else set its AUX enable bit where it has
++ * one. The capability bytes are logged either way.
++ */
++static void
++nv50_edp_aux_backlight_on(struct nouveau_drm *drm, struct nouveau_connector *nv_conn)
++{
++	struct drm_dp_aux *aux = &nv_conn->aux;
++	struct drm_edp_backlight_info info = {};
++	u8 caps[EDP_DISPLAY_CTL_CAP_SIZE] = {};
++	u32 level = 0;
++	u8 mode = 0;
++	int ret;
++
++	ret = drm_dp_dpcd_read(aux, DP_EDP_DPCD_REV, caps, sizeof(caps));
++	NV_INFO(drm, "eDP DPCD backlight caps: read %d, %02x %02x %02x\n",
++		ret, caps[0], caps[1], caps[2]);
++	if (ret < 0)
++		return;
++
++	if (drm_edp_backlight_supported(caps) &&
++	    (caps[2] & DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP)) {
++		ret = drm_edp_backlight_init(aux, &info, 0, 0, caps, &level, &mode, false);
++		if (!ret)
++			ret = drm_edp_backlight_enable(aux, &info, info.max);
++		NV_INFO(drm, "eDP AUX backlight: level %u of %u, mode %u, enable %d\n",
++			level, info.max, mode, ret);
++		return;
++	}
++
++	if (caps[1] & DP_EDP_BACKLIGHT_AUX_ENABLE_CAP) {
++		ret = drm_dp_dpcd_writeb(aux, DP_EDP_DISPLAY_CONTROL_REGISTER,
++					 DP_EDP_BACKLIGHT_ENABLE);
++		NV_INFO(drm, "eDP AUX backlight enable bit: %d\n", ret);
++	}
++}
++#endif
++
+ static void
+ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_commit *state)
+ {
+@@ -1865,6 +1907,8 @@ nv50_sor_atomic_enable(struct drm_encoder *encoder, struct drm_atomic_commit *st
+ 
+ 		NV_INFO(drm, "eDP backlight: was %d, set 100: %d, now %d\n",
+ 			before, ret, nvif_outp_bl_get(outp));
++		if (ret)
++			nv50_edp_aux_backlight_on(drm, nv_connector);
+ 	}
+ #endif
+ }

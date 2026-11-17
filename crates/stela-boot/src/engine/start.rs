@@ -1512,6 +1512,14 @@ fn open_gpus(
         let random = stela_drivers::probe::NativeServices::entropy(&services)
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
+        // GSP-RM takes the backlight table at display init, which the
+        // GPU's start runs; read it from ACPI first.
+        #[cfg(feature = "nvk")]
+        if let Some(acpi) = acpi {
+            gpu::acpi_backlight::load(acpi.session(), &adapters);
+        }
+        #[cfg(not(feature = "nvk"))]
+        let _ = acpi;
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
             gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
         });
