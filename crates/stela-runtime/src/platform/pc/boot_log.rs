@@ -9,17 +9,41 @@
 //! | Offset | Bytes | Field |
 //! | --- | --- | --- |
 //! | 0 | 8 | magic `STELALOG` |
-//! | 8 | 4 | version, 1 |
+//! | 8 | 4 | version, 2 |
 //! | 12 | 4 | reserved, zero |
 //! | 16 | 8 | `head`: every byte ever appended, monotonic |
 //! | 24 | 8 | `boots`: boots that opened the log |
-//! | 32 | 8 | `ring_bytes`: the region less the header |
-//! | 40 | 32 | SHA-256 of bytes 0..40 |
+//! | 32 | 8 | `ring_bytes` |
+//! | 40 | 4 | `records`: boot records after the ring, at most 16 |
+//! | 44 | 4 | `first_bytes`: a record's room for a boot's first lines |
+//! | 48 | 4 | `last_bytes`: a record's room for a boot's last lines |
+//! | 52 | 4 | reserved, zero |
+//! | 56 | 24 each | per record: boot, `start`, first length, last length |
+//! | after them | 32 | SHA-256 of every byte before it |
 //!
 //! The ring follows the header. Stream byte `i` lives at
 //! `ring[i % ring_bytes]`, so the valid stream is
 //! `[head.saturating_sub(ring_bytes), head)`. A blank or invalid header is a
 //! fresh log, reported by its [`HeaderError`]; [`read`] refuses it.
+//!
+//! The boot records follow the ring ([`Layout`]): a running macOS writes
+//! through the whole ring in a few hours, and the lines that say what the
+//! PC is (version, processor, devices, GPU) are a boot's first. Each of the
+//! last [`RECORDS`] boots keeps a copy of its first [`FIRST_BYTES`] of
+//! lines and its last [`LAST_BYTES`], whatever the ring holds by then. A
+//! record's `start` is the stream position of the boot's marker line. Its
+//! first lines are stored once, in the store during which they are
+//! complete; a boot that ends before that, and every boot's last lines, are
+//! copied from the ring when the next boot opens the log, which is always
+//! in time: the ring's newest bytes are the last boot's. So a line costs
+//! what it did without records, and a boot costs two record writes.
+//!
+//! Version 1 had no records, 40 bytes of fields, and a ring filling the
+//! region. [`read`] reads both. A [`Writer`] that opens a version 1 log
+//! converts it in place ([`convert`]): the ring keeps its newest bytes, the
+//! bytes the record area takes are the oldest, and the header is written
+//! last. Software older than the records refuses a version 2 header by its
+//! version and starts a fresh log; it never reads one as the other.
 //!
 //! [`Writer`] opens the log once per boot, counts the boot and appends a
 //! `=== STELA BOOT n ===` line. Appends wait in a bounded [`Pending`]
@@ -53,15 +77,96 @@ pub const LOG_BYTES: u64 = 4 << 20;
 /// The smallest machine-state partition that holds the log.
 pub const PARTITION_BYTES: u64 = OFFSET + LOG_BYTES;
 pub const HEADER_BYTES: u64 = 4096;
+/// The boot records of a [`LOG_BYTES`] region.
+pub const RECORDS: u32 = 8;
+/// A record's room for a boot's first lines: what a boot prints before it
+/// starts macOS, 90 to 130 KiB on the PCs seen.
+pub const FIRST_BYTES: u32 = 112 << 10;
+/// A record's room for a boot's last lines.
+pub const LAST_BYTES: u32 = 16 << 10;
+/// The most records a header names: they fit its first 512-byte block.
+const MAX_RECORDS: u32 = 16;
 /// The ring of a [`LOG_BYTES`] region.
-pub const RING_BYTES: u64 = LOG_BYTES - HEADER_BYTES;
+pub const RING_BYTES: u64 = Layout::of(LOG_BYTES).ring_bytes;
 /// The bound of a pending buffer between flushes.
 pub const PENDING_BYTES: usize = 1 << 20;
 pub const MAGIC: &[u8; 8] = b"STELALOG";
-pub const VERSION: u32 = 1;
-/// The header fields the checksum covers.
-const FIELDS: usize = 40;
-const RECORD: usize = FIELDS + 32;
+pub const VERSION: u32 = 2;
+/// The version without boot records.
+const VERSION_1: u32 = 1;
+/// The fields a version 1 header's checksum covers.
+const FIELDS_1: usize = 40;
+/// The fields before a version 2 header's records, and each record's.
+const FIELDS: usize = 56;
+const RECORD_FIELDS: usize = 24;
+
+/// How a region is divided after its header: the ring, then the boot
+/// records, each `first_bytes + last_bytes` long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub ring_bytes: u64,
+    pub records: u32,
+    pub first_bytes: u32,
+    pub last_bytes: u32,
+}
+
+impl Layout {
+    /// The layout a writer gives a `region`-byte region: [`RECORDS`]
+    /// records in a whole log's, none in a shorter one.
+    pub const fn of(region: u64) -> Self {
+        let area = RECORDS as u64 * (FIRST_BYTES as u64 + LAST_BYTES as u64);
+        if region >= LOG_BYTES {
+            Self {
+                ring_bytes: region - HEADER_BYTES - area,
+                records: RECORDS,
+                first_bytes: FIRST_BYTES,
+                last_bytes: LAST_BYTES,
+            }
+        } else {
+            Self::ring_only(region)
+        }
+    }
+
+    /// A region that is all ring, as every version 1 log is.
+    pub const fn ring_only(region: u64) -> Self {
+        Self {
+            ring_bytes: region.saturating_sub(HEADER_BYTES),
+            records: 0,
+            first_bytes: 0,
+            last_bytes: 0,
+        }
+    }
+
+    const fn record_bytes(&self) -> u64 {
+        self.first_bytes as u64 + self.last_bytes as u64
+    }
+
+    /// The region this layout fills.
+    const fn region(&self) -> u64 {
+        HEADER_BYTES + self.ring_bytes + self.records as u64 * self.record_bytes()
+    }
+
+    /// Where record `index` starts in the region.
+    const fn record_at(&self, index: usize) -> u64 {
+        HEADER_BYTES + self.ring_bytes + index as u64 * self.record_bytes()
+    }
+
+    /// Whether a `region`-byte region of `block`-byte blocks takes it: a
+    /// ring, and every part on a block boundary.
+    fn fits(&self, region: u64, block: u64) -> bool {
+        self.region() == region
+            && self.ring_bytes != 0
+            && self.records <= MAX_RECORDS
+            && [
+                self.ring_bytes,
+                u64::from(self.first_bytes),
+                u64::from(self.last_bytes),
+            ]
+            .iter()
+            .all(|bytes| bytes.is_multiple_of(block))
+            && (self.records == 0 || self.first_bytes != 0)
+    }
+}
 
 /// Why a region holds no log.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,8 +178,11 @@ pub enum HeaderError {
     Version(u32),
     /// Reserved header bytes are not zero.
     Reserved,
+    /// The header names more boot records than a header holds.
+    Records(u32),
     Checksum,
-    /// The header's ring is not the one this region holds.
+    /// The header's ring and boot records are not what this region holds
+    /// after its header.
     RingSize {
         recorded: u64,
         region: u64,
@@ -90,14 +198,20 @@ impl fmt::Display for HeaderError {
         match self {
             Self::Blank => f.write_str("the log region is blank"),
             Self::NotALog => f.write_str("the log region holds no STELALOG header"),
-            Self::Version(version) => {
-                write!(f, "the log header is version {version}, not {VERSION}")
-            }
+            Self::Version(version) => write!(
+                f,
+                "the log header is version {version}, not {VERSION} or {VERSION_1}"
+            ),
+            Self::Records(records) => write!(
+                f,
+                "the log header names {records} boot records, more than {MAX_RECORDS}"
+            ),
             Self::Reserved => f.write_str("the log header's reserved bytes are not zero"),
             Self::Checksum => f.write_str("the log header's checksum does not match"),
             Self::RingSize { recorded, region } => write!(
                 f,
-                "the log header records a {recorded:#x}-byte ring; the region holds {region:#x}"
+                "the log header's ring and boot records take {recorded:#x} bytes; the region \
+                 holds {region:#x}"
             ),
             Self::Short { bytes } => write!(
                 f,
@@ -200,14 +314,39 @@ pub fn file_runs(
     Ok(runs)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One boot's record: where its lines start in the stream, and how much of
+/// its first and last lines the record holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Record {
+    /// The boot's number; 0 for a record no boot has used.
+    boot: u64,
+    start: u64,
+    first: u32,
+    last: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Header {
+    version: u32,
     head: u64,
     boots: u64,
-    ring_bytes: u64,
+    layout: Layout,
+    /// One per record of the layout.
+    records: Vec<Record>,
 }
 
 impl Header {
+    /// A log no boot has written, in `layout`.
+    fn fresh(layout: Layout) -> Self {
+        Self {
+            version: VERSION,
+            head: 0,
+            boots: 0,
+            layout,
+            records: vec![Record::default(); layout.records as usize],
+        }
+    }
+
     /// `block` with the header at its start and zeros after it.
     fn encode(&self, block: &mut [u8]) {
         block.fill(0);
@@ -215,43 +354,99 @@ impl Header {
         block[8..12].copy_from_slice(&VERSION.to_le_bytes());
         block[16..24].copy_from_slice(&self.head.to_le_bytes());
         block[24..32].copy_from_slice(&self.boots.to_le_bytes());
-        block[32..40].copy_from_slice(&self.ring_bytes.to_le_bytes());
-        let digest = Sha256::digest(&block[..FIELDS]);
-        block[FIELDS..RECORD].copy_from_slice(&digest);
+        block[32..40].copy_from_slice(&self.layout.ring_bytes.to_le_bytes());
+        block[40..44].copy_from_slice(&self.layout.records.to_le_bytes());
+        block[44..48].copy_from_slice(&self.layout.first_bytes.to_le_bytes());
+        block[48..52].copy_from_slice(&self.layout.last_bytes.to_le_bytes());
+        let mut at = FIELDS;
+        for record in &self.records {
+            block[at..at + 8].copy_from_slice(&record.boot.to_le_bytes());
+            block[at + 8..at + 16].copy_from_slice(&record.start.to_le_bytes());
+            block[at + 16..at + 20].copy_from_slice(&record.first.to_le_bytes());
+            block[at + 20..at + 24].copy_from_slice(&record.last.to_le_bytes());
+            at += RECORD_FIELDS;
+        }
+        let digest = Sha256::digest(&block[..at]);
+        block[at..at + 32].copy_from_slice(&digest);
     }
 
-    /// The header at the start of `bytes`, for a region whose ring holds
-    /// `ring_bytes`.
-    fn decode(bytes: &[u8], ring_bytes: u64) -> Result<Self, HeaderError> {
+    /// The header at the start of `bytes`, of either version, for a region
+    /// of `region` bytes.
+    fn decode(bytes: &[u8], region: u64) -> Result<Self, HeaderError> {
         if bytes.iter().all(|&byte| byte == 0) {
             return Err(HeaderError::Blank);
         }
-        if bytes.len() < RECORD || &bytes[..8] != MAGIC {
+        if bytes.len() < FIELDS_1 + 32 || &bytes[..8] != MAGIC {
             return Err(HeaderError::NotALog);
         }
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != VERSION {
-            return Err(HeaderError::Version(version));
-        }
-        if Sha256::digest(&bytes[..FIELDS])[..] != bytes[FIELDS..RECORD] {
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let version = u32_at(8);
+        let (layout, fields) = match version {
+            VERSION_1 => (
+                Layout {
+                    ring_bytes: u64_at(32),
+                    records: 0,
+                    first_bytes: 0,
+                    last_bytes: 0,
+                },
+                FIELDS_1,
+            ),
+            VERSION if bytes.len() >= FIELDS + 32 => {
+                let records = u32_at(40);
+                if records > MAX_RECORDS {
+                    return Err(HeaderError::Records(records));
+                }
+                (
+                    Layout {
+                        ring_bytes: u64_at(32),
+                        records,
+                        first_bytes: u32_at(44),
+                        last_bytes: u32_at(48),
+                    },
+                    FIELDS + records as usize * RECORD_FIELDS,
+                )
+            }
+            VERSION => return Err(HeaderError::NotALog),
+            version => return Err(HeaderError::Version(version)),
+        };
+        if bytes.len() < fields + 32
+            || Sha256::digest(&bytes[..fields])[..] != bytes[fields..fields + 32]
+        {
             return Err(HeaderError::Checksum);
         }
-        if bytes[12..16] != [0; 4] {
+        if bytes[12..16] != [0; 4] || (version == VERSION && bytes[52..56] != [0; 4]) {
             return Err(HeaderError::Reserved);
         }
-        let header = Self {
-            head: u64_at(16),
-            boots: u64_at(24),
-            ring_bytes: u64_at(32),
-        };
-        if header.ring_bytes != ring_bytes {
+        // Checked sizes: a header with a valid checksum and sizes that
+        // overflow is not this region's either.
+        let taken = (layout.records as u64)
+            .checked_mul(layout.record_bytes())
+            .and_then(|area| area.checked_add(layout.ring_bytes));
+        if taken != Some(region.saturating_sub(HEADER_BYTES)) || layout.ring_bytes == 0 {
             return Err(HeaderError::RingSize {
-                recorded: header.ring_bytes,
-                region: ring_bytes,
+                recorded: taken.unwrap_or(u64::MAX),
+                region: region.saturating_sub(HEADER_BYTES),
             });
         }
-        Ok(header)
+        let records = (0..layout.records as usize)
+            .map(|index| {
+                let at = FIELDS + index * RECORD_FIELDS;
+                Record {
+                    boot: u64_at(at),
+                    start: u64_at(at + 8),
+                    first: u32_at(at + 16).min(layout.first_bytes),
+                    last: u32_at(at + 20).min(layout.last_bytes),
+                }
+            })
+            .collect();
+        Ok(Self {
+            version,
+            head: u64_at(16),
+            boots: u64_at(24),
+            layout,
+            records,
+        })
     }
 }
 
@@ -466,7 +661,8 @@ fn join(writes: &mut Vec<(u64, Vec<u8>)>, lba: u64, bytes: &[u8], block: usize) 
 }
 
 /// A step of a store ([`Writer::begin_store`]), each a request the last
-/// one's completion lets go: the ring's bytes, then the header.
+/// one's completion lets go: the ring's bytes, the boot records' when one
+/// is due, then the header.
 enum Step {
     /// Ring blocks from this one; `tail` when the last is the head's.
     Blocks {
@@ -478,16 +674,149 @@ enum Step {
     ReadTail,
     /// The head's block.
     Tail,
+    /// A boot record's lines, in whole blocks.
+    Record {
+        lba: u64,
+        data: Vec<u8>,
+    },
     Header,
+}
+
+/// This boot's first lines, collected as the ring takes them until the
+/// record's room is full.
+struct Capture {
+    /// The boot's record.
+    index: usize,
+    bytes: Vec<u8>,
+}
+
+/// `bytes` up to the end of its last whole line; all of it without one.
+fn whole_lines(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().rposition(|&byte| byte == b'\n') {
+        Some(end) => &bytes[..=end],
+        None => bytes,
+    }
+}
+
+/// Stream bytes `[from, to)` of the ring on `device`, which holds them:
+/// whole blocks around each part, each within the ring.
+fn read_stream(
+    device: &mut dyn BlockDevice,
+    ring_bytes: u64,
+    from: u64,
+    to: u64,
+) -> Result<Vec<u8>, BlockError> {
+    let block = u64::from(device.identity().block_size);
+    let mut read = Vec::with_capacity((to - from) as usize);
+    let mut at = from - from % block;
+    while at < to {
+        let in_ring = at % ring_bytes;
+        let run = (to.next_multiple_of(block) - at).min(ring_bytes - in_ring);
+        let mut buffer = vec![0; run as usize];
+        device.read((HEADER_BYTES + in_ring) / block, &mut buffer)?;
+        read.extend_from_slice(&buffer);
+        at += run;
+    }
+    let skip = (from % block) as usize;
+    read.truncate(skip + (to - from) as usize);
+    read.drain(..skip);
+    Ok(read)
+}
+
+/// Write `bytes` at byte `offset` of the region on `device`, keeping the
+/// other bytes of the blocks they share.
+fn write_region(device: &mut dyn BlockDevice, offset: u64, bytes: &[u8]) -> Result<(), BlockError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let block = u64::from(device.identity().block_size);
+    let first = offset - offset % block;
+    let end = (offset + bytes.len() as u64).next_multiple_of(block);
+    let mut blocks = vec![0; (end - first) as usize];
+    device.read(first / block, &mut blocks)?;
+    let at = (offset - first) as usize;
+    blocks[at..at + bytes.len()].copy_from_slice(bytes);
+    device.write(first / block, &blocks)
+}
+
+/// The line that marks the bytes [`convert`] removed from the middle of a
+/// version 1 stream.
+fn removed_line(bytes: u64) -> Vec<u8> {
+    format!("\n[boot log: {bytes} older bytes were removed here to keep each boot's first lines]\n")
+        .into_bytes()
+}
+
+/// Make the version 1 log on `device`, whose ring fills the region, a
+/// version 2 log in `layout`, whose ring is shorter by the boot records'
+/// area at the region's end; the new head. The new ring starts where the
+/// old one did, so only what the area held moves:
+///
+/// - Nothing, where the stream never reached the area.
+/// - The stream's newest bytes, where the head lies inside the area: they
+///   move to the ring's start, over its oldest bytes, and the ring then
+///   holds the newest `ring_bytes` of the stream in order.
+/// - Otherwise the area held bytes from the middle of the wrapped stream:
+///   they are dropped, and [`removed_line`] takes the place of the last
+///   bytes before them.
+///
+/// The head keeps counting upward, moved on to the position the new ring
+/// gives the same place. The caller writes the header after this, last:
+/// until then the region reads as the version 1 log it was, with at most
+/// these bytes changed, and a boot interrupted here converts it again from
+/// the same bytes.
+fn convert(device: &mut dyn BlockDevice, old: &Header, layout: Layout) -> Result<u64, BlockError> {
+    let (ring, kept) = (old.layout.ring_bytes, layout.ring_bytes);
+    if kept >= ring {
+        return Ok(old.head);
+    }
+    let wrapped = old.head >= ring;
+    // Where the old ring's next byte goes: its newest bytes end here.
+    let place = if wrapped { old.head % ring } else { old.head };
+    if !wrapped && place <= kept {
+        return Ok(old.head);
+    }
+    // The place in the new ring after its newest byte.
+    let at = if place > kept {
+        let newest = read_stream(device, ring, old.head - (place - kept), old.head)?;
+        write_region(device, HEADER_BYTES, &newest)?;
+        place - kept
+    } else {
+        let line = removed_line(ring - kept);
+        let room = (kept - place) as usize;
+        let mark = match room >= line.len() {
+            true => line,
+            // Too little of the older part is left to say it: blank lines.
+            false => vec![b'\n'; room],
+        };
+        write_region(device, HEADER_BYTES + kept - mark.len() as u64, &mark)?;
+        place % kept
+    };
+    if device.identity().features.write_cache {
+        device.flush_cache()?;
+    }
+    // A full ring, at the first position not below the old head.
+    let base = old.head.max(kept) - old.head.max(kept) % kept;
+    Ok(match base + at >= old.head.max(kept) {
+        true => base + at,
+        false => base + kept + at,
+    })
 }
 
 /// The log of one boot: appends wait in memory until a flush stores them.
 pub struct Writer {
     ring: Ring,
     boots: u64,
+    layout: Layout,
+    records: Vec<Record>,
+    /// This boot's first lines while its record still takes them.
+    capture: Option<Capture>,
+    /// Record blocks the next store writes before its header, which names
+    /// their lengths.
+    record_writes: Vec<(u64, Vec<u8>)>,
     /// The head the header on the device records.
     durable: Option<u64>,
     fresh: Option<HeaderError>,
+    converted: bool,
     pending: Pending<Vec<u8>>,
     /// The store in progress: its steps to come and the one running.
     steps: VecDeque<Step>,
@@ -497,7 +826,8 @@ pub struct Writer {
 impl Writer {
     /// Open the log `device` holds whole (a [`LOG_BYTES`] window of the
     /// machine-state partition), count this boot and append its marker
-    /// line. A blank or invalid header starts a fresh log ([`Writer::fresh`]).
+    /// line. A blank or invalid header starts a fresh log ([`Writer::fresh`]);
+    /// a version 1 log is converted ([`Writer::converted`]).
     pub fn open(device: &mut dyn BlockDevice) -> Result<Self, BlockError> {
         Self::with_pending(device, PENDING_BYTES, true)
     }
@@ -515,6 +845,21 @@ impl Writer {
         new_boot: bool,
     ) -> Result<Self, BlockError> {
         let identity = device.identity();
+        let region = identity
+            .blocks
+            .saturating_mul(u64::from(identity.block_size));
+        Self::with_layout(device, pending, new_boot, Layout::of(region))
+    }
+
+    /// [`Self::open`] or [`Self::resume`], giving a fresh or version 1 log
+    /// `layout` where the region takes it and no records where it does not.
+    fn with_layout(
+        device: &mut dyn BlockDevice,
+        pending: usize,
+        new_boot: bool,
+        layout: Layout,
+    ) -> Result<Self, BlockError> {
+        let identity = device.identity();
         let block = identity.block_size as usize;
         if block == 0 || !(HEADER_BYTES as usize).is_multiple_of(block) {
             return Err(BlockError::Unsupported(
@@ -528,20 +873,27 @@ impl Writer {
         if bytes <= HEADER_BYTES {
             return Err(BlockError::Unsupported("the boot log region holds no ring"));
         }
-        let ring_bytes = bytes - HEADER_BYTES;
+        let layout = match layout.fits(bytes, block as u64) {
+            true => layout,
+            false => Layout::ring_only(bytes),
+        };
         let mut first = vec![0; block];
         device.read(0, &mut first)?;
-        let (header, fresh) = match Header::decode(&first, ring_bytes) {
-            Ok(header) => (header, None),
-            Err(error) => (
-                Header {
-                    head: 0,
-                    boots: 0,
-                    ring_bytes,
-                },
-                Some(error),
-            ),
+        let (header, fresh, converted) = match Header::decode(&first, bytes) {
+            Ok(header) if header.version == VERSION => (header, None, false),
+            Ok(old) => {
+                let head = convert(device, &old, layout)?;
+                let header = Header {
+                    head,
+                    boots: old.boots,
+                    ..Header::fresh(layout)
+                };
+                (header, None, true)
+            }
+            Err(error) => (Header::fresh(layout), Some(error), false),
         };
+        let layout = header.layout;
+        let ring_bytes = layout.ring_bytes;
         let mut ring = Ring {
             block,
             ring_bytes,
@@ -568,8 +920,14 @@ impl Writer {
         let mut writer = Self {
             ring,
             boots: header.boots.saturating_add(u64::from(new_boot)),
-            durable: fresh.is_none().then_some(head),
+            layout,
+            records: header.records,
+            capture: None,
+            record_writes: Vec::new(),
+            // A converted log's header is still to be written.
+            durable: (fresh.is_none() && !converted).then_some(head),
             fresh,
+            converted,
             pending: Pending::new(vec![0; pending]),
             steps: VecDeque::new(),
             running: None,
@@ -578,9 +936,120 @@ impl Writer {
             writer.append(b"\n");
         }
         if new_boot {
+            writer.begin_record(device)?;
             writer.append(format!("=== STELA BOOT {} ===\n", writer.boots).as_bytes());
+        } else {
+            writer.resume_record(device)?;
         }
         Ok(writer)
+    }
+
+    /// The stream bytes the ring on the device still holds from.
+    fn oldest(&self) -> u64 {
+        self.ring.head.saturating_sub(self.ring.ring_bytes)
+    }
+
+    /// Queue `bytes` for record `index`, `after` bytes into it, in whole
+    /// blocks: the rest of the last one is zero and beyond the lengths the
+    /// header names.
+    fn queue_record(&mut self, index: usize, after: u64, bytes: &[u8]) {
+        let block = self.ring.block;
+        let mut data = bytes.to_vec();
+        data.resize(bytes.len().next_multiple_of(block), 0);
+        self.record_writes
+            .push(((self.layout.record_at(index) + after) / block as u64, data));
+    }
+
+    /// A new boot opens the log: the last boot's record takes from the
+    /// ring what it lacks, its first lines where it ended before they were
+    /// complete and its last lines, and this boot gets the record after it.
+    fn begin_record(&mut self, device: &mut dyn BlockDevice) -> Result<(), BlockError> {
+        let records = self.records.len();
+        if records == 0 {
+            return Ok(());
+        }
+        let index = (self.boots % records as u64) as usize;
+        let (head, oldest) = (self.ring.head, self.oldest());
+        let last = (0..records)
+            .filter(|&other| other != index && (1..self.boots).contains(&self.records[other].boot))
+            .max_by_key(|&other| self.records[other].boot);
+        if let Some(last) = last {
+            let mut record = self.records[last];
+            if record.first == 0 && (oldest..head).contains(&record.start) {
+                let end = head.min(record.start + u64::from(self.layout.first_bytes));
+                let read = read_stream(device, self.ring.ring_bytes, record.start, end)?;
+                let first = match end < head {
+                    true => whole_lines(&read),
+                    false => &read,
+                };
+                record.first = first.len() as u32;
+                self.queue_record(last, 0, first);
+            }
+            let after_first = record.start.saturating_add(u64::from(record.first));
+            let from = after_first
+                .max(head.saturating_sub(u64::from(self.layout.last_bytes)))
+                .max(oldest);
+            if record.last == 0 && from < head && record.start <= head {
+                let read = read_stream(device, self.ring.ring_bytes, from, head)?;
+                // From the start of a line, unless it follows the first
+                // lines at once.
+                let skip = match from == after_first {
+                    true => 0,
+                    false => read
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(0, |end| end + 1),
+                };
+                record.last = (read.len() - skip) as u32;
+                self.queue_record(last, u64::from(self.layout.first_bytes), &read[skip..]);
+            }
+            self.records[last] = record;
+        }
+        self.records[index] = Record {
+            boot: self.boots,
+            start: self.head(),
+            first: 0,
+            last: 0,
+        };
+        self.capture = Some(Capture {
+            index,
+            bytes: Vec::with_capacity(self.layout.first_bytes as usize),
+        });
+        Ok(())
+    }
+
+    /// The same boot opens the log again: its record goes on taking its
+    /// first lines after those the ring already holds.
+    fn resume_record(&mut self, device: &mut dyn BlockDevice) -> Result<(), BlockError> {
+        let head = self.ring.head;
+        let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.boot == self.boots && record.boot != 0 && record.first == 0)
+        else {
+            return Ok(());
+        };
+        let start = self.records[index].start;
+        if !(self.oldest()..=head).contains(&start) {
+            return Ok(());
+        }
+        let end = head.min(start + u64::from(self.layout.first_bytes));
+        let bytes = read_stream(device, self.ring.ring_bytes, start, end)?;
+        self.capture = Some(Capture { index, bytes });
+        self.close_full_record();
+        Ok(())
+    }
+
+    /// Once this boot's first lines fill its record's room, queue them,
+    /// cut at a line's end, and stop collecting.
+    fn close_full_record(&mut self) {
+        let room = self.layout.first_bytes as usize;
+        let Some(capture) = self.capture.take_if(|capture| capture.bytes.len() >= room) else {
+            return;
+        };
+        let first = whole_lines(&capture.bytes[..room]);
+        self.records[capture.index].first = first.len() as u32;
+        self.queue_record(capture.index, 0, first);
     }
 
     /// Read the header back and check that it records the last flush: a
@@ -588,7 +1057,7 @@ impl Writer {
     pub fn verify(&self, device: &mut dyn BlockDevice) -> Result<(), Unkept> {
         let mut block = vec![0; self.ring.block];
         device.read(0, &mut block).map_err(Unkept::Read)?;
-        let stored = Header::decode(&block, self.ring.ring_bytes).map_err(Unkept::Header)?;
+        let stored = Header::decode(&block, self.layout.region()).map_err(Unkept::Header)?;
         let written = self.durable.unwrap_or_default();
         if stored.head != written || stored.boots != self.boots {
             return Err(Unkept::Head {
@@ -602,6 +1071,16 @@ impl Writer {
     /// Why the log started fresh this boot, if it did.
     pub fn fresh(&self) -> Option<&HeaderError> {
         self.fresh.as_ref()
+    }
+
+    /// Whether this open converted a version 1 log ([`convert`]).
+    pub fn converted(&self) -> bool {
+        self.converted
+    }
+
+    /// How the region is divided.
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
     /// This boot's number.
@@ -640,20 +1119,31 @@ impl Writer {
     }
 
     /// Begin storing the pending bytes; whether there are any. The store
-    /// is the ring's blocks, each durable once written, then the header,
-    /// durable too: a header never names bytes the device lacks, and no
-    /// cache is flushed whole. Bytes appended meanwhile wait for the next.
+    /// is the ring's blocks, each durable once written, a boot record's
+    /// when one is due, then the header, durable too: a header never names
+    /// bytes the device lacks, and no cache is flushed whole. Bytes
+    /// appended meanwhile wait for the next.
     pub fn begin_store(&mut self) -> bool {
         if self.storing() {
             return true;
         }
         let mut remaining = self.pending.bytes();
-        if remaining == 0 && self.durable == Some(self.ring.head) {
+        if remaining == 0 && self.durable == Some(self.ring.head) && self.record_writes.is_empty() {
             return false;
         }
         let mut writes = Vec::new();
         let ring = &mut self.ring;
+        let room = self.layout.first_bytes as usize;
+        let capture = &mut self.capture;
         let Ok(()) = self.pending.drain(|bytes| {
+            // The boot's first lines, as the ring takes them.
+            if let Some(capture) = capture
+                .as_mut()
+                .filter(|capture| capture.bytes.len() < room)
+            {
+                let take = bytes.len().min(room - capture.bytes.len());
+                capture.bytes.extend_from_slice(&bytes[..take]);
+            }
             ring.stage(bytes, &mut remaining, &mut writes);
             Ok::<_, Infallible>(())
         });
@@ -674,6 +1164,10 @@ impl Writer {
         }
         if ring.dirty && !tail {
             self.steps.push_back(Step::Tail);
+        }
+        self.close_full_record();
+        for (lba, data) in self.record_writes.drain(..) {
+            self.steps.push_back(Step::Record { lba, data });
         }
         self.steps.push_back(Step::Header);
         true
@@ -715,12 +1209,25 @@ impl Writer {
                 },
                 Step::Tail,
             ),
+            Step::Record { lba, data } => (
+                Request::Write {
+                    lba,
+                    data,
+                    durable: true,
+                },
+                Step::Record {
+                    lba,
+                    data: Vec::new(),
+                },
+            ),
             Step::Header => {
                 let mut block = vec![0; ring.block];
                 Header {
+                    version: VERSION,
                     head: ring.head,
                     boots: self.boots,
-                    ring_bytes: ring.ring_bytes,
+                    layout: self.layout,
+                    records: self.records.clone(),
                 }
                 .encode(&mut block);
                 let request = Request::Write {
@@ -758,10 +1265,26 @@ impl Writer {
                 ring.unread = false;
             }
             Some(Step::Header) => self.durable = Some(ring.head),
-            Some(Step::Blocks { .. }) | None => {}
+            Some(Step::Blocks { .. }) | Some(Step::Record { .. }) | None => {}
         }
         Ok(())
     }
+}
+
+/// What a boot's record keeps of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootStart {
+    /// The boot's number.
+    pub boot: u64,
+    /// The stream position of its marker line.
+    pub start: u64,
+    /// Its first lines, from the marker; empty while the boot that wrote
+    /// them is the last and ended before they were complete, when the
+    /// stream still holds them.
+    pub first: Vec<u8>,
+    /// Its last lines, which follow the first at once or after others;
+    /// empty for the last boot.
+    pub last: Vec<u8>,
 }
 
 /// A region's log.
@@ -772,6 +1295,8 @@ pub struct Log {
     pub ring_bytes: u64,
     /// The valid stream, oldest byte first.
     pub stream: Vec<u8>,
+    /// The boots with a record, oldest first; none in a version 1 log.
+    pub starts: Vec<BootStart>,
 }
 
 impl Log {
@@ -779,18 +1304,36 @@ impl Log {
     pub fn overwritten(&self) -> u64 {
         self.head.saturating_sub(self.ring_bytes)
     }
+
+    /// The records of the boots whose first lines the stream no longer
+    /// holds, oldest first, each with whether the stream no longer holds
+    /// its last lines either: the stream then starts in a later boot.
+    pub fn kept_starts(&self) -> impl Iterator<Item = (&BootStart, bool)> {
+        let overwritten = self.overwritten();
+        self.starts
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, start)| {
+                let ended = self
+                    .starts
+                    .get(index + 1)
+                    .is_some_and(|next| next.start <= overwritten);
+                (start.start < overwritten && !start.first.is_empty()).then_some((start, ended))
+            })
+    }
 }
 
-/// The log a whole region holds, its stream in order. A blank or invalid
-/// header is refused by name.
+/// The log a whole region holds, of either version: its stream in order
+/// and its boot records. A blank or invalid header is refused by name.
 pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let bytes = region.len() as u64;
     if bytes <= HEADER_BYTES {
         return Err(HeaderError::Short { bytes });
     }
-    let (header, ring) = region.split_at(HEADER_BYTES as usize);
-    let ring_bytes = bytes - HEADER_BYTES;
-    let Header { head, boots, .. } = Header::decode(header, ring_bytes)?;
+    let header = Header::decode(&region[..HEADER_BYTES as usize], bytes)?;
+    let (head, layout) = (header.head, header.layout);
+    let ring_bytes = layout.ring_bytes;
+    let ring = &region[HEADER_BYTES as usize..(HEADER_BYTES + ring_bytes) as usize];
     let start = head.saturating_sub(ring_bytes);
     let len = (head - start) as usize;
     let at = (start % ring_bytes) as usize;
@@ -798,11 +1341,29 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let mut stream = Vec::with_capacity(len);
     stream.extend_from_slice(&ring[at..at + first]);
     stream.extend_from_slice(&ring[..len - first]);
+    let mut starts: Vec<BootStart> = header
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.boot != 0 && record.boot <= header.boots)
+        .map(|(index, record)| {
+            let at = layout.record_at(index) as usize;
+            let last = at + layout.first_bytes as usize;
+            BootStart {
+                boot: record.boot,
+                start: record.start,
+                first: region[at..at + record.first as usize].to_vec(),
+                last: region[last..last + record.last as usize].to_vec(),
+            }
+        })
+        .collect();
+    starts.sort_by_key(|start| start.boot);
     Ok(Log {
-        boots,
+        boots: header.boots,
         head,
         ring_bytes,
         stream,
+        starts,
     })
 }
 
@@ -822,32 +1383,19 @@ pub fn read_newest(
     if block == 0 || !HEADER_BYTES.is_multiple_of(block) || bytes <= HEADER_BYTES {
         return Ok(Vec::new());
     }
-    let ring_bytes = bytes - HEADER_BYTES;
     let mut header = vec![0; HEADER_BYTES as usize];
     device.read(0, &mut header)?;
-    let Ok(Header { head, .. }) = Header::decode(&header, ring_bytes) else {
+    let Ok(header) = Header::decode(&header, bytes) else {
         return Ok(Vec::new());
     };
+    let (head, ring_bytes) = (header.head, header.layout.ring_bytes);
     let oldest = head.saturating_sub(ring_bytes);
     let mut newest = Vec::new();
     let mut from = head;
     while from > oldest {
         let to = from;
         from = to.saturating_sub(chunk.max(block)).max(oldest);
-        // Whole blocks around [from, to), each within the ring.
-        let mut read = Vec::with_capacity((to - from) as usize);
-        let mut at = from - from % block;
-        while at < to {
-            let in_ring = at % ring_bytes;
-            let run = (to.next_multiple_of(block) - at).min(ring_bytes - in_ring);
-            let mut buffer = vec![0; run as usize];
-            device.read((HEADER_BYTES + in_ring) / block, &mut buffer)?;
-            read.extend_from_slice(&buffer);
-            at += run;
-        }
-        let skip = (from % block) as usize;
-        read.truncate(skip + (to - from) as usize);
-        read.drain(..skip);
+        let mut read = read_stream(device, ring_bytes, from, to)?;
         read.extend_from_slice(&newest);
         newest = read;
         if enough(&newest) {

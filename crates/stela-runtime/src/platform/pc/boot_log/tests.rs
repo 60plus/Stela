@@ -245,7 +245,7 @@ fn the_reader_orders_a_wrapped_region() {
     Header {
         head: ring + 5,
         boots: 3,
-        ring_bytes: ring,
+        ..Header::fresh(Layout::ring_only(HEADER_BYTES + ring))
     }
     .encode(&mut region[..HEADER_BYTES as usize]);
     // Stream bytes 5..21: 16..21 wrapped to ring 0..5.
@@ -359,19 +359,26 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
         bytes[offset] ^= 0x5a;
         bytes
     };
+    let sealed = |mut bytes: Vec<u8>| {
+        let digest = Sha256::digest(&bytes[..FIELDS]);
+        bytes[FIELDS..FIELDS + 32].copy_from_slice(&digest);
+        bytes
+    };
     let mut wrong_version = good.clone();
-    wrong_version[8] = 2;
-    let digest = Sha256::digest(&wrong_version[..FIELDS]);
-    wrong_version[FIELDS..RECORD].copy_from_slice(&digest);
+    wrong_version[8] = 3;
+    let wrong_version = sealed(wrong_version);
     let mut other_ring = good.clone();
     other_ring[32..40].copy_from_slice(&8192u64.to_le_bytes());
-    let digest = Sha256::digest(&other_ring[..FIELDS]);
-    other_ring[FIELDS..RECORD].copy_from_slice(&digest);
+    let other_ring = sealed(other_ring);
+    let mut many_records = good.clone();
+    many_records[40] = 17;
+    let many_records = sealed(many_records);
     let cases = [
         (damage(0), HeaderError::NotALog),
         (damage(16), HeaderError::Checksum),
         (damage(FIELDS + 3), HeaderError::Checksum),
-        (wrong_version, HeaderError::Version(2)),
+        (wrong_version, HeaderError::Version(3)),
+        (many_records, HeaderError::Records(17)),
         (
             other_ring,
             HeaderError::RingSize {
@@ -491,4 +498,261 @@ fn a_file_gives_the_block_runs_of_its_clusters_that_hold_the_layout() {
         file_runs(&file(&[(0, LOG_BYTES)]), 512, LOG_BYTES),
         Ok(vec![(0, LOG_BYTES / 512)])
     );
+}
+
+/// A small region with three boot records of one 4 KiB part each.
+const SMALL: Layout = Layout {
+    ring_bytes: 8 * 4096,
+    records: 3,
+    first_bytes: 4096,
+    last_bytes: 4096,
+};
+
+fn small_disk(block: u32) -> Recorder {
+    Recorder::new(SMALL.region(), block)
+}
+
+fn open_small(disk: &mut Recorder, new_boot: bool) -> Writer {
+    Writer::with_layout(disk, PENDING_BYTES, new_boot, SMALL).unwrap()
+}
+
+/// `count` numbered lines of 12 bytes from `from`.
+fn lines(from: usize, count: usize) -> Vec<u8> {
+    (from..from + count)
+        .flat_map(|line| format!("line {line:06}\n").into_bytes())
+        .collect()
+}
+
+/// A version 1 log holding `stream`, the newest bytes its ring has room
+/// for: a 40-byte header and a ring that fills the region.
+fn version_1(region: u64, block: u32, stream: &[u8], boots: u64) -> Recorder {
+    let mut disk = Recorder::new(region, block);
+    let ring = region - HEADER_BYTES;
+    let head = stream.len() as u64;
+    let bytes = &mut disk.disk.bytes;
+    bytes[..8].copy_from_slice(MAGIC);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[16..24].copy_from_slice(&head.to_le_bytes());
+    bytes[24..32].copy_from_slice(&boots.to_le_bytes());
+    bytes[32..40].copy_from_slice(&ring.to_le_bytes());
+    let digest = Sha256::digest(&bytes[..40]);
+    bytes[40..72].copy_from_slice(&digest);
+    for at in head.saturating_sub(ring)..head {
+        bytes[(HEADER_BYTES + at % ring) as usize] = stream[at as usize];
+    }
+    disk
+}
+
+#[test]
+fn a_version_1_log_is_read_as_it_was_written() {
+    let stream = lines(0, 6000);
+    let region = SMALL.region();
+    let ring = (region - HEADER_BYTES) as usize;
+    let disk = version_1(region, 512, &stream, 7);
+    let log = disk.log().unwrap();
+    assert_eq!((log.boots, log.head), (7, stream.len() as u64));
+    assert_eq!(log.ring_bytes, ring as u64);
+    assert_eq!(log.stream, stream[stream.len() - ring..]);
+    assert!(log.starts.is_empty());
+    assert_eq!(log.kept_starts().count(), 0);
+}
+
+#[test]
+fn a_version_1_log_is_converted_keeping_its_newest_lines_in_order() {
+    let region = SMALL.region();
+    let old_ring = region - HEADER_BYTES;
+    let kept = SMALL.ring_bytes as usize;
+    // The head before the record area, inside it, inside it after a wrap,
+    // and before it after a wrap.
+    for (head, removed) in [
+        (20_000, false),
+        (40_000, false),
+        (old_ring + 40_001, false),
+        (old_ring + 10_001, true),
+        (old_ring + kept as u64, false),
+    ] {
+        for block in [512, 4096] {
+            let stream = lines(0, head as usize / 12 + 1)[..head as usize].to_vec();
+            let mut disk = version_1(region, block, &stream, 4);
+            let before = disk.log().unwrap();
+            // A conversion that ends before its header leaves a version 1
+            // log, and the next one gives what an undisturbed one does.
+            drop(open_small(&mut disk, true));
+            let interrupted = disk.log().unwrap();
+            assert_eq!((interrupted.head, interrupted.boots), (head, 4));
+            assert_eq!(interrupted.ring_bytes, old_ring);
+            let mut writer = open_small(&mut disk, true);
+            assert!(writer.converted() && writer.fresh().is_none());
+            assert_eq!(writer.boots(), 5);
+            writer.flush(&mut disk).unwrap();
+            assert_eq!(writer.verify(&mut disk), Ok(()));
+            let log = disk.log().unwrap();
+            assert_eq!(log.ring_bytes, kept as u64);
+            assert!(log.head >= head, "{head} {block}");
+            let marker = "\n=== STELA BOOT 5 ===\n";
+            let converted = log.stream.strip_suffix(marker.as_bytes()).unwrap();
+            if !removed {
+                let newest = &stream[stream.len().saturating_sub(kept)..];
+                // The marker took the place of the oldest bytes of a full ring.
+                assert!(newest.ends_with(converted), "{head} {block}");
+                assert!(newest.len() - converted.len() <= marker.len());
+                continue;
+            }
+            // The older part, the line that says what went, the newest part.
+            let line = removed_line(old_ring - kept as u64);
+            let place = (head % old_ring) as usize;
+            let at = converted
+                .windows(line.len())
+                .position(|window| window == line)
+                .unwrap();
+            assert_eq!(
+                &converted[at + line.len()..],
+                &stream[stream.len() - place..]
+            );
+            let older = &converted[..at];
+            assert!(
+                before.stream[..kept - place - line.len()].ends_with(older),
+                "{head} {block}"
+            );
+            // A second open finds a version 2 log.
+            assert!(!open_small(&mut disk, false).converted());
+        }
+    }
+}
+
+#[test]
+fn a_boot_keeps_its_first_lines_once_the_ring_has_overwritten_them() {
+    for block in [512, 4096] {
+        let mut disk = small_disk(block);
+        let mut writer = open_small(&mut disk, true);
+        // Nearly twice the ring, stored a few lines at a time.
+        let body = lines(0, 5000);
+        for chunk in body.chunks(12 * 50) {
+            writer.append(chunk);
+            writer.flush(&mut disk).unwrap();
+        }
+        let mut stream = b"=== STELA BOOT 1 ===\n".to_vec();
+        stream.extend_from_slice(&body);
+        let log = disk.log().unwrap();
+        assert_eq!(
+            log.stream,
+            stream[stream.len() - SMALL.ring_bytes as usize..]
+        );
+        let [start] = &log.starts[..] else {
+            panic!("{:?}", log.starts.len());
+        };
+        assert_eq!((start.boot, start.start), (1, 0));
+        // Whole lines, as many as fit the record.
+        let first = whole_lines(&stream[..4096]);
+        assert_eq!(start.first, first);
+        assert!(first.len() > 4096 - 12 && first.ends_with(b"\n"));
+        assert!(start.last.is_empty());
+        let kept: Vec<_> = log.kept_starts().collect();
+        assert_eq!(kept, [(start, false)]);
+
+        // The next boot gives it its last lines, from a line's start.
+        let mut next = open_small(&mut disk, true);
+        next.append(b"short boot\n");
+        next.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        assert_eq!(log.starts.len(), 2);
+        assert_eq!(log.starts[0].first, first);
+        let last = &log.starts[0].last;
+        assert!(stream.ends_with(last) && last.starts_with(b"line "));
+        assert!(last.len() > 4096 - 12 && last.len() <= 4096);
+        assert_eq!(
+            (log.starts[1].boot, log.starts[1].start),
+            (2, stream.len() as u64)
+        );
+        assert!(log.starts[1].first.is_empty());
+
+        // A boot that ended before its first lines were complete gets all
+        // of them at the next open, and no last lines beside them.
+        let mut third = open_small(&mut disk, true);
+        third.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        assert_eq!(log.starts[1].first, b"=== STELA BOOT 2 ===\nshort boot\n");
+        assert!(log.starts[1].last.is_empty());
+        // The stream holds boots 2 and 3 whole: only boot 1 is told apart.
+        assert_eq!(log.kept_starts().count(), 1);
+
+        // The fourth boot takes the oldest record.
+        let mut fourth = open_small(&mut disk, true);
+        fourth.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        let boots: Vec<u64> = log.starts.iter().map(|start| start.boot).collect();
+        assert_eq!(boots, [2, 3, 4]);
+        assert_eq!(log.kept_starts().count(), 0);
+    }
+}
+
+#[test]
+fn a_resumed_boot_goes_on_with_its_first_lines() {
+    let mut disk = small_disk(512);
+    let mut loader = open_small(&mut disk, true);
+    let before = lines(0, 100);
+    loader.append(&before);
+    loader.flush(&mut disk).unwrap();
+    drop(loader);
+    let mut engine = open_small(&mut disk, false);
+    let after = lines(100, 600);
+    engine.append(&after);
+    engine.flush(&mut disk).unwrap();
+    let mut stream = b"=== STELA BOOT 1 ===\n".to_vec();
+    stream.extend_from_slice(&before);
+    stream.extend_from_slice(&after);
+    let log = disk.log().unwrap();
+    assert_eq!(log.starts[0].first, whole_lines(&stream[..4096]));
+    // A third open in the same boot finds the record complete.
+    let mut again = open_small(&mut disk, false);
+    again.append(b"more\n");
+    again.flush(&mut disk).unwrap();
+    assert_eq!(
+        disk.log().unwrap().starts[0].first,
+        whole_lines(&stream[..4096])
+    );
+}
+
+/// A line costs what it did without records: its tail block and the
+/// header. A whole log's boot writes its first lines once more, in the one
+/// store during which they are complete.
+#[test]
+fn a_boot_s_record_costs_one_write_and_no_line_more() {
+    let mut disk = Recorder::new(LOG_BYTES, 512);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert_eq!(writer.layout(), Layout::of(LOG_BYTES));
+    assert_eq!(writer.ring_bytes(), RING_BYTES);
+    writer.flush(&mut disk).unwrap();
+    let (mut two, mut three) = (0, 0);
+    for line in 0..2400 {
+        disk.events.clear();
+        let reads = disk.reads;
+        writer.append(
+            format!("HOST DEVICE PCI 0000:{line:04x}:00.0 start, as a boot says it\n").as_bytes(),
+        );
+        writer.flush(&mut disk).unwrap();
+        assert_eq!(disk.reads, reads);
+        match disk.events.iter().filter(|event| event.is_some()).count() {
+            2 => two += 1,
+            3 => three += 1,
+            writes => panic!("line {line}: {writes} writes"),
+        }
+    }
+    assert_eq!((two, three), (2399, 1));
+    let log = disk.log().unwrap();
+    assert_eq!(log.starts.len(), 1);
+    let first = &log.starts[0].first;
+    assert!(log.stream.starts_with(first));
+    assert!(first.len() > FIRST_BYTES as usize - 80 && first.len() <= FIRST_BYTES as usize);
+    // The next boot's first store adds the last boot's last lines.
+    let mut next = Writer::open(&mut disk).unwrap();
+    disk.events.clear();
+    next.flush(&mut disk).unwrap();
+    assert_eq!(
+        disk.events.iter().filter(|event| event.is_some()).count(),
+        3
+    );
+    let log = disk.log().unwrap();
+    assert!(log.starts[0].last.len() > LAST_BYTES as usize - 80);
+    assert!(log.stream.ends_with(b"=== STELA BOOT 2 ===\n"));
 }

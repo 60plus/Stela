@@ -429,6 +429,13 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     if let Some(reason) = writer.fresh() {
         output::arguments(format_args!("BOOT LOG fresh: {reason}\n"));
     }
+    if writer.converted() {
+        output::arguments(format_args!(
+            "BOOT LOG layout changed to keep each boot's first lines: the newest {} KiB of the \
+             earlier boots' lines stay\n",
+            writer.ring_bytes() >> 10
+        ));
+    }
     output::arguments(format_args!(
         "BOOT LOG boot={} offset={:#x} bytes={:#x} head={:#x}\n",
         writer.boots(),

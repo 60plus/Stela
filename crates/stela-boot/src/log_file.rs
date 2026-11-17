@@ -150,6 +150,13 @@ fn report(writer: &Writer, through: &str) {
 fn shared<P: ProtocolPointer + ?Sized>(handle: Handle) -> Option<ScopedProtocol<P>> {
     // SAFETY: used only for queries and file access while boot services
     // run; no driver on `handle` is replaced while it is held.
+    if writer.converted() {
+        output::arguments(format_args!(
+            "BOOT LOG FILE layout changed to keep each boot's first lines: the newest {} KiB \
+             of the earlier boots' lines stay\n",
+            writer.ring_bytes() >> 10
+        ));
+    }
     unsafe {
         boot::open_protocol::<P>(
             OpenProtocolParams {

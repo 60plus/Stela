@@ -125,11 +125,11 @@ impl BootLog {
 
 /// Print `logs` in order, each after a heading naming its place when
 /// `headings`, or write them to `output` and say where they went. Each
-/// stream is written as the boot wrote it, oldest boot first; each log's
-/// one-line summary goes to standard error.
-/// Write `logs` to `output` or standard output. Each of `notes` (what the
-/// logs lack, [`scan_noted`]) is the file's first lines, so a reader of an
-/// attached file sees it, and is said again after the summary.
+/// log's one-line summary goes to standard error and before its lines,
+/// which are written as the boot wrote them, oldest boot first
+/// ([`write_log`]). Each of `notes` (what the logs lack, [`scan_noted`]) is
+/// the file's first lines, so a reader of an attached file sees it, and is
+/// said again after the summary.
 pub(crate) fn write_logs(
     logs: &[(String, Log)],
     headings: bool,
@@ -157,8 +157,12 @@ pub(crate) fn write_logs(
             eprint!("{place}: ");
             written = writeln!(sink, "=== {place} ===");
         }
-        eprint!("{}", summary(log));
-        match written.and_then(|()| sink.write_all(&log.stream)) {
+        let summary = summary(log);
+        eprint!("{summary}");
+        match written
+            .and_then(|()| writeln!(sink, "=== {} ===", summary.trim_end()))
+            .and_then(|()| write_log(&mut sink, log))
+        {
             // A reader that closed the pipe early (`| head`) has what it
             // asked for.
             Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -180,6 +184,94 @@ pub(crate) fn write_logs(
         eprintln!("Note: {note}");
     }
     Ok(())
+}
+
+/// A log's lines: first what its boot records keep of the boots whose
+/// first lines the log has since overwritten (`Log::kept_starts`), each
+/// boot under a line naming it, then the stream as it was written.
+fn write_log(sink: &mut dyn Write, log: &Log) -> std::io::Result<()> {
+    let mut ended_line = |sink: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
+        sink.write_all(bytes)?;
+        match bytes.last() {
+            Some(b'\n') | None => Ok(()),
+            Some(_) => sink.write_all(b"\n"),
+        }
+    };
+    let mut kept = false;
+    for (start, ended) in log.kept_starts() {
+        kept = true;
+        writeln!(
+            sink,
+            "=== BOOT {}: its first lines, kept apart; the log has since overwritten them ===",
+            start.boot
+        )?;
+        ended_line(sink, &start.first)?;
+        match (ended, start.last.is_empty()) {
+            (true, false) => {
+                writeln!(
+                    sink,
+                    "=== BOOT {}: its last lines; those between were overwritten ===",
+                    start.boot
+                )?;
+                ended_line(sink, &start.last)?;
+            }
+            (true, true) => writeln!(
+                sink,
+                "=== BOOT {}: its later lines were overwritten ===",
+                start.boot
+            )?,
+            (false, _) => writeln!(
+                sink,
+                "=== BOOT {}: lines were overwritten here; the log below goes on in this boot ===",
+                start.boot
+            )?,
+        }
+    }
+    if kept {
+        writeln!(
+            sink,
+            "=== THE LOG, every line it still holds, oldest first ==="
+        )?;
+    }
+    sink.write_all(&log.stream)
+}
+
+/// The milliseconds since the PC started that a log line begins with,
+/// `[  12.345] ` (`stela.efi`'s `output::stamp`).
+fn stamp(line: &[u8]) -> Option<u64> {
+    let inner = line.strip_prefix(b"[")?;
+    let end = inner.iter().take(16).position(|&byte| byte == b']')?;
+    let (seconds, millis) = std::str::from_utf8(&inner[..end])
+        .ok()?
+        .trim()
+        .split_once('.')?;
+    Some(seconds.parse::<u64>().ok()? * 1000 + millis.parse::<u64>().ok()?)
+}
+
+/// The seconds of running the lines of `stream` cover: in each boot, from
+/// its first stamped line to its last.
+pub(crate) fn covered_seconds(stream: &[u8]) -> u64 {
+    let (mut total, mut span) = (0, None::<(u64, u64)>);
+    for line in stream.split(|&byte| byte == b'\n') {
+        if line.starts_with(b"=== STELA BOOT ") {
+            total += span
+                .take()
+                .map_or(0, |(first, last)| last.saturating_sub(first));
+        } else if let Some(at) = stamp(line) {
+            span = Some((span.map_or(at, |(first, _)| first), at));
+        }
+    }
+    (total + span.map_or(0, |(first, last)| last.saturating_sub(first))) / 1000
+}
+
+/// `seconds` as a person says a duration: `2 h 40 min`, `49 min`, `35 s`.
+fn duration_text(seconds: u64) -> String {
+    match (seconds / 3600, seconds % 3600 / 60) {
+        (0, 0) => format!("{seconds} s"),
+        (0, minutes) => format!("{minutes} min"),
+        (hours, 0) => format!("{hours} h"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
 }
 
 /// Where `count` logs were written, as the full path to attach.
@@ -421,6 +513,7 @@ fn file_log(read: &mut Reader<'_>, bytes: u64) -> Result<StickLog> {
                     head: stream.len() as u64,
                     ring_bytes: boot_log::RING_BYTES,
                     stream,
+                    starts: Vec::new(),
                 },
                 error,
             ))
@@ -600,11 +693,34 @@ fn read(file: &mut File, state: u64) -> Result<Log> {
     boot_log::read(&region).with_context(|| format!("no boot log at {start:#x}"))
 }
 
-/// What a log holds, one line.
+/// What a log holds, one line: its boots, how much running time its lines
+/// cover where they are stamped, and, once it has overwritten older lines,
+/// the boots whose first lines it kept apart.
 pub(crate) fn summary(log: &Log) -> String {
     let mut text = format!("Stela boot log: {} boots", log.boots);
+    let seconds = covered_seconds(&log.stream);
+    if seconds != 0 {
+        let _ = write!(
+            text,
+            "; its lines cover {} of running",
+            duration_text(seconds)
+        );
+    }
     if log.overwritten() != 0 {
-        text.push_str("; older boots were overwritten");
+        text.push_str("; older lines were overwritten");
+        let kept: Vec<u64> = log.kept_starts().map(|(start, _)| start.boot).collect();
+        match kept[..] {
+            [] => {}
+            [boot] => {
+                let _ = write!(text, ", the first lines of boot {boot} are kept");
+            }
+            [first, .., last] => {
+                let _ = write!(
+                    text,
+                    ", the first lines of boots {first} to {last} are kept"
+                );
+            }
+        }
     }
     text.push('\n');
     text
@@ -1254,9 +1370,10 @@ pub(crate) mod tests {
             (String::from("disk"), log),
         ];
         write_logs(&logs, true, &[String::from("first\nnote")], Some(&output)).unwrap();
-        let mut expected = b"=== NOTE: first note ===\n=== USB ===\n".to_vec();
+        let mut expected =
+            b"=== NOTE: first note ===\n=== USB ===\n=== Stela boot log: 1 boots ===\n".to_vec();
         expected.extend_from_slice(&logs[0].1.stream);
-        expected.extend_from_slice(b"=== disk ===\n");
+        expected.extend_from_slice(b"=== disk ===\n=== Stela boot log: 1 boots ===\n");
         expected.extend_from_slice(&logs[1].1.stream);
         assert_eq!(std::fs::read(&output).unwrap(), expected);
         let said = saved(2, &output, false);
@@ -1270,5 +1387,87 @@ pub(crate) mod tests {
         );
         let error = write_logs(&logs, false, &[], Some(&dir.path().join("no/such/dir")));
         assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
+    }
+
+    /// A boot that ran until the log overwrote its own first lines: they
+    /// are written first, from the boot's record, and the summary says how
+    /// much running the lines cover.
+    #[test]
+    fn a_long_boot_s_first_lines_are_written_before_the_log() {
+        let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
+        let mut region = Bytes {
+            bytes: &mut bytes,
+            identity: Identity {
+                transport: Transport::VirtioBlk,
+                location: "test".into(),
+                model: "RAM".into(),
+                serial: String::new(),
+                blocks: boot_log::LOG_BYTES / 512,
+                block_size: 512,
+                read_only: false,
+                features: Default::default(),
+            },
+        };
+        let mut writer = Writer::open(&mut region).unwrap();
+        writer.append(b"[    1.000] HOST version=0.5.0 cpu=test\n");
+        // A line every 100 ms: 36 bytes each, more than the ring holds.
+        let lines = boot_log::RING_BYTES / 36 + 5000;
+        for line in 0..lines {
+            let millis = 2000 + line * 100;
+            writer.append(
+                format!(
+                    "[{:5}.{:03}] BEAT blocks={line:010}\n",
+                    millis / 1000,
+                    millis % 1000
+                )
+                .as_bytes(),
+            );
+            if line % 2000 == 0 {
+                writer.flush(&mut region).unwrap();
+            }
+        }
+        writer.flush(&mut region).unwrap();
+        drop(writer);
+        let mut next = Writer::open(&mut region).unwrap();
+        next.append(b"[    0.500] HOST version=0.5.0 cpu=test\n");
+        next.flush(&mut region).unwrap();
+        let log = boot_log::read(&bytes).unwrap();
+        assert!(log.overwritten() > 0);
+        assert!(!String::from_utf8_lossy(&log.stream[..40_000]).contains("HOST version"));
+        // The ring holds some 87,000 lines of boot 1, 100 ms apart.
+        let seconds = covered_seconds(&log.stream);
+        assert!((8000..9500).contains(&seconds), "{seconds}");
+        let said = summary(&log);
+        let expected = format!(
+            "Stela boot log: 2 boots; its lines cover {} of running; older lines were \
+             overwritten, the first lines of boot 1 are kept\n",
+            duration_text(seconds)
+        );
+        assert_eq!(said, expected);
+        let mut written = Vec::new();
+        write_log(&mut written, &log).unwrap();
+        let text = String::from_utf8(written).unwrap();
+        let first = "=== BOOT 1: its first lines, kept apart; the log has since overwritten \
+                     them ===\n=== STELA BOOT 1 ===\n[    1.000] HOST version=0.5.0 cpu=test\n";
+        assert!(text.starts_with(first), "{}", &text[..200]);
+        let goes_on = "=== BOOT 1: lines were overwritten here; the log below goes on in this \
+                       boot ===\n=== THE LOG, every line it still holds, oldest first ===\n";
+        let at = text.find(goes_on).unwrap();
+        assert!(at >= boot_log::FIRST_BYTES as usize - 100);
+        assert_eq!(&text.as_bytes()[at + goes_on.len()..], &log.stream[..]);
+        assert!(text.ends_with("=== STELA BOOT 2 ===\n[    0.500] HOST version=0.5.0 cpu=test\n"));
+
+        assert_eq!(stamp(b"[12345.678] x"), Some(12_345_678));
+        assert_eq!(stamp(b"[    0.007] x"), Some(7));
+        assert_eq!(stamp(b"=== STELA BOOT 3 ==="), None);
+        assert_eq!(stamp(b"[boot log dropped 4 bytes]"), None);
+        assert_eq!(
+            covered_seconds(b"[   10.000] a\n[   70.000] b\n=== STELA BOOT 2 ===\nx\n[    5.000] c\n[   35.500] d\n"),
+            90
+        );
+        assert_eq!(
+            [duration_text(35), duration_text(2940), duration_text(7200)],
+            ["35 s", "49 min", "2 h"]
+        );
     }
 }
