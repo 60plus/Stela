@@ -10,6 +10,29 @@ use stela_contracts::{
 /// taken in compiled code.
 pub const OUTSIDE_KINDS: usize = ExitKind::Amx as usize + 2;
 
+/// What a PE's host core reports of its own clock so far ([`Host::clock`]),
+/// every count cumulative since the core started sampling: its actual and
+/// reference cycles in the running state (x86 IA32_APERF and IA32_MPERF,
+/// whose ratio scales the reference rate to the clock it delivered), the
+/// samples taken, and of those the samples that found the core over its
+/// thermal limit, below its requested performance for a power limit, or
+/// slowed by a PROCHOT# or FORCEPR# signal; and the last sample's degrees
+/// below the core's highest allowed temperature. `counters` and `thermal`
+/// say which of the two register sets the core has; a host that has
+/// neither leaves both false.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostClock {
+    pub actual: u64,
+    pub reference: u64,
+    pub samples: u64,
+    pub hot: u64,
+    pub power: u64,
+    pub prochot: u64,
+    pub headroom: Option<u8>,
+    pub counters: bool,
+    pub thermal: bool,
+}
+
 /// One PE's System registers that take none of the board's locks, as
 /// [`Devices::system_register`] serves them.
 pub trait LocalRegisters: Send + Sync {
@@ -434,6 +457,13 @@ pub trait Host {
     /// count them answers zeros.
     fn outside(&self) -> [[u64; 2]; OUTSIDE_KINDS] {
         [[0; 2]; OUTSIDE_KINDS]
+    }
+    /// This host core's clock and thermal state so far ([`HostClock`]),
+    /// sampled at a bounded rate: the heartbeat's clock each PE's core
+    /// delivered and whether a thermal or power limit held it back. A host
+    /// without the registers answers the default.
+    fn clock(&self) -> HostClock {
+        HostClock::default()
     }
     /// A cycle count for `--profile`'s phase timing ([`step_timing`]); a
     /// host without one answers 0.

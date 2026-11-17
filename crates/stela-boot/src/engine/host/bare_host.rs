@@ -362,6 +362,10 @@ impl Host for BareHost<'_> {
         state().outside.sums()
     }
 
+    fn clock(&self) -> stela_engine::machine::engine::HostClock {
+        super::clock()
+    }
+
     unsafe fn execute(&mut self, code: NativeCode, guest: &mut GuestState) -> NativeExit {
         assert!(!state().native, "nested native block entry");
         state().native = true;

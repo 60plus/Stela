@@ -603,6 +603,8 @@ pub struct State {
     /// The runs of compiled code and the time from their returns to the
     /// next entries, by the kind of exit that ended them (`PES EXIT TIME`).
     outside: stela_boot_core::exit_times::ExitTimes,
+    /// This core's clock and thermal samples (`PES CLOCK`).
+    clock: stela_boot_core::host_clock::Clock,
     #[cfg(feature = "native-profile")]
     native_profile: profile::Profile,
     /// Where the guest's address space lies beside the window.
@@ -781,6 +783,9 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             fills: 0,
             native_ticks: 0,
             outside: stela_boot_core::exit_times::ExitTimes::new(),
+            clock: stela_boot_core::host_clock::Clock::new(
+                stela_boot_core::host_clock::Features::read(),
+            ),
             #[cfg(feature = "native-profile")]
             native_profile: profile::Profile::default(),
             resets: 0,
@@ -938,6 +943,15 @@ fn serialize_code() {
 /// TSC ticks spent in compiled guest code so far.
 pub fn native_ticks() -> u64 {
     state().native_ticks
+}
+
+/// This core's clock and thermal samples so far, after a sample when the
+/// last is old enough (`stela_boot_core::host_clock`).
+pub(super) fn clock() -> stela_engine::machine::engine::HostClock {
+    // SAFETY: CPL0 on this core, whose own enumeration its State holds.
+    state().clock.sample(rdtsc(), |features| unsafe {
+        stela_boot_core::host_clock::Reading::take(features)
+    })
 }
 
 /// From `now` (a TSC reading) this core does the host's work between two

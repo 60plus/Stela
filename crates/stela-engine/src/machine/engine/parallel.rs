@@ -556,6 +556,8 @@ pub struct Counts {
     /// Its runs of compiled code and the TSC ticks from their returns to the
     /// next entries, by the kind of exit that ended them ([`Host::outside`]).
     pub outside: [[u64; 2]; super::OUTSIDE_KINDS],
+    /// Its host core's clock and thermal samples ([`Host::clock`]).
+    pub clock: super::HostClock,
     /// Counter ticks its host core halted or spun on a monitored granule
     /// ([`super::Statistics::sleep_ticks`], `spin_ticks`) and spent waiting
     /// on other PEs ([`super::Statistics::sync_ticks`]), and its waits.
@@ -2665,6 +2667,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             line_ticks: statistics.line_ticks,
             native_ticks: self.host.native_ticks(),
             outside: self.host.outside(),
+            clock: self.host.clock(),
             sleep_ticks: statistics.sleep_ticks,
             spin_ticks: statistics.spin_ticks,
             halt_ticks: statistics.halt_ticks,

@@ -2125,6 +2125,9 @@ impl Heartbeat {
             // without halting, which its waits' exits include
             // (`stela_boot_core::exit_times`).
             let mut pe_exits = Vec::with_capacity(per_pe.len());
+            // Per PE in any boot: its host core's clock and thermal samples
+            // at the last beat and now (`stela_boot_core::host_clock`).
+            let mut pe_clocks = Vec::with_capacity(per_pe.len());
             let counter_ticks = |tsc: u64| {
                 (u128::from(tsc) * u128::from(host::COUNTER_HZ) / u128::from(tsc_hz.max(1))) as u64
             };
@@ -2161,6 +2164,10 @@ impl Heartbeat {
                     polled: (u128::from(idle(now).saturating_sub(idle(before)))
                         * u128::from(tsc_hz)
                         / u128::from(host::COUNTER_HZ)) as u64,
+                });
+                pe_clocks.push(stela_boot_core::host_clock::PeClock {
+                    before: before.clock,
+                    now: now.clock,
                 });
                 let rate = u128::from(now.retired.saturating_sub(before.retired))
                     .saturating_mul(u128::from(tsc_hz))
@@ -2438,6 +2445,10 @@ impl Heartbeat {
             output::arguments(format_args!(
                 "{}\n",
                 stela_boot_core::exit_times::pes_exit_time(tsc_hz / 1000, &pe_exits)
+            ));
+            output::arguments(format_args!(
+                "{}\n",
+                stela_boot_core::host_clock::pes_clock(tsc_hz, elapsed, &pe_clocks)
             ));
             output::arguments(format_args!("{fetches}\n"));
             let mut cache = None;
