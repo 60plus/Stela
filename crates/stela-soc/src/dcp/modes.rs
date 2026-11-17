@@ -832,6 +832,12 @@ impl Advertised {
         )
     }
 
+    /// The rates in millihertz the mode is advertised at, the preferred
+    /// one first, then the others faster first.
+    pub fn rates(&self) -> impl Iterator<Item = u32> + '_ {
+        self.timings().map(|(_, rate, _)| rate)
+    }
+
     /// The refresh in millihertz of the advertised timing `timing`.
     pub fn refresh_of(&self, timing: u32) -> Option<u32> {
         self.timings()

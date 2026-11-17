@@ -144,7 +144,17 @@ pub enum Log {
         image_cm: (u8, u8),
         uuid: String,
         from_monitor: bool,
+        /// The rates in millihertz macOS is offered the size at, the
+        /// preferred one first.
+        rates: Vec<u32>,
     },
+    /// macOS set the display's mode (`set_digital_out_mode`) to another
+    /// advertised timing than before, `timing`, which runs at `refresh`
+    /// millihertz: the preferred one as it opens the display, a rate chosen
+    /// in Displays settings, or one macOS kept for this display and
+    /// restored. A monitor that runs slower than its preferred rate was
+    /// set so here.
+    ModeSet { timing: u32, refresh: u32 },
     /// A swap shown before `io_fence_notify` named every surface it waited
     /// for: those layers may still have been drawing.
     FenceTimeout {
@@ -279,17 +289,25 @@ impl core::fmt::Display for Log {
                 image_cm,
                 uuid,
                 from_monitor,
-            } => write!(
+                rates,
+            } => {
+                write!(
+                    f,
+                    "DCP display published at {width}x{height}, image {}x{} cm, as display \
+                     {uuid} (identity from {}); rates offered, the preferred first, in mHz:",
+                    image_cm.0,
+                    image_cm.1,
+                    if *from_monitor {
+                        "the monitor's EDID and the size"
+                    } else {
+                        "the size: no monitor EDID"
+                    }
+                )?;
+                rates.iter().try_for_each(|rate| write!(f, " {rate}"))
+            }
+            Log::ModeSet { timing, refresh } => write!(
                 f,
-                "DCP display published at {width}x{height}, image {}x{} cm, as display {uuid} \
-                 (identity from {})",
-                image_cm.0,
-                image_cm.1,
-                if *from_monitor {
-                    "the monitor's EDID and the size"
-                } else {
-                    "the size: no monitor EDID"
-                }
+                "DCP macOS set the display to {refresh} mHz (advertised timing {timing})"
             ),
             Log::FenceTimeout {
                 swap_id,

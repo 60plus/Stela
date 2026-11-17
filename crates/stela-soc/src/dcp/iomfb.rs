@@ -1832,6 +1832,7 @@ impl Methods {
             image_cm: (advertised.edid[21], advertised.edid[22]),
             uuid: advertised.display_uuid(),
             from_monitor: advertised.from_monitor(),
+            rates: advertised.rates().collect(),
         };
         for (key, xml) in properties {
             self.publish_property(key, xml)?;
@@ -2213,7 +2214,15 @@ impl Service for Methods {
                 {
                     return self.refuse(tag, reason);
                 }
-                self.digital_out = Some((color, timing));
+                // A set that changes the mode is said once: a rate macOS
+                // kept for this display and set again is no fault of the
+                // rates offered.
+                if self.digital_out.replace((color, timing)) != Some((color, timing)) {
+                    self.record_log(Log::ModeSet {
+                        timing,
+                        refresh: rate,
+                    });
+                }
                 let packed = Packed::new().u32(IO_RETURN_SUCCESS).finish(output);
                 self.reply(tag, packed)
             }

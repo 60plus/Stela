@@ -621,7 +621,8 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
         published.to_string(),
         format!(
             "DCP display published at 1920x1080, image 54x30 cm, as display {} \
-             (identity from the size: no monitor EDID)",
+             (identity from the size: no monitor EDID); rates offered, the preferred first, in \
+             mHz: 60000",
             advertised.display_uuid()
         )
     );
@@ -3198,4 +3199,21 @@ fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
             .is_err()
     );
     assert_eq!(rate.load(Relaxed), 144_000);
+    // The same mode set again changes nothing and is not said again.
+    returned(methods.call(*b"A413", &set(modes::TIMING_ID), 4));
+    // The boot log says each change of the mode, so a monitor macOS set to
+    // a slower rate than the preferred one is told from one never offered
+    // the faster.
+    let sets: Vec<_> = core::iter::from_fn(|| methods.take_log())
+        .filter(|entry| matches!(entry, Log::ModeSet { .. }))
+        .map(|entry| entry.to_string())
+        .collect();
+    assert_eq!(
+        sets,
+        [
+            "DCP macOS set the display to 144000 mHz (advertised timing 1)",
+            "DCP macOS set the display to 60000 mHz (advertised timing 3)",
+            "DCP macOS set the display to 144000 mHz (advertised timing 1)",
+        ]
+    );
 }
