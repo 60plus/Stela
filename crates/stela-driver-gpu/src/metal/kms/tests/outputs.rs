@@ -227,6 +227,47 @@ fn another_output_gives_the_picture_when_the_first_cannot_be_set() {
     assert_eq!((both.destroyed.len(), both.unmapped), (6, 6));
 }
 
+/// The monitor the firmware showed on gives the picture its size and its
+/// rates. After the GPU's reset it may be detected, or its EDID read, later
+/// than another monitor of the GPU: whoever takes the display is told, to
+/// wait for it a bounded time.
+#[test]
+fn an_output_the_firmware_lit_that_shows_no_display_yet_is_told() {
+    let mut card = two_monitors();
+    // The firmware lit none, or the one it lit is detected with its modes.
+    assert_eq!(returning(&mut &mut card), Ok(false));
+    card.lit = 50;
+    assert_eq!(returning(&mut &mut card), Ok(false));
+    // Not detected yet, while the other monitor is.
+    card.first_connected = false;
+    assert_eq!(returning(&mut &mut card), Ok(true));
+    // A take now gives the picture the other monitor's own size and rate.
+    {
+        let display =
+            Display::take_fitting(&mut card, Wanted::Native((4, 2)), &|_, _, _| true).unwrap();
+        assert_eq!(
+            (display.size(), display.refresh_millihertz()),
+            ((6, 4), 60_000)
+        );
+    }
+    card.set = None;
+    // Detected, its EDID not read yet: it lists no mode.
+    card.first_connected = true;
+    let modes = core::mem::take(&mut card.first);
+    assert_eq!(returning(&mut &mut card), Ok(true));
+    // Back with its modes: the take that waited gives its size and rate.
+    card.first = vec![at(8, 4, PREFERRED, 144)];
+    assert_eq!(returning(&mut &mut card), Ok(false));
+    let display =
+        Display::take_fitting(&mut card, Wanted::Native((4, 2)), &|_, _, _| true).unwrap();
+    assert_eq!(
+        (display.size(), display.refresh_millihertz()),
+        ((8, 4), 144_000)
+    );
+    assert_eq!(display.heads[0].connector, 50);
+    drop(modes);
+}
+
 /// A DisplayPort hub's monitors (MST) each list the hub's encoders, one a
 /// controller: every one of them shows the picture, at the take or when
 /// connected later.

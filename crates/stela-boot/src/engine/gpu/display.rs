@@ -523,7 +523,11 @@ pub(in crate::engine) enum Shown<'a> {
 /// its display again. The GPU's reset ends the signal, and a monitor that
 /// then searches its inputs drops hot-plug detect for some seconds; Linux
 /// takes such a display when its hot-plug event arrives. A display later
-/// still is taken by the scanout's looks.
+/// still is taken by the scanout's looks. The same time is given to an
+/// output the firmware lit while another output of the GPU already detects
+/// its monitor ([`kms::returning`]): the guest's size and rates are set
+/// once, by the take, and are the firmware-lit monitor's when it returns
+/// in this time.
 const RETURN_SECONDS: u64 = 8;
 /// The pause between two detections in that time.
 const RETURN_STEP_MILLIS: u64 = 100;
@@ -565,7 +569,24 @@ pub(in crate::engine) fn take(
             true => RETURN_SECONDS.saturating_mul(gpu.tsc_hz),
             false => 0,
         };
-        let result = loop {
+        let pause = || {
+            let step = host::rdtsc();
+            while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS {
+                core::hint::spin_loop();
+            }
+        };
+        // `absent`: an output the firmware lit still detected no display
+        // when the wait for it ended.
+        let (result, absent) = loop {
+            let patient = host::rdtsc().wrapping_sub(began) < patience;
+            // The monitor the firmware showed on gives the picture its
+            // size, its rates and its name: while it is not detected again
+            // another monitor of this GPU does not give them in its place.
+            let absent = patience != 0 && kms::returning(&mut Node(fd)) == Ok(true);
+            if absent && patient {
+                pause();
+                continue;
+            }
             match Display::take_fitting(
                 Node(fd),
                 match size {
@@ -574,20 +595,19 @@ pub(in crate::engine) fn take(
                 },
                 &stela_soc::dcp::modes::advertisable,
             ) {
-                Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
-                    let step = host::rdtsc();
-                    while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS
-                    {
-                        core::hint::spin_loop();
-                    }
-                }
-                result => break result,
+                Err(DisplayError::NoOutput) if patient => pause(),
+                result => break (result, absent),
             }
         };
         let waited_ms = host::rdtsc().wrapping_sub(began) / (gpu.tsc_hz / 1000).max(1);
         match result {
             Ok(mut display) => {
-                if waited_ms >= RETURN_STEP_MILLIS {
+                if absent {
+                    output::arguments(format_args!(
+                        "GPU {name}: an output the firmware lit detected no display in \
+                         {waited_ms} ms, so another output gives the picture its size\n"
+                    ));
+                } else if waited_ms >= RETURN_STEP_MILLIS {
                     output::arguments(format_args!(
                         "GPU {name}: display detected after {waited_ms} ms\n"
                     ));

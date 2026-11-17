@@ -1251,6 +1251,26 @@ fn listed<D: Drm>(
     )
 }
 
+/// Whether an output the firmware lit detects no display yet, or one that
+/// lists no mode yet, each probed anew. The GPU's reset ends the signal,
+/// and a monitor that then searches its inputs is detected again, or has
+/// its EDID read, some seconds later, often after another monitor of the
+/// same GPU. Whoever takes the display waits a bounded time for it, so
+/// that the monitor the firmware showed on gives the picture its size, its
+/// rates and its name, where a take at once gave them from the other
+/// monitor: the first then showed that monitor's size at that monitor's
+/// rate when it listed it, or stayed dark when it was the smaller.
+pub fn returning<D: Drm>(drm: &mut D) -> Result<bool, Error> {
+    let (_, connectors) = resources(drm)?;
+    for id in connectors {
+        let found = output(drm, id)?;
+        if found.lit && (!found.connected || found.modes.is_empty()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// One buffer of the mode's size, with its framebuffer and mapping. A
 /// buffer that cannot be finished is given back: a display that is not
 /// taken is looked for again, and each look would keep its buffers.
