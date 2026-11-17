@@ -136,11 +136,30 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             // wake their waiters before its work.
             if !self.device.deferred() {
                 self.commit_events_only(connection, queue, &stream_bytes);
+                self.count_dropped(fault.status);
             }
             return Err(fault);
         }
-        let value = self.device.commit_on(connection.get(), queue, commands)?;
+        let value = match self.device.commit_on(connection.get(), queue, commands) {
+            Ok(value) => value,
+            Err(error) => {
+                let fault = Fault::from(error);
+                if !self.device.deferred() {
+                    self.count_dropped(fault.status);
+                }
+                return Err(fault);
+            }
+        };
         call.reply(&Value { value })
+    }
+
+    /// Counts a command buffer whose commit failed with `status` and is
+    /// not made again.
+    fn count_dropped(&mut self, status: Status) {
+        self.dropped.command_buffers += 1;
+        if status == Status::OutOfMemory {
+            self.dropped.out_of_memory += 1;
+        }
     }
 
     /// Replays the stream into `commands`. A command that defers does not

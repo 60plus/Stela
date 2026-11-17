@@ -254,10 +254,21 @@ impl Connection {
 /// GPU left ([`Service::loss`]).
 pub const REOPEN_FAILED: &str = "the lost device did not reopen: ";
 
+/// Command buffers whose commit failed since the service opened: each did
+/// none of its work, so what it would have drawn is missing or stale on
+/// screen. The guest's refusal names each one's label and pipelines.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Dropped {
+    pub command_buffers: u64,
+    /// Those that failed for want of memory.
+    pub out_of_memory: u64,
+}
+
 /// What a service holds at one moment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemoryReport {
     pub device: crate::metal::device::DeviceMemory,
+    pub dropped: Dropped,
     pub connections: Vec<ConnectionMemory>,
 }
 
@@ -383,6 +394,8 @@ pub struct Service<B: Backend, C: Compiler> {
     /// What the last call made, for the platform's log: a render pipeline's
     /// stages and vertex fetch.
     noted: Option<String>,
+    /// Command buffers whose commit failed, which did none of their work.
+    dropped: Dropped,
     /// The last call's operation and status, for the platform's timing.
     served: (u32, Status),
     /// Whether a refusal named the work the device was lost running.
@@ -432,6 +445,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             failed_from: 0,
             failed_at: 0,
             noted: None,
+            dropped: Dropped::default(),
             served: (0, Status::Ok),
             loss_described: false,
             pins_reported: false,
@@ -677,6 +691,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     pub fn memory(&self) -> MemoryReport {
         MemoryReport {
             device: self.device.memory(),
+            dropped: self.dropped,
             connections: self
                 .connections
                 .iter()

@@ -126,6 +126,18 @@ pub struct MemoryBlocks {
     pub own: usize,
 }
 
+/// One of the driver's memory heaps as it counts it now
+/// (`VK_EXT_memory_budget`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeapUse {
+    pub size: u64,
+    pub device_local: bool,
+    /// What the driver estimates this process may still use of it.
+    pub budget: u64,
+    /// What this process uses of it.
+    pub usage: u64,
+}
+
 /// A descriptor written into the bindless heap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Descriptor {
@@ -443,6 +455,13 @@ pub trait Backend {
     /// time them; the device takes before and after the call it splits.
     fn take_split(&mut self) -> [u64; 3] {
         [0; 3]
+    }
+
+    /// The driver's memory heaps as it counts them now; none when it does
+    /// not say. The driver asks its kernel driver, a host call: for the
+    /// few notes of a device's memory, not for every call.
+    fn memory_heaps(&mut self) -> Vec<HeapUse> {
+        Vec::new()
     }
 
     /// The blocks [`Self::create_buffer`] and [`Self::create_image`] place

@@ -191,6 +191,8 @@ pub(crate) struct MockBackend {
     pub(crate) memory_limit: Option<u64>,
     /// The bytes of each live allocation, by memory.
     pub(crate) live_memory: BTreeMap<u64, u64>,
+    /// How often the device asked for the driver's heaps.
+    pub(crate) heap_queries: usize,
     /// While a call may defer, this many more compute pipeline creations
     /// each defer to a job of its own that runs at once.
     pub(crate) deferred_pipelines: u8,
@@ -315,6 +317,17 @@ impl Backend for MockBackend {
         let id = self.id();
         self.live_memory.insert(id, bytes);
         Ok(Memory(id))
+    }
+    fn memory_heaps(&mut self) -> Vec<crate::metal::vulkan::backend::HeapUse> {
+        self.heap_queries += 1;
+        let live: u64 = self.live_memory.values().sum();
+        let size = self.memory_limit.unwrap_or(8 << 30);
+        alloc::vec![crate::metal::vulkan::backend::HeapUse {
+            size,
+            device_local: true,
+            budget: size.saturating_sub(live),
+            usage: live,
+        }]
     }
     fn buffer_requirements(&mut self, info: &BufferInfo) -> Result<Requirements> {
         Ok(Requirements {

@@ -802,7 +802,8 @@ fn report_long_turn(served: &Served) {
 /// work, the resources automatic heaps answered nil for (no
 /// room / room only in pieces), its memory blocks with the resources placed in them and
 /// those in memory of their own, its upload chunks, the allocations that ran out of
-/// memory, and the connections counting the most
+/// memory, the command buffers whose commit failed (in all / for want of memory), and
+/// the connections counting the most
 /// bytes, each as
 /// id:objects/MiB. Nothing while a call holds the service.
 fn report_memory(service: &Shared) {
@@ -813,7 +814,7 @@ fn report_memory(service: &Shared) {
     let mib = |bytes: u64| bytes >> 20;
     let device = memory.device;
     output::arguments(format_args!(
-        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} blocks={}/{}M placed={}/{}M own={} chunks={}/{}M oom={} connections={}",
+        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} blocks={}/{}M placed={}/{}M own={} chunks={}/{}M oom={} dropped={}/{} connections={}",
         mib(device.allocated),
         device.deferred,
         mib(device.deferred_bytes),
@@ -837,6 +838,8 @@ fn report_memory(service: &Shared) {
         device.chunks.chunks,
         mib(device.chunks.bytes),
         device.out_of_memory,
+        memory.dropped.command_buffers,
+        memory.dropped.out_of_memory,
         memory.connections.len(),
     ));
     memory

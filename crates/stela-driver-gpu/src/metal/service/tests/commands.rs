@@ -204,6 +204,9 @@ fn refused_commands_discard_the_command_buffer() {
         Ok(Value { value: 1 }),
         "nothing refused was submitted"
     );
+    // Each did none of its work, which the service counts for the log.
+    let dropped = service.memory().dropped;
+    assert_eq!((dropped.command_buffers, dropped.out_of_memory), (6, 0));
 }
 
 #[test]

@@ -3537,7 +3537,63 @@ fn a_device_out_of_memory_frees_what_it_keeps_for_reuse_and_tries_again() {
             "{note}"
         );
         assert!(note.contains("tried again, which succeeded"), "{note}");
+        assert!(note.contains("; driver heaps use/budget/size: "), "{note}");
     }
+}
+
+/// The device notes what it holds at its first call and at each step its
+/// holdings rise, with the driver's count of its heaps, which it asks for
+/// only then: a log shows how full the memory was before anything failed.
+#[test]
+fn the_device_notes_its_memory_at_its_first_call_and_at_each_step() {
+    let mut backend = MockBackend::new();
+    backend.memory_limit = Some(4 << 30);
+    let mut device = device_on(backend);
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    // The fixture's driver budgets 7936 MiB of device memory.
+    assert!(
+        first.starts_with("VRAM holds 0M of the 7936M the guest works in: allocated=0M"),
+        "{first}"
+    );
+    assert!(
+        first.ends_with("out_of_memory=0; driver heaps use/budget/size: 0/4096/4096M/local"),
+        "{first}"
+    );
+    let large = TextureDescriptor {
+        width: 4096,
+        height: 4096,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    // A step is a sixteenth of the budget, 496 MiB: seven 64 MiB textures
+    // are under it and the eighth passes it.
+    for _ in 0..7 {
+        device.new_texture(&large).unwrap();
+        device.note_memory_step();
+        assert_eq!(device.take_memory_note(), None);
+    }
+    device.new_texture(&large).unwrap();
+    device.note_memory_step();
+    let step = device.take_memory_note().unwrap();
+    assert!(
+        step.starts_with("VRAM holds 512M of the 7936M the guest works in: allocated=512M"),
+        "{step}"
+    );
+    assert!(
+        step.contains("driver heaps use/budget/size: 512/3584/4096M/local"),
+        "{step}"
+    );
+    device.note_memory_step();
+    assert_eq!(
+        device.take_memory_note(),
+        None,
+        "the same holdings are noted once"
+    );
+    assert_eq!(
+        device.backend().heap_queries,
+        2,
+        "the driver is asked for each note only"
+    );
 }
 
 /// An allocation whose host kernel call the platform withdrew fails as out

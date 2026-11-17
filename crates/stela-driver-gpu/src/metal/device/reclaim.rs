@@ -10,6 +10,11 @@
 //! leave a note for the platform's log: what failed, what was freed and
 //! what the device still holds.
 //!
+//! The same notes carry the driver's own count of its heaps, and one is
+//! left at the device's first call and at each step its holdings rise
+//! ([`Device::note_memory_step`]), so a log shows how full the device memory
+//! was before anything failed.
+//!
 //! An allocation whose host kernel call the platform withdrew, no task
 //! having taken it in time, fails the same way and is not one of these: the
 //! service makes its call again where it may, and the device makes no
@@ -46,10 +51,15 @@ impl Reclaimed {
     }
 }
 
-/// The device's out-of-memory count and the notes it left.
+/// The least a device's holdings rise between two notes of them.
+const STEP_BYTES: u64 = 64 << 20;
+
+/// The device's out-of-memory count, the holdings its next note of them
+/// waits for, and the notes it left.
 #[derive(Debug, Default)]
 pub(super) struct Shortage {
     count: u64,
+    next_step: u64,
     notes: VecDeque<String>,
 }
 
@@ -194,15 +204,65 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             ),
         };
         let held = self.memory();
+        let driver = self.driver_heaps();
         self.shortage.notes.push_back(format!(
             "OUT OF MEMORY {count}: {} failed; {outcome}; the device holds allocated={}M \
-             deferred={}M behind {} command buffers recycled={}M chunks={}M",
+             deferred={}M behind {} command buffers recycled={}M chunks={}M; {driver}",
             what(),
             mib(held.allocated),
             mib(held.deferred_bytes),
             held.in_flight,
             mib(held.recycled.bytes),
             mib(held.chunks.bytes),
+        ));
+    }
+
+    /// The driver's heaps as it counts them now, for a note.
+    fn driver_heaps(&mut self) -> String {
+        let heaps = self.backend.memory_heaps();
+        if heaps.is_empty() {
+            return String::from("the driver does not say what its heaps hold");
+        }
+        let mut text = String::from("driver heaps use/budget/size:");
+        for heap in heaps {
+            let kind = if heap.device_local { "local" } else { "host" };
+            text.push_str(&format!(
+                " {}/{}/{}M/{kind}",
+                heap.usage >> 20,
+                heap.budget >> 20,
+                heap.size >> 20
+            ));
+        }
+        text
+    }
+
+    /// Notes what the device holds when the call served now is its first,
+    /// and each time its holdings pass the next sixteenth of the memory the
+    /// guest was told to work in (at least [`STEP_BYTES`]) above the last
+    /// note's: a log then shows the device's memory as it filled, with the
+    /// driver's own count of its heaps at each step.
+    pub fn note_memory_step(&mut self) {
+        let held = self.allocated + self.recycled().bytes;
+        if held < self.shortage.next_step || self.shortage.notes.len() >= NOTES {
+            return;
+        }
+        let budget = self.capabilities.recommended_max_working_set_size;
+        let step = (budget / 16).max(STEP_BYTES);
+        self.shortage.next_step = (held / step + 1) * step;
+        let mib = |bytes: u64| bytes >> 20;
+        let memory = self.memory();
+        let driver = self.driver_heaps();
+        self.shortage.notes.push_back(format!(
+            "VRAM holds {}M of the {}M the guest works in: allocated={}M recycled={}M \
+             chunks={}M blocks={}/{}M out_of_memory={}; {driver}",
+            mib(held + memory.chunks.bytes),
+            mib(budget),
+            mib(memory.allocated),
+            mib(memory.recycled.bytes),
+            mib(memory.chunks.bytes),
+            memory.blocks.blocks,
+            mib(memory.blocks.block_bytes),
+            memory.out_of_memory,
         ));
     }
 

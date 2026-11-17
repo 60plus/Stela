@@ -155,6 +155,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
         };
         // What the device noted of its memory, when the call noted nothing.
+        self.device.note_memory_step();
         if self.noted.is_none() {
             self.noted = self.device.take_memory_note();
         }

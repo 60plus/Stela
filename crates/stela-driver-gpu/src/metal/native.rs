@@ -37,8 +37,8 @@ use super::{
     vulkan::{
         SampleCounts,
         backend::{
-            Backend, BufferAllocation, Descriptor, IdleStep, MemoryBlocks, Object, Outside,
-            PreparedImport, Requirements, requirements,
+            Backend, BufferAllocation, Descriptor, HeapUse, IdleStep, MemoryBlocks, Object,
+            Outside, PreparedImport, Requirements, requirements,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -547,6 +547,8 @@ pub struct NativeBackend {
     // A failed idle query leaves the driver's code and export owner live.
     _entry: ManuallyDrop<ash::Entry>,
     instance: ash::Instance,
+    /// The physical device behind `device`, for its memory heaps' use.
+    physical: vk::PhysicalDevice,
     messenger: Option<Messenger>,
     device: ash::Device,
     fns: ExtensionFns,
@@ -824,6 +826,7 @@ impl NativeBackend {
         let mut backend = Self {
             _entry: ManuallyDrop::new(entry),
             instance,
+            physical,
             messenger,
             device,
             fns,
@@ -3461,6 +3464,34 @@ impl Backend for NativeBackend {
 
     fn take_split(&mut self) -> [u64; 3] {
         core::mem::take(&mut self.split)
+    }
+
+    fn memory_heaps(&mut self) -> Vec<HeapUse> {
+        if !self.snapshot.features.memory_budget {
+            return Vec::new();
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: `physical` came from this instance, whose device enables
+        // the budget extension the chained structure belongs to.
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.physical, &mut properties);
+        }
+        let heaps = properties
+            .memory_properties
+            .memory_heaps_as_slice()
+            .to_vec();
+        heaps
+            .iter()
+            .enumerate()
+            .map(|(index, heap)| HeapUse {
+                size: heap.size,
+                device_local: heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+                budget: budget.heap_budget[index],
+                usage: budget.heap_usage[index],
+            })
+            .collect()
     }
 
     fn memory_blocks(&self) -> MemoryBlocks {
