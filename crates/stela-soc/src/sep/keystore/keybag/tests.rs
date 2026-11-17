@@ -821,7 +821,12 @@ fn bind_lock_state_and_transition_refuse_shapes_outside_the_login_calls() {
         (
             DEVICE_STATE_TRANSITION,
             0,
-            transition_body_with(handle, 1, 1, &[]),
+            transition_body_with(handle, 1, 2, &[]),
+        ),
+        (
+            DEVICE_STATE_TRANSITION,
+            0,
+            transition_body_with(handle, 5, 1, &[]),
         ),
     ] {
         assert!(sep.ask(2, command, variant, &body).is_err());
@@ -1156,6 +1161,49 @@ fn lock_assertions_defer_a_lock_until_the_last_drop() {
     let open = sep.create(2, b"");
     assert_eq!(transition(&mut sep, open, LOCK_TRANSITION), Ok(0));
     assert_eq!(sep.ss(open), (NO_PIN | BEEN_UNLOCKED) as u8);
+}
+
+/// Sel 32 (`MKBLockDeviceNow`, `LockDeviceNow`) sends the lock with
+/// argument 1: the same lock at once, deferred by held assertions.
+#[test]
+fn a_lock_now_locks_as_a_lock_does() {
+    let mut sep = Sep::new(ROOT);
+    let handle = sep.create(2, SECRET);
+    sep.bind(handle).unwrap();
+    let transition = |sep: &mut Sep, transition: u32, argument: u64| -> Result<u64, Refusal> {
+        let fields = sep.ask(
+            2,
+            DEVICE_STATE_TRANSITION,
+            0,
+            &transition_body_with(SESSION_BAG, transition, argument, &[]),
+        )?;
+        assert_eq!(fields.len(), 16);
+        assert_eq!(fields[8..], [0; 8]);
+        Ok(u64::from_le_bytes(fields[..8].try_into().unwrap()))
+    };
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert_eq!(sep.ss(SESSION_BAG), 4);
+    assert_eq!(
+        transition(&mut sep, LOCK_TRANSITION, 1),
+        Ok(NOTIFY_LOCK_STATE)
+    );
+    assert_eq!(sep.ss(SESSION_BAG), 5);
+    assert_eq!(transition(&mut sep, LOCK_TRANSITION, 1), Ok(0));
+    // A held assertion defers it to the last drop.
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert_eq!(transition(&mut sep, HOLD_ASSERTION, 0), Ok(0));
+    assert_eq!(transition(&mut sep, LOCK_TRANSITION, 1), Ok(0));
+    assert_eq!(sep.ss(SESSION_BAG), 4);
+    assert_eq!(
+        transition(&mut sep, DROP_ASSERTION, 0),
+        Ok(NOTIFY_LOCK_STATE)
+    );
+    assert_eq!(sep.ss(SESSION_BAG), 5);
+    // No other transition takes the argument, and no other argument.
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert!(transition(&mut sep, HOLD_ASSERTION, 1).is_err());
+    assert!(transition(&mut sep, LOCK_TRANSITION, 2).is_err());
+    assert_eq!(sep.ss(SESSION_BAG), 4);
 }
 
 fn verify_body(handle: i32, secret: &[u8], acm: &[u8], flags: u64) -> Vec<u8> {

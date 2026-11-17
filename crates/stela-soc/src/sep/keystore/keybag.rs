@@ -79,9 +79,11 @@ pub(super) const MAKE_SYSTEM: u8 = 0x0d;
 /// `handle_device_state_return` as flags and deadline. The 26B123 kernel's
 /// senders (`device_state_transition` VA 0xfffffe0009d411f4 and its
 /// callers): `unlock_the_device` (sel 9) sends [`UNLOCK_TRANSITION`] with
-/// the passcode; sel 8 sends [`LOCK_TRANSITION`] with argument 0 (sel 32,
-/// which enters sel 8's code with argument 1, and sel 0x7a's transition 1,
-/// and transition 10 are not modeled);
+/// the passcode; sel 8 sends [`LOCK_TRANSITION`] with argument 0 and sel 32
+/// enters the same code (VA 0xfffffe0009d4f6a4) with argument
+/// [`LOCK_NOW`]; sel 0x7a's transition 1 (VA 0xfffffe0009d4eae4, the
+/// effective bag of request 0x7a) and sel 0x91's transition 10 are not
+/// modeled;
 /// `hold_device_lockassertion` (VA 0xfffffe0009d4143c, from the user
 /// client's `handleLockAssertion`, after the kernel checked the device
 /// state) sends [`HOLD_ASSERTION`] and `drop_device_lockassertion` (VA
@@ -126,6 +128,15 @@ const ACM_SECRET: u64 = 0x100;
 const UNLOCK_TRANSITION: u32 = 0;
 /// Lock now.
 const LOCK_TRANSITION: u32 = 1;
+/// [`LOCK_TRANSITION`]'s argument from sel 32: libaks `aks_lock_device`
+/// (shared cache 0x187d74a28) takes sel 32 rather than 8 when its second
+/// argument is set, which `MKBLockDeviceNow` (0x197f9bfe8) and
+/// `MKBLockDevice` with the option `LockDeviceNow` (0x197f9bf1c) set. The
+/// SEP's handling is not readable (sepOS is encrypted). Inferred: "now"
+/// skips a delay before the lock, and this model's lock has none, so it is
+/// the same lock, which held assertions defer as they do argument 0's: an
+/// assertion keeps the bag open until it is dropped.
+const LOCK_NOW: u64 = 1;
 /// Hold a lock assertion: the bag stays unlocked until it is dropped.
 const HOLD_ASSERTION: u32 = 5;
 /// Drop a lock assertion.
@@ -1112,7 +1123,7 @@ impl Keybags {
                         note,
                     ));
                 }
-                if argument != 0 {
+                if argument != 0 && !(transition == LOCK_TRANSITION && argument == LOCK_NOW) {
                     return Err(self.refuse_shape("transition argument", argument, note));
                 }
                 if transition == UNLOCK_TRANSITION {
