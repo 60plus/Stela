@@ -71,6 +71,10 @@
 /* nouveau and what its Kconfig entry selects. */
 #define CONFIG_DRM 1
 #define CONFIG_DRM_NOUVEAU 1
+/* nouveau's panel backlight, as its Kconfig defaults: an eDP panel's DPCD
+ * backlight is enabled at registration and at each mode set, and a PWM one
+ * is registered at the level read back (nouveau_backlight.c). */
+#define CONFIG_DRM_NOUVEAU_BACKLIGHT 1
 #define CONFIG_DRM_TTM 1
 #define CONFIG_DRM_TTM_HELPER 1
 #define CONFIG_DRM_EXEC 1
