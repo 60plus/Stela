@@ -317,6 +317,9 @@ mod tests {
         let mut rx = Ring::receive_ring(&mut dma, true).unwrap();
         rx.initialize(true);
         assert!(!rx.linux_layout());
+        // The start says so once (`Warning::PackedReceiveBuffers`).
+        let said = alloc::format!("{}", crate::realtek::Warning::PackedReceiveBuffers);
+        assert!(said.contains("packed 2 KiB buffers"), "{said}");
         assert_eq!(rx.receive_maximum(), 2048);
         assert_eq!(rx.descriptors.bus_address() % 4096, 0);
         assert_eq!(rx.descriptors.read::<u32>(0), OWN | BUFFER as u32);

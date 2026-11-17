@@ -220,6 +220,10 @@ pub enum Warning {
     /// An RTL8168D PHY's readiness sentinel differed, so its firmware was
     /// skipped, as Linux `rtl8168d_apply_firmware_cond` skips it.
     PhyNotReadyForFirmware { readiness: u16 },
+    /// The DMA memory had no room for Linux's receive buffers
+    /// (`Ring::receive_ring`): the ring runs on packed 2 KiB buffers,
+    /// without Linux's descriptor fetch mode ([`receive_config_for`]).
+    PackedReceiveBuffers,
 }
 impl fmt::Display for Warning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -237,6 +241,9 @@ impl fmt::Display for Warning {
             Self::PhyNotReadyForFirmware { readiness } => write!(
                 f,
                 "RTL8168D PHY not ready for firmware (sentinel {readiness:04x}): started without it, as Linux does"
+            ),
+            Self::PackedReceiveBuffers => f.write_str(
+                "no DMA memory for 16 KiB receive buffers: started on packed 2 KiB buffers, without Linux's descriptor fetch mode",
             ),
         }
     }
@@ -494,6 +501,9 @@ impl Realtek {
             events: Events::default(),
             fetch_left: false,
         };
+        if !net.receive.linux_layout() {
+            net.warnings.push(Warning::PackedReceiveBuffers);
+        }
         net.receive.initialize(true);
         net.transmit.initialize(false);
         let hardware = Hardware::new(&net.device, &net.clock, revision, function.address.function);
