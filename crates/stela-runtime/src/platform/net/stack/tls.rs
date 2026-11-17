@@ -17,6 +17,13 @@ pub struct SecureTransfer {
     idle_at: u64,
 }
 
+impl SecureTransfer {
+    /// The connection the channel runs over.
+    pub(super) fn tcp(&self) -> &Transfer {
+        &self.tcp
+    }
+}
+
 fn tls_error(error: stela_tls::channel::ChannelError) -> NetError {
     match error {
         stela_tls::channel::ChannelError::Truncated => NetError::Truncated("TLS record stream"),

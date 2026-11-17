@@ -29,6 +29,9 @@ pub struct Http {
     url: String,
     etag: String,
     len: u64,
+    /// A range failed since the last note: its line is followed by the
+    /// adapter's state.
+    failed: bool,
 }
 
 impl RangeSource for Http {
@@ -71,15 +74,23 @@ impl RangeSource for Http {
 
     fn note(&mut self, line: core::fmt::Arguments<'_>) {
         output::arguments(line);
-        // The first failed range of the boot also says what the adapter's
-        // registers and rings show then: a stalled receive or transmit path
-        // is told apart from a slow server. Once a boot, so it stays bounded.
-        static STATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if !STATED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        // Each failed range's line is followed by what the adapter's
+        // registers, rings and PHY show then: a stalled receive or transmit
+        // path is told apart from a slow server. A range fails at most a
+        // few times a minute (`Ranges`' backoff), so the lines stay few.
+        if core::mem::take(&mut self.failed)
             && let Ok(mut network) = self.network.0.try_borrow_mut()
             && let Some(state) = network.diagnostic()
         {
             output::arguments(format_args!("REMOTE IMAGE adapter state: {state}\n"));
+        }
+    }
+
+    fn state(&mut self, (transfer, _): &Self::Range) -> String {
+        self.failed = true;
+        match self.network.0.try_borrow_mut() {
+            Ok(mut network) => network.download_state(transfer),
+            Err(_) => String::from("network in use"),
         }
     }
 }
@@ -112,6 +123,7 @@ impl Remote {
             url: url.clone(),
             etag: etag.clone(),
             len: manifest.source.bytes,
+            failed: false,
         };
         Ok(Self(Ranges::new(http, manifest.source.bytes)))
     }

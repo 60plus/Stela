@@ -509,6 +509,20 @@ impl HostNetwork {
         self.stack.close_http(transfer);
     }
 
+    /// What a download's connection and the adapter's frame counts say as
+    /// it fails (`Stack::describe_http`): a connection that never opened,
+    /// one that carried bytes and stopped, and an adapter that received no
+    /// frame at all are told apart.
+    pub fn download_state(&mut self, transfer: &HttpTransfer) -> String {
+        let state = self.stack.describe_http(transfer);
+        let frames = &self.stack.link_mut().frames;
+        format!(
+            "{state} frames sent={} received={}",
+            frames.sent.get(),
+            frames.received.get()
+        )
+    }
+
     pub fn close(&mut self, transfer: Transfer) {
         self.stack.close(transfer);
     }

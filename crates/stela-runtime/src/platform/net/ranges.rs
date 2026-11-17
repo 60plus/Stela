@@ -24,7 +24,7 @@
 //! The transport is a [`RangeSource`], so the boot's network and tests
 //! serve the same logic.
 use super::NetError;
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::fmt;
 use stela_formats::payload::ReadAt;
 
@@ -70,6 +70,12 @@ pub trait RangeSource {
     fn millis(&mut self) -> u64;
     /// Records a progress line.
     fn note(&mut self, line: fmt::Arguments<'_>);
+    /// What the transport knows of `range` as it fails, for the failure's
+    /// line: its connection's state, what it carried and when it last did.
+    /// Empty where the transport keeps none.
+    fn state(&mut self, _range: &Self::Range) -> String {
+        String::new()
+    }
 }
 
 struct Stream<R> {
@@ -77,6 +83,8 @@ struct Stream<R> {
     start: u64,
     buffer: VecDeque<u8>,
     range: Option<R>,
+    /// The object offset the open range started at.
+    opened: u64,
     /// The farthest byte a read asked for since the buffer started.
     wanted: u64,
     /// When a read last used the stream, on [`Ranges::tick`].
@@ -188,6 +196,21 @@ impl<S: RangeSource> Ranges<S> {
         }
     }
 
+    /// What a failing range of stream `at` got and its transport's state
+    /// ([`RangeSource::state`]), for the failure's line, before the range
+    /// is closed. A range that never opened got nothing and has no state.
+    fn failed(&mut self, at: usize) -> String {
+        let stream = &self.streams[at];
+        match &stream.range {
+            Some(range) => {
+                let got = stream.end() - stream.opened;
+                let state = self.source.state(range);
+                alloc::format!("got={got} {state}")
+            }
+            None => String::from("not opened"),
+        }
+    }
+
     /// The stream a read at `offset` uses: the one it continues, else a new
     /// one while fewer than [`STREAMS`] exist, else the least recently read
     /// one, restarted at `offset`.
@@ -205,6 +228,7 @@ impl<S: RangeSource> Ranges<S> {
                 start: offset,
                 buffer: VecDeque::with_capacity(ahead + KEEP + SLACK),
                 range: None,
+                opened: offset,
                 wanted: offset,
                 used: 0,
                 failures: 0,
@@ -265,6 +289,7 @@ impl<S: RangeSource> Ranges<S> {
             let (first, last) = (self.streams[at].end(), self.len - 1);
             let range = self.source.open(first, last)?;
             self.streams[at].range = Some(range);
+            self.streams[at].opened = first;
             self.ranges += 1;
             let ranges = self.ranges;
             self.source.note(format_args!(
@@ -317,6 +342,7 @@ impl<S: RangeSource> Ranges<S> {
             }
             let before = self.streams[at].end();
             if let Err(error) = self.step(at) {
+                let detail = self.failed(at);
                 self.stop(at);
                 let stream = &mut self.streams[at];
                 if !error.retryable() {
@@ -326,7 +352,7 @@ impl<S: RangeSource> Ranges<S> {
                 stream.failures += 1;
                 let failures = stream.failures;
                 self.source.note(format_args!(
-                    "REMOTE IMAGE range at {before} failed ({failures}/{ATTEMPTS}): {error}\n"
+                    "REMOTE IMAGE range at {before} failed ({failures}/{ATTEMPTS}): {error}; {detail}\n"
                 ));
                 if failures == ATTEMPTS {
                     self.streams[at].failures = 0;
@@ -363,7 +389,7 @@ impl<S: RangeSource> Ranges<S> {
 
     /// Without waiting, takes what has arrived for each stream while its
     /// share of [`AHEAD`] is not buffered, opening the next range when one
-    /// ends. A failure leaves the next read to retry.
+    /// ends. A failure is noted and leaves the next read to retry.
     pub fn pump(&mut self) {
         if !self.ahead || self.streams.is_empty() {
             return;
@@ -371,7 +397,14 @@ impl<S: RangeSource> Ranges<S> {
         let share = AHEAD / self.streams.len();
         for at in 0..self.streams.len() {
             let stream = &self.streams[at];
-            if stream.buffer.len() < share && stream.end() < self.len && self.step(at).is_err() {
+            if stream.buffer.len() >= share || stream.end() >= self.len {
+                continue;
+            }
+            if let Err(error) = self.step(at) {
+                let (end, detail) = (self.streams[at].end(), self.failed(at));
+                self.source.note(format_args!(
+                    "REMOTE IMAGE read-ahead range at {end} failed: {error}; {detail}\n"
+                ));
                 self.stop(at);
                 self.ahead = false;
                 return;

@@ -724,3 +724,69 @@ fn a_named_transfer_opens_without_waiting_and_resolves_as_it_is_driven() {
     assert_eq!(stack.phy.link.dns_queries, vec![28]);
     stack.close(transfer);
 }
+
+/// A transfer says where it stands for the line of one that failed: a
+/// name still resolving, then the TCP state, the bytes received and when
+/// the last came. A download that times out keeps the state its
+/// connection had then, after its socket is retired: a peer that never
+/// answered the connection is told apart from one that stopped mid-body.
+#[test]
+fn a_transfer_describes_its_state_and_a_failed_download_keeps_it() {
+    let clock = TestClock::default();
+    let mut named = Stack::new(Lan::ipv6(8192, clock.clone()), clock.clone(), 7).unwrap();
+    named.automatic().unwrap();
+    let request = http::get_range("restore.test", "/source", 0, 9, None).unwrap();
+    let mut transfer = named.open("restore.test", request, 1024).unwrap();
+    assert!(
+        named.describe(&transfer).starts_with("dns asked="),
+        "{}",
+        named.describe(&transfer)
+    );
+    let mut ranged = http::Ranged::new(0, 9);
+    for _ in 0..10_000 {
+        let done = named
+            .read(&mut transfer, |chunk, closed| {
+                ranged.feed(chunk, closed, &mut |_: &[u8]| ())
+            })
+            .unwrap();
+        if done {
+            break;
+        }
+    }
+    let state = named.describe(&transfer);
+    assert!(state.starts_with("tcp="), "{state}");
+    assert!(!state.contains("received=0 "), "{state}");
+    assert!(
+        state.contains(" last_byte=") && !state.contains("never"),
+        "{state}"
+    );
+    named.close(transfer);
+
+    let clock = TestClock::default();
+    let mut lan = Lan::new(100, clock.clone());
+    lan.drop_every = 1;
+    let mut silent = stack(lan, clock);
+    let mut download = silent
+        .open_http(
+            "http://10.0.2.2/",
+            HttpRequest::range(0, 9, None),
+            4096,
+            Err(TlsUnavailable::Trust),
+        )
+        .unwrap();
+    assert!(silent.describe_http(&download).starts_with("tcp=SYN-SENT "));
+    let error = loop {
+        match silent.read_http(&mut download, |_, _| Ok(false)) {
+            Ok(_) => silent.wait(100_000).unwrap(),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error, NetError::Timeout("TCP transfer"));
+    let state = silent.describe_http(&download);
+    assert!(
+        state.starts_with("tcp=SYN-SENT request=0/")
+            && state.contains(" received=0 last_byte=never "),
+        "{state}"
+    );
+    silent.close_http(download);
+}

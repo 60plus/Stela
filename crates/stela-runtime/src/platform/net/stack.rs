@@ -191,6 +191,10 @@ pub struct Transfer {
     sent: usize,
     /// When the transfer fails unless something arrives first.
     idle_at: u64,
+    /// The bytes received so far and when the last of them came, for
+    /// [`Stack::describe`].
+    received: u64,
+    last_at: Option<u64>,
 }
 
 #[cfg(test)]
@@ -689,6 +693,8 @@ impl<L: Link, C: Clock> Stack<L, C> {
             request,
             sent: 0,
             idle_at: u64::MAX,
+            received: 0,
+            last_at: None,
         };
         let started = self.now().and_then(|now| {
             if let Endpoint::Resolving(lookup) = &mut transfer.endpoint {
@@ -809,14 +815,17 @@ impl<L: Link, C: Clock> Stack<L, C> {
         }
         let mut done = false;
         while socket.can_recv() && !done && capacity != 0 {
-            done = socket
-                .recv(|bytes| {
-                    let count = bytes.len().min(capacity);
-                    capacity -= count;
-                    (count, take(&bytes[..count], false))
-                })
-                .map_err(|_| NetError::Reset)??;
+            let mut taken = 0;
+            let received = socket.recv(|bytes| {
+                let count = bytes.len().min(capacity);
+                capacity -= count;
+                taken = count;
+                (count, take(&bytes[..count], false))
+            });
+            transfer.received += taken as u64;
+            transfer.last_at = Some(now);
             transfer.idle_at = now + IDLE_US;
+            done = received.map_err(|_| NetError::Reset)??;
         }
         if done {
             return Ok(true);
@@ -831,6 +840,40 @@ impl<L: Link, C: Clock> Stack<L, C> {
             tcp::State::SynSent | tcp::State::SynReceived => self.waiting(transfer, now),
             _ if !socket.may_recv() && !socket.can_recv() => take(&[], true),
             _ => self.waiting(transfer, now),
+        }
+    }
+
+    /// `transfer`'s state in a few words, for the line of a transfer that
+    /// failed: while its name resolves, how many of the DNS servers were
+    /// asked; once connected, the TCP state, how much of the request left,
+    /// the bytes received and how long ago the last came, and what waits
+    /// unread and unsent in the socket. No address or name is in it.
+    pub fn describe(&mut self, transfer: &Transfer) -> String {
+        match &transfer.endpoint {
+            Endpoint::Resolving(lookup) => alloc::format!(
+                "dns asked={} of {} servers",
+                lookup.asked,
+                self.dns_servers.len()
+            ),
+            Endpoint::Connected(socket) => {
+                let last = match (transfer.last_at, self.now()) {
+                    (None, _) => String::from("never"),
+                    (Some(at), Ok(now)) => {
+                        alloc::format!("{} ms ago", now.saturating_sub(at) / 1000)
+                    }
+                    (Some(_), Err(_)) => String::from("unknown"),
+                };
+                let socket = self.sockets.get::<tcp::Socket>(*socket);
+                alloc::format!(
+                    "tcp={} request={}/{} received={} last_byte={last} unread={} unsent={}",
+                    socket.state(),
+                    transfer.sent,
+                    transfer.request.len(),
+                    transfer.received,
+                    socket.recv_queue(),
+                    socket.send_queue()
+                )
+            }
         }
     }
 

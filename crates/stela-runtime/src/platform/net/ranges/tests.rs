@@ -22,6 +22,7 @@ struct Mock {
     chunk: usize,
     stalled: bool,
     opens: Vec<u64>,
+    notes: Vec<String>,
     waits: usize,
     live: usize,
     open_errors: VecDeque<NetError>,
@@ -35,6 +36,7 @@ impl Mock {
             chunk: 1 << 20,
             stalled: false,
             opens: Vec::new(),
+            notes: Vec::new(),
             waits: 0,
             live: 0,
             open_errors: VecDeque::new(),
@@ -85,7 +87,13 @@ impl RangeSource for Mock {
         self.now
     }
 
-    fn note(&mut self, _: fmt::Arguments<'_>) {}
+    fn note(&mut self, line: fmt::Arguments<'_>) {
+        self.notes.push(alloc::format!("{line}"));
+    }
+
+    fn state(&mut self, range: &Range) -> String {
+        alloc::format!("next={}", range.next)
+    }
 }
 
 fn ranges() -> Ranges<Mock> {
@@ -290,4 +298,46 @@ fn an_unbounded_reads_backoff_serves_the_network() {
     // A second of backoff in waits of at most 100 ms.
     assert!(source.waits - waits >= 10, "{}", source.waits - waits);
     assert_eq!(source.opens, [0, 8192]);
+}
+
+/// Each failed range's line says what the range got and its transport's
+/// state then, and a read-ahead that fails is noted too, where it stopped
+/// without a line.
+#[test]
+fn a_failed_range_says_what_it_got_and_a_failed_read_ahead_is_noted() {
+    let mut reader = ranges();
+    reader.source_mut().chunk = 4096;
+    read(&mut reader, 0, 6000).unwrap();
+    let failed = |reader: &Ranges<Mock>| {
+        let notes = &reader.source().notes;
+        notes.iter().filter(|note| note.contains("failed")).count()
+    };
+    assert_eq!(failed(&reader), 0);
+    reader
+        .source_mut()
+        .read_errors
+        .push_back(NetError::Timeout("TCP transfer"));
+    read(&mut reader, 6000, 6000).unwrap();
+    let source = reader.source();
+    let line =
+        "REMOTE IMAGE range at 8192 failed (1/7): timed out: TCP transfer; got=8192 next=8192\n";
+    assert!(
+        source.notes.iter().any(|note| note == line),
+        "{:?}",
+        source.notes
+    );
+    // The read-ahead's failure is said and the next read retries it.
+    reader.source_mut().read_errors.push_back(NetError::Reset);
+    reader.pump();
+    assert_eq!(failed(&reader), 2);
+    let source = reader.source();
+    let note = source.notes.last().unwrap();
+    assert!(
+        note.starts_with("REMOTE IMAGE read-ahead range at ")
+            && note.contains(" failed: ")
+            && note.contains("; got="),
+        "{note}"
+    );
+    assert_eq!(source.live, 0);
+    read(&mut reader, 12000, 100).unwrap();
 }

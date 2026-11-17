@@ -114,6 +114,9 @@ pub struct HttpTransfer {
     buffer: usize,
     done: bool,
     failed: bool,
+    /// The connection's state as the transfer failed
+    /// ([`Stack::describe_http`]).
+    ended: Option<String>,
 }
 impl HttpTransfer {
     pub fn url(&self) -> &str {
@@ -160,7 +163,24 @@ impl<L: Link, C: Clock> Stack<L, C> {
             buffer,
             done: false,
             failed: false,
+            ended: None,
         })
+    }
+    /// `transfer`'s connection in a few words ([`Stack::describe`]): as it
+    /// is now, or as it was when the transfer failed and its socket was
+    /// retired.
+    pub fn describe_http(&mut self, transfer: &HttpTransfer) -> String {
+        match (&transfer.ended, &transfer.connection) {
+            (Some(ended), _) => ended.clone(),
+            (None, Some(connection)) => self.describe_connection(connection),
+            (None, None) => String::from("no connection"),
+        }
+    }
+    fn describe_connection(&mut self, connection: &Connection) -> String {
+        match connection {
+            Connection::Plain(tcp) => self.describe(tcp),
+            Connection::Secure(tls) => alloc::format!("{} tls", self.describe(tls.tcp())),
+        }
     }
     fn connect_http(
         &mut self,
@@ -199,6 +219,9 @@ impl<L: Link, C: Clock> Stack<L, C> {
         let result = self.read_http_once(transfer, &mut take);
         if result.is_err() || matches!(result, Ok(true)) {
             if let Some(connection) = transfer.connection.take() {
+                if result.is_err() {
+                    transfer.ended = Some(self.describe_connection(&connection));
+                }
                 self.close_connection(connection);
             }
             transfer.request.take();
