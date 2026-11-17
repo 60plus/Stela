@@ -3186,29 +3186,13 @@ fn start_devices(
                     crate::status::info(&format!("Ethernet adapter not started: {line}."));
                 }
             }
-            // The guest's adapter is its own: the mount's client keeps the
-            // first one. Without one the Mac boots with no network, which
-            // is reported once.
-            let guest_network = options
-                .guest_network
-                .then(|| {
-                    network::GuestNetwork::open(&mut links, wants_network)
-                        .inspect_err(|error| {
-                            output::arguments(format_args!("guest network refusal: {error}\n"));
-                            // Optional: macOS boots without it.
-                            crate::status::info(
-                                "macOS starts without a network: no supported network \
-                                 adapter is free for it",
-                            );
-                        })
-                        .ok()
-                })
-                .flatten();
             // A missing network is reported here and refused only by what
             // needs it, so the mount still boots and logs how far it gets.
+            // The mount's client picks first, from every adapter: an
+            // install needs it, and the guest takes one of the others.
             let network = wants_network.then(|| {
                 crate::status::begin("Getting a network address");
-                network::HostNetwork::open(links, host_clock, handoff, options)
+                network::HostNetwork::open(&mut links, host_clock, handoff, options)
                     .inspect(|network| crate::status::done(network.describe()))
                     .map(|network| network::Shared(Rc::new(RefCell::new(network))))
                     .inspect_err(|error| {
@@ -3221,6 +3205,25 @@ fn start_devices(
                         lines.for_each(crate::status::info);
                     })
             });
+            // The guest's adapter is its own, one the mount's client left.
+            // Without one the Mac boots with no network, which is reported
+            // once. Adapters left over are stopped with `links`.
+            let guest_network = options
+                .guest_network
+                .then(|| {
+                    network::GuestNetwork::open(&mut links)
+                        .inspect_err(|error| {
+                            output::arguments(format_args!("guest network refusal: {error}\n"));
+                            // Optional: macOS boots without it.
+                            crate::status::info(
+                                "macOS starts without a network: no supported network \
+                                 adapter is free for it",
+                            );
+                        })
+                        .ok()
+                })
+                .flatten();
+            drop(links);
             (
                 services,
                 medium,

@@ -319,6 +319,12 @@ impl<L: Link, C: Clock> Stack<L, C> {
         &mut self.phy.link
     }
 
+    /// The link, for another owner once this stack is done with it: an
+    /// adapter that got no address here may still serve another use.
+    pub fn into_link(self) -> L {
+        self.phy.link
+    }
+
     pub fn config(&self) -> Option<&Config> {
         self.config.as_ref()
     }
