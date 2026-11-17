@@ -190,7 +190,7 @@ pub(crate) fn write_logs(
 /// first lines the log has since overwritten (`Log::kept_starts`), each
 /// boot under a line naming it, then the stream as it was written.
 fn write_log(sink: &mut dyn Write, log: &Log) -> std::io::Result<()> {
-    let mut ended_line = |sink: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
+    let ended_line = |sink: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
         sink.write_all(bytes)?;
         match bytes.last() {
             Some(b'\n') | None => Ok(()),
