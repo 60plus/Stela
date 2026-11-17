@@ -24,6 +24,9 @@
 //! show a frame being filled. While the first's controller is off, after a
 //! mode set the driver refused, the next output that is on paces.
 //!
+//! Each connector read is kept as a [`Listing`] for the boot log: every
+//! mode it lists and why each was passed over.
+//!
 //! NVIDIA's display engine reads only video memory, so a guest surface in
 //! guest RAM cannot be scanned out in place: frames copy in, top to bottom,
 //! and only the rows a buffer lacks since it last held a frame.
@@ -53,6 +56,10 @@ use core::ffi::c_void;
 use core::ops::Range;
 use core::ptr::{self, NonNull};
 use stela_contracts::{Refusal, refuse};
+
+mod listing;
+pub use listing::Listing;
+use listing::{Dark, Lost, Role};
 
 /// `_IOWR('d', number, T)`.
 const fn request<T>(number: u32) -> u32 {
@@ -435,6 +442,11 @@ pub struct Display<D> {
     rates: Vec<ModeInfo>,
     /// The mode [`Self::set_refresh`] asked for, not yet set.
     retime: Option<ModeInfo>,
+    /// The connectors read since [`Self::listings`] last gave them: those
+    /// connected at the take, and each one a look showed or gave up on.
+    listings: Vec<Listing>,
+    /// The connector [`Self::join`] or [`Self::restore`] last read.
+    looked: Option<Listing>,
 }
 
 /// Looks at which a shown output connected again is set once more, or a
@@ -914,38 +926,66 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
             .chain(listed)
             .collect(),
     };
-    let fitting = |modes: &[ModeInfo], size: (u32, u32)| {
-        modes
-            .iter()
-            .any(|mode| size_of_mode(mode) == size && fits(size.0, size.1, refresh(mode)))
-    };
-    let covered = |size: (u32, u32)| {
-        outputs
-            .iter()
-            .filter(|modes| modes.iter().any(|mode| size_of_mode(mode) == size))
-            .count()
-    };
     let (_, &size) = sizes
         .iter()
         .enumerate()
-        .filter(|&(_, &size)| covered(size) != 0)
+        .filter(|&(_, &size)| covered(outputs, size) != 0)
         .max_by_key(|&(order, &size)| {
-            let told = outputs.iter().any(|modes| fitting(modes, size));
+            let told = told(outputs, size, fits);
             let rank = match wanted {
-                Wanted::Native(_) => (told, false, covered(size)),
+                Wanted::Native(_) => (told, false, covered(outputs, size)),
                 Wanted::Size(only) => (told, size == only, 0),
             };
             (rank, core::cmp::Reverse(order))
         })?;
     let gives = outputs
         .iter()
-        .position(|modes| fitting(modes, size))
+        .position(|modes| fitting(modes, size, fits))
         .or_else(|| {
             outputs
                 .iter()
                 .position(|modes| modes.iter().any(|mode| size_of_mode(mode) == size))
         })?;
     Some((size, gives))
+}
+
+/// Whether `modes` has a mode of `size` the guest can be told of.
+fn fitting(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> bool {
+    modes
+        .iter()
+        .any(|mode| size_of_mode(mode) == size && fits(size.0, size.1, refresh(mode)))
+}
+
+/// Whether any of `outputs` has a mode of `size` the guest can be told of.
+fn told(outputs: &[&[ModeInfo]], size: (u32, u32), fits: Fits<'_>) -> bool {
+    outputs.iter().any(|modes| fitting(modes, size, fits))
+}
+
+/// How many of `outputs` list a mode of `size`.
+fn covered(outputs: &[&[ModeInfo]], size: (u32, u32)) -> usize {
+    outputs
+        .iter()
+        .filter(|modes| modes.iter().any(|mode| size_of_mode(mode) == size))
+        .count()
+}
+
+/// Why [`plan`] for `outputs` passed over `other`, a size one of them
+/// lists, for `size`: its ranks in their order, for the boot log.
+fn lost(
+    outputs: &[&[ModeInfo]],
+    wanted: Wanted,
+    fits: Fits<'_>,
+    size: (u32, u32),
+    other: (u32, u32),
+) -> Lost {
+    if told(outputs, size, fits) && !told(outputs, other, fits) {
+        return Lost::Untold;
+    }
+    match wanted {
+        Wanted::Size(only) if only == size => Lost::Asked,
+        Wanted::Native(_) if covered(outputs, other) < covered(outputs, size) => Lost::Fewer,
+        _ => Lost::Later,
+    }
 }
 
 /// The mode one output with `modes` runs: [`plan`] for it alone.
@@ -1135,9 +1175,29 @@ fn set_scaling<D: Drm>(drm: &mut D, id: u32, property: u32, value: u64) -> Resul
 enum Follow {
     /// This mode, scaled or not.
     Run(ModeInfo, Option<Scaling>),
-    /// Nothing: it stays dark, its native size smaller than the picture or
-    /// not.
-    Dark { smaller: bool },
+    /// Nothing: it stays dark, and why.
+    Dark(Dark),
+}
+
+impl Follow {
+    /// The mode the monitor runs and whether the picture is scaled into
+    /// it, for the boot log ([`listing::follows`]).
+    fn runs(&self) -> Option<(ModeInfo, bool)> {
+        match self {
+            Self::Run(_, Some(scaling)) => Some((scaling.native, true)),
+            Self::Run(mode, None) => Some((*mode, false)),
+            Self::Dark(_) => None,
+        }
+    }
+
+    /// What the output does with the picture when it is not the first.
+    fn role(&self) -> Role {
+        match self {
+            Self::Run(_, Some(_)) => Role::ShowsScaled,
+            Self::Run(_, None) => Role::Shows,
+            Self::Dark(dark) => Role::Dark(*dark),
+        }
+    }
 }
 
 /// What an output after the first with `modes` on connector `id` runs to
@@ -1156,11 +1216,39 @@ fn follow<D: Drm>(
         Fit::Mode(mode) => Follow::Run(mode, None),
         Fit::Scaled(native) => match scaler(drm, id)? {
             Some(property) => Follow::Run(timing, Some(Scaling { property, native })),
-            None => Follow::Dark { smaller: false },
+            None => Follow::Dark(Dark::NoScaler),
         },
-        Fit::Smaller(_) => Follow::Dark { smaller: true },
-        Fit::Nothing => Follow::Dark { smaller: false },
+        Fit::Smaller(_) => Follow::Dark(Dark::Smaller),
+        Fit::Nothing => Follow::Dark(Dark::NoModes),
     })
+}
+
+/// Connector `id`, read as `found`, as the boot log names it: showing a
+/// `picture` as `role` says, each of its modes with its verdict.
+fn listed<D: Drm>(
+    drm: &mut D,
+    id: u32,
+    found: &Output,
+    picture: (u32, u32),
+    role: Role,
+    verdicts: &[listing::Verdict],
+) -> Listing {
+    // Read without a probe; one the connector cannot give leaves the line
+    // without its EDID's part.
+    let edid = edid(drm, id).ok().flatten();
+    Listing::new(
+        id,
+        Port {
+            kind: found.kind,
+            index: found.index,
+        },
+        (found.connected, found.lit),
+        picture,
+        role,
+        &found.modes,
+        verdicts,
+        edid.as_deref(),
+    )
 }
 
 /// One buffer of the mode's size, with its framebuffer and mapping. A
@@ -1308,21 +1396,30 @@ impl<D: Drm> Display<D> {
         let (crtcs, connectors) = resources(&mut drm)?;
         let mut usable = Vec::new();
         let mut others = Vec::new();
+        let mut dark = Vec::new();
         for &id in &connectors {
             let found = output(&mut drm, id)?;
             let reach = match found.connected && !found.modes.is_empty() {
                 true => reach(&mut drm, &found.encoders, &crtcs)?,
                 false => 0,
             };
+            if reach != 0 {
+                usable.push((id, found, reach));
+                continue;
+            }
             // Encoders that reach no controller stay so. A connected output
             // that lists no mode yet is tried again: its EDID may read at a
             // later probe.
-            match reach {
-                0 if found.connected && !found.modes.is_empty() => {
-                    others.push((id, RESTORE_TRIES));
-                }
-                0 => others.push((id, u8::from(found.connected))),
-                _ => usable.push((id, found, reach)),
+            let (tries, why) = match (found.connected, found.modes.is_empty()) {
+                (true, false) => (RESTORE_TRIES, Some(Dark::Unreachable)),
+                (true, true) => (1, Some(Dark::NoModes)),
+                (false, _) => (0, found.lit.then_some(Dark::Absent)),
+            };
+            others.push((id, tries));
+            if let Some(why) = why {
+                let verdicts = alloc::vec![listing::Verdict::Unused; found.modes.len()];
+                let role = Role::Dark(why);
+                dark.push(listed(&mut drm, id, &found, (0, 0), role, &verdicts));
             }
         }
         // What the firmware lit first, then DRM's order.
@@ -1354,6 +1451,7 @@ impl<D: Drm> Display<D> {
             let rates = rates_of(&giver.1.modes, size, fits);
             let mut heads: Vec<Head> = Vec::new();
             let mut others = others.clone();
+            let mut listings = dark.clone();
             let (mut smaller, mut scaling_refused) = (0, None);
             let rest = able
                 .iter()
@@ -1366,22 +1464,43 @@ impl<D: Drm> Display<D> {
                     free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
                 let Some((crtc, encoder)) = free else {
                     others.push((id, RESTORE_TRIES));
+                    let verdicts = listing::follows(&found.modes, size, None);
+                    let role = Role::Dark(Dark::Taken);
+                    listings.push(listed(&mut drm, id, found, size, role, &verdicts));
                     continue;
                 };
-                let run = match heads.first() {
-                    None => mode_of(&found.modes, size, fits).map(|mode| (mode, None)),
+                let (run, role, verdicts) = match heads.first() {
+                    None => {
+                        let run = mode_of(&found.modes, size, fits);
+                        let why = |other| lost(&modes, wanted, fits, size, other);
+                        let verdicts = match &run {
+                            Some(set) => listing::gives(&found.modes, size, set, fits, &why),
+                            None => listing::follows(&found.modes, size, None),
+                        };
+                        (run.map(|mode| (mode, None)), Role::Gives, verdicts)
+                    }
                     Some(shown) => match follow(&mut drm, id, &found.modes, size, shown.mode) {
-                        Ok(Follow::Run(mode, scaling)) => Some((mode, scaling)),
-                        Ok(Follow::Dark { smaller: dark }) => {
-                            smaller += usize::from(dark);
-                            None
+                        Ok(follow) => {
+                            let verdicts = listing::follows(&found.modes, size, follow.runs());
+                            let role = follow.role();
+                            match follow {
+                                Follow::Run(mode, scaling) => {
+                                    (Some((mode, scaling)), role, verdicts)
+                                }
+                                Follow::Dark(why) => {
+                                    smaller += usize::from(why.smaller());
+                                    (None, role, verdicts)
+                                }
+                            }
                         }
                         Err(error) => {
                             scaling_refused.get_or_insert(error);
-                            None
+                            let verdicts = listing::follows(&found.modes, size, None);
+                            (None, Role::Dark(Dark::Refused(error)), verdicts)
                         }
                     },
                 };
+                listings.push(listed(&mut drm, id, found, size, role, &verdicts));
                 match run {
                     Some((mode, scaling)) => heads.push(Head {
                         crtc,
@@ -1404,8 +1523,15 @@ impl<D: Drm> Display<D> {
             }
             // An output refused as the one that gives the mode may show the
             // picture at a later look: its link may train at a later set.
-            others.extend(refusals.iter().map(|&(id, _)| (id, 1)));
-            let display = match Self::run(drm, heads, crtcs.clone(), others) {
+            for &(id, error) in &refusals {
+                others.push((id, 1));
+                if let Some((_, found, _)) = usable.iter().find(|(output, _, _)| *output == id) {
+                    let verdicts = listing::follows(&found.modes, size, None);
+                    let role = Role::Dark(Dark::Refused(error));
+                    listings.push(listed(&mut drm, id, found, size, role, &verdicts));
+                }
+            }
+            let display = match Self::run(drm, heads, crtcs.clone(), others, listings) {
                 Ok(display) => display,
                 Err(Failed {
                     drm: node,
@@ -1443,6 +1569,7 @@ impl<D: Drm> Display<D> {
         mut heads: Vec<Head>,
         crtcs: Vec<u32>,
         mut others: Vec<(u32, u8)>,
+        listings: Vec<Listing>,
     ) -> Result<Self, Failed<D>> {
         let failed = |drm: D, error: Error| Failed {
             drm,
@@ -1493,6 +1620,8 @@ impl<D: Drm> Display<D> {
             power: None,
             rates: Vec::new(),
             retime: None,
+            listings,
+            looked: None,
         };
         if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
@@ -1510,8 +1639,16 @@ impl<D: Drm> Display<D> {
                 if head.scaling.is_some() {
                     display.refused.get_or_insert(error);
                 }
+                let connector = head.connector;
+                if let Some(listing) = display
+                    .listings
+                    .iter_mut()
+                    .find(|listing| listing.connector == connector)
+                {
+                    listing.refuse(error);
+                }
                 // Its link may train at a later set.
-                others.push((head.connector, 1));
+                others.push((connector, 1));
             }
         }
         display.others = others;
@@ -1668,7 +1805,16 @@ impl<D: Drm> Display<D> {
                 (true, true) if !self.dark && head.tries < RESTORE_TRIES => {
                     head.tries += 1;
                     let last = head.tries == RESTORE_TRIES;
-                    match self.restore(index, &mut watched) {
+                    let restored = self.restore(index, &mut watched);
+                    // What the output does now, or at its last try does not.
+                    let settled = last || matches!(restored, Ok(Restore::Set { .. }));
+                    match self.looked.take() {
+                        Some(listing) if settled && !matches!(restored, Ok(Restore::Gone)) => {
+                            self.listings.push(listing);
+                        }
+                        _ => {}
+                    }
+                    match restored {
                         Ok(Restore::Set { scaled }) => {
                             self.heads[index].lost = false;
                             watched.restored += 1;
@@ -1709,7 +1855,14 @@ impl<D: Drm> Display<D> {
             }
             self.others[index - 1].1 = tries + 1;
             let last = tries + 1 == RESTORE_TRIES;
-            match self.join(id) {
+            let joined = self.join(id);
+            match self.looked.take() {
+                Some(listing) if last || matches!(joined, Ok(Joined::Shown { .. })) => {
+                    self.listings.push(listing);
+                }
+                _ => {}
+            }
+            match joined {
                 Ok(Joined::Shown { scaled }) => {
                     self.others.remove(index - 1);
                     index -= 1;
@@ -1732,6 +1885,7 @@ impl<D: Drm> Display<D> {
     /// Set head `index` again on its connector as its driver reads it now
     /// ([`Self::watch`]).
     fn restore(&mut self, index: usize, watched: &mut Watched) -> Result<Restore, Error> {
+        self.looked = None;
         let connector = self.heads[index].connector;
         let found = output(&mut self.drm, connector)?;
         if !found.connected {
@@ -1753,12 +1907,24 @@ impl<D: Drm> Display<D> {
             .or_else(|| mode_of(&found.modes, size, &|_, _, _| true));
         // Every head's mode is of the display's size, so the one it ran
         // serves as a scaled picture's timing.
-        let (mode, scaling) = match own {
-            Some(mode) => (mode, None),
-            None => match follow(&mut self.drm, connector, &found.modes, size, ran)? {
-                Follow::Run(mode, scaling) => (mode, scaling),
-                Follow::Dark { smaller } => return Ok(Restore::NoMode { smaller }),
-            },
+        let follow = match own {
+            Some(mode) => Follow::Run(mode, None),
+            None => follow(&mut self.drm, connector, &found.modes, size, ran)?,
+        };
+        let role = match (index, &follow) {
+            (0, Follow::Run(..)) => Role::Gives,
+            _ => follow.role(),
+        };
+        let verdicts = listing::follows(&found.modes, size, follow.runs());
+        let read = listed(&mut self.drm, connector, &found, size, role, &verdicts);
+        self.looked = Some(read);
+        let (mode, scaling) = match follow {
+            Follow::Run(mode, scaling) => (mode, scaling),
+            Follow::Dark(why) => {
+                return Ok(Restore::NoMode {
+                    smaller: why.smaller(),
+                });
+            }
         };
         let was = self.heads[index].scaling;
         self.heads[index].mode = mode;
@@ -1780,7 +1946,12 @@ impl<D: Drm> Display<D> {
         {
             watched.error.get_or_insert(error);
         }
-        self.light(index)?;
+        if let Err(error) = self.light(index) {
+            if let Some(listing) = &mut self.looked {
+                listing.refuse(error);
+            }
+            return Err(error);
+        }
         self.heads[index].off = false;
         Ok(Restore::Set {
             scaled: scaling.is_some(),
@@ -1791,19 +1962,33 @@ impl<D: Drm> Display<D> {
     /// controller and a free encoder of its own, in its mode of the
     /// display's size or scaled ([`follow`]).
     fn join(&mut self, id: u32) -> Result<Joined, Error> {
+        self.looked = None;
         let found = output(&mut self.drm, id)?;
+        if !found.connected {
+            return Ok(Joined::Dark { smaller: false });
+        }
+        let size = (self.width, self.height);
         let reach = reach(&mut self.drm, &found.encoders, &self.crtcs)?;
         let free = free_crtc(reach, &self.crtcs, &self.heads)
             .zip(free_encoder(&found.encoders, &self.heads));
-        let (Some((crtc, encoder)), Some(shown), true) =
-            (free, self.heads.first(), found.connected)
-        else {
+        let (Some((crtc, encoder)), Some(shown)) = (free, self.heads.first()) else {
+            let verdicts = listing::follows(&found.modes, size, None);
+            let role = Role::Dark(Dark::Taken);
+            let read = listed(&mut self.drm, id, &found, size, role, &verdicts);
+            self.looked = Some(read);
             return Ok(Joined::Dark { smaller: false });
         };
-        let size = (self.width, self.height);
-        let (mode, scaling) = match follow(&mut self.drm, id, &found.modes, size, shown.mode)? {
+        let follow = follow(&mut self.drm, id, &found.modes, size, shown.mode)?;
+        let verdicts = listing::follows(&found.modes, size, follow.runs());
+        let read = listed(&mut self.drm, id, &found, size, follow.role(), &verdicts);
+        self.looked = Some(read);
+        let (mode, scaling) = match follow {
             Follow::Run(mode, scaling) => (mode, scaling),
-            Follow::Dark { smaller } => return Ok(Joined::Dark { smaller }),
+            Follow::Dark(why) => {
+                return Ok(Joined::Dark {
+                    smaller: why.smaller(),
+                });
+            }
         };
         self.heads.push(Head {
             crtc,
@@ -1823,6 +2008,9 @@ impl<D: Drm> Display<D> {
         let last = self.heads.len() - 1;
         if let Err(error) = self.light(last) {
             self.heads.remove(last);
+            if let Some(listing) = &mut self.looked {
+                listing.refuse(error);
+            }
             return match scaling {
                 Some(_) => Err(error),
                 None => Ok(Joined::Dark { smaller: false }),
@@ -1852,6 +2040,15 @@ impl<D: Drm> Display<D> {
     /// How many outputs show the picture.
     pub fn outputs(&self) -> usize {
         self.heads.len()
+    }
+
+    /// The connectors read since this last gave them, each once: after the
+    /// take, every connected one and any the firmware lit that detects no
+    /// display; after a look, each one it showed the picture on, and each
+    /// it gave up on at its last try. Each names every mode the connector
+    /// lists and why it was passed over.
+    pub fn listings(&mut self) -> Vec<Listing> {
+        core::mem::take(&mut self.listings)
     }
 
     /// The connectors that show the picture, the one that paces it first.

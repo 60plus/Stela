@@ -272,6 +272,7 @@ impl KmsScanout {
                 });
                 let watched = display.watch();
                 report_watched(name, display, watched);
+                report_listings(name, display);
                 if let Some(error) = watched.error
                     && !core::mem::replace(&mut self.reported, true)
                 {
@@ -301,10 +302,11 @@ impl KmsScanout {
                 kms::Wanted::Size(wanted),
                 &stela_soc::dcp::modes::advertisable,
             ) {
-                Ok(display) if display.size() == wanted => {
+                Ok(mut display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
                     report_ports(name, &display);
                     report_outputs(name, &display);
+                    report_listings(name, &mut display);
                     let screen = screen(&display);
                     match self.presented {
                         // The guest's frame on screen shows here at once,
@@ -321,7 +323,7 @@ impl KmsScanout {
                     self.reported = false;
                     return;
                 }
-                Ok(display) => {
+                Ok(mut display) => {
                     // No output runs the guest's size itself, which the
                     // output that gives the picture's timing must; the
                     // outputs are turned off, their buffers and the node
@@ -332,6 +334,7 @@ impl KmsScanout {
                          which macOS draws, only {width}x{height}: not shown\n",
                         wanted.0, wanted.1
                     ));
+                    report_listings(name, &mut display);
                     let Node(fd) = display.release();
                     client::close_descriptor(fd);
                     self.waiting.swap_remove(index);
@@ -387,6 +390,17 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
                 display.outputs()
             ));
         }
+    }
+}
+
+/// Each connector the take or the last look read, one line for each: every
+/// mode it lists, the one it runs and why each other was passed over, so a
+/// size or a rate macOS was not offered is told from one the monitor's
+/// output never listed. A take names every connected output once; a look
+/// names an output when it shows the picture or is given up on.
+fn report_listings(name: &str, display: &mut Display<Node>) {
+    for listing in display.listings() {
+        output::arguments(format_args!("GPU {name}: output {listing}\n"));
     }
 }
 
@@ -572,7 +586,7 @@ pub(in crate::engine) fn take(
         };
         let waited_ms = host::rdtsc().wrapping_sub(began) / (gpu.tsc_hz / 1000).max(1);
         match result {
-            Ok(display) => {
+            Ok(mut display) => {
                 if waited_ms >= RETURN_STEP_MILLIS {
                     output::arguments(format_args!(
                         "GPU {name}: display detected after {waited_ms} ms\n"
@@ -614,6 +628,7 @@ pub(in crate::engine) fn take(
                 }
                 TAKEN_INDEX.store(index, Ordering::Relaxed);
                 report_outputs(name, &display);
+                report_listings(name, &mut display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {
                     client::close_descriptor(fd);

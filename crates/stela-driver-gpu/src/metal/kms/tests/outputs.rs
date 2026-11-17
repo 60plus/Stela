@@ -167,6 +167,20 @@ fn another_output_gives_the_picture_when_the_first_cannot_be_set() {
         assert_eq!(display.heads[0].connector, 51);
         assert_eq!(display.refresh_millihertz(), 60_000);
         assert_eq!(display.refresh_rates(), [60_000]);
+        let lines: Vec<_> = display
+            .listings()
+            .iter()
+            .map(|listing| alloc::format!("{listing}"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Unknown-0 connected, gives the picture 6x4; modes (* preferred): runs: 6x4 \
+                 60*; not the size asked for: 4x2 60",
+                "Unknown-0 connected, dark: the driver refused to set it: Request(-22); modes \
+                 (* preferred): not the picture's size: 8x4 60*, 4x2 60; not run: 6x4 75",
+            ]
+        );
         // The refused output is tried again at the next looks.
         display.drm.refused_crtc = None;
         assert_eq!(display.watch().joined, 1);
