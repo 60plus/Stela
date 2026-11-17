@@ -137,19 +137,6 @@ fn an_output_that_cannot_be_set_stays_dark_and_the_others_keep_the_buffers() {
     assert!(card.set_40.is_some() && card.set.is_none());
     assert!(card.destroyed.is_empty() && card.removed.is_empty());
 
-    // The output that gives the mode is refused: all three buffers go, and
-    // no other output was set.
-    let mut first = two_monitors();
-    first.refused_crtc = Some(40);
-    assert_eq!(
-        Display::take(&mut first, (6, 4)).err(),
-        Some(Error::Request(-22))
-    );
-    assert_eq!(first.destroyed.len(), 3);
-    assert_eq!(first.removed.len(), 3);
-    assert_eq!(first.unmapped, 3);
-    assert_eq!(first.set, None);
-
     // A buffer that cannot be made: the ones made go, nothing is set.
     let mut mapped = two_monitors();
     mapped.map_refusals = 1;
@@ -163,6 +150,67 @@ fn an_output_that_cannot_be_set_stays_dark_and_the_others_keep_the_buffers() {
     shared.possible_crtcs = 0b11;
     let display = Display::take(&mut shared, (6, 4)).unwrap();
     assert_eq!((display.outputs(), display.unshown()), (1, 1));
+}
+
+/// The driver refuses the mode set of the output that would give the
+/// picture, as one whose link it cannot run: the other output gives it,
+/// where the take stopped there and no monitor showed anything until that
+/// output was unplugged.
+#[test]
+fn another_output_gives_the_picture_when_the_first_cannot_be_set() {
+    let mut card = two_monitors();
+    card.refused_crtc = Some(40);
+    {
+        let mut display = Display::take(&mut card, (6, 4)).unwrap();
+        assert_eq!((display.outputs(), display.unshown()), (1, 1));
+        // The second output gives the size, the rate and the rates.
+        assert_eq!(display.heads[0].connector, 51);
+        assert_eq!(display.refresh_millihertz(), 60_000);
+        assert_eq!(display.refresh_rates(), [60_000]);
+        // The refused output is tried again at the next looks.
+        display.drm.refused_crtc = None;
+        assert_eq!(display.watch().joined, 1);
+        assert_eq!(display.outputs(), 2);
+    }
+    // The first try's three buffers went back; the display keeps its own.
+    assert_eq!(card.destroyed.len(), 3);
+    assert_eq!(card.removed.len(), 3);
+    assert_eq!(card.unmapped, 3);
+    assert!(card.set.is_some() && card.set_40.is_some());
+
+    // No other output can give the picture: the refusal is the answer, and
+    // every buffer made is given back.
+    let mut alone = Card::new(vec![at(6, 4, PREFERRED, 60)]);
+    alone.refused_crtc = Some(41);
+    assert_eq!(
+        Display::take(&mut alone, (6, 4)).err(),
+        Some(Error::Request(-22))
+    );
+    assert_eq!((alone.destroyed.len(), alone.unmapped), (3, 3));
+
+    // Nor can an output without the guest's set size: that size alone is
+    // shown, so the look is refused and made again later.
+    let mut sized = Card::new(vec![at(8, 4, PREFERRED, 60)]);
+    sized.first = vec![at(6, 4, PREFERRED, 60)];
+    sized.first_connected = true;
+    sized.refused_crtc = Some(40);
+    assert_eq!(
+        Display::take(&mut sized, (6, 4)).err(),
+        Some(Error::Request(-22))
+    );
+    assert_eq!(sized.set, None);
+    assert_eq!((sized.destroyed.len(), sized.unmapped), (3, 3));
+
+    // Both refused: the first refusal, with nothing left set.
+    let mut both = two_monitors();
+    both.set_error = Some(-5);
+    both.refused_crtc = Some(41);
+    assert_eq!(
+        Display::take(&mut both, (6, 4)).err(),
+        Some(Error::Request(-5))
+    );
+    assert_eq!((both.set, both.set_40), (None, None));
+    assert_eq!((both.destroyed.len(), both.unmapped), (6, 6));
 }
 
 /// A DisplayPort hub's monitors (MST) each list the hub's encoders, one a

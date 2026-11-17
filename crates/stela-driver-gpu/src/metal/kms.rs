@@ -17,7 +17,9 @@
 //! smaller mode; an output whose native size is smaller than the picture in
 //! either direction, or that offers no such property, stays dark. The output
 //! the firmware lit, which the driver reads back as the connector's current
-//! encoder, wins ties, then DRM's order. The first output paces the flips;
+//! encoder, wins ties, then DRM's order, and gives the picture its size,
+//! its rates and the monitor's name; when the driver refuses its mode set,
+//! the next output that can gives them. The first output paces the flips;
 //! the others follow it to the newest buffer, and one that lags a frame may
 //! show a frame being filled. While the first's controller is off, after a
 //! mode set the driver refused, the next output that is on paces.
@@ -494,6 +496,15 @@ enum Joined {
     /// display's size and no larger native one it can scale to, its native
     /// size smaller than the picture or not.
     Dark { smaller: bool },
+}
+
+/// A take that [`Display::run`] could not finish, with the node back.
+struct Failed<D> {
+    drm: D,
+    error: Error,
+    /// The connector of the output that gives the picture, when the
+    /// driver refused its mode set: another output may give it.
+    first: Option<u32>,
 }
 
 /// A complete frame in the hidden buffer. Dropping it leaves the display
@@ -1285,9 +1296,14 @@ impl<D: Drm> Display<D> {
     /// [`Self::take`] in the size [`plan`] picks for [`Wanted`] and `fits`.
     /// Every connected output with a controller no other output runs and
     /// a free encoder of its own ([`free_encoder`]) shows the picture: the
-    /// output that gives the guest's mode is set first, and its refusal
-    /// stops the take; each other in its mode of that size, else scaled
-    /// ([`follow`]). A refusal of another leaves it dark.
+    /// output that gives the guest's mode is set first; each other in its
+    /// mode of that size, else scaled ([`follow`]). A refusal of another
+    /// leaves it dark. When the driver refuses the mode set of the output
+    /// that gives the mode, the take is planned again without it, so that
+    /// one output the driver cannot set does not keep the picture from
+    /// every other: the first refusal is the take's answer only when no
+    /// other output can give the mode, or, for [`Wanted::Size`], none can
+    /// give that size.
     pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         let mut usable = Vec::new();
@@ -1311,86 +1327,130 @@ impl<D: Drm> Display<D> {
         }
         // What the firmware lit first, then DRM's order.
         usable.sort_by_key(|(_, found, _)| !found.lit);
-        let modes: Vec<&[ModeInfo]> = usable.iter().map(|(_, found, _)| &*found.modes).collect();
-        let Some((size, first)) = plan(&modes, wanted, fits) else {
-            return Err(Error::NoOutput);
-        };
-        let first = usable.remove(first);
-        let [width, height] = first.1.size_mm;
-        // The monitor's identity for the guest; one the connector cannot
-        // give leaves the size alone to name it.
-        let edid = edid(&mut drm, first.0).ok().flatten();
-        let preferred = first.1.modes.iter().any(|mode| mode.kind & PREFERRED != 0);
-        let mut heads: Vec<Head> = Vec::new();
-        let rates = rates_of(&first.1.modes, size, fits);
-        let (mut smaller, mut refused) = (0, None);
-        for (id, found, reach) in core::iter::once(first).chain(usable) {
-            let free = free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
-            let Some((crtc, encoder)) = free else {
-                others.push((id, RESTORE_TRIES));
-                continue;
+        // The outputs the driver refused to set as the one that gives the
+        // mode, each with its answer.
+        let mut refusals: Vec<(u32, Error)> = Vec::new();
+        loop {
+            let refused = |id: u32| refusals.iter().find(|(output, _)| *output == id);
+            let able: Vec<&(u32, Output, u32)> = usable
+                .iter()
+                .filter(|(id, _, _)| refused(*id).is_none())
+                .collect();
+            let modes: Vec<&[ModeInfo]> = able.iter().map(|(_, found, _)| &*found.modes).collect();
+            let planned = plan(&modes, wanted, fits).filter(|&(size, _)| {
+                refusals.is_empty() || !matches!(wanted, Wanted::Size(only) if only != size)
+            });
+            let Some((size, first)) = planned else {
+                return Err(refusals
+                    .first()
+                    .map_or(Error::NoOutput, |&(_, error)| error));
             };
-            let run = match heads.first() {
-                None => mode_of(&found.modes, size, fits).map(|mode| (mode, None)),
-                Some(shown) => match follow(&mut drm, id, &found.modes, size, shown.mode) {
-                    Ok(Follow::Run(mode, scaling)) => Some((mode, scaling)),
-                    Ok(Follow::Dark { smaller: dark }) => {
-                        smaller += usize::from(dark);
-                        None
-                    }
-                    Err(error) => {
-                        refused.get_or_insert(error);
-                        None
-                    }
-                },
-            };
-            match run {
-                Some((mode, scaling)) => heads.push(Head {
-                    crtc,
-                    connector: id,
-                    port: Port {
-                        kind: found.kind,
-                        index: found.index,
+            let giver = able[first];
+            let [width, height] = giver.1.size_mm;
+            // The monitor's identity for the guest; one the connector cannot
+            // give leaves the size alone to name it.
+            let edid = edid(&mut drm, giver.0).ok().flatten();
+            let preferred = giver.1.modes.iter().any(|mode| mode.kind & PREFERRED != 0);
+            let rates = rates_of(&giver.1.modes, size, fits);
+            let mut heads: Vec<Head> = Vec::new();
+            let mut others = others.clone();
+            let (mut smaller, mut scaling_refused) = (0, None);
+            let rest = able
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| index != first)
+                .map(|(_, output)| *output);
+            for (id, found, reach) in core::iter::once(giver).chain(rest) {
+                let (id, reach) = (*id, *reach);
+                let free =
+                    free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
+                let Some((crtc, encoder)) = free else {
+                    others.push((id, RESTORE_TRIES));
+                    continue;
+                };
+                let run = match heads.first() {
+                    None => mode_of(&found.modes, size, fits).map(|mode| (mode, None)),
+                    Some(shown) => match follow(&mut drm, id, &found.modes, size, shown.mode) {
+                        Ok(Follow::Run(mode, scaling)) => Some((mode, scaling)),
+                        Ok(Follow::Dark { smaller: dark }) => {
+                            smaller += usize::from(dark);
+                            None
+                        }
+                        Err(error) => {
+                            scaling_refused.get_or_insert(error);
+                            None
+                        }
                     },
-                    encoder,
-                    mode,
-                    scaling,
-                    lost: false,
-                    tries: 0,
-                    behind: false,
-                    off: false,
-                }),
-                // Its mode list may still be a fallback until its EDID reads.
-                None => others.push((id, 1)),
+                };
+                match run {
+                    Some((mode, scaling)) => heads.push(Head {
+                        crtc,
+                        connector: id,
+                        port: Port {
+                            kind: found.kind,
+                            index: found.index,
+                        },
+                        encoder,
+                        mode,
+                        scaling,
+                        lost: false,
+                        tries: 0,
+                        behind: false,
+                        off: false,
+                    }),
+                    // Its mode list may still be a fallback until its EDID reads.
+                    None => others.push((id, 1)),
+                }
             }
+            // An output refused as the one that gives the mode may show the
+            // picture at a later look: its link may train at a later set.
+            others.extend(refusals.iter().map(|&(id, _)| (id, 1)));
+            let display = match Self::run(drm, heads, crtcs.clone(), others) {
+                Ok(display) => display,
+                Err(Failed {
+                    drm: node,
+                    error,
+                    first: Some(connector),
+                }) => {
+                    drm = node;
+                    refusals.push((connector, error));
+                    continue;
+                }
+                Err(Failed { error, .. }) => return Err(error),
+            };
+            // The rates hold the mode set, which may be one that does not fit.
+            let rates = match display.heads[0].mode {
+                set if rates.iter().any(|mode| refresh(mode) == refresh(&set)) => rates,
+                set => alloc::vec![set],
+            };
+            return Ok(Self {
+                size_mm: (width != 0 && height != 0).then_some((width, height)),
+                edid,
+                preferred,
+                rates,
+                smaller,
+                refused: scaling_refused.or(display.refused),
+                ..display
+            });
         }
-        let display = Self::run(drm, heads, crtcs, others)?;
-        // The rates hold the mode set, which may be one that does not fit.
-        let rates = match display.heads[0].mode {
-            set if rates.iter().any(|mode| refresh(mode) == refresh(&set)) => rates,
-            set => alloc::vec![set],
-        };
-        Ok(Self {
-            size_mm: (width != 0 && height != 0).then_some((width, height)),
-            edid,
-            preferred,
-            rates,
-            smaller,
-            refused: refused.or(display.refused),
-            ..display
-        })
     }
 
     /// Set the first of `heads`, then the others, on the first of three
-    /// new buffers of the first's size.
+    /// new buffers of the first's size. A failure gives the node back,
+    /// every buffer made given back and no controller left set.
     fn run(
         mut drm: D,
         mut heads: Vec<Head>,
         crtcs: Vec<u32>,
         mut others: Vec<(u32, u8)>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Failed<D>> {
+        let failed = |drm: D, error: Error| Failed {
+            drm,
+            error,
+            first: None,
+        };
         let Some(mode) = heads.first().map(|head| head.mode) else {
-            return Err(Error::NoOutput);
+            return Err(failed(drm, Error::NoOutput));
         };
         let (width, height) = size_of_mode(&mode);
         let mut made = Vec::new();
@@ -1399,12 +1459,16 @@ impl<D: Drm> Display<D> {
                 Ok(buffer) => made.push(buffer),
                 Err(error) => {
                     release_all(&mut drm, &made);
-                    return Err(error);
+                    return Err(failed(drm, error));
                 }
             }
         }
-        let Ok(buffers) = <[Buffer; 3]>::try_from(made) else {
-            return Err(Error::Allocation);
+        let buffers = match <[Buffer; 3]>::try_from(made) {
+            Ok(buffers) => buffers,
+            Err(made) => {
+                release_all(&mut drm, &made);
+                return Err(failed(drm, Error::Allocation));
+            }
         };
         let rest = heads.split_off(1);
         let mut display = Self {
@@ -1432,7 +1496,11 @@ impl<D: Drm> Display<D> {
         };
         if let Err(error) = display.set_mode(0) {
             release_all(&mut display.drm, &display.buffers);
-            return Err(error);
+            return Err(Failed {
+                first: Some(display.heads[0].connector),
+                drm: display.drm,
+                error,
+            });
         }
         for head in rest {
             display.heads.push(head);
