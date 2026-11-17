@@ -68,6 +68,14 @@ static void test_formatting(void)
 	FORMATS("a %", "%c %%", 'a');
 	FORMATS("abc|  ab|ab  ", "%s|%4.2s|%-4.2s", "abc", "abc", "abc");
 	FORMATS("(null)", "%s", (char *)NULL);
+	errno = ENOMEM;
+	FORMATS("Cannot allocate memory (12)", "%m (%d)", 12);
+	errno = ETIMEDOUT;
+	FORMATS("Connection timed out", "%m");
+	errno = 4000;
+	FORMATS("Unknown error 4000", "%m");
+	CHECK(!strcmp(strerror(EINVAL), "Invalid argument"));
+	errno = 0;
 	FORMATS("3.141590", "%f", 3.14159);
 	FORMATS("3.14|   3.1|0.5000", "%.2f|%6.1f|%.4f", 3.14159, 3.14159, 0.5);
 	FORMATS("1.500000e+00", "%e", 1.5);

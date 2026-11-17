@@ -555,10 +555,45 @@ char *strtok(char *text, const char *delimiters)
 	return strtok_r(text, delimiters, &state);
 }
 
+/* Linux's names of the errors the host's calls answer, as a driver's
+ * message of a failed call (`%m`) is all a log shows of its cause. */
 char *strerror(int error)
 {
-	(void)error;
-	return (char *)"host error";
+	static const struct {
+		int error;
+		const char *name;
+	} names[] = {
+		{0, "Success"},
+		{EPERM, "Operation not permitted"},
+		{ENOENT, "No such file or directory"},
+		{EINTR, "Interrupted system call"},
+		{EIO, "Input/output error"},
+		{EBADF, "Bad file descriptor"},
+		{EAGAIN, "Resource temporarily unavailable"},
+		{ENOMEM, "Cannot allocate memory"},
+		{EACCES, "Permission denied"},
+		{EFAULT, "Bad address"},
+		{EBUSY, "Device or resource busy"},
+		{EEXIST, "File exists"},
+		{ENODEV, "No such device"},
+		{EINVAL, "Invalid argument"},
+		{EMFILE, "Too many open files"},
+		{ENOTTY, "Inappropriate ioctl for device"},
+		{ENOSPC, "No space left on device"},
+		{ERANGE, "Numerical result out of range"},
+		{ENOSYS, "Function not implemented"},
+		{ETIME, "Timer expired"},
+		{EOPNOTSUPP, "Operation not supported"},
+		{ETIMEDOUT, "Connection timed out"},
+		{ECANCELED, "Operation canceled"},
+	};
+	static _Thread_local char unknown[32];
+
+	for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++)
+		if (names[index].error == error)
+			return (char *)names[index].name;
+	snprintf(unknown, sizeof(unknown), "Unknown error %d", error);
+	return unknown;
 }
 
 int strerror_r(int error, char *buffer, size_t size)

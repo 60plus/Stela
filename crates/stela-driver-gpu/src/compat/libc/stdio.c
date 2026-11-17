@@ -316,6 +316,12 @@ int vsnprintf(char *buffer, size_t size, const char *format, va_list arguments)
 			put_padded(&sink, prefix, text, count, width, left, zero ? '0' : ' ');
 			continue;
 		}
+		case 'm': {
+			/* glibc's: the text of errno, which takes no argument. */
+			const char *string = strerror(errno);
+			put_padded(&sink, "", string, strlen(string), width, left, ' ');
+			continue;
+		}
 		case '%':
 			put(&sink, '%');
 			continue;
