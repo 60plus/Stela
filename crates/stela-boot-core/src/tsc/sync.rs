@@ -7,7 +7,7 @@
 //! and the one device counter that every core reads and that never goes
 //! back ([`Monotonic`]).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// The most a rendezvous point, or the turn lock of a round, waits for the
 /// other core beyond a round: far above the microseconds between the two
@@ -104,6 +104,166 @@ pub fn correction(seen_here: u64, seen_by_bsp: u64) -> i64 {
     }
 }
 
+/// The core of an AP's synchronization that reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Bsp = 0,
+    Ap = 1,
+}
+
+impl Side {
+    const fn other(self) -> u8 {
+        match self {
+            Self::Bsp => Self::Ap as u8,
+            Self::Ap => Self::Bsp as u8,
+        }
+    }
+}
+
+/// No core wrote the round's last value yet.
+const NOBODY: u8 = 2;
+
+/// What one round of an AP's synchronization showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Each core read right after the other at least once and neither saw
+    /// the shared value go back: the counters agree.
+    Agrees,
+    /// The shared value went back: add `step` to the AP's counter
+    /// ([`correction`]).
+    Apart { step: i64 },
+    /// Neither saw it go back, but one core never read right after the
+    /// other: the reads did not interleave, which proves nothing about how
+    /// far apart the counters are. The round is taken again.
+    NotInterleaved,
+}
+
+/// The shared value of one AP's rounds with the BSP and the turns the two
+/// take at it, after Linux's `check_tsc_warp`: under one lock each core
+/// takes the last value, reads its counter and leaves its read as the last,
+/// and a read below the last one taken is a warp.
+///
+/// The turns are fair, as Linux's queued `arch_spin_lock` is: a ticket
+/// lock, so a core giving its turn back cannot take it again before the
+/// other core's waiting turn. Under a lock either core may take again at
+/// once, one core could read for a whole round while the other only waited,
+/// and the other then read only after it: a core ahead read after one
+/// behind sees no warp, and an AP two seconds ahead agreed in one round.
+/// A round in which a core never read right after the other is therefore
+/// no agreement either ([`Verdict::NotInterleaved`]).
+pub struct Exchange {
+    next: AtomicU32,
+    serving: AtomicU32,
+    last: AtomicU64,
+    writer: AtomicU8,
+    /// The most the shared value went back, as each side saw it.
+    warps: [AtomicU64; 2],
+    /// How often each side read right after the other.
+    handoffs: [AtomicU32; 2],
+}
+
+impl Default for Exchange {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Exchange {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicU32::new(0),
+            serving: AtomicU32::new(0),
+            last: AtomicU64::new(0),
+            writer: AtomicU8::new(NOBODY),
+            warps: [AtomicU64::new(0), AtomicU64::new(0)],
+            handoffs: [AtomicU32::new(0), AtomicU32::new(0)],
+        }
+    }
+
+    /// Forget the last round: by the AP, before the point both cores meet
+    /// at to start the next, after the BSP's last read of this one.
+    pub fn clear(&self) {
+        self.last.store(0, Ordering::Relaxed);
+        self.writer.store(NOBODY, Ordering::Relaxed);
+        for side in 0..2 {
+            self.warps[side].store(0, Ordering::Relaxed);
+            self.handoffs[side].store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Take a turn, waiting from `since` for at most `wait` ticks of `read`:
+    /// false when the other core held the turns that long.
+    fn take(&self, since: u64, wait: u64, read: &mut impl FnMut() -> u64) -> bool {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        while self.serving.load(Ordering::Acquire) != ticket {
+            if read().wrapping_sub(since) >= wait {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        true
+    }
+
+    fn give(&self) {
+        self.serving.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the counter `read`, moved by `offset`, in turn with the other
+    /// core for `round` ticks of it, noting the most the shared value went
+    /// back as `side` saw it: false when the other core held the turns past
+    /// `wait` ticks, after which this exchange takes no more rounds.
+    pub fn measure(
+        &self,
+        side: Side,
+        offset: i64,
+        round: u64,
+        wait: u64,
+        mut read: impl FnMut() -> u64,
+    ) -> bool {
+        let started = read();
+        loop {
+            let waiting = read();
+            if !self.take(waiting, wait, &mut read) {
+                return false;
+            }
+            let previous = self.last.load(Ordering::Relaxed);
+            let writer = self.writer.load(Ordering::Relaxed);
+            let now = read().wrapping_add(offset as u64);
+            self.last.store(now, Ordering::Relaxed);
+            self.writer.store(side as u8, Ordering::Relaxed);
+            self.give();
+            if writer == side.other() {
+                self.handoffs[side as usize].fetch_add(1, Ordering::Relaxed);
+            }
+            if now < previous {
+                self.warps[side as usize].fetch_max(previous - now, Ordering::Relaxed);
+            }
+            if now.wrapping_sub(offset as u64).wrapping_sub(started) >= round {
+                return true;
+            }
+        }
+    }
+
+    /// What the round showed, once both cores measured it and met after.
+    pub fn verdict(&self) -> Verdict {
+        let seen_by_bsp = self.warps[Side::Bsp as usize].load(Ordering::Relaxed);
+        let seen_here = self.warps[Side::Ap as usize].load(Ordering::Relaxed);
+        if seen_by_bsp != 0 || seen_here != 0 {
+            Verdict::Apart {
+                step: correction(seen_here, seen_by_bsp),
+            }
+        } else if self
+            .handoffs
+            .iter()
+            .any(|handoffs| handoffs.load(Ordering::Relaxed) == 0)
+        {
+            Verdict::NotInterleaved
+        } else {
+            Verdict::Agrees
+        }
+    }
+}
+
 /// How one round of an AP's synchronization moves its counter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Move {
@@ -127,6 +287,70 @@ pub fn correction_move(adjustable: bool, round: u32, rounds: u32) -> Move {
         Move::Adjust
     } else {
         Move::Software
+    }
+}
+
+/// What an AP does after a round ([`Rounds::next`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Its counter agrees with the BSP's: done.
+    Agreed,
+    /// Take the round again without moving the counter.
+    Again,
+    /// Move its counter by `step`, `how`, and take another round.
+    Correct { step: i64, how: Move },
+    /// Still apart after every correction: refused.
+    Differs,
+    /// No round's reads interleaved: refused, as nothing showed agreement.
+    NeverInterleaved,
+}
+
+/// The decisions over one AP's rounds: up to twice `rounds` rounds that
+/// showed something, through `IA32_TSC_ADJUST` and then in software
+/// ([`correction_move`]), and as many again whose reads did not interleave.
+pub struct Rounds {
+    adjustable: bool,
+    rounds: u32,
+    conclusive: u32,
+    retried: u32,
+}
+
+impl Rounds {
+    pub const fn new(adjustable: bool, rounds: u32) -> Self {
+        Self {
+            adjustable,
+            rounds,
+            conclusive: 0,
+            retried: 0,
+        }
+    }
+
+    /// What to do after a round that showed `verdict`.
+    pub fn next(&mut self, verdict: Verdict) -> Next {
+        match verdict {
+            Verdict::Agrees => Next::Agreed,
+            Verdict::NotInterleaved if self.retried >= 2 * self.rounds => Next::NeverInterleaved,
+            Verdict::NotInterleaved => {
+                self.retried += 1;
+                Next::Again
+            }
+            Verdict::Apart { step } => {
+                self.conclusive += 1;
+                if self.conclusive >= 2 * self.rounds {
+                    Next::Differs
+                } else {
+                    Next::Correct {
+                        step,
+                        how: correction_move(self.adjustable, self.conclusive, self.rounds),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rounds taken again because their reads did not interleave.
+    pub fn retried(&self) -> u32 {
+        self.retried
     }
 }
 
@@ -260,6 +484,138 @@ mod tests {
         let other = Rendezvous::new();
         other.abandon();
         assert!(!other.meet(1, || panic!("no wait")));
+    }
+
+    /// Issue 189 (i7-14700HX at 2,304,000,000 Hz): slots 2 to 7 ran
+    /// 4,592,707,547 ticks ahead of the BSP and were moved back, while slot
+    /// 1 agreed in one round with no correction and macOS met non-monotonic
+    /// time. A round in which the BSP read its whole share before the AP
+    /// first read, as an unfair lock lets it, sees no warp for an AP ahead:
+    /// that round proves nothing. In the other order the BSP sees the warp.
+    #[test]
+    fn issue_189s_rounds_that_never_interleave_prove_nothing() {
+        const AHEAD: u64 = 4_592_707_547;
+        let wall = &AtomicU64::new(1_000_000_000);
+        let read = |ahead: u64| move || wall.fetch_add(10, Ordering::Relaxed) + ahead;
+        let exchange = Exchange::new();
+        assert!(exchange.measure(Side::Bsp, 0, 1_000, 1_000_000, read(0)));
+        assert!(exchange.measure(Side::Ap, 0, 1_000, 1_000_000, read(AHEAD)));
+        // No warp either way, so the old check took this as agreement.
+        assert!(
+            exchange
+                .warps
+                .iter()
+                .all(|warp| warp.load(Ordering::Relaxed) == 0)
+        );
+        assert_eq!(exchange.verdict(), Verdict::NotInterleaved);
+        let mut rounds = Rounds::new(true, 4);
+        assert_eq!(rounds.next(exchange.verdict()), Next::Again);
+
+        exchange.clear();
+        assert!(exchange.measure(Side::Ap, 0, 1_000, 1_000_000, read(AHEAD)));
+        assert!(exchange.measure(Side::Bsp, 0, 1_000, 1_000_000, read(0)));
+        let Verdict::Apart { step } = exchange.verdict() else {
+            panic!("the BSP read after the AP ahead");
+        };
+        assert!((-(AHEAD as i64)..-(AHEAD as i64) + 1_000).contains(&step));
+    }
+
+    /// The decisions of one AP's rounds: the schedule of corrections the
+    /// rounds that showed something follow, unchanged by rounds taken
+    /// again, and both kinds bounded.
+    #[test]
+    fn rounds_correct_in_hardware_then_software_and_retry_a_bounded_number_of_times() {
+        let apart = Verdict::Apart { step: -7 };
+        let mut rounds = Rounds::new(true, 4);
+        for how in [Move::Adjust, Move::Adjust, Move::Adjust] {
+            assert_eq!(rounds.next(apart), Next::Correct { step: -7, how });
+            assert_eq!(rounds.next(Verdict::NotInterleaved), Next::Again);
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                rounds.next(apart),
+                Next::Correct {
+                    step: -7,
+                    how: Move::Software
+                }
+            );
+        }
+        assert_eq!(rounds.next(apart), Next::Differs);
+        assert_eq!(rounds.retried(), 3);
+
+        let mut rounds = Rounds::new(false, 4);
+        for _ in 0..8 {
+            assert_eq!(rounds.next(Verdict::NotInterleaved), Next::Again);
+        }
+        assert_eq!(rounds.next(Verdict::NotInterleaved), Next::NeverInterleaved);
+        assert_eq!(rounds.retried(), 8);
+        let mut rounds = Rounds::new(false, 4);
+        assert_eq!(
+            rounds.next(apart),
+            Next::Correct {
+                step: -7,
+                how: Move::Software
+            }
+        );
+        assert_eq!(rounds.next(Verdict::Agrees), Next::Agreed);
+    }
+
+    /// A core that holds its turn past the wait ends the other's round.
+    #[test]
+    fn a_turn_held_past_the_wait_ends_the_round() {
+        let exchange = Exchange::new();
+        // The other core took a turn and never gave it back.
+        exchange.next.fetch_add(1, Ordering::Relaxed);
+        let mut now = 0u64;
+        let read = || {
+            now += 1;
+            now
+        };
+        assert!(!exchange.measure(Side::Ap, 0, 1_000, 500, read));
+    }
+
+    /// Two cores, the AP far ahead, take fair turns: each round either
+    /// interleaves and shows the warp, or is taken again; the corrections
+    /// it gives bring the AP to agree.
+    #[test]
+    fn two_cores_apart_take_turns_until_they_agree() {
+        use std::time::Instant;
+        const AHEAD: u64 = 4_592_707_547;
+        // Nanoseconds as ticks: a 20 ms round and a 1 s wait.
+        const ROUND: u64 = 20_000_000;
+        const WAIT: u64 = 1_000_000_000;
+        let origin = Instant::now();
+        let ticks = move || origin.elapsed().as_nanos() as u64 + 1_000_000_000;
+        let exchange = Exchange::new();
+        let mut rounds = Rounds::new(false, 4);
+        let mut offset = 0i64;
+        let mut first_step = None;
+        loop {
+            exchange.clear();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    assert!(exchange.measure(Side::Bsp, 0, ROUND, WAIT, ticks));
+                });
+                assert!(exchange.measure(Side::Ap, offset, ROUND, WAIT, move || ticks() + AHEAD));
+            });
+            match rounds.next(exchange.verdict()) {
+                Next::Agreed => break,
+                Next::Again => {}
+                Next::Correct { step, how } => {
+                    assert_eq!(how, Move::Software);
+                    first_step.get_or_insert(step);
+                    offset += step;
+                }
+                other => panic!("{other:?} at offset {offset}"),
+            }
+        }
+        let first = first_step.expect("the AP ahead was corrected");
+        assert!(first <= -(AHEAD as i64) / 2, "{first}");
+        // What is left of the AP's lead is what one turn's handoff hid.
+        assert!(
+            (offset + AHEAD as i64).unsigned_abs() < AHEAD / 2,
+            "{offset}"
+        );
     }
 
     #[test]

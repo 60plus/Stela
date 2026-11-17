@@ -791,8 +791,8 @@ fn serve(
                 }
                 let outcome = argument.tsc.outcome();
                 crate::output::arguments(format_args!(
-                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={}\n",
-                    outcome.adjusted, outcome.offset, outcome.rounds,
+                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={} retried={}\n",
+                    outcome.adjusted, outcome.offset, outcome.rounds, outcome.retried,
                 ));
                 static OFFSET_REPORTED: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
