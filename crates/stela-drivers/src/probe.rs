@@ -28,6 +28,8 @@ use core::fmt;
 use stela_driver_base::budget;
 
 #[cfg(feature = "native-acpi")]
+pub mod backlight;
+#[cfg(feature = "native-acpi")]
 mod companion;
 #[cfg(feature = "native-acpi")]
 pub mod d3cold;

@@ -27,7 +27,7 @@ use crate::engine::host;
 use crate::{Result, output};
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
@@ -381,6 +381,15 @@ fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
     }
 }
 
+/// Whether a display taken shows on a laptop's built-in panel, whose
+/// backlight is set apart from the picture ([`panel_shown`]).
+static PANEL: AtomicBool = AtomicBool::new(false);
+
+/// Whether a GPU's display shows on a built-in panel (eDP, LVDS or DSI).
+pub(in crate::engine) fn panel_shown() -> bool {
+    PANEL.load(Ordering::Relaxed)
+}
+
 /// The connectors `display` shows on, the one that paces it first, which
 /// tells a laptop panel on this GPU (eDP) from an external monitor.
 fn report_ports(name: &str, display: &Display<Node>) {
@@ -391,6 +400,7 @@ fn report_ports(name: &str, display: &Display<Node>) {
         }
         let _ = core::fmt::write(&mut ports, format_args!("{port}"));
         if port.panel() {
+            PANEL.store(true, Ordering::Relaxed);
             ports.push_str(" (built-in panel)");
         }
     }

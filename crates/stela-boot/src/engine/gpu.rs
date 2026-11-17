@@ -1961,6 +1961,79 @@ pub(super) fn serve(
     }
 }
 
+/// When a GPU's display shows on a laptop's built-in panel, set the panel's
+/// brightness through ACPI video, as Linux's ACPI video driver does when it
+/// registers the panel's backlight, which nouveau asks of it where it has
+/// none of its own: the level read back where it is listed and not zero,
+/// else the highest (`stela_drivers::probe::backlight`). The GPU's reset
+/// may have left the backlight at zero, a picture with no light. One line
+/// for each output device, or one saying none was found.
+pub(super) fn panel_brightness(
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] acpi: Option<
+        &'static super::aml::HostAcpi,
+    >,
+) {
+    #[cfg(feature = "nvk")]
+    {
+        use stela_drivers::probe::backlight::{self, Brightness};
+        if !display::panel_shown() {
+            return;
+        }
+        let Some(acpi) = acpi else {
+            output::arguments(format_args!(
+                "DISPLAY built-in panel: no ACPI namespace, so its brightness stays as it is\n"
+            ));
+            return;
+        };
+        let Some(found) = acpi.firmware(
+            "panel brightness",
+            "the panel keeps the brightness it has",
+            false,
+            backlight::initialize_all,
+        ) else {
+            return;
+        };
+        let outcomes = match found {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "DISPLAY built-in panel: ACPI devices unreadable (status {:#x}), so its \
+                     brightness stays as it is\n",
+                    error.0
+                ));
+                return;
+            }
+        };
+        if outcomes.is_empty() {
+            output::arguments(format_args!(
+                "DISPLAY built-in panel: ACPI has no display output with _BCL and _BCM, so \
+                 only the GPU driver sets its brightness\n"
+            ));
+        }
+        for outcome in outcomes {
+            let path = outcome.path;
+            match outcome.result {
+                Ok(Brightness { level, max, read }) => {
+                    let read = match read {
+                        Some(read) => format!("read {read}"),
+                        None => String::from("not readable"),
+                    };
+                    output::arguments(format_args!(
+                        "DISPLAY panel brightness {path}: set to {level} of {max} ({read})\n"
+                    ));
+                }
+                Err(None) => output::arguments(format_args!(
+                    "DISPLAY panel brightness {path}: _BCL lists no levels, left as it is\n"
+                )),
+                Err(Some(error)) => output::arguments(format_args!(
+                    "DISPLAY panel brightness {path}: _BCM refused (status {:#x})\n",
+                    error.0
+                )),
+            }
+        }
+    }
+}
+
 /// Bring Linux up over `claimed`, and return once nouveau has bound them or
 /// failed, as the guest should not start with a half-started GPU beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {

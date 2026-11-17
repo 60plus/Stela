@@ -3135,6 +3135,7 @@ fn start_devices(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                 );
+                gpu::panel_brightness(host_acpi);
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
