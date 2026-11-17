@@ -157,3 +157,34 @@ fn another_output_paces_the_flips_while_the_firsts_controller_is_off() {
     assert!(!display.queued());
     assert_eq!(display.drm.flips, [hidden]);
 }
+
+/// The first output's monitor is disconnected while the outputs sleep, so
+/// the wake leaves its controller off: the next output paces the flips,
+/// where the first, whose every flip Linux answered as busy, kept the
+/// frame queued and the other monitor kept its old picture.
+#[test]
+fn another_output_paces_the_flips_after_a_wake_without_the_first_monitor() {
+    let mut card = two_monitors();
+    let (spare, next);
+    {
+        let mut display = Display::take(&mut card, (6, 4)).unwrap();
+        display.set_power(false).unwrap();
+        display.drm.first_connected = false;
+        assert_eq!(display.watch().lost, 1);
+        display.set_power(true).unwrap();
+        assert_eq!(display.drm.set_40, None);
+        spare = display.buffers[2].framebuffer;
+        display.present(&[7; 96]).unwrap();
+        assert!(!display.queued());
+        assert!(display.drm.flips_40.is_empty());
+        // Connected again, it is set on the newest frame and paces again.
+        display.drm.first_connected = true;
+        assert_eq!(display.watch().restored, 1);
+        assert_eq!(display.drm.set_40.map(|(_, shown)| shown), Some(spare));
+        next = display.buffers[2].framebuffer;
+        display.present(&[9; 96]).unwrap();
+        assert!(!display.queued());
+    }
+    assert_eq!(card.flips, [spare, next]);
+    assert_eq!(card.flips_40, [next]);
+}

@@ -22,7 +22,8 @@
 //! the next output that can gives them. The first output paces the flips;
 //! the others follow it to the newest buffer, and one that lags a frame may
 //! show a frame being filled. While the first's controller is off, after a
-//! mode set the driver refused, the next output that is on paces.
+//! mode set the driver refused or a wake that skipped its disconnected
+//! monitor, the next output that is on paces.
 //!
 //! Each connector read is kept as a [`Listing`] for the boot log: every
 //! mode it lists and why each was passed over.
@@ -371,8 +372,9 @@ struct Head {
     /// Not the pacing head: its flip to the newest buffer is still to be
     /// requested.
     behind: bool,
-    /// Its controller was turned off and its mode set refused since: it
-    /// takes no flip until a look sets it again ([`Display::watch`]).
+    /// Its controller was turned off, by display sleep or before a mode
+    /// set, and not set since: it takes no flip until a wake or a look
+    /// sets it again ([`Display::watch`]).
     off: bool,
 }
 
@@ -1752,7 +1754,9 @@ impl<D: Drm> Display<D> {
                 false => self.crtc_off(index),
             };
             match result {
-                Ok(()) => self.heads[index].off = false,
+                // A lost output skipped at the wake keeps its controller
+                // off, and the next output that is on paces.
+                Ok(()) => self.heads[index].off = !on,
                 Err(error) => {
                     if on {
                         // Its controller stays off: a look sets it again.
