@@ -230,10 +230,14 @@ impl Pe {
             if step_timing {
                 host::sampling::host_service();
             }
+            // The host's work between slices is no exit's time
+            // (`PES EXIT TIME`).
+            host::outside_resume(host::rdtsc());
             let stop = machine.run_with_budget(RunBudget {
                 blocks: limit,
                 host_ticks: Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND),
             });
+            host::outside_pause(host::rdtsc());
             #[cfg(feature = "native-profile")]
             if step_timing {
                 let counter = host::fresh_counter();

@@ -35,6 +35,7 @@ pub mod drivers_turn;
 pub mod early_fault;
 pub mod entropy;
 pub mod exit_port;
+pub mod exit_times;
 #[cfg(target_arch = "x86_64")]
 pub mod fiber;
 pub mod firmware_connect;

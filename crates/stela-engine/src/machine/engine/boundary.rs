@@ -6,6 +6,10 @@ use stela_contracts::{
     refuse,
 };
 
+/// The kinds [`Host::outside`] counts: every [`ExitKind`], then a fault
+/// taken in compiled code.
+pub const OUTSIDE_KINDS: usize = ExitKind::Amx as usize + 2;
+
 /// One PE's System registers that take none of the board's locks, as
 /// [`Devices::system_register`] serves them.
 pub trait LocalRegisters: Send + Sync {
@@ -421,6 +425,15 @@ pub trait Host {
     /// not count them answers 0.
     fn native_ticks(&self) -> u64 {
         0
+    }
+    /// For each kind of exit from compiled code (the compiler's
+    /// [`ExitKind`]s in their order, then a fault), the runs that ended in
+    /// it and the TSC ticks from their returns to the next entries, so far
+    /// and less the core's halts and the host's own work: the heartbeat's
+    /// split of each PE's time outside guest code. A host that does not
+    /// count them answers zeros.
+    fn outside(&self) -> [[u64; 2]; OUTSIDE_KINDS] {
+        [[0; 2]; OUTSIDE_KINDS]
     }
     /// A cycle count for `--profile`'s phase timing ([`step_timing`]); a
     /// host without one answers 0.

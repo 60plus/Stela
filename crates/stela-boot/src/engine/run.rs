@@ -905,10 +905,13 @@ pub(super) fn run<H: Host>(
         };
         let slice_started = host::rdtsc();
         service.slice_start(slice_started);
+        // The host's work between slices is no exit's time (`PES EXIT TIME`).
+        host::outside_resume(slice_started);
         machine.observe_parallel_source(parallel::SourcePhase::SliceEnter);
         let stop = execute(machine, limit);
         machine.observe_parallel_source(parallel::SourcePhase::SliceExit);
         let service_now = host::rdtsc();
+        host::outside_pause(service_now);
         let waited = matches!(stop, Stop::Waiting) || machine.yielded_for_interrupt(&stop);
         service.slice_end(service_now, if waited { "wait" } else { "guest" });
         heartbeat.sliced_ticks += service_now.wrapping_sub(slice_started);
@@ -2116,6 +2119,12 @@ impl Heartbeat {
             // engine, and its runs of guest code
             // (`stela_boot_core::load_lines`).
             let mut pe_times = Vec::with_capacity(per_pe.len());
+            // Per PE in any boot: its runs of guest code and the time from
+            // their returns to the next entries by the kind of exit that
+            // ended them, in TSC ticks, and the ticks it polled for a wake
+            // without halting, which its waits' exits include
+            // (`stela_boot_core::exit_times`).
+            let mut pe_exits = Vec::with_capacity(per_pe.len());
             let counter_ticks = |tsc: u64| {
                 (u128::from(tsc) * u128::from(host::COUNTER_HZ) / u128::from(tsc_hz.max(1))) as u64
             };
@@ -2139,6 +2148,19 @@ impl Heartbeat {
                         .iter()
                         .sum::<u64>()
                         .saturating_sub(before.fetches.iter().sum()),
+                });
+                let idle = |counts: &parallel::Counts| {
+                    (counts.sleep_ticks + counts.spin_ticks).saturating_sub(counts.halt_ticks)
+                };
+                pe_exits.push(stela_boot_core::exit_times::PeExits {
+                    kinds: core::array::from_fn(|kind| {
+                        [0, 1].map(|part| {
+                            now.outside[kind][part].saturating_sub(before.outside[kind][part])
+                        })
+                    }),
+                    polled: (u128::from(idle(now).saturating_sub(idle(before)))
+                        * u128::from(tsc_hz)
+                        / u128::from(host::COUNTER_HZ)) as u64,
                 });
                 let rate = u128::from(now.retired.saturating_sub(before.retired))
                     .saturating_mul(u128::from(tsc_hz))
@@ -2412,6 +2434,10 @@ impl Heartbeat {
             output::arguments(format_args!(
                 "{}\n",
                 stela_boot_core::load_lines::pes_share(interval_ticks as u64, &pe_times)
+            ));
+            output::arguments(format_args!(
+                "{}\n",
+                stela_boot_core::exit_times::pes_exit_time(tsc_hz / 1000, &pe_exits)
             ));
             output::arguments(format_args!("{fetches}\n"));
             let mut cache = None;

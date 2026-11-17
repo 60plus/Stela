@@ -600,6 +600,9 @@ pub struct State {
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
+    /// The runs of compiled code and the time from their returns to the
+    /// next entries, by the kind of exit that ended them (`PES EXIT TIME`).
+    outside: stela_boot_core::exit_times::ExitTimes,
     #[cfg(feature = "native-profile")]
     native_profile: profile::Profile,
     /// Where the guest's address space lies beside the window.
@@ -777,6 +780,7 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             ring,
             fills: 0,
             native_ticks: 0,
+            outside: stela_boot_core::exit_times::ExitTimes::new(),
             #[cfg(feature = "native-profile")]
             native_profile: profile::Profile::default(),
             resets: 0,
@@ -934,6 +938,23 @@ fn serialize_code() {
 /// TSC ticks spent in compiled guest code so far.
 pub fn native_ticks() -> u64 {
     state().native_ticks
+}
+
+/// From `now` (a TSC reading) this core does the host's work between two
+/// slices of guest execution, which is no exit's time (`PES EXIT TIME`),
+/// until [`outside_resume`]. Nothing on a core that runs no guest code.
+pub(super) fn outside_pause(now: u64) {
+    if let Some(state) = local::installed() {
+        state.outside.pause(now);
+    }
+}
+
+/// This core runs its guest again from `now`: the time of the exit that
+/// ended its last run of compiled code counts again.
+pub(super) fn outside_resume(now: u64) {
+    if let Some(state) = local::installed() {
+        state.outside.resume(now);
+    }
 }
 
 /// Serialize both sides of the reference-counter observation. Compiler fences
@@ -1389,7 +1410,16 @@ fn native_return(code: NativeCode, exit: BlockExit, entered: u64) -> NativeExit 
     crate::native_mmio::shootdown::service();
     let state = state();
     state.native = false;
-    state.native_ticks += rdtsc() - entered;
+    let returned = rdtsc();
+    state.native_ticks += returned - entered;
+    // The exit before this run took until `entered`; this one's time runs
+    // from here to the next entry.
+    let kind = if exit.kind == FAULT_KIND {
+        stela_boot_core::exit_times::FAULT
+    } else {
+        stela_compiler::x86_64::chain::ExitWord::split(exit.kind).0 as usize
+    };
+    state.outside.run(entered, returned, kind);
     #[cfg(feature = "native-profile")]
     state.native_profile.exit(exit.kind);
     if exit.kind == FAULT_KIND

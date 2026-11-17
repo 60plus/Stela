@@ -358,6 +358,10 @@ impl Host for BareHost<'_> {
         state().native_ticks
     }
 
+    fn outside(&self) -> [[u64; 2]; stela_engine::machine::engine::OUTSIDE_KINDS] {
+        state().outside.sums()
+    }
+
     unsafe fn execute(&mut self, code: NativeCode, guest: &mut GuestState) -> NativeExit {
         assert!(!state().native, "nested native block entry");
         state().native = true;
@@ -741,33 +745,10 @@ impl Host for BareHost<'_> {
     }
 
     fn wait_for_interrupt(&mut self) {
-        crate::native_mmio::shootdown::service();
-        local::clear_interrupt();
-        // The wait sends queued serial output until an interrupt comes,
-        // opening a window for one after each burst.
-        while crate::output::send_queued() {
-            // SAFETY: STI holds interrupts off for one more instruction, so
-            // only the NOP's boundary takes a pending one.
-            unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
-            if local::interrupted() {
-                return;
-            }
-        }
-        // The wait may last until the armed one-shot count runs out.
-        const MASKED: u32 = 1 << 16;
-        let budget = {
-            let state = state();
-            let remaining = state.apic.read(apic::CURRENT);
-            (state.apic_hz != 0 && state.apic.read(apic::LVT_TIMER) & MASKED == 0 && remaining != 0)
-                .then(|| u64::from(remaining) * 1_000_000 / state.apic_hz)
-        };
-        let ring = state().ring;
-        // Halted, it uses no window translation: shootdowns count it as
-        // acknowledged until it wakes, and it flushes first then.
-        let _idle = crate::native_mmio::shootdown::idle();
-        // SAFETY: interrupts are disabled and the host IDT takes the wake;
-        // the ring is this processor's.
-        unsafe { crate::native_idle::wait_with(|| budget, ring) };
+        // The wait is no exit's time (`PES EXIT TIME`).
+        state().outside.pause(rdtsc());
+        self.halt_for_interrupt();
+        state().outside.resume(rdtsc());
     }
 
     fn relax(&mut self) {
@@ -815,5 +796,39 @@ impl Host for BareHost<'_> {
     fn translations(&mut self) -> Option<&mut dyn stela_engine::machine::Translations> {
         super::super::translations::store()
             .map(|store| store as &mut dyn stela_engine::machine::Translations)
+    }
+}
+
+impl BareHost<'_> {
+    /// Wait for an interrupt with this core halted, sending queued serial
+    /// output meanwhile.
+    fn halt_for_interrupt(&mut self) {
+        crate::native_mmio::shootdown::service();
+        local::clear_interrupt();
+        // The wait sends queued serial output until an interrupt comes,
+        // opening a window for one after each burst.
+        while crate::output::send_queued() {
+            // SAFETY: STI holds interrupts off for one more instruction, so
+            // only the NOP's boundary takes a pending one.
+            unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
+            if local::interrupted() {
+                return;
+            }
+        }
+        // The wait may last until the armed one-shot count runs out.
+        const MASKED: u32 = 1 << 16;
+        let budget = {
+            let state = state();
+            let remaining = state.apic.read(apic::CURRENT);
+            (state.apic_hz != 0 && state.apic.read(apic::LVT_TIMER) & MASKED == 0 && remaining != 0)
+                .then(|| u64::from(remaining) * 1_000_000 / state.apic_hz)
+        };
+        let ring = state().ring;
+        // Halted, it uses no window translation: shootdowns count it as
+        // acknowledged until it wakes, and it flushes first then.
+        let _idle = crate::native_mmio::shootdown::idle();
+        // SAFETY: interrupts are disabled and the host IDT takes the wake;
+        // the ring is this processor's.
+        unsafe { crate::native_idle::wait_with(|| budget, ring) };
     }
 }
