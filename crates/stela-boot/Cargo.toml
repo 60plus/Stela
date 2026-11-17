@@ -37,7 +37,7 @@ nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 amdgpu = ["stela-drivers/amdgpu-port"]
 # amdgpu with RADV, NIR and ACO among the Mesa drivers `cargo xtask gpu nvk`
 # builds, which back the Metal device on the GPU amdgpu binds.
-radv = ["nvk", "amdgpu"]
+radv = ["nvk", "amdgpu", "stela-drivers/radv"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }
