@@ -3541,6 +3541,46 @@ fn a_device_out_of_memory_frees_what_it_keeps_for_reuse_and_tries_again() {
     }
 }
 
+/// A test build's cap makes the device's allocations run out of memory at
+/// that many bytes held, with the same freeing and the same notes as a
+/// driver that is full.
+#[test]
+fn a_capped_device_runs_out_of_memory_at_its_cap() {
+    let mut device = device_on(MockBackend::new());
+    device.cap_memory(256 << 20);
+    let large = TextureDescriptor {
+        width: 4096,
+        height: 4096,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let mut textures = Vec::new();
+    for _ in 0..4 {
+        textures.push(device.new_texture(&large).unwrap());
+    }
+    assert_eq!(device.new_texture(&large), Err(Error::OutOfMemory));
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.contains("failed; it kept nothing to free; the device holds allocated=256M"),
+        "{note}"
+    );
+    for texture in textures.drain(..2) {
+        device.destroy_texture(texture).unwrap();
+    }
+    assert_eq!(device.memory().recycled.bytes, 128 << 20);
+    device
+        .new_buffer(96 << 20, options(StorageMode::Private))
+        .unwrap();
+    assert_eq!(device.memory().recycled.bytes, 0);
+    assert_eq!(device.memory().out_of_memory, 2);
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.contains(
+            "it freed recycled=128M chunks=0M released=0M and tried again, which succeeded"
+        ),
+        "{note}"
+    );
+}
+
 /// The device notes what it holds at its first call and at each step its
 /// holdings rise, with the driver's count of its heaps, which it asks for
 /// only then: a log shows how full the memory was before anything failed.

@@ -39,6 +39,10 @@ metal-linked = ["metal-vulkan"]
 # AMD's stack draws on RADV, which the image must link (`stela_vulkan_amd`);
 # without it amdgpu shows frames another GPU drew.
 radv = ["amdgpu-port", "metal-linked"]
+# Test builds only: holds the Metal device to `STELA_VRAM_CAP_MIB` MiB of
+# device memory when the build sets it, so a GPU with much memory takes the
+# paths of one with little.
+vram-cap = ["metal"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", optional = true }

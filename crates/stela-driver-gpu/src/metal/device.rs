@@ -173,6 +173,10 @@ pub struct Device<B: Backend, C: Compiler> {
     /// The service's lock, which says when the platform withdrew a host
     /// call of the call served now ([`Self::watch_host_calls`]).
     host_calls: Option<alloc::sync::Arc<super::compiler::CompileLock>>,
+    /// The bytes a test build holds the device to
+    /// ([`VRAM_CAP`](crate::metal::vulkan::physical::VRAM_CAP)): at or over
+    /// them an allocation runs out of memory without asking the driver.
+    memory_cap: Option<u64>,
     resources: resources::Resources,
     pipelines: pipelines::Pipelines,
     execution_sets: execution_sets::ExecutionSets,
@@ -384,6 +388,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             allocated: 0,
             shortage: reclaim::Shortage::default(),
             host_calls: None,
+            memory_cap: crate::metal::vulkan::physical::VRAM_CAP,
             resources: resources::Resources::default(),
             pipelines: pipelines::Pipelines::default(),
             execution_sets: execution_sets::ExecutionSets::default(),

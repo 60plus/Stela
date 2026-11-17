@@ -332,7 +332,50 @@ pub struct MemoryType {
     pub heap_index: u32,
 }
 
+/// The device memory a test build holds the Metal device to, in bytes: the
+/// `vram-cap` feature built with `STELA_VRAM_CAP_MIB` set. A GPU with much
+/// memory then shows what one with little does: its device-local heaps
+/// report no more ([`Memory::capped`]), and the device's allocations run out
+/// of memory once it holds that much. No other build has one.
+#[cfg(feature = "vram-cap")]
+pub const VRAM_CAP: Option<u64> = match option_env!("STELA_VRAM_CAP_MIB") {
+    Some(mebibytes) => Some(decimal(mebibytes) << 20),
+    None => None,
+};
+#[cfg(not(feature = "vram-cap"))]
+pub const VRAM_CAP: Option<u64> = None;
+
+/// The number `text` writes in decimal digits; the build stops on any other
+/// text.
+#[cfg(any(feature = "vram-cap", test))]
+const fn decimal(text: &str) -> u64 {
+    let digits = text.as_bytes();
+    assert!(!digits.is_empty(), "the cap is a count of MiB");
+    let mut value = 0u64;
+    let mut index = 0;
+    while index < digits.len() {
+        let digit = digits[index];
+        assert!(digit.is_ascii_digit(), "the cap is a count of MiB");
+        value = value * 10 + (digit - b'0') as u64;
+        index += 1;
+    }
+    value
+}
+
 impl Memory {
+    /// The same memory with each device-local heap, and its budget, held to
+    /// `bytes`.
+    #[must_use]
+    pub fn capped(mut self, bytes: u64) -> Self {
+        for heap in &mut self.heaps {
+            if heap.flags.contains(MemoryHeapFlags::DEVICE_LOCAL) {
+                heap.size = heap.size.min(bytes);
+                heap.budget = heap.budget.map(|budget| budget.min(bytes));
+            }
+        }
+        self
+    }
+
     /// Bytes of device-local heap memory, the GPU's own memory.
     pub fn device_local_bytes(&self) -> u64 {
         self.heaps
@@ -411,5 +454,41 @@ impl FormatTable {
             .iter()
             .find(|(known, _)| *known == format)
             .map_or_else(FormatSupport::default, |(_, support)| *support)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_capped_memory_holds_its_device_local_heaps_to_the_cap() {
+        let heap = |size: u64, flags, budget| MemoryHeap {
+            size,
+            flags,
+            budget,
+        };
+        let memory = Memory {
+            heaps: vec![
+                heap(16 << 30, MemoryHeapFlags::DEVICE_LOCAL, Some(15 << 30)),
+                heap(256 << 20, MemoryHeapFlags::DEVICE_LOCAL, None),
+                heap(32 << 30, MemoryHeapFlags::EMPTY, Some(24 << 30)),
+            ],
+            types: Vec::new(),
+        };
+        let capped = memory.clone().capped(4 << 30);
+        assert_eq!(
+            capped.heaps,
+            [
+                heap(4 << 30, MemoryHeapFlags::DEVICE_LOCAL, Some(4 << 30)),
+                heap(256 << 20, MemoryHeapFlags::DEVICE_LOCAL, None),
+                heap(32 << 30, MemoryHeapFlags::EMPTY, Some(24 << 30)),
+            ]
+        );
+        assert_eq!(capped.device_local_budget(), None);
+        assert_eq!(capped.device_local_bytes(), (4 << 30) + (256 << 20));
+        assert_eq!(memory.clone().capped(u64::MAX), memory);
+        assert_eq!(decimal("4096"), 4096);
     }
 }

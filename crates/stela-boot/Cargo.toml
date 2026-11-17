@@ -38,6 +38,9 @@ amdgpu = ["stela-drivers/amdgpu-port", "stela-loader/amdgpu-port"]
 # amdgpu with RADV, NIR and ACO among the Mesa drivers `cargo xtask gpu nvk`
 # builds, which back the Metal device on the GPU amdgpu binds.
 radv = ["nvk", "amdgpu", "stela-drivers/radv"]
+# Test builds only: holds the Metal device to `STELA_VRAM_CAP_MIB` MiB of
+# device memory, which `cargo xtask boot` selects when the variable is set.
+vram-cap = ["stela-drivers/vram-cap"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

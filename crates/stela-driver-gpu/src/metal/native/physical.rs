@@ -7,7 +7,7 @@ use crate::metal::vulkan::{
     ResolveModes, SampleCounts, ShaderStages, SubgroupFeatures,
     physical::{
         Features, FormatSupport, FormatTable, Identity, Limits, Memory, MemoryHeap, MemoryType,
-        MeshLimits, PciBusInfo, PhysicalDevice, SampleLocationLimits, SparseLimits,
+        MeshLimits, PciBusInfo, PhysicalDevice, SampleLocationLimits, SparseLimits, VRAM_CAP,
     },
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -711,7 +711,7 @@ fn memory(instance: &ash::Instance, device: vk::PhysicalDevice, extensions: &Ext
     // chained only when its extension is supported.
     unsafe { instance.get_physical_device_memory_properties2(device, &mut properties) };
     let properties = properties.memory_properties;
-    Memory {
+    let memory = Memory {
         heaps: properties
             .memory_heaps_as_slice()
             .iter()
@@ -730,6 +730,10 @@ fn memory(instance: &ash::Instance, device: vk::PhysicalDevice, extensions: &Ext
                 heap_index: memory.heap_index,
             })
             .collect(),
+    };
+    match VRAM_CAP {
+        Some(bytes) => memory.capped(bytes),
+        None => memory,
     }
 }
 

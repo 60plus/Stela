@@ -588,6 +588,10 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
             command.args(["--features", "radv"]);
         }
     }
+    // A test build that holds the Metal device to that much device memory.
+    if std::env::var_os("STELA_VRAM_CAP_MIB").is_some() {
+        command.args(["--features", "vram-cap"]);
+    }
     if release {
         command.arg("--release");
     }

@@ -15,6 +15,11 @@
 //! ([`Device::note_memory_step`]), so a log shows how full the device memory
 //! was before anything failed.
 //!
+//! A test build may hold the device to a count of bytes
+//! ([`VRAM_CAP`](crate::metal::vulkan::physical::VRAM_CAP)), at which its
+//! allocations run out of memory as a full driver's would: a GPU with much
+//! memory then takes the paths one with little takes.
+//!
 //! An allocation whose host kernel call the platform withdrew, no task
 //! having taken it in time, fails the same way and is not one of these: the
 //! service makes its call again where it may, and the device makes no
@@ -116,18 +121,36 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         mut make: impl FnMut(&mut B) -> Result<T>,
         what: impl FnOnce() -> String,
     ) -> Result<T> {
-        let first = make(&mut self.backend);
+        let first = if self.over_cap() {
+            Err(Error::OutOfMemory)
+        } else {
+            make(&mut self.backend)
+        };
         if !matches!(first, Err(Error::OutOfMemory)) || self.host_call_withdrawn() {
             return first;
         }
         let reclaimed = self.reclaim()?;
-        let made = if reclaimed.any() {
+        let made = if reclaimed.any() && !self.over_cap() {
             make(&mut self.backend)
         } else {
             first
         };
         self.note_shortage(what, reclaimed, made.is_ok());
         made
+    }
+
+    /// Whether a test build's cap leaves the device no memory: it holds as
+    /// much as the cap in resources, recycled textures and upload chunks.
+    fn over_cap(&self) -> bool {
+        self.memory_cap.is_some_and(|cap| {
+            self.allocated + self.recycled().bytes + self.upload_chunks().bytes >= cap
+        })
+    }
+
+    /// Holds the device to `bytes`, as a test build's cap does.
+    #[cfg(test)]
+    pub(super) fn cap_memory(&mut self, bytes: u64) {
+        self.memory_cap = Some(bytes);
     }
 
     /// Gives the device the service's lock, through which the platform
