@@ -15,6 +15,12 @@ publish = false
 name = "stela"
 path = "src/main.rs"
 
+[features]
+# The AMD GPU port's firmware on the sticks `stela` makes, for a boot image
+# built with amdgpu (`cargo xtask boot build --amdgpu` or `--radv`); a
+# release leaves both out.
+amdgpu-port = ["stela-loader/amdgpu-port"]
+
 [dependencies]
 stela-gpu-maintenance.workspace = true
 stela-soc-data = { path = "../stela-soc-data", default-features = false }

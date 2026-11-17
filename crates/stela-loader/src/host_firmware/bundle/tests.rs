@@ -20,10 +20,18 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     let (count, bytes) = size();
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
-    // do, and amdgpu's `mec` and `mec2` of Raphael and of Navi 21.
-    assert_eq!(count + 4, recipes().count());
-    // The recipes' recorded lengths: 121 files, 184.9 MiB.
-    assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+    // do, and, with the AMD port, amdgpu's `mec` and `mec2` of Raphael and
+    // of Navi 21.
+    if Ports::BUILT == Ports::ALL {
+        assert_eq!(count + 4, recipes().count());
+        // The recipes' recorded lengths: 121 files, 184.9 MiB.
+        assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+    }
+    if Ports::BUILT == Ports::NONE {
+        assert_eq!(count + 2, recipes().count());
+        // Without the AMD port: 88 files, 177.0 MiB.
+        assert_eq!((count, bytes), (88, 185_584_904), "{count} {bytes}");
+    }
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
     let manifest = manifest(&complete()).unwrap();
@@ -158,14 +166,17 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.sort_unstable();
     assert_eq!(members(&ax210), expected);
-    // Ryzen 9000 graphics: the files amdgpu asks for on it, its HDMI audio
+    // With the AMD port: Ryzen 9000 graphics, the files amdgpu asks for on it, its HDMI audio
     // function needs none, and an AMD display chip without pinned files
     // (Navi 10) is named once.
-    let ryzen = select(&[
-        pci(0x1002, 0x13c0, 0x03),
-        pci(0x1002, 0x1640, 0x04),
-        pci(0x1002, 0x731f, 0x03),
-    ]);
+    let ryzen = select_for(
+        &[
+            pci(0x1002, 0x13c0, 0x03),
+            pci(0x1002, 0x1640, 0x04),
+            pci(0x1002, 0x731f, 0x03),
+        ],
+        Ports::ALL,
+    );
     // The files amdgpu asks for on a GPU of the PCI device ID `device`.
     let family = |device: u16| {
         let mut inventory = Inventory::default();
@@ -196,14 +207,20 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     assert_eq!(ryzen.unknown, ["pci 1002:731f"]);
     // An RX 9070 (Navi 48) and its audio function: amdgpu's files for Navi
     // 48 and nothing for the audio function.
-    let navi48 = select(&[pci(0x1002, 0x7550, 0x03), pci(0x1002, 0xab40, 0x04)]);
+    let navi48 = select_for(
+        &[pci(0x1002, 0x7550, 0x03), pci(0x1002, 0xab40, 0x04)],
+        Ports::ALL,
+    );
     let mut expected: Vec<&str> = USB.to_vec();
     expected.extend(family(0x7550));
     expected.sort_unstable();
     assert_eq!(members(&navi48), expected);
     assert!(navi48.unknown.is_empty());
     // An RX 6800 XT (Navi 21): its files, `mec2` held once as `mec`'s bytes.
-    let navi21 = select(&[pci(0x1002, 0x73bf, 0x03), pci(0x1002, 0xab28, 0x04)]);
+    let navi21 = select_for(
+        &[pci(0x1002, 0x73bf, 0x03), pci(0x1002, 0xab28, 0x04)],
+        Ports::ALL,
+    );
     let found = members(&navi21);
     let files = family(0x73bf);
     assert!(
@@ -369,4 +386,79 @@ fn an_exact_binding_wins_over_the_bundle() {
     let provider = BundleProvider::with_pins(exact, synthetic_pin);
     let image = provider.load(REQUEST).unwrap();
     assert_eq!(image.bytes(), b"abcd");
+}
+
+/// The AMD port named in a Cargo.toml line's feature list.
+fn ports_of(line: &str) -> Ports {
+    Ports {
+        amd: line.contains("amdgpu-port\""),
+    }
+}
+
+/// The line of `manifest` that starts with `start`.
+fn line<'a>(manifest: &'a str, start: &str) -> &'a str {
+    manifest
+        .lines()
+        .find(|line| line.starts_with(start))
+        .unwrap_or_else(|| panic!("no line {start}"))
+}
+
+#[test]
+fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
+    let boot = include_str!("../../../../stela-boot/Cargo.toml");
+    let loader = include_str!("../../../Cargo.toml");
+    let cli = include_str!("../../../../stela-cli/Cargo.toml");
+    // The default image's drivers, the boot's bundle and a default stick's:
+    // no AMD port in any.
+    let drivers = ports_of(line(boot, "stela-drivers = "));
+    assert_eq!(drivers, Ports::NONE);
+    assert_eq!(ports_of(line(boot, "stela-loader = ")), drivers);
+    assert_eq!(ports_of(line(loader, "default = ")), drivers);
+    // An image with amdgpu reads its firmware, and `stela` built with the
+    // port writes it.
+    let amdgpu = line(boot, "amdgpu = ");
+    assert!(amdgpu.contains("\"stela-drivers/amdgpu-port\""), "{amdgpu}");
+    assert!(amdgpu.contains("\"stela-loader/amdgpu-port\""), "{amdgpu}");
+    let port = line(cli, "amdgpu-port = ");
+    assert!(port.contains("\"stela-loader/amdgpu-port\""), "{port}");
+}
+
+#[test]
+fn a_build_without_the_amd_port_bundles_none_of_its_firmware() {
+    let theirs = |member: &str| member.starts_with("amdgpu/");
+    let without_port = objects_for(Ports::NONE);
+    assert!(!without_port.is_empty());
+    assert!(without_port.iter().all(|artifact| !theirs(artifact.member)));
+    assert!(
+        families_for(Ports::NONE)
+            .flat_map(|(_, recipes)| recipes.iter())
+            .all(|recipe| !recipe.license.member.contains("amdgpu"))
+    );
+    // Its GPUs select nothing; the rest is as with the port.
+    let functions = [pci(0x1002, 0x13c0, 3), pci(0x10de, 0x2c02, 3)];
+    let without = select_for(&functions, Ports::NONE);
+    assert!(
+        without
+            .wanted
+            .iter()
+            .all(|(artifact, _)| !theirs(artifact.member))
+    );
+    assert!(without.unknown.is_empty());
+    assert!(
+        without
+            .wanted
+            .iter()
+            .any(|(artifact, _)| artifact.member.starts_with("nvidia/"))
+    );
+    let with = select_for(&functions, Ports::ALL);
+    assert!(
+        with.wanted
+            .iter()
+            .any(|(artifact, _)| theirs(artifact.member))
+    );
+    // This build's bundle holds them exactly when it has the port.
+    assert_eq!(
+        objects().iter().any(|artifact| theirs(artifact.member)),
+        Ports::BUILT.amd
+    );
 }

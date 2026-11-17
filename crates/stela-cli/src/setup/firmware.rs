@@ -494,7 +494,7 @@ const MARGIN: u64 = 16 * MIB;
 
 /// The bundle's files that go on a volume with `free` bytes left (`None`:
 /// no limit) beside `present` bytes the bundle already holds there, in
-/// [`bundle::FAMILIES`] order, and the files left out.
+/// [`bundle::families`] order, and the files left out.
 pub(super) fn bundle_plan(
     free: Option<u64>,
     present: u64,
@@ -630,7 +630,7 @@ fn licence_notes(written: &[(&Artifact, &Artifact)]) -> Vec<String> {
 /// Put the complete bundle on the stick's data volume `volume`, beside the
 /// EFI partition `esp` whose boot program is `mount_image`, downloading
 /// what the cache lacks. A volume short of room gets what fits, in
-/// [`bundle::FAMILIES`] order, and the notes name what was left out. Once
+/// [`bundle::families`] order, and the notes name what was left out. Once
 /// the bundle holds every file of an older per-PC set on the EFI partition,
 /// that set is removed. Nothing depends on this computer's devices.
 pub(super) fn provision_bundle(
@@ -1037,8 +1037,14 @@ mod tests {
         let manifest = bundle::manifest(&files).unwrap();
         let parsed = bundle::Bundle::parse(&manifest).unwrap();
         assert!(parsed.missing().is_empty());
-        assert_eq!(parsed.objects.len(), 121);
-        assert_eq!(bundle_summary(), "for every supported device (184.9 MiB)");
+        // A stick for an image with the AMD port also holds its firmware.
+        let (objects, summary) = if cfg!(feature = "amdgpu-port") {
+            (121, "for every supported device (184.9 MiB)")
+        } else {
+            (88, "for every supported device (177.0 MiB)")
+        };
+        assert_eq!(parsed.objects.len(), objects);
+        assert_eq!(bundle_summary(), summary);
         // A volume short of room keeps the small files and leaves the large
         // GPU images out, by name.
         let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
@@ -1323,7 +1329,11 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware on the stick is incomplete: 3 of 121 files are there"
+            if cfg!(feature = "amdgpu-port") {
+                "the firmware on the stick is incomplete: 3 of 121 files are there"
+            } else {
+                "the firmware on the stick is incomplete: 3 of 88 files are there"
+            }
         );
     }
 
@@ -1345,7 +1355,12 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        assert!(status.contains("lacks 120 of 121 files"), "{status}");
+        let lacks = if cfg!(feature = "amdgpu-port") {
+            "lacks 120 of 121 files"
+        } else {
+            "lacks 87 of 88 files"
+        };
+        assert!(status.contains(lacks), "{status}");
         assert!(!status.contains("nvidia/"), "{status}");
         assert!(status.contains("1 of its files are damaged"), "{status}");
     }
