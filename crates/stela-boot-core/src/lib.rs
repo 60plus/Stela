@@ -109,6 +109,7 @@ pub mod stop_record;
 pub mod storage;
 pub mod topology;
 pub mod tsc;
+pub mod uart;
 pub mod usb_legacy;
 pub mod vfct;
 #[cfg(target_arch = "x86_64")]
