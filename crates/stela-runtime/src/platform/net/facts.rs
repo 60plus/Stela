@@ -114,7 +114,7 @@ impl Facts {
                 if destination != 443 {
                     return;
                 }
-                if hello(data, 1) && server_name(data).is_some_and(|name| is_apple(name)) {
+                if hello(data, 1) && server_name(data).is_some_and(is_apple) {
                     self.remember(packet.destination);
                 }
                 let apple = self.is_apple_address(&packet.destination);
