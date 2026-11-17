@@ -33,10 +33,13 @@
 //! lines and its last [`LAST_BYTES`], whatever the ring holds by then. A
 //! record's `start` is the stream position of the boot's marker line. Its
 //! first lines are stored once, in the store during which they are
-//! complete; a boot that ends before that, and every boot's last lines, are
-//! copied from the ring when the next boot opens the log, which is always
-//! in time: the ring's newest bytes are the last boot's. So a line costs
-//! what it did without records, and a boot costs two record writes.
+//! complete, or the next one where no header on the device names the
+//! record as this boot's yet (the room may still be an older boot's); a
+//! boot that ends before that, and every boot's last lines, are copied from
+//! the ring when the next boot opens the log, which is always in time: the
+//! ring's newest bytes are the last boot's. So a line costs what it did
+//! without records, and a boot costs two record writes. A record's first
+//! lines start with its boot's marker; [`read`] drops one that does not.
 //!
 //! Version 1 had no records, 40 bytes of fields, and a ring filling the
 //! region. [`read`] reads both. A [`Writer`] that opens a version 1 log
