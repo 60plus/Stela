@@ -49,6 +49,7 @@ pub mod gpu_status;
 pub mod guarded_stacks;
 pub mod guest_bluetooth;
 pub mod guest_screen;
+pub mod guest_session;
 pub mod guest_timeouts;
 pub mod handoff_records;
 pub mod heap;

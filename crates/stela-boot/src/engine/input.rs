@@ -165,10 +165,13 @@ impl HostInput {
     }
 
     fn deliver(&mut self, devices: &mut AppleDevices, input: Input) {
-        if let Err(error) = devices.input(input)
-            && !core::mem::replace(&mut self.refused, true)
-        {
-            output::arguments(format_args!("INPUT refused {input:?}: {error}\n"));
+        match devices.input(input) {
+            Ok(()) => super::session::input(),
+            Err(error) => {
+                if !core::mem::replace(&mut self.refused, true) {
+                    output::arguments(format_args!("INPUT refused {input:?}: {error}\n"));
+                }
+            }
         }
     }
 

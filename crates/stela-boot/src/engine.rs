@@ -46,6 +46,7 @@ mod remote;
 mod restore;
 mod service;
 mod services;
+mod session;
 mod speculation;
 mod step_watchdog;
 pub(crate) use step_watchdog::alone_idle_stage;
@@ -998,7 +999,8 @@ fn guest_line(fragment: &console_lines::Line) {
 /// `taken`) as `GUEST|` lines, in order, while `more` allows, keeping the
 /// rest for the next call: the home PE's reports write them between slices,
 /// not the PE whose UART write ended the line under the board's lock. With
-/// `more` always true, everything left.
+/// `more` always true, everything left. The guest session's line reads
+/// each line written and follows once a minute ([`session`]).
 pub(super) fn write_guest_output(taken: console_lines::Queued, more: impl FnMut() -> bool) {
     GUEST_WRITING.try_with(|writing| {
         writing.append(taken);
@@ -1006,8 +1008,12 @@ pub(super) fn write_guest_output(taken: console_lines::Queued, more: impl FnMut(
         if skipped != 0 {
             guest_dropped(skipped);
         }
-        writing.write(guest_dropped, more, guest_line);
+        writing.write(guest_dropped, more, |fragment| {
+            guest_line(fragment);
+            session::console_line(&fragment.text);
+        });
     });
+    session::minute();
 }
 
 /// At a stop, on any processor and before its reason, record and screen:
@@ -1251,6 +1257,7 @@ fn run_machine<H: Host>(
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",
     });
+    session::begin();
     service::install(service::Service::new(
         machine.devices.worker(),
         restore,

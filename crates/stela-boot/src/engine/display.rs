@@ -289,6 +289,9 @@ fn take_screen() -> bool {
 /// line starts `DCP `.
 pub fn print_log(entry: &DisplayLog) {
     output::arguments(format_args!("{entry}\n"));
+    if let DisplayLog::Pacing(pacing) = entry {
+        super::session::presented(pacing.presented);
+    }
 }
 
 /// `--scanout-mirror`: any scanout, with its newest frame kept at one address

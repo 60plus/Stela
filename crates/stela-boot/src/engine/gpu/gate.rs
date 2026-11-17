@@ -450,6 +450,15 @@ pub(super) fn watch_losses() {
     }
 }
 
+/// The accelerator connections open now on every service, for the guest
+/// session's line; `None` while a call holds a service.
+pub(in crate::engine) fn open_connections() -> Option<usize> {
+    shared()
+        .iter()
+        .map(|service| service.memory().map(|memory| memory.connections.len()))
+        .sum()
+}
+
 /// Logs each distinct error or warning NVK reports, such as why a call failed
 /// with only a generic result: in a job too, where no slice ends in it.
 fn driver_message(text: &str) {
