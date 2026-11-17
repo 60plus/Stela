@@ -751,7 +751,10 @@ impl Advertised {
     /// built from [`fast_timing`], and its EDID, which gives only the
     /// monitor's identity ([`Self::display_attributes`]), holds the same
     /// size at 60 Hz, as a monitor's base block often does for its fast
-    /// modes, which it lists in an extension.
+    /// modes, which it lists in an extension. So does the EDID of a mode
+    /// whose clock fits a detailed timing while its rates pass what the
+    /// base block's range limits hold, 510 Hz and 510 kHz, as 1280x720
+    /// from 511 to 535 Hz: its record is its detailed timing's.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
         Self::of_monitor(mode, refresh, size_mm, None)
     }
@@ -766,21 +769,22 @@ impl Advertised {
         monitor: Option<MonitorId>,
     ) -> Result<Self> {
         let from_monitor = monitor.is_some();
-        if fast(mode, refresh) {
+        if !fast(mode, refresh)
+            && let Ok(edid) = edid_of(mode, refresh, size_mm, monitor)
+        {
+            let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
             return Ok(Self {
-                edid: edid_of(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm, monitor)?,
-                timing: timing_record(mode, refresh, size_mm)?,
+                edid,
+                timing: timing_data(&dtd)?,
                 color: color_data(),
                 refresh,
                 others: Vec::new(),
                 from_monitor,
             });
         }
-        let edid = edid_of(mode, refresh, size_mm, monitor)?;
-        let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
         Ok(Self {
-            edid,
-            timing: timing_data(&dtd)?,
+            edid: edid_of(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm, monitor)?,
+            timing: timing_record(mode, refresh, size_mm)?,
             color: color_data(),
             refresh,
             others: Vec::new(),
@@ -1645,6 +1649,71 @@ mod tests {
         assert_eq!(format!("{one:?}"), "MonitorId(..)");
         // The published EDID stays well formed.
         assert_eq!(native.edid.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0);
+    }
+
+    /// No rate a monitor runs is passed over for the model's own records:
+    /// every whole rate from 24 to 600 Hz, and the fractional ones near
+    /// it, of the usual sizes is advertisable while its pixel clock fits
+    /// the timing record's 32 bits, at the rate itself.
+    #[test]
+    fn every_rate_of_a_usual_size_whose_clock_fits_the_record_is_advertisable() {
+        let sizes = [
+            (1024, 768),
+            (1280, 720),
+            (1280, 1024),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1080),
+            (2560, 1440),
+            (3440, 1440),
+            (3840, 1600),
+            (3840, 2160),
+        ];
+        for (width, height) in sizes {
+            let mode = Mode {
+                width,
+                height,
+                ..FULL_HD
+            };
+            for whole in 24..=600u32 {
+                for less in [0, 30, 88, 400] {
+                    let refresh = whole * 1000 - less;
+                    // About reduced blanking's clock, with CVT's 460 us:
+                    // one near the record's limit is not asked.
+                    let blank = 460 * u64::from(refresh) / 1000;
+                    let lines = u64::from(height) * 1_000_000 / (1_000_000 - blank);
+                    let clock = (u64::from(width) + 80) * lines * u64::from(refresh) / 1000;
+                    if clock > u64::from(u32::MAX) - 50_000_000 {
+                        continue;
+                    }
+                    let advertised = Advertised::at(mode, refresh);
+                    assert!(advertised.is_ok(), "{width}x{height} at {refresh} mHz");
+                    let advertised = advertised.unwrap();
+                    assert_eq!(advertised.native(), (width, height));
+                    assert_eq!(
+                        hertz(&advertised),
+                        whole,
+                        "{width}x{height} at {refresh} mHz"
+                    );
+                }
+            }
+        }
+        // 1280x720 at 520 Hz: a detailed timing's clock, rates past the
+        // range limits' 510 Hz. Its EDID names the monitor at 60 Hz.
+        let hd = Mode {
+            width: 1280,
+            height: 720,
+            ..FULL_HD
+        };
+        let fast = Advertised::at(hd, 520_000).unwrap();
+        assert_eq!(get(&fast.timing, 0x44), 636_480_000);
+        assert_eq!(&fast.edid[..], &edid(hd, 60_000).unwrap()[..]);
+        // And as one of a slower mode's other rates.
+        let rates = Advertised::at(hd, 60_000)
+            .unwrap()
+            .with_rates(&[520_000, 320_000], None);
+        assert_eq!(rates.refresh_of(OTHER_TIMING_IDS), Some(520_000));
+        assert_eq!(rates.refresh_of(OTHER_TIMING_IDS + 1), Some(320_000));
     }
 
     #[test]
