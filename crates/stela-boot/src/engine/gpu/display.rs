@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
-use stela_soc::machine::{Scanout, ScanoutFormat, ScanoutMode};
+use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
 
 /// A GPU's primary node, the DRM master.
 struct Node(c_int);
@@ -77,6 +77,9 @@ struct KmsScanout {
     mode: ScanoutMode,
     refresh_millihertz: u32,
     size_mm: Option<(u32, u32)>,
+    /// The identity of the monitor the guest's display was made for: the
+    /// taken output's, or the firmware screen's while one is awaited.
+    monitor: Option<MonitorId>,
     /// The GPU showing the display, and the display.
     display: Option<(String, Display<Node>)>,
     /// Without a display: the GPUs' open nodes to look on.
@@ -111,6 +114,10 @@ impl Scanout for KmsScanout {
 
     fn physical_size_mm(&self) -> Option<(u32, u32)> {
         self.size_mm
+    }
+
+    fn monitor(&self) -> Option<MonitorId> {
+        self.monitor
     }
 
     fn present(&mut self, rows: &[u8]) -> Result<()> {
@@ -224,12 +231,14 @@ impl KmsScanout {
         mode: ScanoutMode,
         refresh_millihertz: u32,
         size_mm: Option<(u32, u32)>,
+        monitor: Option<MonitorId>,
         tsc_hz: u64,
     ) -> Self {
         Self {
             mode,
             refresh_millihertz,
             size_mm,
+            monitor,
             display: None,
             waiting: Vec::new(),
             presented: false,
@@ -636,6 +645,7 @@ pub(in crate::engine) fn scanout() -> Option<Box<dyn Scanout>> {
         },
         display.refresh_millihertz(),
         display.size_mm(),
+        display.edid().and_then(MonitorId::from_edid),
         gpu.tsc_hz,
     );
     scanout.display = Some((name, display));
@@ -663,15 +673,17 @@ pub(in crate::engine) fn awaited(screen: Option<Framebuffer>) -> Option<Box<dyn 
         return None;
     }
     use stela_boot_core::guest_screen;
-    let ((width, height), refresh, size_mm) = match screen {
+    let ((width, height), refresh, size_mm, monitor) = match screen {
         Some(screen) => (
             screen.resolution(),
             screen.refresh_millihertz(),
             screen.size_mm(),
+            screen.monitor(),
         ),
         None => (
             guest_screen::DEFAULT,
             guest_screen::DEFAULT_REFRESH_MILLIHERTZ,
+            None,
             None,
         ),
     };
@@ -683,6 +695,7 @@ pub(in crate::engine) fn awaited(screen: Option<Framebuffer>) -> Option<Box<dyn 
         },
         refresh,
         size_mm,
+        monitor,
         gpu.tsc_hz,
     );
     scanout.waiting = waiting;

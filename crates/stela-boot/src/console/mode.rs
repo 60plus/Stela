@@ -9,6 +9,7 @@ use alloc::{format, string::String, vec::Vec};
 use core::cell::RefCell;
 use stela_contracts::refuse;
 use stela_runtime::pc::display;
+use stela_soc::machine::MonitorId;
 use uefi::{
     Handle,
     boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType},
@@ -47,10 +48,18 @@ static NATIVE: Global<Option<(u32, u32, u32)>> = Global(RefCell::new(None));
 /// The monitor's image size in millimetres, from the EDID [`select`] read.
 static SIZE: Global<Option<(u32, u32)>> = Global(RefCell::new(None));
 
+/// The monitor's identity, from the EDID [`select`] read.
+static MONITOR: Global<Option<MonitorId>> = Global(RefCell::new(None));
+
 /// The monitor's image size in millimetres, when its EDID reports one: the
 /// size of the screen whatever mode it runs.
 pub(super) fn size_mm() -> Option<(u32, u32)> {
     SIZE.0.try_borrow().ok().and_then(|size| *size)
+}
+
+/// The monitor's identity, when [`select`] read its EDID.
+pub(super) fn monitor() -> Option<MonitorId> {
+    MONITOR.0.try_borrow().ok().and_then(|monitor| *monitor)
 }
 
 /// The refresh in millihertz of a `width` by `height` screen: the EDID's
@@ -111,6 +120,11 @@ fn choose(handle: Handle, gop: &mut GraphicsOutput) {
         .and_then(|(bytes, _)| display::physical_size(bytes));
     if let Ok(mut slot) = SIZE.0.try_borrow_mut() {
         *slot = size;
+    }
+    if let Ok(mut slot) = MONITOR.0.try_borrow_mut() {
+        *slot = edid
+            .as_ref()
+            .and_then(|(bytes, _)| MonitorId::from_edid(bytes));
     }
     if let Some((width, height)) = size {
         output::arguments(format_args!("DISPLAY EDID image {width}x{height} mm\n"));

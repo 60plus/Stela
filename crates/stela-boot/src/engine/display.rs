@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::staged_frame::StagedFrame;
 use stela_contracts::refuse;
 use stela_formats::boot_bundle;
-use stela_soc::machine::{DisplayLog, Scanout, ScanoutFormat, ScanoutMode};
+use stela_soc::machine::{DisplayLog, MonitorId, Scanout, ScanoutFormat, ScanoutMode};
 use stela_soc::scanout::union;
 
 #[cfg(feature = "nvk")]
@@ -54,6 +54,7 @@ pub struct GopScanout {
     mode: ScanoutMode,
     refresh_millihertz: u32,
     size_mm: Option<(u32, u32)>,
+    monitor: Option<MonitorId>,
 }
 
 /// The screen and the frame kept for it ([`GopScanout`]).
@@ -342,6 +343,10 @@ impl Scanout for MirroredScanout {
         self.scanout.physical_size_mm()
     }
 
+    fn monitor(&self) -> Option<MonitorId> {
+        self.scanout.monitor()
+    }
+
     fn present(&mut self, rows: &[u8]) -> Result<()> {
         timed(|| {
             self.fit(rows.len());
@@ -423,6 +428,7 @@ impl GopScanout {
             },
             refresh_millihertz: screen.refresh_millihertz(),
             size_mm: screen.size_mm(),
+            monitor: screen.monitor(),
         };
         let frame = StagedFrame::new(width * 4, height);
         if mirror {
@@ -482,6 +488,10 @@ impl Scanout for GopScanout {
 
     fn physical_size_mm(&self) -> Option<(u32, u32)> {
         self.size_mm
+    }
+
+    fn monitor(&self) -> Option<MonitorId> {
+        self.monitor
     }
 
     fn present(&mut self, rows: &[u8]) -> Result<()> {
