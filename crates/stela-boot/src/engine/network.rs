@@ -736,6 +736,11 @@ pub struct GuestNetwork {
     carrier: Option<bool>,
     /// When the carrier was last looked at (`output::now`).
     carrier_checked: u64,
+    /// Counts of the guest's lookups, HTTPS and TLS traffic and clock,
+    /// for Apple's services apart ([`Self::report`]).
+    facts: stela_runtime::net::facts::Facts,
+    /// Reports since the facts line was last looked at.
+    facts_reports: u32,
 }
 
 /// Reports between two host adapter state lines while the guest receives
@@ -844,6 +849,8 @@ impl GuestNetwork {
             silent_reports: 0,
             carrier: None,
             carrier_checked: 0,
+            facts: Default::default(),
+            facts_reports: 0,
         })
     }
 
@@ -915,6 +922,17 @@ impl GuestNetwork {
     /// kept no early lines still shows whether its link, PHY, receive ring
     /// and interrupts work.
     pub fn report(&mut self) {
+        // Once a minute, when they changed: whether the guest's lookups of
+        // Apple's services were answered, its HTTPS connections to them
+        // accepted or reset, TLS stopped with an alert, and its clock
+        // against a time server's. Counts and codes only, no name or
+        // address.
+        if self.facts_reports.is_multiple_of(SILENT_REPORTS)
+            && let Some(line) = self.facts.line()
+        {
+            output::arguments(format_args!("GUEST NETWORK facts {line}\n"));
+        }
+        self.facts_reports = self.facts_reports.wrapping_add(1);
         let counters = self.counters;
         output::arguments(format_args!(
             "GUEST NETWORK frames link={} host_link={} to_host={} to_guest={} drops={} \
@@ -972,7 +990,10 @@ impl GuestNetwork {
                 break;
             };
             match received {
-                Ok(Some(frame)) => self.received.push_back(frame),
+                Ok(Some(frame)) => {
+                    self.facts.inbound(&frame);
+                    self.received.push_back(frame);
+                }
                 Ok(None) => break,
                 Err(error) => {
                     self.refuse(error.into());
@@ -1013,6 +1034,9 @@ impl GuestNetwork {
     /// is dropped, as a NIC without a cable drops it: the guest sees the
     /// link down ([`Self::carrier`]), and that is no refusal.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+        for frame in &frames {
+            self.facts.outbound(frame);
+        }
         self.unsent.extend(frames);
         let mut reusable = None;
         while let Some(frame) = self.unsent.front() {

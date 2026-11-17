@@ -5,11 +5,13 @@
 //! redirect policy and range validators. TLS uses the shared protocol provider
 //! and requires owned entropy and a UTC-correlated continuous clock.
 //! Missing native capabilities refuse HTTPS; they cannot select plaintext.
-//! Stateful DHCPv6 is unsupported. Raw guest relay bytes stay opaque.
+//! Stateful DHCPv6 is unsupported. Raw guest relay bytes stay opaque, but
+//! for the header counts of [`facts`].
 use alloc::string::String;
 use core::fmt;
 use stela_drivers::net::LinkError;
 
+pub mod facts;
 pub mod http;
 pub mod ranges;
 pub mod stack;
