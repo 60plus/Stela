@@ -339,6 +339,45 @@ fn diagnostic_line<R: Registers>(
     )
 }
 
+/// The PHY's part of the diagnostic line: its control, status,
+/// advertisement, link partner and 1000BASE-T registers (clause 22
+/// registers 0, 1, 4, 5, 9 and 10), read once, and which setup the start
+/// ran: the MAC version's PHY sequence and whether its firmware file was
+/// applied. A link that stays down is then told apart: no partner at all
+/// (no cable, a dead port), a partner whose negotiation never completes,
+/// or a negotiated link the MAC does not report.
+fn phy_line<R: Registers, T: Timer>(hw: &Hardware<'_, R, T>, warnings: &[Warning]) -> String {
+    let firmware = match hw.revision.firmware {
+        None => "none",
+        Some(_)
+            if warnings.iter().any(|warning| {
+                matches!(
+                    warning,
+                    Warning::FirmwareSkipped { .. } | Warning::PhyNotReadyForFirmware { .. }
+                )
+            }) =>
+        {
+            "skipped"
+        }
+        Some(_) => "applied",
+    };
+    let words: Result<Vec<u16>, BlockError> = [PHY_CONTROL, MII_STATUS, 4, 5, 9, 10]
+        .into_iter()
+        .map(|register| hw.phy_read(register))
+        .collect();
+    match words {
+        Ok(words) => format!(
+            "phy bmcr={:#06x} bmsr={:#06x} advertise={:#06x} partner={:#06x} ctrl1000={:#06x} \
+             stat1000={:#06x} setup=version {} firmware {firmware}",
+            words[0], words[1], words[2], words[3], words[4], words[5], hw.revision.version
+        ),
+        Err(error) => format!(
+            "phy unread ({error}) setup=version {} firmware {firmware}",
+            hw.revision.version
+        ),
+    }
+}
+
 impl Realtek {
     /// What the start tolerated, each said once.
     pub fn warnings(&self) -> &[Warning] {
@@ -998,7 +1037,7 @@ impl Link for Realtek {
                 "registers read all ones: the chip does not answer",
             ));
         }
-        Some(diagnostic_line(
+        let line = diagnostic_line(
             &self.device,
             self.revision,
             self.mac,
@@ -1006,7 +1045,9 @@ impl Link for Realtek {
             &self.transmit,
             self.events,
             self.signalled,
-        ))
+        );
+        let hardware = Hardware::new(&self.device, &self.clock, self.revision, self.function);
+        Some(format!("{line} {}", phy_line(&hardware, &self.warnings)))
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.receive_frame(<[u8]>::to_vec)

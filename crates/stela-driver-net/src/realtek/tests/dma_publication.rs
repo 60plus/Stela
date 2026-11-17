@@ -186,3 +186,40 @@ fn publication_sets_the_receive_size_and_fetch_mode_for_the_ring_layout() {
         assert_eq!(model.read32(RX_CONFIG), config);
     }
 }
+
+/// The PHY's words and the setup that ran follow the MAC's on the failure
+/// report's line; a PHY that does not answer is said, not left out.
+#[test]
+fn the_diagnostic_line_gives_the_phy_words_and_the_setup_that_ran() {
+    let time = Time::default();
+    let mut model = Model::ready(&time);
+    {
+        let mut s = model.state.borrow_mut();
+        s.phy.insert((0, 4), 0x0de1);
+        s.phy.insert((0, 5), 0xc5e1);
+        s.phy.insert((0, 10), 0x7800);
+    }
+    let hw = Hardware::new(&model, &time, revision(18), 0);
+    assert_eq!(
+        phy_line(&hw, &[]),
+        "phy bmcr=0x1140 bmsr=0x7909 advertise=0x0de1 partner=0xc5e1 ctrl1000=0x1b00 \
+         stat1000=0x7800 setup=version 18 firmware none"
+    );
+    let skipped = [Warning::FirmwareSkipped {
+        name: "rtl_nic/rtl8168h-2.fw",
+        supplied: false,
+    }];
+    let hw = Hardware::new(&model, &time, revision(46), 0);
+    let line = phy_line(&hw, &skipped);
+    assert!(line.starts_with("phy bmcr="), "{line}");
+    assert!(
+        line.ends_with("setup=version 46 firmware skipped"),
+        "{line}"
+    );
+    assert!(phy_line(&hw, &[]).ends_with("firmware applied"));
+    model.fail_phy_at = model.state.borrow().mdio_commands;
+    let hw = Hardware::new(&model, &time, revision(18), 0);
+    let line = phy_line(&hw, &[]);
+    assert!(line.starts_with("phy unread ("), "{line}");
+    assert!(line.ends_with("setup=version 18 firmware none"), "{line}");
+}
