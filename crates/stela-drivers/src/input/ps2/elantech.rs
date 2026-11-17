@@ -208,6 +208,11 @@ impl Engine {
     pub(super) fn partial(&self) -> bool {
         self.position != 0
     }
+    /// Drop the packet in progress, as psmouse drops a packet that lost
+    /// synchronization, so the next byte starts a packet.
+    pub(super) fn resync(&mut self) {
+        self.position = 0;
+    }
     pub(super) fn expire(&mut self, now: u64, timeout: u64) -> Result<(), ErrorKind> {
         if self.partial() && now.wrapping_sub(self.start) >= timeout {
             self.last_fault = Some((self.packet, self.position));
@@ -243,7 +248,11 @@ impl Engine {
         timeout: u64,
         inputs: &mut Vec<Input>,
     ) -> Result<(), ErrorKind> {
-        self.expire(now, timeout)?;
+        // A packet that expired before this byte is dropped, and the byte
+        // may start the next one.
+        if self.expire(now, timeout).is_err() {
+            self.resync();
+        }
         if self.frames.len() >= FRAME_LIMIT + QUEUE_LIMIT {
             return Err(ErrorKind::QueueFull);
         }

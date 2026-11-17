@@ -227,10 +227,9 @@ fn v3_debounce_invalid_signatures_stop_and_requery_keep_source_cached_head_prove
         let mut raw = packet(crc, true, 1, 400, 300, 0);
         raw[3] ^= if crc { 8 } else { 2 };
         emit(&h, Port::Mouse, &raw);
-        assert_eq!(
-            c.poll().unwrap_err().kind,
-            ErrorKind::Elantech(elantech::Error::Packet)
-        );
+        // Dropped, and the pad reads on, as psmouse resynchronizes.
+        assert!(c.poll().unwrap().is_empty());
+        assert!(c.framing_errors() != 0);
         c.release_inputs();
         assert_eq!(c.elantech_fragment(), Some(raw.as_slice()));
     }

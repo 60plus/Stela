@@ -434,17 +434,13 @@ fn packet_failures_and_idle_prefix_timeouts_preserve_owner_fragment_without_fake
             } else {
                 0x20
             };
-            emit(&h, Port::Mouse, &packet);
-            assert!(matches!(
-                c.poll().unwrap_err(),
-                super::super::Error {
-                    response: None,
-                    kind: ErrorKind::Synaptics(synaptics::Error::Packet { .. }),
-                    ..
-                }
-            ));
+            emit(&h, Port::Mouse, &packet[..=index]);
+            // The broken packet is dropped and the pad reads on, as psmouse
+            // resynchronizes.
+            assert!(c.poll().unwrap().is_empty());
             assert_eq!(c.synaptics_fragment().unwrap(), &packet[..=index]);
-            assert!(c.needs_reset());
+            assert!(c.is_ready());
+            assert_eq!(c.framing_errors(), 1);
             assert!(c.drain_synaptics_frames().is_empty());
         }
         let (mut c, h) = ready_synaptics(new);
@@ -456,11 +452,9 @@ fn packet_failures_and_idle_prefix_timeouts_preserve_owner_fragment_without_fake
         emit(&h, Port::Mouse, &packet[..2]);
         assert!(c.poll().unwrap().is_empty());
         h.borrow().time.set(h.borrow().time.get() + 501);
-        assert_eq!(
-            c.poll().unwrap_err().kind,
-            ErrorKind::PacketTimeout(Port::Mouse)
-        );
+        assert!(c.poll().unwrap().is_empty());
         assert_eq!(c.synaptics_fragment().unwrap(), &packet[..2]);
+        assert!(c.is_ready());
     }
 }
 #[test]
@@ -1626,7 +1620,8 @@ fn child_backpressure_keeps_raw_packets() {
     }
     assert_eq!(motions, 100);
     emit(&h, Port::Mouse, &wrapped([0, 1, 0, 0]));
-    assert_eq!(c.poll().unwrap_err().kind, ErrorKind::MouseSync(0));
+    assert!(c.poll().unwrap().is_empty());
+    assert_eq!(c.framing_errors(), 1);
     assert_eq!(c.drain_synaptics_passthrough()[0].fields()[0], 0);
     assert!(c.drain_synaptics_child_inputs().is_empty());
     c.release_inputs();
@@ -2176,10 +2171,10 @@ fn forcepad_interleaved_raw_records_preserve_pressure_epoch_and_fault_release() 
     emit(&h, Port::Mouse, &force_packet(50, 5, true));
     assert_eq!(c.poll_synaptics().unwrap().frames[0].buttons, 1);
     emit(&h, Port::Mouse, &[0]);
-    assert!(c.poll().is_err());
+    assert!(c.poll().unwrap().is_empty());
     assert!(c.drain_events().is_empty());
     assert!(c.release_inputs().contains(&Input::MouseButtons(0)));
-    assert!(c.needs_reset());
+    assert!(c.is_ready());
 }
 #[test]
 fn client_bytes_use_sliced_transport_without_fabricating_child_ack_or_identity() {

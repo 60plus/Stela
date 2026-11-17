@@ -164,6 +164,8 @@ pub(super) struct Engine {
     firmware_id: Option<alloc::string::String>,
     packet: [u8; 6],
     position: usize,
+    /// The last packet dropped to resynchronize, as far as it came.
+    last_fault: Option<([u8; 6], usize)>,
     start: u64,
     relaxed: Option<bool>,
     /// The pad's mouse emulation, made with its first frame.
@@ -188,6 +190,7 @@ impl Engine {
             firmware_id: None,
             packet: [0; 6],
             position: 0,
+            last_fault: None,
             start: 0,
             relaxed: None,
             pointer: None,
@@ -243,6 +246,12 @@ impl Engine {
     pub(super) fn partial(&self) -> bool {
         self.position != 0
     }
+    /// Drop the packet in progress, as psmouse drops a packet that lost
+    /// synchronization, so the next byte starts a packet.
+    pub(super) fn resync(&mut self) {
+        self.last_fault = Some((self.packet, self.position));
+        self.position = 0;
+    }
     pub(super) fn expire(&self, now: u64, timeout: u64) -> Result<(), ErrorKind> {
         if self.partial() && now.wrapping_sub(self.start) >= timeout {
             return Err(ErrorKind::PacketTimeout(Port::Mouse));
@@ -269,7 +278,11 @@ impl Engine {
         timeout: u64,
         inputs: &mut Vec<Input>,
     ) -> Result<(), ErrorKind> {
-        self.expire(now, timeout)?;
+        // A packet that expired before this byte is dropped, and the byte
+        // may start the next one.
+        if self.expire(now, timeout).is_err() {
+            self.resync();
+        }
         if self.frames.len() + self.advanced.len() + self.passthrough.len()
             == FRAME_LIMIT + QUEUE_LIMIT
         {
@@ -553,7 +566,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     }
     /// Exact partial/rejected bytes remain in their owner after a framing fault.
     pub fn synaptics_fragment(&self) -> Option<&[u8]> {
-        self.synaptics.as_ref().map(|e| &e.packet[..e.position])
+        self.synaptics.as_ref().map(|e| match &e.last_fault {
+            Some((raw, length)) if e.position == 0 => &raw[..*length],
+            _ => &e.packet[..e.position],
+        })
     }
     pub fn synaptics_queries(&self) -> Option<&[Query]> {
         self.synaptics.as_ref().map(|e| e.queries.as_slice())
