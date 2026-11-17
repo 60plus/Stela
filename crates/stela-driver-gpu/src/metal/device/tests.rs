@@ -3598,6 +3598,13 @@ fn a_device_out_of_memory_frees_at_once_what_work_in_flight_never_read() {
 fn a_capped_device_runs_out_of_memory_at_its_cap() {
     let mut device = device_on(MockBackend::new());
     device.cap_memory(256 << 20);
+    // Its first note says the cap is a test build's.
+    device.note_memory_step();
+    let first = device.take_memory_note().unwrap();
+    assert!(
+        first.ends_with("; a test build caps the device at 256M"),
+        "{first}"
+    );
     let large = TextureDescriptor {
         width: 4096,
         height: 4096,

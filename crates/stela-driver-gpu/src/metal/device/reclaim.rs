@@ -281,9 +281,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let mib = |bytes: u64| bytes >> 20;
         let memory = self.memory();
         let driver = self.driver_heaps();
+        // A capped test build says so in each note, so its log is never
+        // read as a small GPU's.
+        let cap = self.memory_cap.map_or_else(String::new, |cap| {
+            format!("; a test build caps the device at {}M", mib(cap))
+        });
         self.shortage.notes.push_back(format!(
             "VRAM holds {}M of the {}M the guest works in: allocated={}M recycled={}M \
-             chunks={}M blocks={}/{}M out_of_memory={}; {driver}",
+             chunks={}M blocks={}/{}M out_of_memory={}; {driver}{cap}",
             mib(held + memory.chunks.bytes),
             mib(budget),
             mib(memory.allocated),
