@@ -10,18 +10,19 @@
 //! them in the loader's root, which keeps the firmware's runtime regions
 //! mapped by identity, as `SetVirtualAddressMap` is never called.
 use crate::output;
-use alloc::{boxed::Box, string::String};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
+use stela_boot_core::running_record::{self, Running};
 use stela_boot_core::stop_record::{
     ATTRIBUTES, FirmwareCall, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR,
     carried_notice, fitting, piece_name, pieces, read, stop_reason,
 };
 use uefi::{
     CStr16, Guid,
-    runtime::{self, VariableVendor},
+    runtime::{self, VariableAttributes, VariableVendor},
     table::Revision,
 };
 
@@ -119,6 +120,112 @@ pub(crate) fn disarm() {
 /// This boot's number in the USB's log, once it is open.
 pub(crate) fn set_boot(boot: u64) {
     BOOT.store(boot, Ordering::Relaxed);
+}
+
+/// This boot's number in the USB's log; 0 without one.
+pub(crate) fn boot() -> u64 {
+    BOOT.load(Ordering::Relaxed)
+}
+
+/// The last boot on this PC that reached the firmware's exit, as the
+/// firmware's variable names it (`running_record`), and the USB log's
+/// newest lines from before this boot's own, which [`tell_unfinished`]
+/// decides from.
+static LAST_RUN: output::Global<Option<(Running, Vec<u8>)>> =
+    output::Global(core::cell::RefCell::new(None));
+
+/// The firmware's record of the last boot that reached its exit; `None`
+/// where it holds none. A read, while boot services run: nothing is
+/// written.
+pub(crate) fn running() -> Option<Running> {
+    let name = CStr16::from_u16_with_nul(&running_record::NAME).ok()?;
+    let (value, _) = runtime::get_variable_boxed(name, &VariableVendor(VENDOR)).ok()?;
+    Running::decode(&value)
+}
+
+/// Keep `running` and the log's `newest` lines, read before this boot's
+/// marker joined them, for [`tell_unfinished`].
+pub(crate) fn keep_last_run(running: Running, newest: Vec<u8>) {
+    if let Ok(mut last) = LAST_RUN.0.try_borrow_mut() {
+        *last = Some((running, newest));
+    }
+}
+
+/// Say, in the log and on the screen, that the boot before this one ended
+/// without a stop, with the last step its log shows
+/// (`running_record::unfinished`): it hung and was switched off, or the PC
+/// reset. Called once the USB's log, on partition `log`, is open and
+/// [`carry`] ran; `carried` is the boot of the stop record it copied.
+/// Nothing is said, and nothing written, for a boot whose end is in the
+/// log or the firmware, or for another USB's.
+pub(crate) fn tell_unfinished(log: [u8; 16], carried: Option<u64>) {
+    let Some((running, newest)) = LAST_RUN
+        .0
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut last| last.take())
+    else {
+        return;
+    };
+    let Some(found) = running_record::unfinished(&running, boot(), &log, carried, &newest) else {
+        return;
+    };
+    output::arguments(format_args!("{}", found.line()));
+    crate::status::warning(&found.notice());
+}
+
+/// Leave the firmware the record that this boot reached its exit: one
+/// variable write, the only one a boot makes for it
+/// (`running_record::WRITES_PER_BOOT`), made here while boot services run
+/// and the log is open, and never after them. Firmware that does not
+/// report its store, has too little of it free or refuses the write is
+/// named in one line and the boot goes on: a boot that then ends without
+/// a stop is not told at the next start. Without the USB's log, on
+/// partition `log`, there is no boot to name and nothing is written.
+pub(crate) fn mark_running(log: Option<[u8; 16]>) {
+    let boot = boot();
+    let (Some(log), true) = (log, boot != 0) else {
+        return;
+    };
+    let Ok(name) = CStr16::from_u16_with_nul(&running_record::NAME) else {
+        return;
+    };
+    let attributes = VariableAttributes::from_bits_retain(running_record::ATTRIBUTES);
+    let started = output::now();
+    let refused = match runtime::query_variable_info(attributes) {
+        Err(error) => Some(format!(
+            "the firmware does not report its variable store ({:?})",
+            error.status()
+        )),
+        Ok(info) if !running_record::store_takes(info.remaining_variable_storage_size) => {
+            Some(format!(
+                "the firmware's variable store has only {} bytes free",
+                info.remaining_variable_storage_size
+            ))
+        }
+        Ok(_) => {
+            let seconds = output::now() / output::counter_hz().max(1);
+            let record = Running {
+                boot,
+                log,
+                seconds: u32::try_from(seconds).unwrap_or(u32::MAX),
+            };
+            runtime::set_variable(name, &VariableVendor(VENDOR), attributes, &record.encode())
+                .err()
+                .map(|error| format!("the firmware refused the write ({:?})", error.status()))
+        }
+    };
+    let millis = output::millis_since(started);
+    match refused {
+        None => output::arguments(format_args!(
+            "BOOT RUNNING RECORD boot={boot} written in {millis} ms: the next start on this PC \
+             says so if this boot ends without a stop\n"
+        )),
+        Some(why) => output::arguments(format_args!(
+            "BOOT RUNNING RECORD not written: {why}; if this boot ends without a stop, the \
+             next start does not say so\n"
+        )),
+    }
 }
 
 /// The firmware call a processor is in ([`in_firmware`]): its kind in the
@@ -332,8 +439,8 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
 /// log holds the lines. Variables that are no whole record are reported in
 /// one line and deleted. Called once the USB's log is open, while boot services run;
 /// a PC that holds no record, as one the stick was moved to, gets no line
-/// and no write.
-pub(crate) fn carry() {
+/// and no write. The boot a whole record names, for [`tell_unfinished`].
+pub(crate) fn carry() -> Option<u64> {
     let vendor = VariableVendor(VENDOR);
     let value = |name: &[u16]| -> Option<Box<[u8]>> {
         let name = CStr16::from_u16_with_nul(name).ok()?;
@@ -346,8 +453,9 @@ pub(crate) fn carry() {
         core::array::from_fn(|index| value(&piece_name(index)));
     // The stop's reason, for the screen: a stop after the GPU's reset left
     // none of its own.
+    let mut carried = None;
     let reason = match read(header.as_deref(), &values) {
-        Kept::Absent => return,
+        Kept::Absent => return None,
         Kept::Damaged(why) => {
             output::arguments(format_args!(
                 "PREVIOUS BOOT left a stop record in this PC's firmware that cannot be read: \
@@ -365,6 +473,7 @@ pub(crate) fn carry() {
                 output::arguments(format_args!("PREVIOUS BOOT {line}\n"));
             }
             output::arguments(format_args!("PREVIOUS BOOT stop record ends\n"));
+            carried = Some(boot);
             Some(stop_reason(&text).map(String::from))
         }
     };
@@ -379,7 +488,7 @@ pub(crate) fn carry() {
             "PREVIOUS BOOT stop record stays in this PC's firmware: the USB's log did not take \
              it\n"
         ));
-        return;
+        return carried;
     }
     let names = core::iter::once((HEADER_NAME.as_slice(), header.is_some())).chain(
         PIECE_NAMES
@@ -408,6 +517,7 @@ pub(crate) fn carry() {
              next start copies it again\n"
         )),
     }
+    carried
 }
 
 /// Every piece's name, for [`carry`]'s borrow of them.

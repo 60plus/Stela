@@ -299,9 +299,11 @@ fn main() -> Status {
     // A stop the USB's log cannot keep leaves its record in the firmware.
     stop_record::arm(stop_record::Services::capture(), None);
     let log = log_file::open();
-    // The record of such a stop at an earlier start reaches the log now.
-    if log.is_some() {
-        stop_record::carry();
+    // The record of such a stop at an earlier start reaches the log now,
+    // and a start that ended with neither a stop nor a record is told.
+    if let Some(log) = log.as_ref() {
+        let carried = stop_record::carry();
+        stop_record::tell_unfinished(log.0, carried);
     }
     output::arguments(format_args!("{}", host_identity()));
     if let Some(line) = previous_reset() {

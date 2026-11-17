@@ -874,6 +874,9 @@ fn load(
             prepared.rehearse()
         ));
     }
+    // From here a boot that ends without a stop leaves no line of its own:
+    // the firmware keeps that it got this far, for the next start to say.
+    crate::stop_record::mark_running(log.as_ref().map(|guid| guid.0));
     crate::status::begin("Taking control of the other processors");
     // Named before the buffer's allocation, the last one: the firmware's
     // exit can take long, and the screen keeps this detail through it. The

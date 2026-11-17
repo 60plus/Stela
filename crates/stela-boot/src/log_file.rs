@@ -44,6 +44,17 @@ pub fn open() -> Option<Guid> {
         let mut device: Box<dyn BlockDevice> = Box::new(device);
         // The earlier boots' account, before this boot's marker joins it.
         read_device_skips(&mut *device);
+        // The last boot's last lines, where this PC's firmware says one
+        // reached its exit: whether it ended by a stop is in them.
+        if let Some(running) = crate::stop_record::running() {
+            let newest = boot_log::read_newest(
+                &mut *device,
+                32 * 1024,
+                stela_boot_core::running_record::enough,
+            )
+            .unwrap_or_default();
+            crate::stop_record::keep_last_run(running, newest);
+        }
         let writer = Writer::open(&mut *device)
             .map_err(|error| refuse!("firmware boot log: {error}", %error))?;
         report(&writer, "firmware");
@@ -139,6 +150,13 @@ fn report(writer: &Writer, through: &str) {
     if let Some(reason) = writer.fresh() {
         output::arguments(format_args!("BOOT LOG FILE fresh: {reason}\n"));
     }
+    if writer.converted() {
+        output::arguments(format_args!(
+            "BOOT LOG FILE layout changed to keep each boot's first lines: the newest {} KiB \
+             of the earlier boots' lines stay\n",
+            writer.ring_bytes() >> 10
+        ));
+    }
     output::arguments(format_args!(
         "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x}\n",
         writer.boots(),
@@ -150,13 +168,6 @@ fn report(writer: &Writer, through: &str) {
 fn shared<P: ProtocolPointer + ?Sized>(handle: Handle) -> Option<ScopedProtocol<P>> {
     // SAFETY: used only for queries and file access while boot services
     // run; no driver on `handle` is replaced while it is held.
-    if writer.converted() {
-        output::arguments(format_args!(
-            "BOOT LOG FILE layout changed to keep each boot's first lines: the newest {} KiB \
-             of the earlier boots' lines stay\n",
-            writer.ring_bytes() >> 10
-        ));
-    }
     unsafe {
         boot::open_protocol::<P>(
             OpenProtocolParams {

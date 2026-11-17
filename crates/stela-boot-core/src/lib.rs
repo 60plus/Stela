@@ -97,6 +97,7 @@ pub mod resident_image;
 pub mod root_transition;
 pub mod screen;
 pub mod service_watch;
+pub mod running_record;
 pub mod shutdown;
 pub mod smi;
 pub mod source_health;
