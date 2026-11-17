@@ -148,7 +148,7 @@ fn an_output_that_cannot_scale_or_would_shrink_stays_dark() {
         assert_eq!((display.outputs(), display.unshown()), (1, 1));
         assert_eq!(display.smaller(), 0);
     }
-    assert_eq!((card.set, card.property_reads), (None, 2));
+    assert_eq!((card.set, card.property_reads), (None, 1));
     assert!(card.scalings.is_empty());
 
     // The larger monitor gives the picture: the smaller one would need

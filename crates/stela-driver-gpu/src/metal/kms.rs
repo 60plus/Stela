@@ -70,6 +70,7 @@ const CRTC_GET_SEQUENCE: u32 = request::<CrtcSequence>(0x3b);
 const GET_PROPERTY: u32 = request::<PropertyInfo>(0xaa);
 const OBJECT_PROPERTIES: u32 = request::<ObjectProperties>(0xb9);
 const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
+const GET_BLOB: u32 = request::<Blob>(0xac);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -85,6 +86,11 @@ const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const SCALING_MODE: &[u8] = b"scaling mode";
 const SCALE_NONE: u64 = 0;
 const SCALE_ASPECT: u64 = 3;
+/// DRM's standard connector property holding the monitor's EDID as a blob
+/// (`drm_connector_update_edid_property`), 0 when it has none.
+const EDID: &[u8] = b"EDID";
+/// The longest EDID read: 256 blocks of 128 bytes.
+const EDID_BYTES: u32 = 256 * 128;
 /// A property's values read: the scaling mode has four.
 const PROPERTY_VALUES: usize = 8;
 /// `DRM_FORMAT_XRGB8888`: blue in the low byte of the little-endian pixel.
@@ -262,6 +268,15 @@ struct PropertyInfo {
     enum_count: u32,
 }
 
+/// `struct drm_mode_get_blob`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct Blob {
+    id: u32,
+    length: u32,
+    data: u64,
+}
+
 /// `struct drm_mode_obj_set_property`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -375,6 +390,9 @@ pub struct Display<D> {
     refresh: u32,
     /// The monitor's image size in millimetres, when its EDID gave one.
     size_mm: Option<(u32, u32)>,
+    /// The EDID of the monitor on the output that gives the picture, when
+    /// the connector has one.
+    edid: Option<Vec<u8>>,
     /// What the engine reads, then the one the next frame fills.
     /// The newest frame, the one before it and the one that shows neither.
     buffers: [Buffer; 3],
@@ -1013,6 +1031,64 @@ fn scaler<D: Drm>(drm: &mut D, id: u32) -> Result<Option<u32>, Error> {
     Ok(None)
 }
 
+/// Connector `id`'s EDID, from its "EDID" blob property, as the driver
+/// last read it from the monitor: `None` when it has none or one longer
+/// than [`EDID_BYTES`]. Reading it does not probe the connector.
+fn edid<D: Drm>(drm: &mut D, id: u32) -> Result<Option<Vec<u8>>, Error> {
+    let mut sized = ObjectProperties {
+        id,
+        kind: OBJECT_CONNECTOR,
+        ..ObjectProperties::default()
+    };
+    call(drm, OBJECT_PROPERTIES, &mut sized)?;
+    let mut properties = list::<u32>(sized.count)?;
+    let mut values = list::<u64>(sized.count)?;
+    let mut described = ObjectProperties {
+        properties: properties.as_mut_ptr() as u64,
+        values: values.as_mut_ptr() as u64,
+        count: properties.len() as u32,
+        id,
+        kind: OBJECT_CONNECTOR,
+    };
+    call(drm, OBJECT_PROPERTIES, &mut described)?;
+    let count = (described.count as usize).min(properties.len());
+    for (&property, &value) in properties[..count].iter().zip(&values[..count]) {
+        let mut info = PropertyInfo {
+            id: property,
+            ..PropertyInfo::default()
+        };
+        call(drm, GET_PROPERTY, &mut info)?;
+        let length = info.name.iter().position(|&byte| byte == 0);
+        if &info.name[..length.unwrap_or(info.name.len())] != EDID {
+            continue;
+        }
+        let Ok(blob) = u32::try_from(value) else {
+            return Ok(None);
+        };
+        if blob == 0 {
+            return Ok(None);
+        }
+        let mut asked = Blob {
+            id: blob,
+            ..Blob::default()
+        };
+        call(drm, GET_BLOB, &mut asked)?;
+        if asked.length == 0 || asked.length > EDID_BYTES {
+            return Ok(None);
+        }
+        let mut bytes = list::<u8>(asked.length)?;
+        // Linux copies the blob only when the length asked is its own.
+        let mut read = Blob {
+            id: blob,
+            length: asked.length,
+            data: bytes.as_mut_ptr() as u64,
+        };
+        call(drm, GET_BLOB, &mut read)?;
+        return Ok((read.length == asked.length).then_some(bytes));
+    }
+    Ok(None)
+}
+
 /// Set connector `id`'s scaling `property` to `value`. The connector must
 /// run no controller: the change then needs no mode set, and the next one
 /// takes it.
@@ -1223,6 +1299,9 @@ impl<D: Drm> Display<D> {
         };
         let first = usable.remove(first);
         let [width, height] = first.1.size_mm;
+        // The monitor's identity for the guest; one the connector cannot
+        // give leaves the size alone to name it.
+        let edid = edid(&mut drm, first.0).ok().flatten();
         let mut heads: Vec<Head> = Vec::new();
         let rates = rates_of(&first.1.modes, size, fits);
         let (mut smaller, mut refused) = (0, None);
@@ -1273,6 +1352,7 @@ impl<D: Drm> Display<D> {
         };
         Ok(Self {
             size_mm: (width != 0 && height != 0).then_some((width, height)),
+            edid,
             rates,
             smaller,
             refused: refused.or(display.refused),
@@ -1312,6 +1392,7 @@ impl<D: Drm> Display<D> {
             height,
             refresh: refresh(&mode),
             size_mm: None,
+            edid: None,
             buffers,
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
@@ -1740,6 +1821,13 @@ impl<D: Drm> Display<D> {
     /// The monitor's image size in millimetres, when its EDID gave one.
     pub fn size_mm(&self) -> Option<(u32, u32)> {
         self.size_mm
+    }
+
+    /// The EDID of the monitor on the output that gives the picture (the
+    /// first, which also gives its size and refresh), as its connector
+    /// held it at the take; `None` when it held none.
+    pub fn edid(&self) -> Option<&[u8]> {
+        self.edid.as_deref()
     }
 
     /// The buffer on screen and the bytes between its rows, for what draws

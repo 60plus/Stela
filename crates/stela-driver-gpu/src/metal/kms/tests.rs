@@ -98,8 +98,11 @@ struct Card {
     removed: Vec<u32>,
     unmapped: usize,
     /// Both connectors offer DRM's "scaling mode" as property 70, besides
-    /// property 69, "DPMS", which every connector offers.
+    /// property 69, "DPMS", and property 71, "EDID", which every connector
+    /// offers.
     scaler: bool,
+    /// Connector 50's and 51's EDID, blobs 90 and 91; none is blob 0.
+    edids: [Option<Vec<u8>>; 2],
     /// Connector 50's and 51's scaling mode.
     scaling: [u64; 2],
     /// Scaling modes set, by connector, and the property reads.
@@ -150,6 +153,7 @@ impl Card {
             removed: Vec::new(),
             unmapped: 0,
             scaler: false,
+            edids: [None, None],
             scaling: [SCALE_NONE; 2],
             scalings: Vec::new(),
             property_reads: 0,
@@ -158,7 +162,8 @@ impl Card {
         }
     }
 
-    /// Requests about connector properties: none where nothing is scaled.
+    /// Requests about connector properties other than the EDID: none
+    /// where nothing is scaled.
     fn property_requests(&self) -> usize {
         self.property_reads as usize + self.scalings.len()
     }
@@ -286,11 +291,20 @@ unsafe impl Drm for &mut Card {
                     let object = &mut *argument.cast::<ObjectProperties>();
                     assert_eq!(object.kind, OBJECT_CONNECTOR);
                     assert!(matches!(object.id, 50 | 51));
-                    self.property_reads += 1;
-                    let offered: &[u32] = if self.scaler { &[69, 70] } else { &[69] };
+                    let offered: &[u32] = if self.scaler {
+                        &[71, 69, 70]
+                    } else {
+                        &[71, 69]
+                    };
+                    let index = (object.id - 50) as usize;
+                    let edid = self.edids[index].as_ref().map_or(0, |_| 90 + index as u64);
                     if object.count as usize >= offered.len() {
                         let list = object.properties as *mut u32;
                         ptr::copy_nonoverlapping(offered.as_ptr(), list, offered.len());
+                        let values = object.values as *mut u64;
+                        for (at, &property) in offered.iter().enumerate() {
+                            values.add(at).write(if property == 71 { edid } else { 0 });
+                        }
                     }
                     object.count = offered.len() as u32;
                 }
@@ -299,8 +313,10 @@ unsafe impl Drm for &mut Card {
                     let name: &[u8] = match info.id {
                         69 => b"DPMS",
                         70 => SCALING_MODE,
+                        71 => EDID,
                         other => panic!("property {other}"),
                     };
+                    self.property_reads += u32::from(info.id != 71);
                     info.name = [0; 32];
                     info.name[..name.len()].copy_from_slice(name);
                     let values = info.values as *mut u64;
@@ -308,6 +324,21 @@ unsafe impl Drm for &mut Card {
                         values.add(value as usize).write(u64::from(value));
                     }
                     info.value_count = 4;
+                }
+                GET_BLOB => {
+                    let blob = &mut *argument.cast::<Blob>();
+                    let Some(Some(edid)) = blob
+                        .id
+                        .checked_sub(90)
+                        .and_then(|index| self.edids.get(index as usize))
+                    else {
+                        return -2;
+                    };
+                    // Linux copies only when the length asked is the blob's.
+                    if blob.length as usize == edid.len() {
+                        ptr::copy_nonoverlapping(edid.as_ptr(), blob.data as *mut u8, edid.len());
+                    }
+                    blob.length = edid.len() as u32;
                 }
                 SET_OBJECT_PROPERTY => {
                     let set = *argument.cast::<SetProperty>();

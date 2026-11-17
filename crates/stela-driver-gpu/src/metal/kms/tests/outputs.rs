@@ -377,3 +377,43 @@ fn the_outputs_shown_are_named_and_a_built_in_panel_is_known() {
         [true, false]
     );
 }
+
+#[test]
+fn the_identity_is_the_edid_of_the_output_that_gives_the_picture() {
+    let edid = |serial: u8| {
+        let mut e = vec![0u8; 128];
+        e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        e[12] = serial;
+        e
+    };
+    for lit in [50, 51] {
+        let mut card = two_monitors();
+        card.edids = [Some(edid(1)), Some(edid(2))];
+        card.lit = lit;
+        let mut display = Display::take(&mut card, (4, 2)).unwrap();
+        assert_eq!(display.outputs(), 2);
+        // The output that gives the picture, its size and its refresh
+        // names the monitor, the other output's EDID does not.
+        let first = display.heads[0].connector;
+        assert_eq!(first, lit);
+        let own = edid((first - 49) as u8);
+        assert_eq!(display.edid(), Some(&own[..]));
+        // A look at the outputs later keeps it.
+        display.watch();
+        assert_eq!(display.edid(), Some(&own[..]));
+        // Reading it asked nothing about the scaling property.
+        assert_eq!(display.drm.property_requests(), 0);
+    }
+
+    // A connector with no EDID gives none, and the size alone names the
+    // display; one too long to be an EDID is not read.
+    let mut bare = two_monitors();
+    bare.edids = [None, Some(edid(2))];
+    let display = Display::take(&mut bare, (4, 2)).unwrap();
+    assert_eq!(display.heads[0].connector, 50);
+    assert_eq!(display.edid(), None);
+    drop(display);
+    let mut long = two_monitors();
+    long.edids = [Some(vec![0; EDID_BYTES as usize + 1]), None];
+    assert_eq!(Display::take(&mut long, (4, 2)).unwrap().edid(), None);
+}
