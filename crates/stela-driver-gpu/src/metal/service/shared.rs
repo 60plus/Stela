@@ -1836,8 +1836,10 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         let mut read_back = None;
         self.job_lock.lock.set_deferred(false);
         self.job_lock.lock.take_waited();
+        self.job_lock.lock.clear_withdrawn();
         self.job_lock.lock.set_may_defer(deferring);
         (self.host.run)(self.host.stack, &mut || {
+            turn.device().watch_host_calls(&self.job_lock.lock);
             self.free_read_backs(&mut turn);
             self.adopt_jobs(&mut turn);
             turn.device().compiler_mut().defer_compiles(deferring);

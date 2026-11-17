@@ -48,6 +48,8 @@ pub mod pass_times;
 pub mod pins;
 pub mod pipelines;
 pub mod queue;
+mod reclaim;
+pub use reclaim::Reclaimed;
 pub mod resources;
 pub use resources::SurfaceNote;
 
@@ -166,6 +168,11 @@ pub struct Device<B: Backend, C: Compiler> {
     /// The most deferred bytes that only held work kept ([`DeviceMemory`]).
     peak_pinned: u64,
     allocated: u64,
+    /// The allocations that ran out of memory ([`reclaim`]).
+    shortage: reclaim::Shortage,
+    /// The service's lock, which says when the platform withdrew a host
+    /// call of the call served now ([`Self::watch_host_calls`]).
+    host_calls: Option<alloc::sync::Arc<super::compiler::CompileLock>>,
     resources: resources::Resources,
     pipelines: pipelines::Pipelines,
     execution_sets: execution_sets::ExecutionSets,
@@ -219,6 +226,8 @@ pub struct DeviceMemory {
     pub blocks: crate::metal::vulkan::backend::MemoryBlocks,
     /// The upload chunks, which `allocated` does not count.
     pub chunks: crate::metal::upload::ChunkReport,
+    /// Allocations that ran out of memory since the device opened.
+    pub out_of_memory: u64,
     /// Each descriptor array's use, in [`HeapArray`] order.
     pub descriptors: [DescriptorUse; 5],
 }
@@ -304,6 +313,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             heap_refusals: self.heap_refusals(),
             blocks: self.backend.memory_blocks(),
             chunks: self.upload_chunks(),
+            out_of_memory: self.out_of_memory(),
             descriptors: core::array::from_fn(|index| {
                 let array = HeapArray::ALL[index];
                 DescriptorUse {
@@ -372,6 +382,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             scope: pins::Scope::DEVICE,
             peak_pinned: 0,
             allocated: 0,
+            shortage: reclaim::Shortage::default(),
+            host_calls: None,
             resources: resources::Resources::default(),
             pipelines: pipelines::Pipelines::default(),
             execution_sets: execution_sets::ExecutionSets::default(),

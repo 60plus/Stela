@@ -376,7 +376,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::EMPTY,
             mapped: false,
         };
-        let (image, memory, bytes) = self.backend.create_image(&info, request)?;
+        let (image, memory, bytes) = self.make_image(&info, request)?;
         self.allocated += bytes;
         let view_info = ImageViewInfo {
             view_type: ImageViewType::D2Array,
@@ -513,7 +513,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::EMPTY,
             mapped: false,
         };
-        let allocation = match self.backend.create_buffer(&info, request) {
+        let allocation = match self.make_buffer(&info, request) {
             Ok(allocation) => allocation,
             Err(Error::OutOfMemory) => {
                 self.unsupported(
@@ -1243,7 +1243,7 @@ mod tests {
             .unwrap();
         device.extended_working(texture, view).unwrap();
         while device.take_unsupported().is_some() {}
-        device.backend().withdrawn_allocation = Some(|| true);
+        device.backend().memory_limit = Some(0);
         let planes = device
             .extended_pass_planes(texture, view, [1280, 800], actions(true), &mut changes)
             .unwrap()

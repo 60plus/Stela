@@ -191,7 +191,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::EMPTY,
             mapped: false,
         };
-        let (image, copy_memory, bytes) = self.backend.create_image(&info, request)?;
+        let (image, copy_memory, bytes) = self.make_image(&info, request)?;
         self.allocated += bytes;
         self.book_memory(copy_memory, bytes, || {
             alloc::format!(

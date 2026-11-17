@@ -250,6 +250,9 @@ pub struct CompileLock {
     /// taken it in time, while the call could be made again
     /// ([`Self::defer_for_wait`]).
     waited: AtomicBool,
+    /// A host call of the call served now was withdrawn, whether or not
+    /// the call can be made again: what failed then failed for a wait.
+    withdrawn: AtomicBool,
 }
 
 impl CompileLock {
@@ -259,6 +262,7 @@ impl CompileLock {
             deferred: AtomicBool::new(false),
             may_defer: AtomicBool::new(false),
             waited: AtomicBool::new(false),
+            withdrawn: AtomicBool::new(false),
         }
     }
 
@@ -314,6 +318,7 @@ impl CompileLock {
     /// From then on it defers what would need more such calls, as after a
     /// deferral.
     pub fn defer_for_wait(&self) -> bool {
+        self.withdrawn.store(true, Ordering::Release);
         let again = self.may_defer.load(Ordering::Acquire);
         if again {
             self.waited.store(true, Ordering::Release);
@@ -325,6 +330,18 @@ impl CompileLock {
     /// could be made again.
     pub fn waited(&self) -> bool {
         self.waited.load(Ordering::Acquire)
+    }
+
+    /// Whether a host call of the call served now was withdrawn: its
+    /// poster waited the whole bound for it, so the call makes no other in
+    /// place of it, which would hold its processor as long again.
+    pub fn withdrawn(&self) -> bool {
+        self.withdrawn.load(Ordering::Acquire)
+    }
+
+    /// Clears [`Self::withdrawn`] for the next call.
+    pub fn clear_withdrawn(&self) {
+        self.withdrawn.store(false, Ordering::Release);
     }
 
     /// [`Self::waited`], cleared for the next call.

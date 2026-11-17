@@ -316,7 +316,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// `newBufferWithLength:options:`.
     pub fn new_buffer(&mut self, length: u64, options: ResourceOptions) -> Result<BufferId> {
         let plan = resource::buffer(&self.capabilities, length, options)?;
-        let allocation = self.backend.create_buffer(&plan.info, plan.memory)?;
+        let allocation = self.make_buffer(&plan.info, plan.memory)?;
         Ok(self.own_buffer(allocation, length, options))
     }
 
@@ -604,14 +604,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             return Ok(texture);
         }
         self.backend.take_split();
-        let (image, memory, bytes) = match self.backend.create_image(&plan.image, plan.memory) {
-            // Recycled textures hold memory nothing else may use.
-            Err(Error::OutOfMemory) if !self.resources.recycled.is_empty() => {
-                self.trim_recycled(0, 0)?;
-                self.backend.create_image(&plan.image, plan.memory)?
-            }
-            created => created?,
-        };
+        let (image, memory, bytes) = self.make_image(&plan.image, plan.memory)?;
         // The backend splits its call; what it does not is the image's.
         let whole = self.timing.now().wrapping_sub(start);
         let [_, allocate, bind] = self.backend.take_split();
@@ -729,7 +722,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::HOST_CACHED,
             mapped: true,
         };
-        let allocation = self.backend.create_buffer(&info, request)?;
+        let allocation = self.make_buffer(&info, request)?;
         self.allocated += allocation.allocated;
         self.book_memory(allocation.memory, allocation.allocated, || {
             format!(
@@ -1553,7 +1546,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::EMPTY,
             mapped: false,
         };
-        let (image, memory, bytes) = self.backend.create_image(&info, request)?;
+        let (image, memory, bytes) = self.make_image(&info, request)?;
         self.allocated += bytes;
         let view_info = ImageViewInfo {
             view_type: ImageViewType::D2Array,
@@ -2187,7 +2180,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Frees the oldest recycled textures until at most `bytes` and
     /// `textures` remain.
-    fn trim_recycled(&mut self, bytes: u64, textures: usize) -> Result<()> {
+    pub(super) fn trim_recycled(&mut self, bytes: u64, textures: usize) -> Result<()> {
         while self.resources.recycled_bytes > bytes || self.resources.recycled.len() > textures {
             let Some(entry) = self.resources.recycled.pop_front() else {
                 break;
@@ -2520,9 +2513,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             Some(_) => plan.size,
             None => plan.size.next_multiple_of(heap::PAGE),
         };
-        let memory = self
-            .backend
-            .allocate_memory(bytes, plan.memory, memory_types)?;
+        let memory = self.make_memory(bytes, plan.memory, memory_types)?;
         self.allocated += bytes;
         self.book_memory(memory, bytes, || {
             format!("{:?} heap of {bytes} bytes", descriptor.heap_type)
@@ -2664,16 +2655,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 .backend
                 .create_placed_buffer(&plan.info, memory, offset)
                 .map(|(buffer, address)| (buffer, memory, offset, address)),
-            None => self
-                .backend
-                .create_buffer(&plan.info, plan.memory)
-                .map(|own| {
-                    self.allocated += own.allocated;
-                    if let Backing::Heap { own: bytes, .. } = &mut backing {
-                        *bytes = own.allocated;
-                    }
-                    (own.buffer, own.memory, 0, own.address)
-                }),
+            None => self.make_buffer(&plan.info, plan.memory).map(|own| {
+                self.allocated += own.allocated;
+                if let Backing::Heap { own: bytes, .. } = &mut backing {
+                    *bytes = own.allocated;
+                }
+                (own.buffer, own.memory, 0, own.address)
+            }),
         };
         let (buffer, memory, memory_offset, address) = match created {
             Ok(created) => created,
@@ -2735,24 +2723,23 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             real: real.flatten(),
             own: 0,
         };
-        let created =
-            match real {
-                Some(range) => {
-                    let at = range.map_or(offset, |(at, _)| at);
-                    self.backend
-                        .create_placed_image(&plan.image, memory, at)
-                        .map(|image| (image, None))
-                }
-                None => self.backend.create_image(&plan.image, plan.memory).map(
-                    |(image, own, bytes)| {
-                        self.allocated += bytes;
-                        if let Backing::Heap { own: owned, .. } = &mut backing {
-                            *owned = bytes;
-                        }
-                        (image, Some(own))
-                    },
-                ),
-            };
+        let created = match real {
+            Some(range) => {
+                let at = range.map_or(offset, |(at, _)| at);
+                self.backend
+                    .create_placed_image(&plan.image, memory, at)
+                    .map(|image| (image, None))
+            }
+            None => self
+                .make_image(&plan.image, plan.memory)
+                .map(|(image, own, bytes)| {
+                    self.allocated += bytes;
+                    if let Backing::Heap { own: owned, .. } = &mut backing {
+                        *owned = bytes;
+                    }
+                    (image, Some(own))
+                }),
+        };
         let (image, own) = match created {
             Ok(created) => created,
             Err(error) => {

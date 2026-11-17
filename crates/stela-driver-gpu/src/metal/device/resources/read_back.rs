@@ -131,7 +131,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             preferred: MemoryProperties::HOST_CACHED,
             mapped: true,
         };
-        let staging = self.backend.create_buffer(&info, request)?;
+        let staging = self.make_buffer(&info, request)?;
         self.allocated += staging.allocated;
         let Some(host) = self.backend.host_bytes(staging.memory, 0, stored as u64) else {
             // No coherent view of it: the host image copy reads at once.

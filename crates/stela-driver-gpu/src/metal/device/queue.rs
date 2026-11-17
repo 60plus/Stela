@@ -1620,6 +1620,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.queue.chunks.report()
     }
 
+    /// Gives up every free upload chunk, as a device out of memory does;
+    /// answers their bytes.
+    pub(super) fn drop_free_chunks(&mut self) -> u64 {
+        let free = self.queue.chunks.drain_free();
+        self.destroy_chunks(free)
+    }
+
     /// Destroys upload chunks the pool gave up, once no command buffer in
     /// flight may reach their memory; answers their bytes.
     pub(super) fn destroy_chunks(&mut self, chunks: Vec<(Chunk, Memory)>) -> u64 {
@@ -2505,7 +2512,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     preferred: MemoryProperties::HOST_CACHED,
                     mapped: true,
                 };
-                let allocation = self.backend.create_buffer(&info, request)?;
+                let allocation = self.make_buffer(&info, request)?;
                 let unsampled = alloc::vec![0xff; size as usize];
                 if let Err(error) = self.backend.write_memory(allocation.memory, 0, &unsampled) {
                     self.backend.destroy(Object::Buffer(allocation.buffer));
@@ -2666,7 +2673,7 @@ impl<B: Backend, C: Compiler> ChunkSource for DeviceResolver<'_, B, C> {
             usage,
             flags: BufferCreate::EMPTY,
         };
-        let allocation = self.device.backend.create_buffer(&info, CHUNK_MEMORY)?;
+        let allocation = self.device.make_buffer(&info, CHUNK_MEMORY)?;
         let chunk = Chunk {
             buffer: allocation.buffer,
             address: allocation.address,

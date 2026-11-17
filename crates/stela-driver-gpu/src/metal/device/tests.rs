@@ -3364,14 +3364,10 @@ fn completion_recycles_upload_chunks() {
     );
 }
 
-/// The scratch chunk of a pass's imageblock data is destroyed once command
-/// buffers keep retiring without a pass of its size, and small uploads
-/// meanwhile take a default chunk, where the pool kept every chunk it ever
-/// made and gave the first free one, whatever its size, to the next upload.
-#[test]
-fn idle_upload_chunks_are_destroyed() {
-    use crate::metal::{pass::TileMemory, upload::CHUNK_BYTES};
-    let mut device = device();
+/// Commits a pass over a new 1024x1024 target with sixteen bytes of
+/// imageblock data a sample: 16 MiB of scratch memory in a chunk of its own.
+fn imageblock_pass(device: &mut TestDevice) -> u64 {
+    use crate::metal::pass::TileMemory;
     let target = device
         .new_texture(&TextureDescriptor {
             width: 1024,
@@ -3417,8 +3413,18 @@ fn idle_upload_chunks_are_destroyed() {
     let mut commands = device.new_command_buffer();
     device.begin_render(&mut commands, &request).unwrap();
     commands.end_encoding(&mut device.resolver()).unwrap();
-    let pass = device.commit(commands).unwrap();
-    // Sixteen bytes for each of the attachment's samples.
+    device.commit(commands).unwrap()
+}
+
+/// The scratch chunk of a pass's imageblock data is destroyed once command
+/// buffers keep retiring without a pass of its size, and small uploads
+/// meanwhile take a default chunk, where the pool kept every chunk it ever
+/// made and gave the first free one, whatever its size, to the next upload.
+#[test]
+fn idle_upload_chunks_are_destroyed() {
+    use crate::metal::upload::CHUNK_BYTES;
+    let mut device = device();
+    let pass = imageblock_pass(&mut device);
     let imageblocks = 16 << 20;
     let held = device.memory().chunks;
     assert_eq!((held.chunks, held.bytes), (1, imageblocks));
@@ -3451,6 +3457,123 @@ fn idle_upload_chunks_are_destroyed() {
         (1, 1),
         "the scratch chunk and its memory"
     );
+}
+
+/// On a driver with 4 GiB and with 8 GiB of memory, all of it taken: a
+/// buffer, a heap and a texture are each made once the device frees its
+/// free upload chunks and recycled textures, where only a new texture freed
+/// the recycled ones and every other allocation failed with them kept. Each
+/// failure is counted and the first, second and fourth leave a note.
+#[test]
+fn a_device_out_of_memory_frees_what_it_keeps_for_reuse_and_tries_again() {
+    for limit in [4u64 << 30, 8 << 30] {
+        let mut backend = MockBackend::new();
+        backend.memory_limit = Some(limit);
+        let mut device = device_on(backend);
+        let pass = imageblock_pass(&mut device);
+        complete(&mut device, pass);
+        // 64 MiB each, the largest the device recycles.
+        let large = TextureDescriptor {
+            width: 4096,
+            height: 4096,
+            ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+        };
+        let mut textures = Vec::new();
+        loop {
+            match device.new_texture(&large) {
+                Ok(texture) => textures.push(texture),
+                Err(error) => {
+                    assert_eq!(error, Error::OutOfMemory);
+                    break;
+                }
+            }
+        }
+        // The last one freed the scratch chunk and still found no room.
+        assert_eq!(textures.len() as u64, limit / (64 << 20) - 1);
+        assert_eq!(device.memory().chunks.chunks, 0);
+        let note = device.take_memory_note().unwrap();
+        assert!(
+            note.starts_with("OUT OF MEMORY 1: a 4096x4096x1 "),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "it freed recycled=0M chunks=16M released=0M and tried again, which failed"
+            ),
+            "{note}"
+        );
+        assert_eq!(device.new_texture(&large), Err(Error::OutOfMemory));
+        let note = device.take_memory_note().unwrap();
+        assert!(note.contains("it kept nothing to free"), "{note}");
+
+        for texture in textures.drain(..4) {
+            device.destroy_texture(texture).unwrap();
+        }
+        assert_eq!(device.memory().recycled.bytes, 256 << 20);
+        // Each is more than the driver has left without the recycled ones.
+        let buffer = device
+            .new_buffer(96 << 20, options(StorageMode::Private))
+            .unwrap();
+        assert_eq!(device.memory().recycled.bytes, 0);
+        assert_eq!(device.memory().out_of_memory, 3);
+        assert_eq!(device.take_memory_note(), None, "the third leaves no note");
+        device.destroy_buffer(buffer).unwrap();
+        for _ in 0..2 {
+            let texture = textures.pop().unwrap();
+            device.destroy_texture(texture).unwrap();
+        }
+        let heap = HeapDescriptor {
+            size: 320 << 20,
+            options: options(StorageMode::Private),
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size16,
+        };
+        device.new_heap(&heap).unwrap();
+        let note = device.take_memory_note().unwrap();
+        assert!(
+            note.starts_with(
+                "OUT OF MEMORY 4: heap memory of 335544320 bytes failed; it freed recycled=128M"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("tried again, which succeeded"), "{note}");
+    }
+}
+
+/// An allocation whose host kernel call the platform withdrew fails as out
+/// of memory and is not: the device frees nothing for it and makes no
+/// second allocation, whose host call would hold the caller as long again.
+#[test]
+fn a_withdrawn_host_call_frees_nothing_and_is_not_made_again() {
+    extern crate std;
+    use crate::metal::compiler::CompileLock;
+    static LOCK: std::sync::Mutex<Option<Arc<CompileLock>>> = std::sync::Mutex::new(None);
+    fn withdraw() -> bool {
+        let lock = LOCK.lock().unwrap();
+        lock.as_ref().is_some_and(|lock| lock.defer_for_wait())
+    }
+    let lock = Arc::new(CompileLock::new());
+    *LOCK.lock().unwrap() = Some(lock.clone());
+    let mut device = device();
+    device.watch_host_calls(&lock);
+    let kept = device
+        .new_texture(&texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ))
+        .unwrap();
+    device.destroy_texture(kept).unwrap();
+    let recycled = device.memory().recycled.bytes;
+    assert_ne!(recycled, 0);
+    device.backend().withdrawn_allocation = Some(withdraw);
+    let private = options(StorageMode::Private);
+    assert_eq!(
+        device.new_buffer(1 << 20, private).err(),
+        Some(Error::OutOfMemory)
+    );
+    assert_eq!(device.memory().recycled.bytes, recycled);
+    assert_eq!(device.memory().out_of_memory, 0);
+    assert_eq!(device.take_memory_note(), None);
+    // The service clears the mark for the next call, which allocates.
+    lock.clear_withdrawn();
+    device.new_buffer(1 << 20, private).unwrap();
 }
 
 #[test]

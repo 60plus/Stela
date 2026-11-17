@@ -186,6 +186,11 @@ pub(crate) struct MockBackend {
     /// it in time: the allocation tells the platform's hook, as the
     /// platform's withdrawal does, and fails as the driver then does.
     pub(crate) withdrawn_allocation: Option<fn() -> bool>,
+    /// The bytes of memory the driver has: an allocation past them fails
+    /// as out of memory until memory is destroyed.
+    pub(crate) memory_limit: Option<u64>,
+    /// The bytes of each live allocation, by memory.
+    pub(crate) live_memory: BTreeMap<u64, u64>,
     /// While a call may defer, this many more compute pipeline creations
     /// each defer to a job of its own that runs at once.
     pub(crate) deferred_pipelines: u8,
@@ -275,6 +280,17 @@ impl MockBackend {
     }
 }
 
+impl MockBackend {
+    /// Whether the driver has `bytes` more of memory.
+    fn take_memory(&self, bytes: u64) -> Result<()> {
+        let live: u64 = self.live_memory.values().sum();
+        match self.memory_limit {
+            Some(limit) if live + bytes > limit => Err(Error::OutOfMemory),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl Backend for MockBackend {
     fn acknowledge_idle(&mut self) -> Result<()> {
         self.idle_calls += 1;
@@ -290,12 +306,15 @@ impl Backend for MockBackend {
     fn physical_device(&self) -> &PhysicalDevice {
         self.physical.as_ref().unwrap()
     }
-    fn allocate_memory(&mut self, _: u64, _: MemoryRequest, _: u32) -> Result<Memory> {
+    fn allocate_memory(&mut self, bytes: u64, _: MemoryRequest, _: u32) -> Result<Memory> {
         if let Some(withdrawn) = self.withdrawn_allocation.take() {
             withdrawn();
             return Err(Error::OutOfMemory);
         }
-        Ok(Memory(self.id()))
+        self.take_memory(bytes)?;
+        let id = self.id();
+        self.live_memory.insert(id, bytes);
+        Ok(Memory(id))
     }
     fn buffer_requirements(&mut self, info: &BufferInfo) -> Result<Requirements> {
         Ok(Requirements {
@@ -317,7 +336,9 @@ impl Backend for MockBackend {
             withdrawn();
             return Err(Error::OutOfMemory);
         }
+        self.take_memory(info.size)?;
         let id = self.id();
+        self.live_memory.insert(id, info.size);
         Ok(BufferAllocation {
             buffer: Buffer(id),
             memory: Memory(id),
@@ -527,10 +548,11 @@ impl Backend for MockBackend {
         if let Object::Semaphore(Semaphore(id)) = object {
             self.freed_semaphores.push(id);
         }
-        if let Object::Memory(Memory(id)) = object
-            && let Some((_, token)) = self.imports.remove(&id)
-        {
-            self.retired.push_back(token);
+        if let Object::Memory(Memory(id)) = object {
+            self.live_memory.remove(&id);
+            if let Some((_, token)) = self.imports.remove(&id) {
+                self.retired.push_back(token);
+            }
         }
         self.destroyed.push(object);
     }

@@ -154,6 +154,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 }
             }
         };
+        // What the device noted of its memory, when the call noted nothing.
+        if self.noted.is_none() {
+            self.noted = self.device.take_memory_note();
+        }
         self.served = (call.operation, status);
         call.status = status.raw();
         call.reason_length = reason.len() as u64;
