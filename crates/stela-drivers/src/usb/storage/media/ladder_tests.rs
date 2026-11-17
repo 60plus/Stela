@@ -239,18 +239,34 @@ fn a_device_that_keeps_failing_ends_the_command_after_sd_retries() {
     assert_eq!(disk.read(0, &mut [0; 512]), Ok(()));
 }
 
+/// A port reset that fails ends the command, recorded once with the reset's
+/// own cause; the disk fails from then on without another reset or record.
 #[test]
 fn a_failed_port_reset_ends_the_command_and_the_disk() {
     let (mut disk, script) = published(&[Fail::Lost]);
     assert_eq!(disk.read(0, &mut [0; 512]), Err(TRANSACTION));
     assert_eq!(script.borrow().runs, 1);
     assert_eq!(script.borrow().port_resets, 1);
+    let records = take_recoveries().0;
+    assert_eq!(records.len(), 1);
     assert_eq!(
-        recoveries(),
-        [(Cause::Device(4), Step::Again, 1, End::Lost)]
+        (
+            records[0].first,
+            records[0].step,
+            records[0].runs,
+            records[0].end
+        ),
+        (Cause::Device(4), Step::PortReset, 1, End::ResetFailed)
     );
+    assert_eq!(records[0].last, Cause::Device(4));
+    assert!(alloc::format!("{}", records[0]).ends_with(
+        "after 1 runs the port reset failed with USB transaction error (xHCI completion code \
+         4): the disk fails until it is bound again"
+    ));
     assert!(disk.read(0, &mut [0; 512]).is_err());
     assert_eq!(script.borrow().runs, 1);
+    assert_eq!(script.borrow().port_resets, 1);
+    assert!(recoveries().is_empty());
 }
 
 #[test]

@@ -40,6 +40,8 @@ pub enum Cause {
     Reset,
     /// Any other answer, such as the unit's sense or a refusal.
     Other,
+    /// The device left its port: a port reset found it gone.
+    Departed,
 }
 impl Cause {
     fn of(error: &BlockError) -> Self {
@@ -51,6 +53,7 @@ impl Cause {
                 Self::Protocol
             }
             _ if *error == super::media::RESET_ENDED => Self::Reset,
+            _ if crate::usb::xhci::departed(error) => Self::Departed,
             _ => Self::Other,
         }
     }
@@ -62,6 +65,7 @@ impl Cause {
             Self::Protocol => (4, 0),
             Self::Reset => (5, 0),
             Self::Other => (6, 0),
+            Self::Departed => (7, 0),
         };
         (kind << 16 | u64::from(status)) & 0x7_ffff
     }
@@ -73,6 +77,7 @@ impl Cause {
             3 => Self::NoSense,
             4 => Self::Protocol,
             5 => Self::Reset,
+            7 => Self::Departed,
             _ => Self::Other,
         }
     }
@@ -88,6 +93,7 @@ impl fmt::Display for Cause {
             Self::Protocol => f.write_str("a malformed wrapper or status"),
             Self::Reset => f.write_str("a device reset for another command"),
             Self::Other => f.write_str("the unit's answer"),
+            Self::Departed => f.write_str("the device gone from its port"),
         }
     }
 }
@@ -125,6 +131,9 @@ pub enum End {
     Lost,
     /// A run ended with an answer that is no transport error.
     Answered,
+    /// The port reset the ladder ran failed, with the record's `last`
+    /// cause; its unit is no longer published.
+    ResetFailed,
 }
 impl End {
     fn encode(self) -> u64 {
@@ -136,6 +145,7 @@ impl End {
             1 => Self::Retries,
             2 => Self::Runtime,
             3 => Self::Lost,
+            5 => Self::ResetFailed,
             _ => Self::Answered,
         }
     }
@@ -189,6 +199,12 @@ impl fmt::Display for Recovery {
                 f,
                 "after {} runs with {} the unit answered with an error",
                 self.runs, self.step
+            ),
+            End::ResetFailed => write!(
+                f,
+                "after {} runs the port reset failed with {}: the disk fails until it is \
+                 bound again",
+                self.runs, self.last
             ),
         }
     }
@@ -383,6 +399,16 @@ impl Ladder {
         };
         self.end(end, Cause::of(error));
         false
+    }
+    /// The port reset run for the command, which ended with `error`,
+    /// failed with `reset`: the command ends, recorded with the reset's
+    /// cause, as Linux fails the commands of a device whose reset failed.
+    pub(super) fn reset_failed(&mut self, error: &BlockError, reset: &BlockError) {
+        if self.first.is_none() {
+            self.first = Some(Cause::of(error));
+        }
+        self.step = Step::PortReset;
+        self.end(End::ResetFailed, Cause::of(reset));
     }
     /// The ladder ran `step` for the command since its last failure.
     pub(super) fn reached(&mut self, step: Step) {

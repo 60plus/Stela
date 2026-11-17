@@ -258,11 +258,9 @@ impl Host {
         // SAFETY: this sole interface owns exactly all configured class DCIs,
         // and its shared owner was permanently poisoned before retirement.
         let mut fresh = unsafe {
-            controller.borrow_mut().reset_and_reuse_root(
-                &self.device,
-                &self.binding.endpoints(),
-                dma,
-            )?
+            controller
+                .borrow_mut()
+                .reset_and_reuse(&self.device, &self.binding.endpoints(), dma)?
         };
         let id = fresh.id;
         let result = (|| {
@@ -472,15 +470,6 @@ impl Host {
     }
     pub fn requires_rebind(&self) -> bool {
         self.engine.poisoned
-    }
-    /// Whether [`Self::reset_and_rebind`] needs fresh rings from its
-    /// allocator, as a device behind a hub does.
-    pub(super) fn reset_needs_allocation(&self) -> bool {
-        self.engine
-            .io
-            .controller
-            .try_borrow()
-            .is_ok_and(|controller| controller.reset_needs_allocation(self.device.id))
     }
     /// What the last command's data phase moved in before it failed.
     pub(super) fn take_failed_data(&mut self) -> Option<Vec<u8>> {

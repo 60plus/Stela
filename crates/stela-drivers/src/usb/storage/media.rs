@@ -118,6 +118,9 @@ pub(super) struct Owner<T: Scsi> {
     failure_status: Option<String>,
     /// The last port reset that failed ([`Scsi::take_reset_failure`]).
     reset_failure: Option<(String, BlockError)>,
+    /// Why the port reset run for the command under way failed, for that
+    /// command's recovery record ([`Ladder::reset_failed`]).
+    failed_reset: Option<BlockError>,
     /// Times the device left the bus and came back, and was taken again
     /// ([`Self::resume`]).
     returned: u32,
@@ -194,6 +197,7 @@ impl<T: Scsi> Owner<T> {
             declined: false,
             failure_status: None,
             reset_failure: None,
+            failed_reset: None,
             returned: 0,
         }
     }
@@ -336,6 +340,14 @@ impl<T: Scsi> Owner<T> {
                 return result;
             };
             let step = self.step(generation, rebound);
+            // A port reset this run's failure began that failed itself ends
+            // the command with the reset's cause, recorded once.
+            if let Some(reset) = self.failed_reset.take()
+                && published
+            {
+                ladder.reset_failed(error, &reset);
+                return result;
+            }
             if !published || !ladder.again(error, step, self.transport.now_us(), self.usable(lun)) {
                 return result;
             }
@@ -524,7 +536,9 @@ impl<T: Scsi> Owner<T> {
             Err(error) => {
                 let step = self.step(begun.generation, rebound);
                 let usable = self.usable(begun.lun);
-                if begun
+                if let Some(reset) = self.failed_reset.take() {
+                    begun.ladder.reset_failed(error, &reset);
+                } else if begun
                     .ladder
                     .again(error, step, self.transport.now_us(), usable)
                 {
@@ -651,18 +665,9 @@ impl<T: Scsi> Owner<T> {
             self.invalidate();
             return;
         }
-        // A root device's reset reuses its old binding's rings and
-        // buffers. One behind a hub needs new rings, which only
-        // [`UsbStorage::service`] with the drivers' allocator supplies; that
-        // reset disables the old slot and resets the port before it
-        // allocates, so begun here it would lose the device for good. The
-        // transport stays poisoned for the service's reset.
-        if self.transport.reset_needs_allocation() {
-            self.declined = true;
-            self.invalidate();
-            return;
-        }
-        // SAFETY: the empty range hands out no memory.
+        // The reset reuses the old binding's rings and buffers, on a root
+        // port or behind hubs (`xhci::Controller::reset_and_reuse`), so it
+        // needs no allocator. SAFETY: the empty range hands out no memory.
         let mut none = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
         let Some(replaced) = self.transport.reset_device(&mut none) else {
             self.declined = true;
@@ -681,6 +686,7 @@ impl<T: Scsi> Owner<T> {
             }
             Err((operation, error)) => {
                 self.declined = true;
+                self.failed_reset = Some(error.clone());
                 self.reset_failure = Some((
                     format!(
                         "{} port reset after a failed command: {operation}",

@@ -226,11 +226,6 @@ trait Scsi {
     {
         None
     }
-    /// Whether [`Self::reset_device`] needs memory its old binding cannot
-    /// give back: a device behind a hub gets new rings.
-    fn reset_needs_allocation(&self) -> bool {
-        false
-    }
     /// The device's port status when a command last failed in the
     /// transport, for that failure's log line.
     fn take_failure_status(&mut self) -> Option<String> {
@@ -323,9 +318,6 @@ impl<I: Io> Scsi for Bot<I> {
     ) -> Option<Result<Self, (String, BlockError)>> {
         I::reset_device(self, dma)
     }
-    fn reset_needs_allocation(&self) -> bool {
-        self.io.reset_needs_allocation()
-    }
     fn take_failure_status(&mut self) -> Option<String> {
         Bot::take_failure_status(self)
     }
@@ -406,9 +398,6 @@ impl Scsi for uas::Host {
         dma: &mut dyn DmaAllocator,
     ) -> Option<Result<Self, (String, BlockError)>> {
         Some(uas::Host::reset_and_rebind(self, dma))
-    }
-    fn reset_needs_allocation(&self) -> bool {
-        uas::Host::reset_needs_allocation(self)
     }
     fn max_transfer_bytes(&self) -> usize {
         uas::Host::max_transfer_bytes(self)

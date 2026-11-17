@@ -403,11 +403,9 @@ fn native_abort_stale_generation_refuses_before_mmio_and_dma_rewrite() {
     let controller = host.engine.io.controller.clone();
     // SAFETY: this fixture owns the sole UAS interface and all its DCIs.
     let fresh = unsafe {
-        controller.borrow_mut().reset_and_reuse_root(
-            &host.device,
-            &host.binding.endpoints(),
-            &mut dma,
-        )
+        controller
+            .borrow_mut()
+            .reset_and_reuse(&host.device, &host.binding.endpoints(), &mut dma)
     }
     .unwrap();
     assert_ne!(fresh.id, host.device.id);
