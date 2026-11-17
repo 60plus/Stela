@@ -19,7 +19,8 @@
 //! the firmware lit, which the driver reads back as the connector's current
 //! encoder, wins ties, then DRM's order. The first output paces the flips;
 //! the others follow it to the newest buffer, and one that lags a frame may
-//! show a frame being filled.
+//! show a frame being filled. While the first's controller is off, after a
+//! mode set the driver refused, the next output that is on paces.
 //!
 //! NVIDIA's display engine reads only video memory, so a guest surface in
 //! guest RAM cannot be scanned out in place: frames copy in, top to bottom,
@@ -358,9 +359,12 @@ struct Head {
     lost: bool,
     /// Restores tried since the connector was last read disconnected.
     tries: u8,
-    /// Not the first head: its flip to the newest buffer is still to be
+    /// Not the pacing head: its flip to the newest buffer is still to be
     /// requested.
     behind: bool,
+    /// Its controller was turned off and its mode set refused since: it
+    /// takes no flip until a look sets it again ([`Display::watch`]).
+    off: bool,
 }
 
 /// How a scaled output shows the picture.
@@ -1354,6 +1358,7 @@ impl<D: Drm> Display<D> {
                     lost: false,
                     tries: 0,
                     behind: false,
+                    off: false,
                 }),
                 // Its mode list may still be a fallback until its EDID reads.
                 None => others.push((id, 1)),
@@ -1521,13 +1526,18 @@ impl<D: Drm> Display<D> {
                 true => self.set_mode(index),
                 false => self.crtc_off(index),
             };
-            if let Err(error) = result {
-                if on {
-                    self.heads[index].lost = true;
-                    self.heads[index].tries = 0;
-                }
-                if applied.is_ok() {
-                    applied = Err(error);
+            match result {
+                Ok(()) => self.heads[index].off = false,
+                Err(error) => {
+                    if on {
+                        // Its controller stays off: a look sets it again.
+                        self.heads[index].lost = true;
+                        self.heads[index].tries = 0;
+                        self.heads[index].off = true;
+                    }
+                    if applied.is_ok() {
+                        applied = Err(error);
+                    }
                 }
             }
         }
@@ -1686,8 +1696,15 @@ impl<D: Drm> Display<D> {
         self.heads[index].mode = mode;
         self.heads[index].scaling = scaling;
         // A refused off still leaves the set to try.
-        if let Err(error) = self.crtc_off(index) {
-            watched.error.get_or_insert(error);
+        match self.crtc_off(index) {
+            // Off, it takes no flip until it is set.
+            Ok(()) => {
+                self.heads[index].off = true;
+                self.heads[index].behind = false;
+            }
+            Err(error) => {
+                watched.error.get_or_insert(error);
+            }
         }
         // A monitor that has the size now runs it unscaled.
         if let (Some(was), None) = (was, scaling)
@@ -1696,6 +1713,7 @@ impl<D: Drm> Display<D> {
             watched.error.get_or_insert(error);
         }
         self.light(index)?;
+        self.heads[index].off = false;
         Ok(Restore::Set {
             scaled: scaling.is_some(),
         })
@@ -1732,6 +1750,7 @@ impl<D: Drm> Display<D> {
             lost: false,
             tries: 0,
             behind: false,
+            off: false,
         });
         let last = self.heads.len() - 1;
         if let Err(error) = self.light(last) {
@@ -1974,12 +1993,12 @@ impl<D: Drm> Display<D> {
         }
     }
 
-    /// Request the queued frame's flip on the first output, if this
+    /// Request the queued frame's flip on the output that paces, if this
     /// processor may now, then each other output's flip to the newest
     /// buffer. A flip the engine is still busy with stays queued for the
     /// next flush. A refused flip drops the request, reported here: on the
-    /// first output the frame stays in the hidden buffer and shows with the
-    /// next one; another output keeps its picture until the next frame.
+    /// pacing output the frame stays in the hidden buffer and shows with
+    /// the next one; another output keeps its picture until the next frame.
     pub fn flush(&mut self) -> Result<(), Error> {
         if !self.queued() || !self.drm.immediate() {
             return Ok(());
@@ -1994,14 +2013,19 @@ impl<D: Drm> Display<D> {
         if self.dark {
             return flushed;
         }
-        if self.queued {
-            match self.flip(0, self.buffers[2].framebuffer) {
+        // The first output paces the flips while its controller is on. One
+        // whose controller is off answers every flip as busy, so the next
+        // output that is on paces until a look sets the first again; with
+        // none on the frame stays queued.
+        let pacer = self.heads.iter().position(|head| !head.off);
+        if let (true, Some(pacer)) = (self.queued, pacer) {
+            match self.flip(pacer, self.buffers[2].framebuffer) {
                 0 => {
                     self.queued = false;
                     self.buffers.rotate_right(1);
                     self.stale.rotate_right(1);
-                    for head in &mut self.heads[1..] {
-                        head.behind = true;
+                    for (index, head) in self.heads.iter_mut().enumerate() {
+                        head.behind = index != pacer && !head.off;
                     }
                 }
                 BUSY => {}
@@ -2011,7 +2035,7 @@ impl<D: Drm> Display<D> {
                 }
             }
         }
-        for index in 1..self.heads.len() {
+        for index in 0..self.heads.len() {
             if !self.heads[index].behind {
                 continue;
             }

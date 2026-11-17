@@ -104,3 +104,56 @@ fn an_output_that_cannot_be_set_again_does_not_stop_the_next() {
     }
     assert_eq!(card.set, Some((at(6, 4, PREFERRED, 60), front)));
 }
+
+/// The first output's controller is off after a mode set the driver
+/// refused, and Linux answers every flip on it as busy: the next output
+/// paces the flips, where the frame stayed queued and every other output
+/// kept its old picture.
+#[test]
+fn another_output_paces_the_flips_while_the_firsts_controller_is_off() {
+    let mut card = two_monitors();
+    let (spare, next);
+    {
+        let mut display = Display::take(&mut card, (6, 4)).unwrap();
+        assert_eq!(display.heads[0].crtc, 40);
+        display.drm.first_connected = false;
+        assert_eq!(display.watch().lost, 1);
+        // Back, but its mode set is refused after its controller went off.
+        display.drm.first_connected = true;
+        display.drm.refused_light = Some(40);
+        assert_eq!(display.watch().error, Some(Error::Request(-22)));
+        assert_eq!(display.drm.set_40, None);
+        spare = display.buffers[2].framebuffer;
+        display.present(&[7; 96]).unwrap();
+        assert!(!display.queued());
+        assert_eq!(display.buffers[0].framebuffer, spare);
+        assert_eq!(display.drm.flips, [spare]);
+        assert!(display.drm.flips_40.is_empty());
+        // Set at a later look, it shows the newest frame and paces again.
+        display.drm.refused_light = None;
+        assert_eq!(display.watch().restored, 1);
+        assert_eq!(display.drm.set_40.map(|(_, shown)| shown), Some(spare));
+        next = display.buffers[2].framebuffer;
+        display.present(&[9; 96]).unwrap();
+        assert!(!display.queued());
+    }
+    assert_eq!(card.flips_40, [next]);
+    assert_eq!(card.flips, [spare, next]);
+
+    // No output is on: the frame stays queued for the one set next.
+    let mut alone = Card::new(vec![at(2, 2, PREFERRED, 60)]);
+    let mut display = Display::take(&mut alone, (2, 2)).unwrap();
+    display.drm.connected = false;
+    display.watch();
+    display.drm.connected = true;
+    display.drm.refused_light = Some(41);
+    display.watch();
+    let hidden = display.buffers[2].framebuffer;
+    display.present(&[7; 16]).unwrap();
+    assert!(display.queued() && display.drm.flips.is_empty());
+    display.drm.refused_light = None;
+    assert_eq!(display.watch().restored, 1);
+    display.flush().unwrap();
+    assert!(!display.queued());
+    assert_eq!(display.drm.flips, [hidden]);
+}

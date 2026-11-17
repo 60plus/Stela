@@ -67,6 +67,9 @@ struct Card {
     busy_40: u32,
     /// A controller whose mode sets are refused.
     refused_crtc: Option<u32>,
+    /// A controller that can be turned off and whose mode sets with a
+    /// connector are refused.
+    refused_light: Option<u32>,
     flip_error: Option<i64>,
     /// Whether a request completes on the processor making it.
     immediate: bool,
@@ -132,6 +135,7 @@ impl Card {
             flips_40: Vec::new(),
             busy_40: 0,
             refused_crtc: None,
+            refused_light: None,
             flip_error: None,
             immediate: true,
             flip_requests: 0,
@@ -275,7 +279,9 @@ unsafe impl Drm for &mut Card {
                     if let Some(error) = self.set_error.take() {
                         return error;
                     }
-                    if self.refused_crtc == Some(crtc.id) {
+                    if self.refused_crtc == Some(crtc.id)
+                        || (self.refused_light == Some(crtc.id) && crtc.connector_count != 0)
+                    {
                         return -22;
                     }
                     *set = (crtc.connector_count != 0).then(|| {
@@ -364,11 +370,16 @@ unsafe impl Drm for &mut Card {
                         return error;
                     }
                     let flip = *argument.cast::<PageFlip>();
-                    let (busy, flips) = match flip.crtc {
-                        40 => (&mut self.busy_40, &mut self.flips_40),
-                        41 => (&mut self.busy, &mut self.flips),
+                    let (busy, flips, on) = match flip.crtc {
+                        40 => (&mut self.busy_40, &mut self.flips_40, self.set_40.is_some()),
+                        41 => (&mut self.busy, &mut self.flips, self.set.is_some()),
                         other => panic!("controller {other}"),
                     };
+                    // Linux answers a flip on a controller that is off, which
+                    // shows no framebuffer, as busy (`drm_mode_page_flip_ioctl`).
+                    if !on {
+                        return BUSY;
+                    }
                     if *busy != 0 {
                         *busy -= 1;
                         return BUSY;
