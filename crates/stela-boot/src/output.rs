@@ -1207,10 +1207,10 @@ fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
 }
 
 /// What a stopped boot tells the user to do next: where its log is, and how
-/// to read it on another computer.
-pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on another computer, plug in \
-    this USB and run `stela log`, which saves it to log.txt; include that file in a report. Turn \
-    the PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
+/// to read it on any computer with stela.
+pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on any computer with stela, \
+    plug in this USB and run `stela log`, which saves it to log.txt; include that file in a \
+    report. Turn the PC off to try again; Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// What a stop whose last lines the USB's log does not hold, as one before
 /// the engine writes the log again, tells the user once the PC's firmware
@@ -1218,8 +1218,8 @@ pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on another com
 /// moves them into the log.
 pub const STOPPED_RECORDED: &str = "Stela stopped before it could write this part of its log \
     to the USB. This PC keeps its last lines: start Stela on this PC once more, which copies them \
-    into the log on this USB. Then, on another computer, plug in this USB and run `stela log`, \
-    which saves it to log.txt; include that file in a report. Turn the PC off to try again; \
+    into the log on this USB. Then, on any computer with stela, plug in this USB and run `stela \
+    log`, which saves it to log.txt; include that file in a report. Turn the PC off to try again; \
     Ctrl+Alt+Delete on a laptop's own keyboard restarts it.";
 
 /// What such a stop tells the user when the firmware did not take the

@@ -338,8 +338,8 @@ pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
         }
     }
     notice.push_str(if in_log {
-        ". This PC kept its last lines, now in the log on this USB: on another computer, plug \
-         in this USB and run `stela log`, which saves it to log.txt; include that file in a \
+        ". This PC kept its last lines, now in the log on this USB: on any computer with stela, \
+         plug in this USB and run `stela log`, which saves it to log.txt; include that file in a \
          report."
     } else {
         ". This PC keeps its last lines, but the log on this USB did not take them; they stay \

@@ -64,8 +64,10 @@ On Windows, open Terminal with Run as administrator and run:
 
 ## Logs
 
-If Stela does not work, plug the USB stick into the computer that made it and
-save the boot log. Include `log.txt` in your GitHub Issue.
+If Stela does not work, plug the USB stick into any computer with `stela` and
+save the boot log. Include `log.txt` in your GitHub Issue. Save it before you
+start Stela again many times: the log keeps the start of each of the last
+eight boots, but only the latest part of a long run.
 
 ```sh
 sudo ./stela log --output log.txt
