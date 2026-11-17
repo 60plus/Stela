@@ -163,7 +163,26 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
         Some(file) => Some(read_file(file, None, MAX_MANIFEST_BYTES)?),
         None => None,
     };
-    let bundled = bundle::read(root);
+    let exact_bytes = exact.map(|region| {
+        // SAFETY: read_file reserved these pages and completed all writes.
+        unsafe { core::slice::from_raw_parts(region.physical as *const u8, region.bytes as usize) }
+    });
+    let parsed = exact_bytes
+        .map(Manifest::parse)
+        .transpose()
+        .map_err(|error| report(error, output::arguments))?;
+    // The bundle's files share the handoff with the older manifest's and
+    // the firmware observations the catalog adds (`Resources::catalog`).
+    let older = parsed.iter().flat_map(|parsed| &parsed.images);
+    let observed =
+        wifi.iter().map(|capture| capture.region.bytes).sum::<u64>() + smbios.region.bytes;
+    let room = manifest::bundle::Room {
+        images: manifest::MAX_IMAGES.saturating_sub(older.clone().count() + wifi.len() + 1),
+        bytes: manifest::MAX_TOTAL_BYTES
+            .saturating_sub(older.map(|image| image.length).sum::<usize>())
+            .saturating_sub(observed as usize),
+    };
+    let bundled = bundle::read(root, room);
     if exact.is_none() && bundled.is_none() {
         output::arguments(format_args!("HOST FIRMWARE manifest=absent\n"));
         let resources = Resources {
@@ -177,14 +196,6 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
         }?;
         return Ok(resources);
     }
-    let exact_bytes = exact.map(|region| {
-        // SAFETY: read_file reserved these pages and completed all writes.
-        unsafe { core::slice::from_raw_parts(region.physical as *const u8, region.bytes as usize) }
-    });
-    let parsed = exact_bytes
-        .map(Manifest::parse)
-        .transpose()
-        .map_err(|error| report(error, output::arguments))?;
     // Parse/identity checks and the total budget precede every image allocation.
     let started = output::now();
     let mut regions = alloc::vec::Vec::new();

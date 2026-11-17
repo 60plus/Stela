@@ -347,12 +347,88 @@ pub fn handoff_manifest(
     Ok(bytes)
 }
 
-/// One PCI function a boot observed: IDs and base class.
+/// One PCI function a boot observed: where it is, IDs and base class, and
+/// a bridge's bus numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pci {
+    pub segment: u16,
+    pub bus: u8,
     pub vendor: u16,
     pub device: u16,
     pub class: u8,
+    /// A bridge's (type 1 header) secondary and subordinate bus numbers.
+    pub bridge: Option<(u8, u8)>,
+}
+
+impl Pci {
+    /// The function on `bus` of `segment` whose configuration header
+    /// starts with `header`: identity from its first 12 bytes and, for a
+    /// type 1 header, the bus numbers at 0x19 and 0x1a. `None` when the
+    /// header is shorter than a type 1 header's bus numbers.
+    pub fn from_header(segment: u16, bus: u8, header: &[u8]) -> Option<Self> {
+        let header = header.get(..0x1b)?;
+        let word = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+        Some(Self {
+            segment,
+            bus,
+            vendor: word(0),
+            device: word(2),
+            class: header[11],
+            bridge: (header[0x0e] & 0x7f == 1).then_some((header[0x19], header[0x1a])),
+        })
+    }
+}
+
+/// The PCI ports among `functions` where a device the firmware left
+/// without power can answer later: a bridge with a secondary bus of its
+/// own that holds none of `functions`. Stela's engine powers such a port on
+/// through ACPI as Linux does before its PCI census
+/// (`stela_drivers::probe::d3cold`), which finds what lies below it: a
+/// hybrid laptop's discrete GPU in D3cold answers only then.
+pub fn empty_ports(functions: &[Pci]) -> impl Iterator<Item = &Pci> {
+    functions.iter().filter(|port| {
+        // A bridge without a bus number of its own forwards nothing yet.
+        port.bridge.is_some_and(|(secondary, subordinate)| {
+            secondary > port.bus && subordinate >= secondary
+        }) && !functions.iter().any(|function| {
+            function.segment == port.segment
+                && Some(function.bus) == port.bridge.map(|(secondary, _)| secondary)
+        })
+    })
+}
+
+/// A GPU driver's files, all of them, for a GPU that may answer only after
+/// the firmware's exit: no PCI function the firmware showed names the chip,
+/// so every chip's files are read.
+#[derive(Debug)]
+pub struct Late {
+    /// The recipe family, as [`families`] names it.
+    pub family: &'static str,
+    /// Its files the selection did not already want, each once.
+    pub files: Vec<&'static Artifact>,
+    /// Why they may be needed.
+    pub why: String,
+}
+
+impl Late {
+    /// The files' bytes.
+    pub fn bytes(&self) -> usize {
+        self.files.iter().map(|artifact| artifact.length).sum()
+    }
+}
+
+/// The GPU families a GPU can need late: the family's name in [`ALL`], the
+/// PCI vendor of its GPUs and the port it belongs to.
+const GPU_FAMILIES: [(&str, u16, Port); 2] = [
+    ("AMD GPU", 0x1002, Port::Amd),
+    ("NVIDIA GSP-RM", 0x10de, Port::Always),
+];
+
+/// The images and bytes the firmware handoff has left for bundle files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    pub images: usize,
+    pub bytes: usize,
 }
 
 /// The files a PC needs and why, and its devices of a supported family
@@ -363,6 +439,10 @@ pub struct Selection {
     pub wanted: Vec<(&'static Artifact, String)>,
     /// Devices of a supported family that no recipe covers, each once.
     pub unknown: Vec<String>,
+    /// The GPU families whose files a GPU that answers only after the
+    /// firmware's exit would need, not yet in [`Self::wanted`]:
+    /// [`Self::take_late`] moves those the handoff has room for there.
+    pub late: Vec<Late>,
 }
 
 impl Selection {
@@ -399,6 +479,62 @@ impl Selection {
             .map(|(artifact, _)| artifact.length)
             .sum()
     }
+
+    /// Each GPU family of `ports` whose GPUs none of the observed
+    /// `driven` vendors' functions named, as [`Late`] for `why`.
+    fn add_late(&mut self, ports: Ports, driven: &[u16], why: &str) {
+        for (family, vendor, port) in GPU_FAMILIES {
+            if driven.contains(&vendor) || (port == Port::Amd && !ports.amd) {
+                continue;
+            }
+            let Some((_, recipes, _)) = ALL.iter().find(|(name, _, _)| *name == family) else {
+                continue;
+            };
+            let mut files: Vec<&'static Artifact> = Vec::new();
+            for recipe in *recipes {
+                let image = &recipe.image;
+                if !files.iter().any(|seen| seen.sha256 == image.sha256)
+                    && !self
+                        .wanted
+                        .iter()
+                        .any(|(seen, _)| seen.sha256 == image.sha256)
+                {
+                    files.push(image);
+                }
+            }
+            if !files.is_empty() {
+                self.late.push(Late {
+                    family,
+                    files,
+                    why: format!("{why}: {family}"),
+                });
+            }
+        }
+    }
+
+    /// Moves each [`Late`] family that fits whole in `room`, less what
+    /// [`Self::wanted`] already takes, into [`Self::wanted`], smallest
+    /// first; a family's files are of use only together. Gives back the
+    /// families left out for want of room.
+    pub fn take_late(&mut self, room: Room) -> Vec<Late> {
+        let mut images = room.images.saturating_sub(self.wanted.len());
+        let mut bytes = room.bytes.saturating_sub(self.bytes());
+        let mut late = core::mem::take(&mut self.late);
+        late.sort_by_key(Late::bytes);
+        let mut left = Vec::new();
+        for family in late {
+            if family.files.len() > images || family.bytes() > bytes {
+                left.push(family);
+                continue;
+            }
+            images -= family.files.len();
+            bytes -= family.bytes();
+            for artifact in &family.files {
+                self.add(artifact, &family.why);
+            }
+        }
+        left
+    }
 }
 
 /// The files a PC with these PCI functions needs. USB Bluetooth controllers
@@ -408,13 +544,34 @@ pub fn select(functions: &[Pci]) -> Selection {
     select_for(functions, Ports::BUILT)
 }
 
-/// [`select`] in a build with `ports`: a GPU of a port the build leaves out
-/// has no driver and so no files.
-pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
+/// The USB files every boot reads.
+fn usb() -> Selection {
     let mut selection = Selection::default();
     selection.members(recipes::REALTEK_USB, &[], "usb ethernet");
     selection.members(recipes::MEDIATEK_BLUETOOTH, &[], "usb bluetooth");
     selection.members(recipes::INTEL_RSA, &[], "usb bluetooth");
+    selection
+}
+
+/// The files of a boot without the firmware's PCI census: the USB files
+/// and, as [`Late`], every GPU family's of a build with `ports`, since no
+/// GPU's chip is known.
+pub fn select_without_census(ports: Ports) -> Selection {
+    let mut selection = usb();
+    selection.add_late(ports, &[], "a GPU the firmware's PCI census could not name");
+    selection
+}
+
+/// [`select`] in a build with `ports`: a GPU of a port the build leaves out
+/// has no driver and so no files. Where the firmware showed a PCI port
+/// with nothing below it ([`empty_ports`]) and no GPU of a family whose
+/// chip a recipe covers, that family's files are [`Late`]: a GPU the
+/// firmware left without power there answers only after Stela's engine
+/// powers the port, when no file can be read through the firmware.
+pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
+    let mut selection = usb();
+    // The vendors of the GPUs whose files are selected.
+    let mut driven: Vec<u16> = Vec::new();
     for function in functions {
         let why = format!("pci {:04x}:{:04x}", function.vendor, function.device);
         let mut inventory = Inventory::default();
@@ -422,6 +579,7 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             match recipes::nvidia_chip(function.device) {
                 Some(chip) if recipes::require_gsp(&mut inventory, chip).is_ok() => {
                     selection.plan(&inventory, &why);
+                    driven.push(function.vendor);
                 }
                 _ => {
                     if !selection.unknown.contains(&why) {
@@ -437,6 +595,7 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             }
             if recipes::require_amdgpu(&mut inventory, function.device).is_ok() {
                 selection.plan(&inventory, &why);
+                driven.push(function.vendor);
             } else if !selection.unknown.contains(&why) {
                 selection.unknown.push(why.clone());
             }
@@ -467,6 +626,17 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             selection.plan(&inventory, &why);
             selection.members(recipes::REGULATORY, &[], &why);
         }
+    }
+    let empty = empty_ports(functions).count();
+    if empty > 0 {
+        selection.add_late(
+            ports,
+            &driven,
+            &format!(
+                "a GPU that may answer only after Stela powers one of {empty} PCI ports with \
+                 nothing below them"
+            ),
+        );
     }
     selection
 }

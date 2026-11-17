@@ -109,9 +109,20 @@ const USB: [&str; 12] = [
 
 fn pci(vendor: u16, device: u16, class: u8) -> Pci {
     Pci {
+        segment: 0,
+        bus: 0,
         vendor,
         device,
         class,
+        bridge: None,
+    }
+}
+
+/// A PCI port on bus 0 whose secondary bus is `secondary`.
+fn port(secondary: u8) -> Pci {
+    Pci {
+        bridge: Some((secondary, secondary)),
+        ..pci(0x8086, 0x7ab8, 0x06)
     }
 }
 
@@ -461,4 +472,171 @@ fn a_build_without_the_amd_port_bundles_none_of_its_firmware() {
         objects().iter().any(|artifact| theirs(artifact.member)),
         Ports::BUILT.amd
     );
+}
+
+#[test]
+fn a_pci_function_is_read_from_its_configuration_header() {
+    let mut header = [0u8; 64];
+    header[..4].copy_from_slice(&[0xde, 0x10, 0xa0, 0x28]);
+    header[9..12].copy_from_slice(&[0x00, 0x00, 0x03]);
+    let gpu = Pci::from_header(0, 1, &header).unwrap();
+    assert_eq!(
+        gpu,
+        Pci {
+            segment: 0,
+            bus: 1,
+            vendor: 0x10de,
+            device: 0x28a0,
+            class: 0x03,
+            bridge: None,
+        }
+    );
+    // A type 1 header, multi-function bit set, names its buses.
+    header[0x0e] = 0x81;
+    header[0x18..0x1b].copy_from_slice(&[0, 2, 5]);
+    assert_eq!(
+        Pci::from_header(0, 0, &header).unwrap().bridge,
+        Some((2, 5))
+    );
+    assert_eq!(Pci::from_header(0, 0, &header[..0x1a]), None);
+}
+
+#[test]
+fn a_port_with_nothing_below_it_is_where_a_gpu_can_answer_later() {
+    let below = |bus: u8| Pci {
+        bus,
+        ..pci(0x144d, 0xa80a, 0x01)
+    };
+    let functions = [
+        port(1),
+        below(1),
+        // Nothing on bus 2.
+        port(2),
+        // No bus number of its own: it forwards nothing yet.
+        Pci {
+            bridge: Some((0, 0)),
+            ..port(0)
+        },
+        // Bus 3 holds a function only on another segment.
+        port(3),
+        Pci {
+            segment: 1,
+            ..below(3)
+        },
+    ];
+    let empty: Vec<_> = empty_ports(&functions)
+        .map(|function| function.bridge)
+        .collect();
+    assert_eq!(empty, [Some((2, 2)), Some((3, 3))]);
+}
+
+/// The files of each chip Stela's NVIDIA driver runs, by recipe.
+fn every_nvidia_chip_file() -> Vec<&'static str> {
+    let mut files = Vec::new();
+    let mut chips: Vec<&str> = (0..=u16::MAX).filter_map(recipes::nvidia_chip).collect();
+    chips.dedup();
+    assert!(chips.contains(&"ad107"));
+    for chip in chips {
+        let mut inventory = Inventory::default();
+        recipes::require_gsp(&mut inventory, chip).unwrap();
+        for selected in recipes::Plan::select(&inventory).unwrap().selections() {
+            files.push(selected.recipe.image.member);
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+#[test]
+fn a_gpu_the_firmware_left_without_power_gets_every_chips_files() {
+    // A hybrid laptop: the integrated GPU answers, and its discrete GPU's
+    // port has nothing below it while the GPU is in D3cold.
+    let functions = [pci(0x8086, 0x46a6, 0x03), port(1)];
+    let mut laptop = select_for(&functions, Ports::NONE);
+    assert_eq!(members(&laptop), USB);
+    assert_eq!(laptop.late.len(), 1);
+    let late = &laptop.late[0];
+    assert_eq!(late.family, "NVIDIA GSP-RM");
+    assert!(late.why.contains("one of 1 PCI ports"), "{}", late.why);
+    // Every NVIDIA file: 26 files, 150.6 MiB.
+    assert_eq!((late.files.len(), late.bytes()), (26, 157_944_212));
+    let left = laptop.take_late(Room {
+        images: super::super::MAX_IMAGES,
+        bytes: super::super::MAX_TOTAL_BYTES,
+    });
+    assert!(left.is_empty());
+    assert!(laptop.late.is_empty());
+    let wanted = members(&laptop);
+    for file in every_nvidia_chip_file() {
+        assert!(wanted.contains(&file), "{file}");
+    }
+    // With the USB files and an Intel Wi-Fi card's it stays well within
+    // the handoff's images and bytes.
+    assert!(laptop.wanted.len() + 8 < super::super::MAX_IMAGES);
+    assert!(laptop.bytes() + 16 * 1024 * 1024 < super::super::MAX_TOTAL_BYTES);
+    // With the AMD port, its files too.
+    let amd = select_for(&functions, Ports::ALL);
+    let families: Vec<_> = amd.late.iter().map(|late| late.family).collect();
+    assert_eq!(families, ["AMD GPU", "NVIDIA GSP-RM"]);
+    // Without a census nothing is known: every family is late.
+    let unseen = select_without_census(Ports::NONE);
+    assert_eq!(members(&unseen), USB);
+    assert_eq!(unseen.late.len(), 1);
+    assert_eq!(unseen.late[0].files.len(), 26);
+}
+
+#[test]
+fn a_visible_gpu_or_no_empty_port_reads_no_late_files() {
+    // A supported NVIDIA GPU answered: its files only, beside an empty port.
+    let desktop = select_for(&[pci(0x10de, 0x2c02, 0x03), port(2)], Ports::NONE);
+    assert!(desktop.late.is_empty());
+    // An AMD GPU with pinned files keeps the AMD family out, not NVIDIA's.
+    let amd = select_for(&[pci(0x1002, 0x7550, 0x03), port(2)], Ports::ALL);
+    let families: Vec<_> = amd.late.iter().map(|late| late.family).collect();
+    assert_eq!(families, ["NVIDIA GSP-RM"]);
+    // An NVIDIA chip no recipe covers drives nothing: a second GPU may
+    // still answer late.
+    let pascal = select_for(&[pci(0x10de, 0x1b80, 0x03), port(2)], Ports::NONE);
+    assert_eq!(pascal.late.len(), 1);
+    // No port with nothing below it: nothing can answer later.
+    let below = Pci {
+        bus: 2,
+        ..pci(0x8086, 0x2725, 0x02)
+    };
+    let full = select_for(&[pci(0x8086, 0x46a6, 0x03), port(2), below], Ports::NONE);
+    assert!(full.late.is_empty());
+}
+
+#[test]
+fn late_files_are_read_whole_by_family_within_the_handoffs_room() {
+    let functions = [pci(0x8086, 0x46a6, 0x03), port(1)];
+    let usb = select(&[]);
+    let mut tight = select_for(&functions, Ports::ALL);
+    let amd = tight.late[0].bytes();
+    let amd_files = tight.late[0].files.len();
+    // Room for the AMD files but not NVIDIA's: AMD's are taken whole and
+    // NVIDIA's left out whole.
+    let left = tight.take_late(Room {
+        images: usb.wanted.len() + amd_files + 1,
+        bytes: usb.bytes() + amd + 1,
+    });
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].family, "NVIDIA GSP-RM");
+    assert_eq!(tight.wanted.len(), usb.wanted.len() + amd_files);
+    assert!(
+        tight
+            .wanted
+            .iter()
+            .all(|(artifact, _)| !artifact.member.starts_with("nvidia/"))
+    );
+    // One image short: nothing of a family is taken.
+    let mut short = select_for(&functions, Ports::NONE);
+    let files = short.late[0].files.len();
+    let left = short.take_late(Room {
+        images: usb.wanted.len() + files - 1,
+        bytes: usize::MAX,
+    });
+    assert_eq!(left.len(), 1);
+    assert_eq!(members(&short), USB);
 }

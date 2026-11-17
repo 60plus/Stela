@@ -1,15 +1,20 @@
 //! The complete host firmware bundle `stela` puts on the USB's data
 //! volume (`stela_loader::host_firmware::bundle`). Before boot services end
 //! this reads only the files the PC's PCI functions need, logs each one
-//! and the files the bundle lacks, and leaves the bundle as it is. A bundle
-//! that cannot be read leaves the boot without it, as the log says; the
-//! devices that needed its files stay off and their drivers say so.
+//! and the files the bundle lacks, and leaves the bundle as it is. A GPU
+//! the firmware left without power answers only after Stela's engine powers
+//! its port, when no file can be read through the firmware: where the
+//! firmware shows such a port and no GPU of a family Stela drives, that
+//! family's files are read too, within the handoff's room
+//! (`bundle::Selection::take_late`). A bundle that cannot be read leaves
+//! the boot without it, as the log says; the devices that needed its files
+//! stay off and their drivers say so.
 use super::{open, read_file};
 use crate::{handoff::Region, output, pci_io};
 use alloc::{format, string::String, vec::Vec};
 use stela_loader::host_firmware::{
     MAX_IMAGE_BYTES, MAX_MANIFEST_BYTES,
-    bundle::{self, Bundle, Object, Pci},
+    bundle::{self, Bundle, Object, Pci, Room},
 };
 use uefi::{
     boot,
@@ -33,9 +38,9 @@ impl Bundled {
 }
 
 /// The bundle on the boot volume `root`, else on the first other volume
-/// that has one.
-pub fn read(root: &mut Directory) -> Option<Bundled> {
-    if let Some(found) = load(root, "boot volume") {
+/// that has one, its files within `room`.
+pub fn read(root: &mut Directory, room: Room) -> Option<Bundled> {
+    if let Some(found) = load(root, "boot volume", room) {
         return report(found);
     }
     let handles = boot::find_handles::<SimpleFileSystem>().ok()?;
@@ -47,7 +52,7 @@ pub fn read(root: &mut Directory) -> Option<Bundled> {
         let Ok(mut root) = volume.open_volume() else {
             continue;
         };
-        if let Some(found) = load(&mut root, &format!("volume {index}")) {
+        if let Some(found) = load(&mut root, &format!("volume {index}"), room) {
             return report(found);
         }
     }
@@ -66,44 +71,47 @@ fn report(found: Result<Bundled, String>) -> Option<Bundled> {
     }
 }
 
-/// The PCI functions the firmware's drivers found.
-fn functions() -> Vec<Pci> {
+/// The PCI functions the firmware's drivers found, `None` without its
+/// census.
+fn functions() -> Option<Vec<Pci>> {
     match pci_io::capture() {
-        Ok(census) => census
-            .functions
-            .iter()
-            .map(|function| {
-                let identity = function.identity();
-                Pci {
-                    vendor: identity.vendor,
-                    device: identity.device,
-                    class: identity.class[0],
-                }
-            })
-            .collect(),
+        Ok(census) => Some(
+            census
+                .functions
+                .iter()
+                .filter_map(|function| {
+                    Pci::from_header(
+                        function.address.segment,
+                        function.address.bus,
+                        &function.header,
+                    )
+                })
+                .collect(),
+        ),
         Err(error) => {
             output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE no PCI census ({error:?}): USB Bluetooth files only\n"
+                "HOST FIRMWARE BUNDLE no PCI census ({error:?}): the USB files and every GPU's\n"
             ));
-            Vec::new()
+            None
         }
     }
 }
 
 /// The bundle in `root`, if it has one.
-fn load(root: &mut Directory, place: &str) -> Option<Result<Bundled, String>> {
+fn load(root: &mut Directory, place: &str, room: Room) -> Option<Result<Bundled, String>> {
     let file = match open(root, bundle::MANIFEST) {
         Ok(Some(file)) => file,
         Ok(None) => return None,
         Err(error) => return Some(Err(format!("{error}"))),
     };
-    Some(load_from(root, file, place))
+    Some(load_from(root, file, place, room))
 }
 
 fn load_from(
     root: &mut Directory,
     file: uefi::proto::media::file::RegularFile,
     place: &str,
+    room: Room,
 ) -> Result<Bundled, String> {
     let started = output::now();
     let region = read_file(file, None, MAX_MANIFEST_BYTES).map_err(|error| format!("{error}"))?;
@@ -113,7 +121,31 @@ fn load_from(
         unsafe { core::slice::from_raw_parts(region.physical as *const u8, region.bytes as usize) };
     let parsed = Bundle::parse(bytes).map_err(|error| error.0)?;
     let functions = functions();
-    let selection = bundle::select(&functions);
+    let mut selection = match &functions {
+        Some(functions) => bundle::select(functions),
+        None => bundle::select_without_census(bundle::Ports::BUILT),
+    };
+    for late in &selection.late {
+        output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE LATE {}: {} files, {} bytes, for {}\n",
+            late.family,
+            late.files.len(),
+            late.bytes(),
+            late.why
+        ));
+    }
+    for left in selection.take_late(room) {
+        output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE LATE {} not read: its {} files of {} bytes do not fit beside \
+             the files above in the firmware handoff's {} files and {} bytes; a GPU that \
+             answers late lacks them\n",
+            left.family,
+            left.files.len(),
+            left.bytes(),
+            room.images,
+            room.bytes
+        ));
+    }
     for why in &selection.unknown {
         output::arguments(format_args!(
             "HOST FIRMWARE BUNDLE NO RECIPE for the NVIDIA display device at {why}: its \
@@ -170,7 +202,7 @@ fn load_from(
         "HOST FIRMWARE BUNDLE {place} files={} pci={} used={} lacking={lacking} bytes={read_bytes} \
          read_ms={}\n",
         bundled.bundle.objects.len(),
-        functions.len(),
+        functions.as_ref().map_or(0, Vec::len),
         bundled.selected.len(),
         output::millis_since(started)
     ));
