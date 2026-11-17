@@ -7,6 +7,10 @@ use crate::tools::{cargo, exec, root};
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
+    crate::boot::vram_cap(
+        std::env::var_os(crate::boot::VRAM_CAP_VARIABLE).is_some(),
+        true,
+    )?;
     crate::preflight::run()?;
     crate::gpu::fetch::fetch(false)?;
     let built = crate::boot::build(true)?;

@@ -436,3 +436,16 @@ fn storage_mdts_is_optional_typed_and_requires_a_disk() {
         assert!(crate::Cli::try_parse_from(base.into_iter().chain(extra)).is_err());
     }
 }
+
+/// The test-only memory cap is taken only when its variable is set, and an
+/// image that ships stops instead of carrying it, where `cargo xtask dist`
+/// or the release job built it into the image whenever the variable was
+/// left set.
+#[test]
+fn a_shipped_image_never_takes_the_memory_cap() {
+    assert!(!vram_cap(false, false).unwrap());
+    assert!(!vram_cap(false, true).unwrap());
+    assert!(vram_cap(true, false).unwrap());
+    let refused = vram_cap(true, true).unwrap_err().to_string();
+    assert!(refused.starts_with("STELA_VRAM_CAP_MIB holds"), "{refused}");
+}

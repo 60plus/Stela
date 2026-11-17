@@ -569,6 +569,22 @@ pub(crate) fn deploy_image(built: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The variable that holds a test build's Metal device to that many MiB of
+/// device memory (the `vram-cap` feature).
+pub const VRAM_CAP_VARIABLE: &str = "STELA_VRAM_CAP_MIB";
+
+/// Whether a build takes the test-only memory cap: when [`VRAM_CAP_VARIABLE`]
+/// is `set`, never for an image that ships (`shipped`: the release workflow's
+/// build, or `cargo xtask dist`), which stops instead.
+pub fn vram_cap(set: bool, shipped: bool) -> Result<bool> {
+    if set && shipped {
+        anyhow::bail!(
+            "{VRAM_CAP_VARIABLE} holds a test build's GPU to less memory; unset it to build an image that ships"
+        );
+    }
+    Ok(set)
+}
+
 fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
@@ -589,7 +605,10 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
     }
     // A test build that holds the Metal device to that much device memory.
-    if std::env::var_os("STELA_VRAM_CAP_MIB").is_some() {
+    if vram_cap(
+        std::env::var_os(VRAM_CAP_VARIABLE).is_some(),
+        crate::tools::release_build(),
+    )? {
         command.args(["--features", "vram-cap"]);
     }
     if release {
