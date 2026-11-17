@@ -393,6 +393,8 @@ pub struct Display<D> {
     /// The EDID of the monitor on the output that gives the picture, when
     /// the connector has one.
     edid: Option<Vec<u8>>,
+    /// The output that gives the picture lists a preferred mode.
+    preferred: bool,
     /// What the engine reads, then the one the next frame fills.
     /// The newest frame, the one before it and the one that shows neither.
     buffers: [Buffer; 3],
@@ -776,9 +778,10 @@ pub type Fits<'a> = &'a dyn Fn(u32, u32, u32) -> bool;
 /// Which of an output's modes to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wanted {
-    /// The monitor's own preferred mode, its native one, else a mode of
-    /// this size: for a display taken before the guest's mode is set. A
-    /// firmware often shows a 3840x2160 panel in 1920x1080.
+    /// The monitor's own mode, its preferred one or else the first DRM
+    /// lists ([`own_mode`]), else a mode of this size: for a display taken
+    /// before the guest's mode is set. A firmware often shows a 3840x2160
+    /// panel in 1920x1080.
     Native((u32, u32)),
     /// A mode of this size, else the preferred one: the guest's mode is
     /// set, and only that size is shown.
@@ -831,13 +834,25 @@ fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
     across.abs_diff(down) * 100 <= down
 }
 
+/// The mode an output with `modes` runs on its own, as Linux's fbdev
+/// client picks it (`drm_client_target_preferred`): its preferred mode,
+/// else its first listed. DRM lists the largest first when none is
+/// preferred (`drm_mode_sort`), as when the monitor's preferred timing
+/// passes the link's clock and Linux pruned it.
+fn own_mode(modes: &[ModeInfo]) -> Option<&ModeInfo> {
+    modes
+        .iter()
+        .find(|mode| mode.kind & PREFERRED != 0)
+        .or_else(|| modes.first())
+}
+
 /// The size the connected `outputs`, each its modes, show the picture in,
 /// and which of them gives the mode the guest is told of.
 ///
-/// The sizes in order: for [`Wanted::Native`] each output's preferred size,
-/// then each output's listed sizes of its preferred mode's shape, largest
-/// first, then the firmware's, then every listed size; for [`Wanted::Size`]
-/// that size first. A panel's native size the guest cannot be told of, as
+/// The sizes in order: for [`Wanted::Native`] each output's own size
+/// ([`own_mode`]), then each output's listed sizes of its own mode's shape,
+/// largest first, then the firmware's, then every listed size; for
+/// [`Wanted::Size`] that size first. A panel's native size the guest cannot be told of, as
 /// 5120x1440, so gives way to the largest of its shape that it can, as
 /// 3840x1080, before a firmware's 1920x1080 stretched across it. A size
 /// with a mode the guest can be told of beats one
@@ -848,16 +863,15 @@ fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
 /// the mode is the first with a fitting mode of the size, else the first
 /// with one at all.
 fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32, u32), usize)> {
-    let preferred = outputs.iter().filter_map(|modes| {
-        let native = modes.iter().find(|mode| mode.kind & PREFERRED != 0)?;
-        Some(size_of_mode(native))
-    });
+    let preferred = outputs
+        .iter()
+        .filter_map(|modes| own_mode(modes).map(size_of_mode));
     let listed = outputs
         .iter()
         .flat_map(|modes| modes.iter().map(size_of_mode));
     let mut shaped = Vec::new();
     for modes in outputs {
-        let Some(native) = modes.iter().find(|mode| mode.kind & PREFERRED != 0) else {
+        let Some(native) = own_mode(modes) else {
             continue;
         };
         let start = shaped.len();
@@ -1302,6 +1316,7 @@ impl<D: Drm> Display<D> {
         // The monitor's identity for the guest; one the connector cannot
         // give leaves the size alone to name it.
         let edid = edid(&mut drm, first.0).ok().flatten();
+        let preferred = first.1.modes.iter().any(|mode| mode.kind & PREFERRED != 0);
         let mut heads: Vec<Head> = Vec::new();
         let rates = rates_of(&first.1.modes, size, fits);
         let (mut smaller, mut refused) = (0, None);
@@ -1353,6 +1368,7 @@ impl<D: Drm> Display<D> {
         Ok(Self {
             size_mm: (width != 0 && height != 0).then_some((width, height)),
             edid,
+            preferred,
             rates,
             smaller,
             refused: refused.or(display.refused),
@@ -1393,6 +1409,7 @@ impl<D: Drm> Display<D> {
             refresh: refresh(&mode),
             size_mm: None,
             edid: None,
+            preferred: true,
             buffers,
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
@@ -1821,6 +1838,12 @@ impl<D: Drm> Display<D> {
     /// The monitor's image size in millimetres, when its EDID gave one.
     pub fn size_mm(&self) -> Option<(u32, u32)> {
         self.size_mm
+    }
+
+    /// Whether the output that gives the picture listed a preferred mode;
+    /// without one its first listed ran ([`own_mode`]).
+    pub fn preferred_listed(&self) -> bool {
+        self.preferred
     }
 
     /// The EDID of the monitor on the output that gives the picture (the

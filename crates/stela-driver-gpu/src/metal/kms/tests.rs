@@ -500,7 +500,7 @@ fn a_display_taken_at_start_runs_the_monitors_own_mode() {
     let fast = [modes[1], at(3840, 2160, PREFERRED, 60), modes[2]];
     let slow: Fits<'_> = &|_, _, refresh| refresh < 100_000;
     assert_eq!(choose(&fast, firmware, slow), Some(fast[1]));
-    // No preferred mode: the firmware's size, then the first.
+    // No preferred mode: the first listed, the largest as DRM sorts them.
     assert_eq!(choose(&modes[2..], firmware, any), Some(modes[2]));
     assert_eq!(
         choose(&modes[2..], Wanted::Native((800, 600)), any),
@@ -554,8 +554,8 @@ fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
 /// one-byte alpha plane, whose row is the width, is sampled through an
 /// aligned copy where the GPU's linear images cannot take it. A panel's
 /// own mode wins whatever its width, as 2560x1600, a 3440x1440 ultrawide
-/// or a 1366x768 laptop panel, and without a preferred mode the
-/// firmware's size wins, as 1680x1050.
+/// or a 1366x768 laptop panel, and without a preferred mode the first
+/// listed wins, as Linux's fbdev takes it.
 #[test]
 fn a_mode_of_any_width_is_taken() {
     let any: Fits<'_> = &|_, _, _| true;
@@ -571,11 +571,62 @@ fn a_mode_of_any_width_is_taken() {
             "{native:?}"
         );
     }
-    let modes = [mode(1680, 1050, 0), mode(1920, 1200, 0)];
+    let modes = [mode(1920, 1200, 0), mode(1680, 1050, 0)];
     assert_eq!(
         choose(&modes, Wanted::Native((1680, 1050)), any),
         Some(modes[0])
     );
+}
+
+/// A monitor whose preferred timing passes the link's clock, as a
+/// 3440x1440 ultrawide's 60 Hz timing past an HDMI port's TMDS limit, has
+/// it pruned by Linux, which marks no other mode preferred and lists the
+/// largest left first. That one runs, as Linux's fbdev runs its first
+/// listed mode, not the firmware's 1920x1080, which the guest would then
+/// keep as its only size.
+#[test]
+fn without_a_preferred_mode_the_first_listed_runs() {
+    let at = |width, height, vrefresh| ModeInfo {
+        vrefresh,
+        ..mode(width, height, 0)
+    };
+    let modes = [
+        at(3440, 1440, 50),
+        at(2560, 1080, 60),
+        at(1920, 1080, 60),
+        at(1280, 720, 60),
+    ];
+    let any: Fits<'_> = &|_, _, _| true;
+    assert_eq!(
+        choose(&modes, Wanted::Native((1920, 1080)), any),
+        Some(modes[0])
+    );
+    // A guest that cannot be told of it takes the largest of its shape.
+    let narrower: Fits<'_> = &|width, _, _| width < 3440;
+    assert_eq!(
+        choose(&modes, Wanted::Native((1920, 1080)), narrower),
+        Some(modes[1])
+    );
+    // A size asked for still wins.
+    assert_eq!(
+        choose(&modes, Wanted::Size((1920, 1080)), any),
+        Some(modes[2])
+    );
+}
+
+/// The display says whether the output that gives its picture listed a
+/// preferred mode, for the boot's line when it did not.
+#[test]
+fn a_display_says_whether_its_output_listed_a_preferred_mode() {
+    let any: Fits<'_> = &|_, _, _| true;
+    for (kind, listed) in [(PREFERRED, true), (0, false)] {
+        let mut card = Card::new(vec![mode(4, 2, kind), mode(2, 2, 0)]);
+        let display = Display::take_fitting(&mut card, Wanted::Native((2, 2)), any).unwrap();
+        assert_eq!(
+            (display.size(), display.preferred_listed()),
+            ((4, 2), listed)
+        );
+    }
 }
 
 #[test]

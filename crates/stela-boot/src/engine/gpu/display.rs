@@ -583,6 +583,13 @@ pub(in crate::engine) fn take(
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                if size.is_none() && !display.preferred_listed() {
+                    output::arguments(format_args!(
+                        "GPU {name}: the output lists no preferred mode (its EDID marks none, or \
+                         Linux left out the monitor's own mode as past the link's clock), so it \
+                         runs its first listed mode, as Linux does\n"
+                    ));
+                }
                 report_ports(name, &display);
                 // A GPU that serves no Metal device shows what another
                 // draws: the display is wired to it (a laptop's panel on its
