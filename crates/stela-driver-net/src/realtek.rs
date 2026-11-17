@@ -648,8 +648,30 @@ fn prepare_pcie_link<C: ConfigSpace>(
         // either MMIO decoding or bus mastering is enabled by this constructor.
         disable_aspm(function)?;
         clock_request(function.config(), offset, false)?;
+        read_request_4096(function.config(), offset - 8)?;
     }
     Ok(control)
+}
+
+/// Linux `rtl_jumbo_config`'s `pcie_set_readrq(pdev, 4096)` for a PCIe
+/// gigabit chip without jumbo frames: Device Control's Max_Read_Request_Size
+/// (bits 14:12) asks for 4096 bytes, where the firmware's value, often 512,
+/// stayed.
+fn read_request_4096<C: ConfigSpace>(
+    config: &mut C,
+    device_control: u16,
+) -> Result<(), BlockError> {
+    let value = config.read16(device_control)?;
+    if value == u16::MAX {
+        return Err(BlockError::Device {
+            status: u32::from(value),
+        });
+    }
+    let wanted = (value & !(7 << 12)) | (5 << 12);
+    if wanted != value {
+        config.write16(device_control, wanted)?;
+    }
+    Ok(())
 }
 
 /// Whether the chip runs its TBI (fiber) interface, which this driver does

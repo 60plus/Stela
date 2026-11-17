@@ -14,6 +14,7 @@ fn alias_function(device: u16, express: bool) -> Function<AliasConfig> {
         config.words[1] = 1 << 20; // Status: conventional capability list.
         config.words[0x34 / 4] = 0x40;
         config.words[0x40 / 4] = 0x0001_0010;
+        config.words[0x48 / 4] = 0x2810; // Device Control: MaxReadReq 512.
         config.words[0x50 / 4] = 0xa5fc;
     }
     Function::new(
@@ -148,7 +149,8 @@ fn pci_alias_aspm_selection_uses_capability_before_clock_or_enable() {
             assert_eq!(
                 function.config().writes,
                 if express {
-                    vec![(0x50, 0xa4fc)]
+                    // Clock request off, then Linux's MaxReadReq of 4096.
+                    vec![(0x50, 0xa4fc), (0x48, 0x5810)]
                 } else {
                     vec![]
                 }
