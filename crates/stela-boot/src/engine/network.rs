@@ -381,9 +381,7 @@ impl HostNetwork {
                     // It stays started, in its place, for the guest network:
                     // its link may come up later. Unused, it is stopped with
                     // the rest (`Links`).
-                    links
-                        .devices
-                        .insert(next, stack.into_link().into_device());
+                    links.devices.insert(next, stack.into_link().into_device());
                     next += 1;
                     output::arguments(format_args!(
                         "NETWORK adapter {location} kept started, free for the guest network\n"
@@ -797,8 +795,7 @@ impl GuestNetwork {
     /// went missing. `None` between looks, or while another processor is
     /// inside the host drivers.
     pub fn carrier(&mut self) -> Option<bool> {
-        if self.carrier.is_some() && output::millis_since(self.carrier_checked) < CARRIER_MILLIS
-        {
+        if self.carrier.is_some() && output::millis_since(self.carrier_checked) < CARRIER_MILLIS {
             return None;
         }
         let carrier = self.link.carrier_now()?;
