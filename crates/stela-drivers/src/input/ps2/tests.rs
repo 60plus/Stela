@@ -196,6 +196,8 @@ struct Hardware {
     resend_inject: Vec<(Port, u8)>,
     no_ack: Option<(Port, u8)>,
     ignore_scan_query: bool,
+    refuse_scan_select: bool,
+    reset_without_id: bool,
     inject_led: Vec<(Port, u8)>,
     writes: Vec<(bool, u8)>,
     consumed: usize,
@@ -234,6 +236,8 @@ impl Hardware {
             resend_inject: Vec::new(),
             no_ack: None,
             ignore_scan_query: false,
+            refuse_scan_select: false,
+            reset_without_id: false,
             inject_led: Vec::new(),
             writes: Vec::new(),
             consumed: 0,
@@ -333,6 +337,13 @@ impl Hardware {
             return;
         }
         let index = Self::index(port);
+        if port == Port::Keyboard
+            && data == SET_SCAN
+            && self.argument[index].is_none()
+            && self.refuse_scan_select
+        {
+            return;
+        }
         if port == Port::Keyboard
             && data == 0
             && self.argument[index] == Some(SET_SCAN)
@@ -459,7 +470,9 @@ impl Hardware {
                 self.emit(port, BAT_OK);
                 if port == Port::Mouse {
                     self.mouse_id = 0;
-                    self.emit(port, 0);
+                    if !self.reset_without_id {
+                        self.emit(port, 0);
+                    }
                 }
             }
             DISABLE_REPORTING | DEFAULTS => {
@@ -493,6 +506,12 @@ impl Hardware {
             GET_ID if port == Port::Mouse => {
                 self.emit(port, self.force_id.unwrap_or(self.mouse_id))
             }
+            // An MF2 keyboard's ID, unless it does not answer GETID.
+            GET_ID if self.no_ack != Some((port, GET_ID)) => {
+                self.emit(port, 0xab);
+                self.emit(port, 0x83);
+            }
+            GET_ID => {}
             // A mouse's status: disabled, resolution 2, 100 reports a second.
             GET_INFO if port == Port::Mouse => {
                 for byte in [0, 2, 100] {
@@ -720,7 +739,7 @@ fn embedded_keyboard_without_scan_query_works_after_acknowledged_set_selection()
 }
 
 #[test]
-fn omitting_scan_query_still_requires_acknowledged_set_two_selection() {
+fn a_keyboard_that_does_not_take_the_set_two_argument_is_used_with_the_command_kept() {
     let (mut c, h) = controller(Config {
         mouse: false,
         reset_on_start: false,
@@ -728,24 +747,35 @@ fn omitting_scan_query_still_requires_acknowledged_set_two_selection() {
         ..Config::default()
     });
     h.borrow_mut().no_ack = Some((Port::Keyboard, 2));
-    let error = c.initialize().unwrap_err();
+    c.initialize().unwrap();
+    assert!(c.is_ready());
     assert_eq!(
-        error.command,
-        Some(Command::Device {
+        c.refused_commands(),
+        [Command::Device {
             port: Port::Keyboard,
-            byte: 2
-        })
+            byte: SET_SCAN
+        }]
     );
-    assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
-    assert_eq!(error.recovery, Recovery::PortsDisabled);
-    assert!(!c.is_ready());
 }
 
 #[test]
 fn command_timeout_identifies_original_keyboard_command_after_containment() {
+    // A keyboard that refuses reporting disable is kept, as atkbd keeps it.
     let (mut c, h) = controller(Config {
         mouse: false,
         reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, DISABLE_REPORTING));
+    c.initialize().unwrap();
+    assert!(c.refused_commands().contains(&Command::Device {
+        port: Port::Keyboard,
+        byte: DISABLE_REPORTING
+    }));
+    // After a reset that was asked for, reporting disable is required,
+    // and its failure names the command.
+    let (mut c, h) = controller(Config {
+        mouse: false,
         ..Config::default()
     });
     h.borrow_mut().no_ack = Some((Port::Keyboard, DISABLE_REPORTING));
@@ -761,6 +791,118 @@ fn command_timeout_identifies_original_keyboard_command_after_containment() {
     assert_eq!(error.recovery, Recovery::PortsDisabled);
     assert!(c.needs_reset());
 }
+#[test]
+fn a_keyboard_that_refuses_set_two_selection_is_used_in_set_two_as_linux_uses_it() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+    assert_eq!(
+        c.refused_commands(),
+        [Command::Device {
+            port: Port::Keyboard,
+            byte: SET_SCAN
+        }]
+    );
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn a_keyboard_without_getid_is_proved_by_set_leds_and_one_that_answers_neither_fails() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, GET_ID));
+    c.initialize().unwrap();
+    assert!(c.refused_commands().is_empty());
+    let leds = h
+        .borrow()
+        .writes
+        .iter()
+        .filter(|write| **write == (false, SET_LEDS))
+        .count();
+    assert_eq!(leds, 1, "Set LEDs proves the keyboard once, not twice");
+
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, GET_ID));
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, SET_LEDS));
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    assert!(c.refused_commands().contains(&Command::Device {
+        port: Port::Keyboard,
+        byte: SET_LEDS
+    }));
+}
+
+#[test]
+fn the_auxiliary_port_test_passes_with_fa_or_ff_as_linux_accepts() {
+    for reply in [ACK, 0xff] {
+        let (mut c, h) = controller(Config {
+            keyboard: false,
+            reset_on_start: false,
+            ..Config::default()
+        });
+        h.borrow_mut().interface_test = reply;
+        c.initialize().unwrap();
+        assert!(!h.borrow().writes.contains(&(true, TEST_KEYBOARD)));
+    }
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().interface_test = 1;
+    assert_eq!(
+        c.initialize().unwrap_err().kind,
+        ErrorKind::ControllerReply {
+            command: TEST_MOUSE,
+            received: 1
+        }
+    );
+}
+
+#[test]
+fn a_mouse_reset_with_its_self_test_result_alone_passes_as_psmouse_reset() {
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        wheel: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    // A mouse that answers RESET with AA and no ID byte.
+    h.borrow_mut().reset_without_id = true;
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+}
+
 #[test]
 fn a_probed_mouse_that_is_no_touchpad_is_reset_and_probed_for_its_wheel() {
     let (base, h) = controller(Config::default());
