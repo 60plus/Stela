@@ -34,7 +34,8 @@
 //! cites it per command. [`acm::Credentials`] serves context create and
 //! delete, handle queries, externalization, PassphraseEntered credentials,
 //! credential queries and removal, DeviceOwner policy verification
-//! ([`policy`]), the logging level and Lockdown Mode's environment variable.
+//! ([`policy`]), the logging level and the environment variables
+//! ([`environment`]).
 //! Every other command is refused with [`UNSUPPORTED`] and named once in the
 //! diagnostics.
 //!
@@ -46,6 +47,7 @@
 //! through [`Link`] and, when the passphrase opens the user's keybag, grants
 //! PasscodeValidated to the request's context.
 mod acm;
+mod environment;
 mod policy;
 #[cfg(test)]
 pub(crate) mod tests;

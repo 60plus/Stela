@@ -203,13 +203,17 @@ fn the_kernels_initialization_sets_the_logging_level_with_the_head_alone() {
 }
 
 #[test]
-fn lockdown_mode_reads_as_off_and_other_variables_refuse() {
+fn lockdown_mode_reads_as_off_and_unset_variables_read_empty() {
     let mut credentials = Credentials::default();
     assert_eq!(
         ask(&mut credentials, &mut counter(), 25, &41u32.to_le_bytes()),
         (0, alloc::vec![0])
     );
-    refused(&mut credentials, 25, &2u32.to_le_bytes());
+    // Variable 2 is set only inside the SEP; nothing set it here.
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 25, &2u32.to_le_bytes()),
+        (0, Vec::new())
+    );
 }
 
 #[test]
@@ -243,17 +247,199 @@ fn the_engines_initial_variables_read_as_it_sets_them() {
         ask(&mut credentials, &mut counter(), 25, &[7, 0]),
         (-5i32 as u32, Vec::new())
     );
-    // Variables set later, or by data providers (69, the context pool's
-    // statistics), are named once each.
-    refused(&mut credentials, 25, &16u32.to_le_bytes());
+    // Variables answered by data providers (69, the context pool's
+    // statistics; 75, resource usage) are named once each.
     refused(&mut credentials, 25, &69u32.to_le_bytes());
     refused(&mut credentials, 25, &69u32.to_le_bytes());
+    refused(&mut credentials, 25, &75u32.to_le_bytes());
     let notes: Vec<_> = credentials.diagnostics().collect();
     assert_eq!(
         notes,
         [
-            "SEP credential manager: environment variable 16 is not modeled",
-            "SEP credential manager: environment variable 69 is not modeled",
+            "SEP credential manager: environment variable 69 needs its data provider, which is not modeled",
+            "SEP credential manager: environment variable 75 needs its data provider, which is not modeled",
+        ]
+    );
+}
+
+fn variable(id: u32) -> Vec<u8> {
+    id.to_le_bytes().to_vec()
+}
+
+/// SetEnvironmentVariableExtended's input: variable, version, data length,
+/// 32 bytes of policy parameters, data.
+fn extended(id: u32, version: u32, data: &[u8]) -> Vec<u8> {
+    let mut input = variable(id);
+    input.extend_from_slice(&version.to_le_bytes());
+    input.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    input.extend_from_slice(&[0; 32]);
+    input.extend_from_slice(data);
+    input
+}
+
+/// Issue #139's log: at sign-in the AP reads variables 16 and 20, which
+/// nothing set, and later sets 39 (the MacBuddy secure store) with command
+/// 44 and reads it back.
+#[test]
+fn variables_the_ap_sets_read_back_and_unset_ones_read_empty() {
+    let mut credentials = Credentials::default();
+    let mut entropy = counter();
+    for id in [16, 20, 39] {
+        assert_eq!(
+            ask(&mut credentials, &mut entropy, 25, &variable(id)),
+            (0, Vec::new()),
+            "variable {id}"
+        );
+    }
+    let secret = [1, 2, 3, 4, 5, 6];
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            44,
+            &extended(39, 2, &secret)
+        ),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(39)),
+        (0, secret.to_vec())
+    );
+    // Command 24 sets with the data after the variable, and the variable
+    // alone clears.
+    let mut plain = variable(39);
+    plain.push(9);
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 24, &plain),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(39)),
+        (0, alloc::vec![9])
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 24, &variable(39)),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(39)),
+        (0, Vec::new())
+    );
+    // A data length of 0 clears too.
+    ask(&mut credentials, &mut entropy, 44, &extended(16, 2, &[7]));
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 44, &extended(16, 2, &[])),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(16)),
+        (0, Vec::new())
+    );
+    assert_eq!(credentials.diagnostics().count(), 0);
+}
+
+#[test]
+fn environment_requests_answer_the_executors_codes() {
+    let mut credentials = Credentials::default();
+    let mut entropy = counter();
+    let status = |code: i32| (code as u32, Vec::new());
+    // No slot: 32, 76, 77, and past the table.
+    for id in [32, 76, 77, 79, 1000] {
+        assert_eq!(
+            ask(&mut credentials, &mut entropy, 25, &variable(id)),
+            status(-7)
+        );
+        assert_eq!(
+            ask(&mut credentials, &mut entropy, 44, &extended(id, 2, &[1])),
+            status(-7)
+        );
+    }
+    // SEP-internal callers only: 10 reads, 7 sets.
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(10)),
+        status(-1)
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 44, &extended(7, 2, &[1])),
+        status(-1)
+    );
+    // Provider-only without a provider.
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 25, &variable(44)),
+        status(-5)
+    );
+    // A boolean takes exactly one byte; data is 1 to 0x80 bytes.
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            44,
+            &extended(42, 2, &[1, 2])
+        ),
+        status(-3)
+    );
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            44,
+            &extended(39, 2, &[0; 0x81])
+        ),
+        status(-3)
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 44, &extended(42, 2, &[1])),
+        (0, Vec::new())
+    );
+    // Shapes: no input, short, other version, data past the input.
+    assert_eq!(ask(&mut credentials, &mut entropy, 24, &[]), status(-3));
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 24, &[39, 0]),
+        status(-5)
+    );
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            44,
+            &extended(39, 2, &[])[..0x2b]
+        ),
+        status(-5)
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut entropy, 44, &extended(39, 1, &[1])),
+        status(-15)
+    );
+    let mut long = extended(39, 2, &[1, 2]);
+    long.pop();
+    assert_eq!(ask(&mut credentials, &mut entropy, 44, &long), status(-5));
+    assert_eq!(credentials.diagnostics().count(), 0);
+}
+
+#[test]
+fn variables_in_the_locker_or_with_hooks_are_named_once() {
+    let mut credentials = Credentials::default();
+    // 72 (one-time entropy) lives in the persistent locker; 13 needs a
+    // policy; 45 a data validation.
+    refused(&mut credentials, 44, &extended(72, 2, &[1]));
+    refused(&mut credentials, 25, &variable(72));
+    refused(&mut credentials, 44, &extended(13, 2, &[1]));
+    refused(&mut credentials, 44, &extended(13, 2, &[1]));
+    // The initial variables keep their data: the AP may not set them.
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 44, &extended(33, 2, &[0])),
+        (-1i32 as u32, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 25, &variable(33)),
+        (0, alloc::vec![1])
+    );
+    let notes: Vec<_> = credentials.diagnostics().collect();
+    assert_eq!(
+        notes,
+        [
+            "SEP credential manager: environment variable 72 needs the persistent locker, which is not modeled",
+            "SEP credential manager: environment variable 13 needs a policy verification, which is not modeled",
         ]
     );
 }

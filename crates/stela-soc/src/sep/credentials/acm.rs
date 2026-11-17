@@ -25,10 +25,9 @@
 //! global set (`addCredential` 0xfffffe0009290c80, "scope ==
 //! kACMScopeContext" with scope 1).
 //!
-//! **Environment.** GetEnvironmentVariable answers Lockdown Mode (41) as off
-//! and the one-byte variables the engine's initialization sets as it sets
-//! them; variables set later, by the AP or with data providers, are not
-//! modeled.
+//! **Environment.** Get- and SetEnvironmentVariable reach the variables of
+//! [`environment`]; Lockdown Mode (41), which lives in the persistent
+//! locker, reads as off.
 //!
 //! **Model.** Only PassphraseEntered is added from the AP: PasscodeValidated
 //! comes from the keystore's verify ([`Link::passcode_validated`]), so no
@@ -38,6 +37,7 @@
 //! request needs it.
 use super::super::Entropy;
 use super::super::observe::Journal;
+use super::environment::{Refused, Variables};
 use super::policy;
 use crate::Result;
 use alloc::{format, string::String, vec, vec::Vec};
@@ -71,7 +71,13 @@ const SET_LOGGING_LEVEL: u8 = 10;
 const HANDLE_EXISTS: u8 = 18;
 const EXTERNALIZE_CONTEXT: u8 = 19;
 const GET_SUPPORTED_VERSION: u8 = 22;
+const SET_ENVIRONMENT_VARIABLE: u8 = 24;
 const GET_ENVIRONMENT_VARIABLE: u8 = 25;
+/// SetEnvironmentVariable with parameters: `ACMCmdRequest_
+/// SetEnvironmentVariableExtended`, the u32 variable, the u32 version
+/// [`EXTENDED_VERSION`], the u32 data length, 32 bytes of policy parameters
+/// and the data at [`EXTENDED_DATA`].
+const SET_ENVIRONMENT_VARIABLE_EXTENDED: u8 = 44;
 const CONTEXT_CREATE_WITH_TRACKING: u8 = 36;
 const HANDLE_EXISTS_WITH_TRACKING: u8 = 37;
 const CONTEXT_CREATE_NON_AUTO_DISPOSABLE_WITH_TRACKING: u8 = 52;
@@ -84,17 +90,15 @@ const INITIAL_LOGGING_LEVEL: u8 = 0x28;
 /// The environment variable `LDMCheckParity` compares with NVRAM.
 const LOCKDOWN_MODE: u32 = 41;
 const LOCKDOWN_OFF: u8 = 0;
-/// The one-byte environment variables `InitCredentialEngine`
-/// 0xfffffe0009294a40 sets, whose slots (`__envTable` 0xfffffe000cb3d520,
-/// 0x98 bytes each) any caller may read and nothing else in the executor
-/// sets: 5 (+0x150), 6, the biometry type `biometryTypePresent` reads
-/// (+0x98, 0: none), 7 (+0x2ac), 26 (+0x2c8), 33 (+0x2e4, 1) and 34
-/// (+0x300). Variable 23 (from the engine's boot parameters), 24 (the
-/// engine's build date) and those with data providers are not among them.
-const INITIAL_VARIABLES: [(u32, u8); 6] = [(5, 0), (6, 0), (7, 0), (26, 0), (33, 1), (34, 0)];
 /// The executor's answer to a command shorter than its input
-/// (`Exec_ACMGetEnvironmentVariable`+0x194).
+/// (`Exec_ACMGetEnvironmentVariable`+0x194,
+/// `Exec_ACMSetEnvironmentVariable` 0xfffffe0009289668 +0x1b8, +0x248).
 const SHORT_COMMAND: i32 = -5;
+/// `kCmdCurrentVersion_SetEnvironmentVariableExtended`.
+const EXTENDED_VERSION: u32 = 2;
+const EXTENDED_DATA: usize = 0x2c;
+/// The executor's answer to another extended version (+0x240).
+const BAD_VERSION: i32 = -15;
 
 const SETS: usize = 0x100;
 const NON_AUTO_DISPOSABLE_SETS: usize = 0xc0;
@@ -189,6 +193,7 @@ pub struct Credentials {
     tracking: u32,
     uses: u64,
     logging: u8,
+    variables: Variables,
     diagnostics: Journal,
     reported: Vec<String>,
 }
@@ -200,6 +205,7 @@ impl Default for Credentials {
             tracking: 0,
             uses: 0,
             logging: INITIAL_LOGGING_LEVEL,
+            variables: Variables::new(),
             diagnostics: Journal::default(),
             reported: Vec::new(),
         }
@@ -314,6 +320,9 @@ impl Credentials {
             }
             VERIFY_POLICY => self.verify_policy(head.version, input),
             GET_ENVIRONMENT_VARIABLE => self.environment_variable(input),
+            SET_ENVIRONMENT_VARIABLE | SET_ENVIRONMENT_VARIABLE_EXTENDED => self
+                .set_environment_variable(head.command == SET_ENVIRONMENT_VARIABLE_EXTENDED, input)
+                .map(|()| Vec::new()),
             command => {
                 let leading = input.get(..4).map_or(0, |word| {
                     u32::from_le_bytes(word.try_into().expect("4 bytes"))
@@ -333,10 +342,8 @@ impl Credentials {
 
     /// GetEnvironmentVariable (`Exec_ACMGetEnvironmentVariable`
     /// 0xfffffe000928948c): no input is -3, less than the u32 variable is
-    /// -5, and bytes after it are not read. The variables
-    /// `InitCredentialEngine` sets ([`INITIAL_VARIABLES`]) answer their byte,
-    /// as `Env_GetVariable` 0xfffffe00092c0aa8 copies a stored value; every
-    /// other variable is outside the model.
+    /// -5, and bytes after it are not read. The output is the variable's
+    /// data ([`Variables::get`]).
     fn environment_variable(&mut self, input: &[u8]) -> core::result::Result<Vec<u8>, Failure> {
         if input.is_empty() {
             return Err(BAD_PARAMETER.into());
@@ -350,16 +357,66 @@ impl Credentials {
             // enabling it does not survive a reboot.
             return Ok(vec![LOCKDOWN_OFF]);
         }
-        if let Some((_, value)) = INITIAL_VARIABLES.iter().find(|(id, _)| *id == variable) {
-            return Ok(vec![*value]);
+        let answer = self.variables.get(variable);
+        answer.map_err(|refused| self.environment_refused(refused))
+    }
+
+    /// SetEnvironmentVariable (`Exec_ACMSetEnvironmentVariable`
+    /// 0xfffffe0009289668). Command 24: no input is -3, less than the u32
+    /// variable -5, and the rest is the data (none clears). Command 44: up
+    /// to the data offset -5, another version -15, input shorter than its
+    /// data -5, and a data length of 0 clears. The policy parameters only
+    /// matter to variables with a policy, which [`Variables::set`] refuses.
+    fn set_environment_variable(
+        &mut self,
+        extended: bool,
+        input: &[u8],
+    ) -> core::result::Result<(), Failure> {
+        if input.is_empty() {
+            return Err(BAD_PARAMETER.into());
         }
-        Err(self.unmodeled(
-            format!("environment variable {variable} is not modeled"),
-            refuse!(
-                "SEP credential manager does not model this environment variable",
-                variable
+        let word = |at: usize| {
+            input
+                .get(at..at + 4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("4 bytes")))
+        };
+        let (variable, data) = if extended {
+            let (Some(variable), Some(version), Some(length)) = (word(0), word(4), word(8)) else {
+                return Err(SHORT_COMMAND.into());
+            };
+            if input.len() < EXTENDED_DATA {
+                return Err(SHORT_COMMAND.into());
+            }
+            if version != EXTENDED_VERSION {
+                return Err(BAD_VERSION.into());
+            }
+            let Some(data) = input.get(EXTENDED_DATA..EXTENDED_DATA + length as usize) else {
+                return Err(SHORT_COMMAND.into());
+            };
+            (variable, (length != 0).then_some(data))
+        } else {
+            let Some(variable) = word(0) else {
+                return Err(SHORT_COMMAND.into());
+            };
+            let data = &input[4..];
+            (variable, (!data.is_empty()).then_some(data))
+        };
+        let answer = self.variables.set(variable, data);
+        answer.map_err(|refused| self.environment_refused(refused))
+    }
+
+    fn environment_refused(&mut self, refused: Refused) -> Failure {
+        match refused {
+            Refused::Acm(code) => code.into(),
+            Refused::Unmodeled(variable, what) => self.unmodeled(
+                Refused::line(variable, what),
+                refuse!(
+                    "SEP credential manager does not model this environment variable use",
+                    variable,
+                    what
+                ),
             ),
-        ))
+        }
     }
 
     fn global(&mut self, what: &'static str) -> Failure {
