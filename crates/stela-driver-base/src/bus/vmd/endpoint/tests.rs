@@ -476,6 +476,51 @@ fn a_child_firmware_left_mastering_is_stopped_with_the_parent_unmastered() {
     hierarchy.enable(&mut host, 0).unwrap();
 }
 
+/// A function may hard-wire INTx Disable clear, and VMD forwards no INTx,
+/// only MSI and MSI-X through its own vectors: a child that cannot hold the
+/// bit is stopped by its Bus Master and message enables alone, as Linux's
+/// vmd driver takes every child as found, and runs its whole lifecycle with
+/// the bit as the stop left it.
+#[test]
+fn a_child_that_hardwires_intx_disable_clear_is_stopped_and_runs_its_lifecycle() {
+    for base in [BRIDGE, NVME] {
+        let model = Model::default();
+        let state = model.state.clone();
+        {
+            let mut state = state.lock().unwrap();
+            state.set(
+                base + 4,
+                2,
+                u32::from(regs::COMMAND_MEMORY | regs::COMMAND_MASTER),
+            );
+            state.hardwired_clear = Some((base + 4, u32::from(regs::COMMAND_INTX_DISABLE)));
+        }
+        let (mut host, bar) = fixture(model);
+        let mut hierarchy = Hierarchy::discover(&mut host, &bar, NVME_CLASS).unwrap();
+        let command = |state: &State| state.child(base + 4, 2) as u16;
+        assert_eq!(
+            command(&state.lock().unwrap()) & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE),
+            0
+        );
+        hierarchy.prepare(&mut host, &*model_timer(), 0).unwrap();
+        hierarchy.enable(&mut host, 0).unwrap();
+        assert_eq!(
+            command(&state.lock().unwrap()) & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE),
+            regs::COMMAND_MASTER
+        );
+        hierarchy.disable(&mut host, 0).unwrap();
+        assert!(!state.lock().unwrap().any_master());
+        // A bit that appears later is a change the recheck still refuses.
+        {
+            let mut state = state.lock().unwrap();
+            state.hardwired_clear = None;
+            let now = command(&state);
+            state.set(base + 4, 2, u32::from(now | regs::COMMAND_INTX_DISABLE));
+        }
+        assert_eq!(hierarchy.enable(&mut host, 0), Err(Error::ActiveChild));
+    }
+}
+
 #[test]
 fn a_child_that_keeps_mastering_or_signalling_is_refused_and_the_host_poisoned() {
     for (offset, bits) in [

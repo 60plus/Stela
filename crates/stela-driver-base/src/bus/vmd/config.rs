@@ -66,14 +66,20 @@ impl<R: Registers> ChildConfig<'_, R> {
 
 impl<R: Registers> Host<R> {
     /// Stop `child` as firmware may have left it: Bus Master, the MSI and
-    /// MSI-X enables and Enable No Snoop cleared, INTx Disable set, each read
-    /// back. Firmware commonly leaves the NVMe controller behind VMD
+    /// MSI-X enables and Enable No Snoop cleared, each read back, and INTx
+    /// Disable set. Firmware commonly leaves the NVMe controller behind VMD
     /// mastering; Linux's vmd driver scans it as found and its NVMe driver
     /// resets the controller.
     /// Nothing behind VMD reaches memory while the parent's own Bus Master
     /// is clear, so children are stopped only in that state. A child whose
-    /// bits stay set is refused and the host poisoned: it would master once
-    /// the parent's Bus Master is set.
+    /// Bus Master or message interrupt enable stays set is refused and the
+    /// host poisoned: it would master once the parent's Bus Master is set.
+    ///
+    /// INTx Disable is written and not required to read back: a function
+    /// may hard-wire it clear (PCI Express Base, Command register), and VMD
+    /// forwards no INTx at all, only MSI and MSI-X through its own vectors,
+    /// as Linux gives its child bus an MSI domain and no INTx routing. A
+    /// child that keeps the bit clear raises nothing the PC receives.
     pub(super) fn stop_child(&mut self, child: Address) -> Result<(), Error> {
         self.check_live()?;
         let parent = self.io().parent_read(regs::COMMAND, 2)?;
@@ -103,9 +109,7 @@ impl<R: Registers> Host<R> {
             if command != stopped {
                 config.write(regs::COMMAND, 2, u32::from(stopped))?;
                 let observed = word(&mut config, regs::COMMAND)?;
-                if observed & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
-                    != regs::COMMAND_INTX_DISABLE
-                {
+                if observed & regs::COMMAND_MASTER != 0 {
                     return Err(unstopped(regs::COMMAND, observed));
                 }
             }

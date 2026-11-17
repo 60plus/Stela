@@ -77,6 +77,8 @@ pub struct State {
     pub ack_failure: Option<usize>,
     /// Bits a child register keeps set whatever is written, by offset.
     pub stuck: Option<(usize, u32)>,
+    /// Bits a child register keeps clear whatever is written, by offset.
+    pub hardwired_clear: Option<(usize, u32)>,
     pub pm_failure: bool,
     pub pm_loses_bar: bool,
     pub release_failure: bool,
@@ -161,6 +163,7 @@ impl Default for Model {
             events: Vec::new(),
             ack_failure: None,
             stuck: None,
+            hardwired_clear: None,
             pm_failure: false,
             pm_loses_bar: false,
             release_failure: false,
@@ -272,6 +275,11 @@ unsafe impl Registers for Model {
                 && offset == posted
             {
                 value |= bits;
+            }
+            if let Some((offset, bits)) = state.hardwired_clear
+                && offset == posted
+            {
+                value &= !bits;
             }
             state.set(posted, posted_width, value);
             state.events.push(Event::Flushed(posted, posted_width));

@@ -10,6 +10,10 @@ const DECODE: u16 = regs::COMMAND_IO | regs::COMMAND_MEMORY;
 #[derive(Clone)]
 struct Function {
     child: Child,
+    /// COMMAND's INTx Disable as the stop left it: set, or clear on a
+    /// function that hard-wires it (`Host::stop_child`). Rechecks expect
+    /// it unchanged.
+    intx: u16,
     capabilities: Capabilities,
     bars: Vec<u32>,
     bridge: Option<Bridge>,
@@ -159,7 +163,12 @@ fn child_command<R: Registers>(
     let result = (|| {
         host.io()
             .child_write(base + usize::from(regs::COMMAND), 2, u32::from(value))?;
-        if host.io().child_read(base + usize::from(regs::COMMAND), 2)? != u32::from(value) {
+        // INTx Disable is asked for and may be hard-wired clear; each
+        // recheck compares it with what the stop found (`Function::intx`).
+        let hardwired = u32::from(regs::COMMAND_INTX_DISABLE);
+        if host.io().child_read(base + usize::from(regs::COMMAND), 2)? | hardwired
+            != u32::from(value) | hardwired
+        {
             return Err(Error::Readback);
         }
         Ok(())
@@ -175,11 +184,11 @@ fn capture<R: Registers>(host: &mut Host<R>, child: Child) -> Result<Function, E
         if !matches!(child.header, 0 | 1) || (bridge && child.class != [6, 4, 0]) {
             return Err(Error::UnsupportedDevice);
         }
-        if word(config, regs::COMMAND)? & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
-            != regs::COMMAND_INTX_DISABLE
-        {
+        let command = word(config, regs::COMMAND)?;
+        if command & regs::COMMAND_MASTER != 0 {
             return Err(Error::ActiveChild);
         }
+        let intx = command & regs::COMMAND_INTX_DISABLE;
         let capabilities = Capabilities::inspect(config, bridge)?;
         let mut bars = Vec::new();
         for i in 0..if bridge { 2 } else { 6 } {
@@ -203,6 +212,7 @@ fn capture<R: Registers>(host: &mut Host<R>, child: Child) -> Result<Function, E
         };
         Ok(Function {
             child,
+            intx,
             capabilities,
             bars,
             bridge,
@@ -469,7 +479,7 @@ impl Hierarchy {
                 let command = word(config, regs::COMMAND)?;
                 let dma = self.mastering(index);
                 if command & (regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
-                    != (regs::COMMAND_INTX_DISABLE | if dma { regs::COMMAND_MASTER } else { 0 })
+                    != (saved.intx | if dma { regs::COMMAND_MASTER } else { 0 })
                 {
                     return Err(Error::ActiveChild);
                 }
