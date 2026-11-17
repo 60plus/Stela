@@ -909,10 +909,11 @@ impl GuestNetwork {
     /// The beat report's line: the frames the guest adapter moved each way
     /// and dropped (oversized, filtered and overflowed), and the NCM blocks
     /// from the guest that did not decode, so a run shows whether traffic
-    /// moves. While the guest has sent frames and the host adapter has
-    /// given it none, not even a dropped one, the adapter's own state line
-    /// follows once a minute: a log that kept no early lines still shows
-    /// whether its link, receive ring and interrupts work.
+    /// moves. While the host adapter has no link, or the guest has sent
+    /// frames and the host adapter has given it none, not even a dropped
+    /// one, the adapter's own state line follows once a minute: a log that
+    /// kept no early lines still shows whether its link, PHY, receive ring
+    /// and interrupts work.
     pub fn report(&mut self) {
         let counters = self.counters;
         output::arguments(format_args!(
@@ -939,16 +940,18 @@ impl GuestNetwork {
         // Frames the host adapter gave, delivered or dropped at the guest's
         // filter or full queue (`oversized` counts both ways).
         let given = counters.to_guest + counters.filtered + counters.overflowed;
-        if counters.to_host == 0 || given != 0 {
+        let what = if self.carrier == Some(false) {
+            "has no link"
+        } else if counters.to_host != 0 && given == 0 {
+            "gave the guest no frame"
+        } else {
             self.silent_reports = 0;
             return;
-        }
+        };
         if self.silent_reports.is_multiple_of(SILENT_REPORTS)
             && let Some(Some(state)) = self.link.diagnostic_now()
         {
-            output::arguments(format_args!(
-                "GUEST NETWORK host adapter gave the guest no frame: {state}\n"
-            ));
+            output::arguments(format_args!("GUEST NETWORK host adapter {what}: {state}\n"));
         }
         self.silent_reports = self.silent_reports.wrapping_add(1);
     }
