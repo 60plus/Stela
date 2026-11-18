@@ -520,6 +520,7 @@ pub fn compute(iterations: u64) {
 /// milliseconds at most, so the calibration ends within about this.
 pub const BOUND_MS: u64 = 400;
 /// The words of one part of the large buffer's setup.
+#[cfg(target_arch = "x86_64")]
 const PART_WORDS: usize = (1 << 20) / 8;
 
 /// Calibrate the calling core within [`BOUND_MS`], its TSC at `tsc_hz` and
