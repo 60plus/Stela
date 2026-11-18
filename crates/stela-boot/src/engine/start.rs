@@ -2584,6 +2584,77 @@ fn takeover_part(detail: &str, stage: &'static &'static str) {
     super::step_watchdog::progress();
 }
 
+/// The `HOST POWER LIMITS` line (`stela_boot_core::host_power_limits`):
+/// on Intel the package's power limits in their model-specific registers,
+/// read through probes, and in the host bridge's memory-mapped copy, read
+/// through the mapping AML's SystemMemory fields use, before the PCI census
+/// as `pci_power` reads configuration. Nothing is written.
+fn report_power_limits(
+    acpi: Option<&'static super::aml::HostAcpi>,
+    mmio: Option<&'static crate::native_mmio::Source>,
+    root: u64,
+) {
+    use stela_boot_core::host_power_limits::{
+        IntelPackage, MMIO_POWER_LIMIT, amd_line, intel_line, mchbar,
+    };
+    let identity = core::arch::x86_64::__cpuid(0);
+    let intel =
+        (identity.ebx, identity.edx, identity.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    if !intel {
+        if [identity.ebx, identity.edx, identity.ecx] == stela_boot_core::msr::AMD_VENDOR {
+            output::arguments(format_args!("{}", amd_line()));
+        }
+        return;
+    }
+    let limit = host::pmu::read(0x610);
+    // The memory-mapped copy, where the host bridge decodes MCHBAR and the
+    // package has the register copy at all.
+    let mmio_limit = (|| {
+        let (acpi, mmio) = (acpi?, mmio?);
+        limit?;
+        let bridge = stela_drivers::bus::pci::Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let config = |offset| mmio.read_firmware_config(bridge, offset, 4).ok();
+        // An Intel host bridge (class 06h, subclass 00h).
+        if config(0)? & 0xffff != 0x8086 || config(8)? >> 8 != 0x06_0000 {
+            return None;
+        }
+        let register = mchbar(config(0x48)?, config(0x4c)?)? + MMIO_POWER_LIMIT;
+        if !mmio.firmware_owned(register, register + 8) {
+            return None;
+        }
+        // SAFETY: the loader root, which AML's SystemMemory mappings use and
+        // which keeps the engine window, on the BSP whose local record is
+        // installed, as `gpu::keep_video_bios_table` enters it here.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        let pointer = acpi.firmware_memory(register, 8)?.cast::<u32>();
+        // SAFETY: the host bridge's register, outside RAM, mapped uncached
+        // by the call above; reads have no effect.
+        let (low, high) = unsafe { (pointer.read_volatile(), pointer.add(1).read_volatile()) };
+        Some(u64::from(high) << 32 | u64::from(low))
+    })();
+    let package_status = stela_boot_core::host_clock::PACKAGE_THERM_STATUS
+        .implemented()
+        // SAFETY: CPUID.06H:EAX[6] enumerates the register; reading has no
+        // effect.
+        .then(|| unsafe { stela_boot_core::host_clock::PACKAGE_THERM_STATUS.read() });
+    output::arguments(format_args!(
+        "{}",
+        intel_line(IntelPackage {
+            units: host::pmu::read(0x606),
+            limit,
+            mmio_limit,
+            info: host::pmu::read(0x614),
+            temperature_target: host::pmu::read(0x1a2),
+            package_status,
+        })
+    ));
+}
+
 fn start_platform(
     handoff: &'static Handoff,
     host_owner: &mut host::HostOwner,
@@ -2756,6 +2827,7 @@ fn start_platform(
         takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
+    report_power_limits(host_acpi, native_mmio, handoff.root);
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
     takeover_part("PCI functions", &PCI_FUNCTIONS);

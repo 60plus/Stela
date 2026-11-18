@@ -63,6 +63,7 @@ pub mod host_identity;
 pub mod host_memory;
 #[cfg(target_arch = "x86_64")]
 pub mod host_performance;
+pub mod host_power_limits;
 pub mod host_resources;
 pub mod host_samples;
 pub mod hpet;
