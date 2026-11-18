@@ -1046,6 +1046,11 @@ fn a_smaller_log_an_older_loader_started_in_the_file_is_grown_in_place() {
         let small = older.log().unwrap();
         assert_eq!(small.overwritten() > 0, older_boots == 12);
         assert_eq!(disk.log().unwrap(), small, "read in the whole file");
+        assert_eq!(
+            read_newest(&mut disk, 1 << 20, |_| false).unwrap(),
+            small.stream,
+            "its newest lines read back"
+        );
         let mut writer = Writer::open(&mut disk).unwrap();
         assert!(writer.fresh().is_none());
         assert!(!writer.converted());

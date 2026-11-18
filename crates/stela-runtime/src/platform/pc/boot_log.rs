@@ -67,8 +67,8 @@
 //! its lines at their positions. A loader older than the longer file opens
 //! it as a [`LOG_BYTES`] region and starts a log of that size at its start,
 //! whose header names a smaller region than the file's: [`read`] reads that
-//! log, and a [`Writer`] lays it out in the whole file in place ([`grow`]),
-//! so the boots the older loader wrote stay. Writes reach its blocks directly, never
+//! log, as [`read_newest`] does, and a [`Writer`] lays it out in the whole
+//! file in place ([`grow`]), so the boots the older loader wrote stay. Writes reach its blocks directly, never
 //! the volume's directory or FAT: [`file_runs`] gives the block-aligned runs
 //! of its clusters, wherever they lie, that hold the bytes its layout needs.
 use super::fat32;
@@ -1669,8 +1669,15 @@ pub fn read_newest(
     }
     let mut header = vec![0; HEADER_BYTES as usize];
     device.read(0, &mut header)?;
-    let Ok(header) = Header::decode(&header, bytes) else {
-        return Ok(Vec::new());
+    // A smaller log at the region's start, an older loader's, as `read`.
+    let header = match Header::decode(&header, bytes) {
+        Ok(header) => header,
+        Err(error) => match prefix(&error, bytes, block)
+            .and_then(|smaller| Header::decode(&header, smaller).ok())
+        {
+            Some(header) => header,
+            None => return Ok(Vec::new()),
+        },
     };
     let (head, ring_bytes) = (header.head, header.layout.ring_bytes);
     let oldest = head.saturating_sub(ring_bytes);
