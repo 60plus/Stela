@@ -544,8 +544,13 @@ impl Prepared {
         for device in &devices.disks {
             let id = device.identity();
             output::arguments(format_args!(
-                "STORAGE DEVICE {:?} at {} serial={:?} model={:?} blocks={} block_size={}\n",
-                id.transport, id.location, id.serial, id.model, id.blocks, id.block_size
+                "STORAGE DEVICE {:?} at {} serial={} model={:?} blocks={} block_size={}\n",
+                id.transport,
+                id.location,
+                stela_contracts::masked::Tail(&id.serial),
+                id.model,
+                id.blocks,
+                id.block_size
             ));
         }
         let targets = self
@@ -559,7 +564,8 @@ impl Prepared {
                 Err(error) => {
                     output::arguments(format_args!(
                         "STORAGE REFUSED {}:{} {error}\n",
-                        target.serial, target.partition
+                        stela_contracts::masked::Tail(&target.serial),
+                        target.partition
                     ));
                     output::fatal(format_args!("storage target refused: {error}"))
                 }
@@ -580,7 +586,7 @@ impl Prepared {
                     "STORAGE {} {:?} serial={} partition={} blocks={} bytes={} sha256={hash}\n",
                     if write { "CHECKED" } else { "OPENED" },
                     disk.transport,
-                    disk.serial,
+                    stela_contracts::masked::Tail(&disk.serial),
                     target.partition,
                     blocks,
                     if write {
@@ -592,7 +598,8 @@ impl Prepared {
                 Err(error) => {
                     output::arguments(format_args!(
                         "STORAGE ERROR {}:{} {error}\n",
-                        target.serial, target.partition
+                        stela_contracts::masked::Tail(&target.serial),
+                        target.partition
                     ));
                     output::fatal(format_args!("storage check failed: {error}"))
                 }

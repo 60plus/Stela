@@ -980,7 +980,12 @@ fn guest_dropped(dropped: u64) {
 }
 
 fn guest_line(fragment: &console_lines::Line) {
-    output::arguments(format_args!("GUEST| {}\n", fragment.text));
+    // macOS prints MAC addresses, its ECID and UDID and names: the log
+    // keeps tags in their place (`stela_contracts::masked`).
+    output::arguments(format_args!(
+        "GUEST| {}\n",
+        stela_contracts::masked::mask_line(&fragment.text)
+    ));
     if !fragment.complete {
         output::arguments(format_args!(
             "GUEST-FRAGMENT bytes={} continues=1\n",

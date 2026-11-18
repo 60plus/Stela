@@ -396,10 +396,10 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
     for device in &mut devices.disks {
         let id = device.identity().clone();
         output::arguments(format_args!(
-            "DISK {:?} at {} serial={:?} model={:?} blocks={} block_size={} bytes={}\n",
+            "DISK {:?} at {} serial={} model={:?} blocks={} block_size={} bytes={}\n",
             id.transport,
             id.location,
-            id.serial,
+            stela_contracts::masked::Tail(&id.serial),
             id.model,
             id.blocks,
             id.block_size,

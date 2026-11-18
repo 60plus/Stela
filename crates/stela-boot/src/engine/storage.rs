@@ -703,7 +703,7 @@ impl Service {
             if self.failures <= 16 || self.failures.is_power_of_two() {
                 output::arguments(format_args!(
                     "HOST DISK ERROR serial={} {operation}={at}: {error} failures={}\n",
-                    self.inner.identity().serial,
+                    stela_contracts::masked::Tail(&self.inner.identity().serial),
                     self.failures
                 ));
             }
@@ -787,7 +787,7 @@ impl Service {
             self.signals.set(Some(false));
             output::arguments(format_args!(
                 "HOST DISK serial={} no completion interrupt, polling\n",
-                self.inner.identity().serial
+                stela_contracts::masked::Tail(&self.inner.identity().serial)
             ));
         }
     }
@@ -1386,7 +1386,7 @@ pub(super) fn try_stage(
     {
         output::arguments(format_args!(
             "HOST DISK serial={} not staged: every slot is taken; its I/O runs under the devices' lock\n",
-            device.identity().serial
+            stela_contracts::masked::Tail(&device.identity().serial)
         ));
         return Err(device);
     }
@@ -1605,7 +1605,10 @@ impl HostDisks {
                     Ordering::Relaxed,
                 );
             }
-            let mut line = format!("HOST DISK IO serial={serial}");
+            let mut line = format!(
+                "HOST DISK IO serial={}",
+                stela_contracts::masked::Tail(serial)
+            );
             for direction in Direction::ALL {
                 let counts = stats.directions[direction as usize];
                 if counts.ios != 0 {
@@ -1706,7 +1709,8 @@ impl HostDisks {
         for (serial, disk) in &self.disks {
             if let Some(activity) = disk.callback_activity() {
                 output::arguments(format_args!(
-                    "HOST DISK ACTIVITY serial={serial} counter_hz={tsc_hz} observed_before={} observed_after={} advance={:?} direct={:?} none=idle-or-raced coherent=false authority=none\n",
+                    "HOST DISK ACTIVITY serial={} counter_hz={tsc_hz} observed_before={} observed_after={} advance={:?} direct={:?} none=idle-or-raced coherent=false authority=none\n",
+                    stela_contracts::masked::Tail(serial),
                     activity.observed_before_ticks,
                     activity.observed_after_ticks,
                     activity.advance,
@@ -1716,7 +1720,8 @@ impl HostDisks {
             match disk.callback_stats() {
                 Some(callbacks) => Self::report_callback(serial, callbacks, tsc_hz, "guest-stop"),
                 None => output::arguments(format_args!(
-                    "HOST DISK CALLBACK serial={serial} phase=guest-stop unavailable=disabled-unpublished-or-held\n"
+                    "HOST DISK CALLBACK serial={} phase=guest-stop unavailable=disabled-unpublished-or-held\n",
+                    stela_contracts::masked::Tail(serial)
                 )),
             }
         }
@@ -1727,7 +1732,8 @@ impl HostDisks {
         let advance = callbacks.advance;
         let direct = callbacks.direct;
         output::arguments(format_args!(
-            "HOST DISK CALLBACK serial={serial} phase={phase} nested-not-additive=true advance_calls={} advance_total_us={} advance_max_us={} starts={} finishes={} max_starts={} max_finishes={} direct_calls={} direct_total_us={} direct_max_us={}\n",
+            "HOST DISK CALLBACK serial={} phase={phase} nested-not-additive=true advance_calls={} advance_total_us={} advance_max_us={} starts={} finishes={} max_starts={} max_finishes={} direct_calls={} direct_total_us={} direct_max_us={}\n",
+            stela_contracts::masked::Tail(serial),
             advance.calls,
             micros(advance.elapsed_ticks),
             micros(advance.maximum_ticks),
@@ -1922,7 +1928,7 @@ pub unsafe fn open(
     let service = |partition: PartitionDevice<Window>, role: &str| -> Box<dyn BlockDevice> {
         output::arguments(format_args!(
             "HOST PARTITION serial={} partition={} blocks={} block_size={} rotation={}{role}\n",
-            partition.disk().serial,
+            stela_contracts::masked::Tail(&partition.disk().serial),
             partition.partition().unique_guid,
             partition.identity().blocks,
             partition.identity().block_size,
@@ -2067,7 +2073,9 @@ pub unsafe fn open(
     // The log only: the serials stay off the screen.
     for (named, reported) in storage::serial_fallbacks(&mut devices.disks, &required) {
         output::arguments(format_args!(
-            "HOST DISK no disk reports serial {named:?}; its partition GUID is on the disk reporting {reported:?}, which is taken\n"
+            "HOST DISK no disk reports serial {}; its partition GUID is on the disk reporting {}, which is taken\n",
+            stela_contracts::masked::Tail(&named),
+            stela_contracts::masked::Tail(&reported)
         ));
     }
     for host in &devices.usb4_hosts {
@@ -2221,7 +2229,7 @@ pub unsafe fn open(
             };
             refuse!(
                 "{serial}:{partition}: {error}{hint}",
-                serial = target.serial.as_str(),
+                serial = %stela_contracts::masked::Tail(&target.serial),
                 partition = %target.partition,
                 %error,
                 %hint
@@ -2325,7 +2333,7 @@ pub unsafe fn open(
             } else {
                 output::arguments(format_args!(
                     "HOST DISK serial={} left out: the guest's hub has no free port\n",
-                    disk.identity().serial
+                    stela_contracts::masked::Tail(&disk.identity().serial)
                 ));
             }
         }
@@ -2339,7 +2347,7 @@ pub unsafe fn open(
             output::arguments(format_args!(
                 "HOST USB DISK serial={} model={:?} blocks={} block_size={} read_only={} \
                  rotation={}\n",
-                disk.identity().serial,
+                stela_contracts::masked::Tail(&disk.identity().serial),
                 disk.identity().model,
                 disk.identity().blocks,
                 disk.identity().block_size,
@@ -2446,9 +2454,10 @@ fn prepare(
     // The log only: the serials stay off the screen.
     if identity.serial != plan.serial {
         output::arguments(format_args!(
-            "INSTALLER no disk reports serial {:?}; the chosen disk's size and first blocks are \
-             on the disk reporting {:?}, which is taken\n",
-            plan.serial, identity.serial
+            "INSTALLER no disk reports serial {}; the chosen disk's size and first blocks are \
+             on the disk reporting {}, which is taken\n",
+            stela_contracts::masked::Tail(&plan.serial),
+            stela_contracts::masked::Tail(&identity.serial)
         ));
     }
     let name = storage::describe(&identity);
@@ -2457,7 +2466,8 @@ fn prepare(
         Ok(()) => {
             output::arguments(format_args!(
                 "INSTALLER prepared {}:{} on {name}\n",
-                plan.serial, plan.partition.guid
+                stela_contracts::masked::Tail(&plan.serial),
+                plan.partition.guid
             ));
             crate::status::done(if plan.table.is_empty() {
                 "its macOS partition is blank again"
@@ -2499,7 +2509,10 @@ fn update(updates: &[Update], targets: &[&Target], disks: &mut [Box<dyn BlockDev
         } else {
             Err(String::from("this boot does not use the partition"))
         };
-        let (serial, partition) = (target.serial.as_str(), target.partition);
+        let (serial, partition) = (
+            stela_contracts::masked::Tail(&target.serial),
+            target.partition,
+        );
         match (purpose, result) {
             (Purpose::NvramBank, Ok(())) => output::arguments(format_args!(
                 "NVRAM saved the bank without the consumed variables on {serial}:{partition}, \

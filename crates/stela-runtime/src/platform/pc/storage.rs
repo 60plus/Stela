@@ -12,6 +12,7 @@
 use super::gpt::{self, GptError, Guid, PartitionDevice};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt;
+use stela_contracts::masked::Tail;
 use stela_drivers::block::{BlockDevice, BlockError, Identity, Shared, Window};
 
 /// The disk and partition `stela.cfg` names, as `SERIAL:GUID`.
@@ -61,19 +62,19 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDisk { serial, found } => {
-                write!(f, "no disk has serial {serial:?}")?;
+                write!(f, "no disk has serial {}", Tail(serial))?;
                 if found.is_empty() {
                     return f.write_str("; no disk was found");
                 }
                 f.write_str("; found")?;
                 for (index, found) in found.iter().enumerate() {
                     let separator = if index == 0 { " " } else { ", " };
-                    write!(f, "{separator}{found:?}")?;
+                    write!(f, "{separator}{}", Tail(found))?;
                 }
                 Ok(())
             }
             Self::AmbiguousDisk(serial, count) => {
-                write!(f, "{count} disks have serial {serial:?}")
+                write!(f, "{count} disks have serial {}", Tail(serial))
             }
             Self::Table(error) => error.fmt(f),
             Self::NoPartition(guid) => write!(f, "no partition {guid}"),
@@ -544,18 +545,9 @@ fn size(bytes: u64) -> String {
 
 /// The last four characters of an identifier (a serial number, a GUID),
 /// after any padding, or `none`: enough to tell two apart on one PC, too
-/// little to identify the hardware.
+/// little to identify the hardware ([`Tail`]), as the log names it too.
 fn tail(identifier: &str) -> String {
-    let identifier = identifier.trim();
-    if identifier.is_empty() {
-        return String::from("none");
-    }
-    let start = identifier
-        .char_indices()
-        .rev()
-        .nth(3)
-        .map_or(0, |(index, _)| index);
-    alloc::format!("..{}", &identifier[start..])
+    alloc::format!("{}", Tail(identifier))
 }
 
 /// The byte at `offset` of the storage check's pattern.
@@ -666,7 +658,7 @@ mod tests {
                 found: vec![String::from("disk-a"), String::from("blank")],
             }
             .to_string(),
-            "no disk has serial \"disk-c\"; found \"disk-a\", \"blank\""
+            "no disk has serial ..sk-c; found ..sk-a, ..lank"
         );
         assert_eq!(
             StorageError::NoDisk {
@@ -674,7 +666,7 @@ mod tests {
                 found: Vec::new(),
             }
             .to_string(),
-            "no disk has serial \"disk-c\"; no disk was found"
+            "no disk has serial ..sk-c; no disk was found"
         );
         let esp = "AAAAAAAA-0000-0000-0000-000000000001";
         assert_eq!(

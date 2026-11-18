@@ -247,7 +247,7 @@ pub(super) unsafe fn probe_and_rescan(
             .map_err(|error| failure("flush medium B", error))?;
         output::arguments(format_args!(
             "USB MEDIA CHECKED serial={} location={} old_blocks={} fresh_blocks={} block_size={} permanent_stale=true old_read_refused=true old_flush_refused=true old_a1_read_refused=true old_a1_write_refused=true old_a1_flush_refused=true old_a1_poison_unchanged=true old_a2_read_refused=true old_a2_write_refused=true old_a2_flush_refused=true old_a2_poison_unchanged=true\n",
-            identity.serial,
+            stela_contracts::masked::Tail(&identity.serial),
             identity.location,
             identity.blocks,
             fresh.identity().blocks,

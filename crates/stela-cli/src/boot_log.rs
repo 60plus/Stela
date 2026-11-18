@@ -20,6 +20,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+use stela_contracts::masked::mask_line;
 use stela_drivers::block::{BlockDevice, BlockError, Identity, Transport};
 use stela_formats::payload::ReadAt;
 use stela_runtime::pc::{
@@ -144,7 +145,10 @@ pub(crate) fn write_logs(
         None => Box::new(std::io::stdout().lock()),
     };
     for note in notes {
-        match writeln!(sink, "=== NOTE: {} ===", note.replace('\n', " ")) {
+        // Headings name mount folders, which can hold the account's name:
+        // the written log, which people post, has a tag in its place.
+        let note = note.replace('\n', " ");
+        match writeln!(sink, "=== NOTE: {} ===", mask_line(&note)) {
             Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {
                 return Ok(());
             }
@@ -155,7 +159,7 @@ pub(crate) fn write_logs(
         let mut written = Ok(());
         if headings {
             eprint!("{place}: ");
-            written = writeln!(sink, "=== {place} ===");
+            written = writeln!(sink, "=== {} ===", mask_line(place));
         }
         let summary = summary(log);
         eprint!("{summary}");
@@ -1387,6 +1391,20 @@ pub(crate) mod tests {
         );
         let error = write_logs(&logs, false, &[], Some(&dir.path().join("no/such/dir")));
         assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
+
+        // Mount folders name the account; the written log has a tag there.
+        let place = "SanDisk (32 GB, /dev/sdb, /media/someone/STELA): USB";
+        let logs = [(String::from(place), logs[0].1.clone())];
+        let note = String::from("could not read Disk (1 TB, /dev/sda, /home/someone)");
+        write_logs(&logs, true, &[note], Some(&output)).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&output).unwrap()).into_owned();
+        assert!(!text.contains("someone"), "{text}");
+        let tag = stela_contracts::masked::Name("someone").to_string();
+        assert!(
+            text.contains(&format!("/media/{tag}/STELA): USB ===")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("/home/{tag}) ===")), "{text}");
     }
 
     /// A boot that ran until the log overwrote its own first lines: they

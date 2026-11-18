@@ -120,7 +120,7 @@ pub(super) unsafe fn probe_and_reset(
             .map_err(|error| failure("flush after USB reset", error))?;
         output::arguments(format_args!(
             "USB RESET CHECKED serial={} location={} blocks={} block_size={} old_read_refused=true old_flush_refused=true\n",
-            identity.serial,
+            stela_contracts::masked::Tail(&identity.serial),
             identity.location,
             fresh.identity().blocks,
             fresh.identity().block_size

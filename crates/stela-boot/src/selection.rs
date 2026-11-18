@@ -735,7 +735,11 @@ fn route_checked(
             let (disk, part) = match outside {
                 Some(target) => {
                     let value = format!("{}:{}", target.serial, target.partition);
-                    output::arguments(format_args!("BOOT volume on external disk {value}\n"));
+                    output::arguments(format_args!(
+                        "BOOT volume on external disk {}:{}\n",
+                        stela_contracts::masked::Tail(&target.serial),
+                        target.partition
+                    ));
                     retargeted = Some(replace(text, boot_selection::PREBOOT_OPTION, &value));
                     (target, Part::Whole)
                 }

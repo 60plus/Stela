@@ -316,7 +316,7 @@ impl HostNetwork {
             let frames = Rc::clone(&link.frames);
             output::arguments(format_args!(
                 "NETWORK candidate driver={driver} adapter={location} mac={}\n",
-                link.mac()
+                stela_contracts::masked::Mac(&link.mac().0)
             ));
             crate::status::progress(&format!("adapter {location}"));
             let mut seed = [0u8; 8];
@@ -767,7 +767,7 @@ impl GuestNetwork {
         output::arguments(format_args!(
             "GUEST NETWORK adapter {} mac={}\n",
             device.location(),
-            device.mac()
+            stela_contracts::masked::Mac(&device.mac().0)
         ));
         super::ident::set(
             super::ident::Kind::Network,

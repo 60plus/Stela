@@ -261,11 +261,11 @@ pub fn choose() -> Option<Plan> {
     };
     for disk in &picker.disks {
         output::arguments(format_args!(
-            "INSTALLER disk {} {} serial={:?} bytes={} rotation={} random_us={} \
+            "INSTALLER disk {} {} serial={} bytes={} rotation={} random_us={} \
              sequential_kib_s={} table={} refusal={:?}\n",
             disk.bus,
             disk.model,
-            disk.serial,
+            stela_contracts::masked::Tail(disk.serial.as_deref().unwrap_or_default()),
             disk.bytes(),
             disk.rotation,
             disk.speed.map_or(0, |speed| speed.random_us),
@@ -517,7 +517,7 @@ fn log(plan: &Plan, how: &str) {
     output::arguments(format_args!(
         "INSTALLER plan for {}:{} ({how}) first_lba={} blocks={} table_writes={}: nothing is \
          written now; Stela's drivers write it after the firmware has exited\n",
-        plan.serial,
+        stela_contracts::masked::Tail(&plan.serial),
         plan.partition.guid,
         plan.partition.first_lba,
         plan.partition.blocks,

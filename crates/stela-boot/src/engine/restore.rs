@@ -1053,7 +1053,13 @@ impl Experiment {
         let result = self.driver.poll_prefetched(&mut client);
         self.backpressure = client.backpressure();
         for message in &self.driver.session.ledger()[self.ledger..] {
-            output::arguments(format_args!("{label} ledger={message:?}\n"));
+            // The restore's messages hold the PC's ECID, UDID and serial
+            // number: the log keeps tags in their place.
+            let message = format!("{message:?}");
+            output::arguments(format_args!(
+                "{label} ledger={}\n",
+                stela_contracts::masked::mask_line(&message)
+            ));
         }
         self.ledger = self.driver.session.ledger().len();
         match result {
