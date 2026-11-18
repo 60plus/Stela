@@ -6,6 +6,7 @@ mod automatic;
 mod client;
 pub use client::{HttpPost, HttpRequest, HttpTransfer, TlsUnavailable};
 mod dad;
+mod dhcp;
 mod rdnss;
 mod tls;
 use super::{Clock, ClockError, Ipv4, NetError, http};
@@ -53,6 +54,8 @@ const DNS_WAIT_US: u64 = 15_000_000;
 const DNS_SERVER_US: u64 = 11_000_000;
 /// How long a name's address is used before it is looked up again.
 const RESOLVED_US: u64 = 300_000_000;
+/// The DHCP and DNS lines one stack keeps for its caller ([`Stack::take_notes`]).
+const NOTES: usize = 64;
 /// A POST, from connection to the response's end.
 const POST_WAIT_US: u64 = 120_000_000;
 /// A transfer that receives nothing for this long has failed.
@@ -81,6 +84,7 @@ struct Phy<L> {
     approved_ipv6: Vec<Ipv6Addr>,
     rdnss: rdnss::Rdnss,
     manage_ipv6: bool,
+    dhcp: dhcp::DhcpLog,
 }
 
 struct Rx<'a>(&'a [u8]);
@@ -90,6 +94,7 @@ struct Tx<'a, L> {
     frame: &'a mut Vec<u8>,
     fault: &'a mut Option<LinkError>,
     approved_ipv6: Option<&'a [Ipv6Addr]>,
+    dhcp: &'a mut dhcp::DhcpLog,
 }
 
 impl phy::RxToken for Rx<'_> {
@@ -117,7 +122,8 @@ impl<L: Link> phy::TxToken for Tx<'_, L> {
         // A full ring drops the frame, as a full queue would; the protocol
         // retransmits it. Anything else is the link's fault.
         match self.link.transmit(frame) {
-            Ok(()) | Err(LinkError::Busy) => {}
+            Ok(()) => self.dhcp.transmitted(frame),
+            Err(LinkError::Busy) => {}
             Err(error) => {
                 self.fault.get_or_insert(error);
             }
@@ -146,6 +152,7 @@ impl<L: Link> Device for Phy<L> {
                 }
                 self.rdnss
                     .observe(frame, self.local_ipv6, now.total_micros().max(0) as u64);
+                self.dhcp.received(frame);
                 Some((
                     Rx(frame),
                     Tx {
@@ -153,6 +160,7 @@ impl<L: Link> Device for Phy<L> {
                         frame: &mut self.tx_frame,
                         fault: &mut self.fault,
                         approved_ipv6: self.manage_ipv6.then_some(self.approved_ipv6.as_slice()),
+                        dhcp: &mut self.dhcp,
                     },
                 ))
             }
@@ -170,6 +178,7 @@ impl<L: Link> Device for Phy<L> {
             frame: &mut self.tx_frame,
             fault: &mut self.fault,
             approved_ipv6: self.manage_ipv6.then_some(self.approved_ipv6.as_slice()),
+            dhcp: &mut self.dhcp,
         })
     }
 
@@ -274,6 +283,13 @@ pub struct Stack<L: Link, C: Clock> {
     fixed_dns: Option<Vec<IpAddress>>,
     conflicts: Vec<Ipv6Addr>,
     probe_nonce: u64,
+    /// When the DHCP lease came, and when it was lost while none came since.
+    leased_at: Option<u64>,
+    lost_at: Option<u64>,
+    /// Lines for the caller's log ([`Self::take_notes`]), at most [`NOTES`],
+    /// and how many more there were.
+    notes: Vec<String>,
+    notes_dropped: u64,
 }
 
 impl<L: Link, C: Clock> Stack<L, C> {
@@ -295,6 +311,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             approved_ipv6: Vec::new(),
             rdnss: Default::default(),
             manage_ipv6: true,
+            dhcp: dhcp::DhcpLog::new(mac.0),
         };
         let initial = clock.now_us().map_err(NetError::Clock)?;
         let now = Instant::from_micros(
@@ -325,6 +342,10 @@ impl<L: Link, C: Clock> Stack<L, C> {
             fixed_dns: None,
             conflicts: Vec::new(),
             probe_nonce: seed,
+            leased_at: None,
+            lost_at: None,
+            notes: Vec::new(),
+            notes_dropped: 0,
         })
     }
 
@@ -340,6 +361,41 @@ impl<L: Link, C: Clock> Stack<L, C> {
 
     pub fn config(&self) -> Option<&Config> {
         self.config.as_ref()
+    }
+
+    /// The DHCP and DNS lines since the last call, for the caller's log:
+    /// each lease and lease loss, and each lookup that failed with what its
+    /// cached address was. A stack keeps at most [`NOTES`]; the last line
+    /// says how many more there were.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        let mut notes = core::mem::take(&mut self.notes);
+        if self.notes_dropped != 0 {
+            notes.push(alloc::format!(
+                "{} more DHCP and DNS lines not kept",
+                core::mem::take(&mut self.notes_dropped)
+            ));
+        }
+        notes
+    }
+
+    fn note(&mut self, line: String) {
+        if self.notes.len() < NOTES {
+            self.notes.push(line);
+        } else {
+            self.notes_dropped += 1;
+        }
+    }
+
+    /// The DHCPv4 exchange so far, while DHCP configures the interface:
+    /// what was sent, the replies by type and destination, why any was not
+    /// taken, and the last lease's time, server, mask and router.
+    pub fn dhcp_summary(&self) -> Option<String> {
+        self.dhcp?;
+        Some(alloc::format!(
+            "{}; {}",
+            self.phy.dhcp.summary(),
+            self.phy.dhcp.lease()
+        ))
     }
 
     /// Gives the interface `address`/`prefix` and the default router
@@ -451,6 +507,29 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 None => None,
             };
             if let Some(config) = news {
+                let now = self.last_time;
+                match (&config, &self.config) {
+                    (Some(new), _) => {
+                        let line =
+                            alloc::format!("DHCP lease {} {}", new.address, self.phy.dhcp.lease());
+                        self.note(line);
+                        self.leased_at = Some(now);
+                        self.lost_at = None;
+                    }
+                    (None, Some(old)) => {
+                        let age = self
+                            .leased_at
+                            .map_or(0, |at| now.saturating_sub(at) / 1_000_000);
+                        let line = alloc::format!(
+                            "DHCP lease {} lost after {age} s; {}",
+                            old.address,
+                            self.phy.dhcp.summary()
+                        );
+                        self.note(line);
+                        self.lost_at = Some(now);
+                    }
+                    (None, None) => {}
+                }
                 self.apply(config)?;
             }
         }

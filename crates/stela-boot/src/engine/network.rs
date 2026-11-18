@@ -339,7 +339,12 @@ impl HostNetwork {
                     "adapter {location}: waiting for the link, {seconds} s"
                 ));
             };
-            match stack.automatic_waiting(waiting) {
+            let result = stack.automatic_waiting(waiting);
+            // The DHCP lease, or what the exchange did without one.
+            for note in stack.take_notes() {
+                output::arguments(format_args!("NETWORK adapter {location} {note}\n"));
+            }
+            match result {
                 Ok(config) => {
                     output::arguments(format_args!("NETWORK driver={driver}\n"));
                     output::arguments(format_args!(
@@ -364,6 +369,11 @@ impl HostNetwork {
                         frames.sent.get(),
                         frames.received.get()
                     ));
+                    if let Some(dhcp) = stack.dhcp_summary() {
+                        output::arguments(format_args!(
+                            "NETWORK adapter {location} dhcp: {dhcp}\n"
+                        ));
+                    }
                     // What the adapter's own registers and rings say then,
                     // where its driver keeps them: a dead receive or
                     // transmit path is told apart from a silent network.
@@ -536,6 +546,13 @@ impl HostNetwork {
     /// Waits up to `micros` for the adapter's next frame (`Stack::wait`).
     pub fn wait(&mut self, micros: u64) -> Result<(), NetError> {
         self.stack.wait(micros)
+    }
+
+    /// The stack's DHCP and DNS lines since the last call
+    /// (`Stack::take_notes`): a lease lost and got back, a lookup that
+    /// failed and what its cached address was.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        self.stack.take_notes()
     }
 
     /// Opens one opaque TCP stream for the restore reverse proxy.

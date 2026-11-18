@@ -143,6 +143,7 @@ impl Lan {
             approved_ipv6: Vec::new(),
             rdnss: Default::default(),
             manage_ipv6: false,
+            dhcp: dhcp::DhcpLog::new(SERVER),
         };
         let config = InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(SERVER)));
         let mut iface = Interface::new(config, &mut server, Instant::ZERO);
@@ -789,4 +790,124 @@ fn a_transfer_describes_its_state_and_a_failed_download_keeps_it() {
         "{state}"
     );
     silent.close_http(download);
+}
+
+/// A clock that advances `step` µs at each reading, shared with the test.
+#[derive(Clone)]
+struct Stepping(Rc<Cell<u64>>, u64);
+
+impl Clock for Stepping {
+    fn now_us(&self) -> Result<u64, ClockError> {
+        self.0.set(self.0.get() + self.1);
+        Ok(self.0.get())
+    }
+}
+
+/// A DHCP server on the link: it answers each DISCOVER with an OFFER and
+/// each REQUEST with an ACK of 10.0.2.15/24 while `answering`, the OFFER
+/// without a server identifier unless `identified`.
+struct Dhcpd {
+    queue: VecDeque<Vec<u8>>,
+    answering: Rc<Cell<bool>>,
+    identified: bool,
+}
+
+impl Link for Dhcpd {
+    fn mac(&self) -> Mac {
+        CLIENT
+    }
+    fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
+        let request =
+            frame.len() > 282 && frame[12..14] == [0x08, 0x00] && frame[34..38] == [0, 68, 0, 67];
+        if !self.answering.get() || !request {
+            return Ok(());
+        }
+        let xid = u32::from_be_bytes(frame[46..50].try_into().unwrap());
+        // The message type option is the first after the magic cookie.
+        let kind = frame[42 + 240 + 2];
+        let server = [54, 4, 10, 0, 2, 2];
+        let lease = [
+            1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 2, 1, 51, 4, 0, 0, 14, 16,
+        ];
+        let options = match (kind, self.identified) {
+            (1, false) => lease.to_vec(),
+            _ => [&server[..], &lease[..]].concat(),
+        };
+        let reply = match kind {
+            1 => 2,
+            3 => 5,
+            _ => return Ok(()),
+        };
+        self.queue.push_back(dhcp::tests::frame(
+            67, 68, reply, xid, CLIENT.0, false, &options,
+        ));
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+        Ok(self.queue.pop_front())
+    }
+}
+
+fn dhcpd(identified: bool) -> (Stack<Dhcpd, Stepping>, Rc<Cell<bool>>, Stepping) {
+    let answering = Rc::new(Cell::new(true));
+    let clock = Stepping(Rc::default(), 100_000);
+    let link = Dhcpd {
+        queue: VecDeque::new(),
+        answering: answering.clone(),
+        identified,
+    };
+    (
+        Stack::new(link, clock.clone(), 7).unwrap(),
+        answering,
+        clock,
+    )
+}
+
+/// LOG-2: an OFFER the client cannot take is counted with smoltcp's reason,
+/// where the wait ended with no word of what the network answered.
+#[test]
+fn a_dhcp_wait_that_ends_without_a_lease_says_what_came_and_why_it_was_not_taken() {
+    let (mut stack, _, _) = dhcpd(false);
+    assert!(matches!(stack.dhcp(), Err(NetError::Dhcp(_))));
+    let summary = stack.dhcp_summary().unwrap();
+    assert!(summary.starts_with("sent discover="), "{summary}");
+    assert!(summary.contains(" request=0;"), "{summary}");
+    let offers = summary
+        .split("offer=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap();
+    assert_ne!(offers, "0", "{summary}");
+    assert!(
+        summary.contains(&alloc::format!("no_server_id={offers} ")),
+        "{summary}"
+    );
+    assert!(summary.contains("(broadcast=0 unicast="), "{summary}");
+    assert!(summary.ends_with("lease=unseen"), "{summary}");
+}
+
+/// LOG-2: a lease is noted with its time, server, mask and router, and its
+/// loss with its age; a stack configured by hand has no DHCP summary.
+#[test]
+fn a_dhcp_lease_and_its_loss_are_noted() {
+    let (mut stack, answering, clock) = dhcpd(true);
+    stack.dhcp().unwrap();
+    assert_eq!(
+        stack.take_notes(),
+        ["DHCP lease 10.0.2.15/24 lease=3600s server=10.0.2.2 mask=255.255.255.0 router=10.0.2.1"]
+    );
+    answering.set(false);
+    clock.0.set(clock.0.get() + 30_000_000);
+    let dhcp = stack.dhcp.unwrap();
+    stack.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+    stack.poll().unwrap();
+    assert!(stack.config().is_none());
+    let notes = stack.take_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("DHCP lease 10.0.2.15/24 lost after 30 s; sent discover="),
+        "{notes:?}"
+    );
+    stack.set_ipv4(CLIENT_IP, 24, None).unwrap();
+    assert_eq!(stack.dhcp_summary(), None);
 }
