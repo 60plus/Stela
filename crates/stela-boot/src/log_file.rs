@@ -196,7 +196,7 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
     let mut file = root
         .open(&path, FileMode::ReadWrite, FileAttribute::empty())
         .ok()
-        .and_then(|file| file.into_regular_file())
+        .and_then(|file| crate::file_kind::regular(file).ok())
         .ok_or(refuse!("Stela's volume has no \\EFI\\stela\\boot.log"))?;
     let size = file
         .get_boxed_info::<FileInfo>()
