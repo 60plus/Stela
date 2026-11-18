@@ -34,6 +34,42 @@ fn idle_poll_reads_status_once_and_still_checks_a_silent_prefix() {
 }
 
 #[test]
+fn the_bytes_each_port_gave_and_the_controller_state_are_counted_for_the_log() {
+    let (mut controller, hardware) = controller(Config::default());
+    controller.initialize().unwrap();
+    let start = controller.bytes_read();
+    hardware
+        .borrow_mut()
+        .output
+        .extend([(Port::Keyboard, 0x1c, 0), (Port::Keyboard, 0xf0, 0)]);
+    hardware
+        .borrow_mut()
+        .output
+        .push_back((Port::Keyboard, 0x1c, 0));
+    let inputs = controller.poll().unwrap();
+    assert!(!inputs.is_empty());
+    assert_eq!(controller.bytes_read()[0] - start[0], 3);
+    assert_eq!(controller.bytes_read()[1], start[1]);
+    let (status, config) = controller.controller_state();
+    assert!(status.is_some());
+    let config = config.expect("the start read the configuration byte");
+    let line = describe_controller(status, Some(config));
+    assert!(line.contains("keyboard port on"), "{line}");
+    assert_eq!(standing_status(0x1d), 0x14);
+    assert_eq!(standing_status(0xff), 0xff);
+    assert_eq!(
+        describe_controller(Some(0x04), Some(0x64)),
+        "status 04 (system flag on, keyboard inhibited, last byte's timeout off and parity \
+         error off), configuration 64 (keyboard port on, mouse port off, translation on, \
+         keyboard interrupt off, mouse interrupt off)"
+    );
+    assert_eq!(
+        describe_controller(Some(0xff), None),
+        "status ff (no controller answers), configuration not read"
+    );
+}
+
+#[test]
 fn full_reply_side_queue_preserves_every_consumed_byte_and_leaves_further_hardware_unread() {
     let (mut c, h) = controller(Config::default());
     c.initialize().unwrap();

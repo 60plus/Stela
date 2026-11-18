@@ -65,6 +65,56 @@ const GET_INFO: u8 = 0xe9;
 const QUEUE_LIMIT: usize = 64;
 const MAX_ATTEMPTS: usize = 2;
 
+/// Status bits that stand rather than follow each byte: the system flag
+/// and the keyboard's inhibit switch (set when not inhibited).
+const STANDING_STATUS: u8 = 0x14;
+
+/// The bits of the status register that stand, for telling a change from
+/// the flow of bytes; all ones, a controller that does not answer, kept.
+pub fn standing_status(status: u8) -> u8 {
+    if status == u8::MAX {
+        status
+    } else {
+        status & STANDING_STATUS
+    }
+}
+
+/// `status XX (...), configuration XX (...)`: the controller's status
+/// register and configuration byte in words, for the boot log.
+pub fn describe_controller(status: Option<u8>, config: Option<u8>) -> alloc::string::String {
+    use alloc::format;
+    let on = |set: bool| if set { "on" } else { "off" };
+    let status = match status {
+        None => alloc::string::String::from("status not read yet"),
+        Some(u8::MAX) => alloc::string::String::from("status ff (no controller answers)"),
+        Some(status) => format!(
+            "status {status:02x} (system flag {}, keyboard {}, last byte's timeout {} and parity \
+             error {})",
+            on(status & 0x04 != 0),
+            if status & 0x10 != 0 {
+                "not inhibited"
+            } else {
+                "inhibited"
+            },
+            on(status & 0x40 != 0),
+            on(status & 0x80 != 0),
+        ),
+    };
+    let config = match config {
+        None => alloc::string::String::from("configuration not read"),
+        Some(config) => format!(
+            "configuration {config:02x} (keyboard port {}, mouse port {}, translation {}, \
+             keyboard interrupt {}, mouse interrupt {})",
+            on(config & KEYBOARD_DISABLED == 0),
+            on(config & MOUSE_DISABLED == 0),
+            on(config & TRANSLATION != 0),
+            on(config & 1 != 0),
+            on(config & 2 != 0),
+        ),
+    };
+    format!("{status}, {config}")
+}
+
 /// Ordered, exclusively owned byte operations on the i8042 register pair.
 pub trait Registers {
     fn status(&mut self) -> u8;
@@ -389,6 +439,13 @@ pub struct Controller<R = PortIo, T = Clock> {
     /// Mouse bytes dropped for their parity or timeout bit, and bytes that
     /// broke a keyboard sequence or mouse packet and were dropped.
     framing_errors: u64,
+    /// Bytes read from the data port, by the port the status named:
+    /// keyboard, then mouse.
+    bytes_read: [u64; 2],
+    /// The last status read, `None` before the first.
+    last_status: Option<u8>,
+    /// The configuration byte the firmware left, as the first start read it.
+    firmware_config: Option<u8>,
 }
 
 /// The psmouse protocol probe the first initialization runs on the mouse port.
@@ -441,6 +498,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             last_command: None,
             refused: Vec::new(),
             framing_errors: 0,
+            bytes_read: [0; 2],
+            last_status: None,
+            firmware_config: None,
         })
     }
     /// Select the mouse port's protocol as Linux `psmouse_extensions` does
@@ -514,6 +574,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     }
     fn status(&mut self) -> Result<u8, ErrorKind> {
         let status = self.registers.status();
+        self.last_status = Some(status);
         if status == u8::MAX {
             Err(ErrorKind::NoController)
         } else {
@@ -572,6 +633,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(ErrorKind::QueueFull);
             }
             let data = self.registers.read_data();
+            let counted = &mut self.bytes_read[usize::from(port == Port::Mouse)];
+            *counted = counted.saturating_add(1);
             if dropped {
                 framed = status;
                 self.observed_response = Some(ObservedResponse { port, data });
@@ -847,6 +910,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         let config = self.controller_response(READ_CONFIG)?;
         self.controller_config = Some(config);
+        self.firmware_config.get_or_insert(config);
         self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         if self.config.reset_on_start {
             self.expect_controller(SELF_TEST, 0x55)?;
@@ -993,6 +1057,22 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// resynchronize.
     pub fn framing_errors(&self) -> u64 {
         self.framing_errors
+    }
+    /// Bytes read from the data port since the controller was taken, by
+    /// the port its status named: keyboard, then mouse, dropped ones
+    /// included.
+    pub fn bytes_read(&self) -> [u64; 2] {
+        self.bytes_read
+    }
+    /// The last status register read, and the configuration byte the
+    /// controller last held as this driver read or wrote it; `None` before
+    /// either.
+    pub fn controller_state(&self) -> (Option<u8>, Option<u8>) {
+        (self.last_status, self.controller_config)
+    }
+    /// The configuration byte the firmware left, as the first start read it.
+    pub fn firmware_config(&self) -> Option<u8> {
+        self.firmware_config
     }
     /// Set up the mouse's selected protocol, its reporting still disabled.
     fn set_up_mouse(&mut self) -> Result<(), ErrorKind> {
