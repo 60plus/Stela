@@ -64,6 +64,11 @@ pub(crate) enum StartupFailure {
         slot: usize,
         reason: Refusal,
     },
+    /// A processor that neither parked before the firmware's AML nor took
+    /// INIT, twice, may still read the startup page (`park::release_page`).
+    PageHeld {
+        apic: u32,
+    },
 }
 
 /// This object and its descriptors remain pinned for the whole boot, even
@@ -517,12 +522,6 @@ pub(crate) unsafe fn start(
     _fp_qualification: bool,
 ) -> Result<Executors, StartupFailure> {
     let cores = handoff.native_resources.cores as usize;
-    if cores > 1 && park::page_held() {
-        return Err(StartupFailure::Resources(
-            "a processor that did not park before the firmware's AML may still read the \
-             startup page",
-        ));
-    }
     if cores == 0 || cores > capture.core_count as usize {
         return Err(StartupFailure::Resources(
             "the reserved cores are none or more than the processor capture selects",
@@ -537,6 +536,9 @@ pub(crate) unsafe fn start(
         handoff.apic_base,
         layout::physical(handoff.apic_base & apic::BASE_ADDRESS),
     );
+    // SAFETY: CPL0 on the BSP, which alone sends, with interrupts masked and
+    // no processor started from the page yet.
+    let page = unsafe { park::release_page(&sender, handoff.tsc_hz) };
     let mut processors = Vec::with_capacity(cores - 1);
     let mut started: Vec<Starting> = Vec::with_capacity(cores - 1);
     // SAFETY: CPL0, BSP; PAT exists under the validated native floor.
@@ -613,6 +615,11 @@ pub(crate) unsafe fn start(
     // An AP that does not start ends the startup of the ones after it, and
     // the guest runs on the cores before it (`Executors::failure`).
     let mut failed: Vec<(usize, StartupFailure)> = Vec::new();
+    if let stela_boot_core::parking::Page::Held(holder) = page
+        && cores > 1
+    {
+        failed.push((1, StartupFailure::PageHeld { apic: holder.apic }));
+    }
     for slot in 1..cores {
         if !failed.is_empty() {
             break;

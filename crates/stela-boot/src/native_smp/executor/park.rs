@@ -21,7 +21,10 @@
 //! firmware's own idle loop or online, never in wait-for-SIPI. A PE's
 //! processor parked there is started from the page again later, by INIT
 //! and SIPI, as the startup always does; one that does not park is sent
-//! INIT again, so it reads nothing, and stays in wait-for-SIPI.
+//! INIT again, so it reads nothing, and stays in wait-for-SIPI. One that
+//! takes no INIT either holds the page: the startup sends it INIT once more
+//! and, when that fails too, starts no processor from the page and boots on
+//! the boot processor alone ([`release_page`]).
 use super::super::{bootstrap, firmware, memory_types::Image, topology};
 use crate::{
     apic::{self, Apic},
@@ -36,9 +39,9 @@ use core::{
         x86_64::{__cpuid, CpuidResult},
     },
     cell::UnsafeCell,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-use stela_boot_core::parking::{Census, Idle, IdleCpuid, Left, UNPUBLISHED};
+use stela_boot_core::parking::{Census, Holder, Idle, IdleCpuid, Left, Page, UNPUBLISHED};
 use stela_engine::machine::mmu::placement::Placement;
 
 /// A parked processor's stack: its descriptor installation runs on it, then
@@ -220,15 +223,43 @@ pub(super) unsafe fn park(
 pub(super) static OTHERS_PARKED: AtomicU32 = AtomicU32::new(0);
 pub(super) static OTHERS_WAITING: AtomicU32 = AtomicU32::new(0);
 
-/// A processor that did not park before the firmware's AML did not take
-/// INIT again either: it may still read the startup page, from which no
-/// other processor then starts.
-static PAGE_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A processor that did not park before the firmware's AML and did not take
+/// INIT again either, which may still read the startup page: its firmware
+/// number above its APIC ID, or [`NO_HOLDER`].
+static HOLDER: AtomicU64 = AtomicU64::new(NO_HOLDER);
+const NO_HOLDER: u64 = u64::MAX;
 
 /// Whether the startup page may still be read by a processor that did not
 /// park before the firmware's AML.
 pub(super) fn page_held() -> bool {
-    PAGE_HELD.load(Ordering::Acquire)
+    HOLDER.load(Ordering::Acquire) != NO_HOLDER
+}
+
+/// Send the processor that holds the startup page, if one does, INIT once
+/// more, and log what came of it: the page is free when it took it. When it
+/// did not, the page stays held, no processor starts from it, and the boot
+/// goes on with the boot processor alone (`Page::Held`).
+///
+/// # Safety
+/// On the boot processor, which alone sends interprocessor interrupts, with
+/// interrupts masked, before any processor starts from the startup page.
+pub(super) unsafe fn release_page(sender: &Apic, tsc_hz: u64) -> Page {
+    let word = HOLDER.load(Ordering::Acquire);
+    let holder = (word != NO_HOLDER).then_some(Holder {
+        apic: word as u32,
+        firmware_cpu: (word >> 32) as u32,
+    });
+    let page = stela_boot_core::parking::release(holder, |apic| {
+        // SAFETY: a destination validated before its parking; the caller's.
+        unsafe { sender.init_only(apic, tsc_hz) }.is_ok()
+    });
+    if let Page::Released(_) = page {
+        HOLDER.store(NO_HOLDER, Ordering::Release);
+    }
+    if page != Page::Free {
+        crate::output::arguments(format_args!("{page}\n"));
+    }
+    page
 }
 
 /// Each processor's wait from [`park_before_firmware`] (`Idle::encode`), by
@@ -320,7 +351,10 @@ pub(super) unsafe fn park_before_firmware(
                     // no other processor starts from the page here.
                     // SAFETY: a validated destination; the BSP alone sends.
                     if unsafe { sender.init_only(destination, handoff.tsc_hz) }.is_err() {
-                        PAGE_HELD.store(true, Ordering::Release);
+                        HOLDER.store(
+                            u64::from(processor.processor_number) << 32 | u64::from(destination),
+                            Ordering::Release,
+                        );
                         break;
                     }
                 }

@@ -163,10 +163,96 @@ impl fmt::Display for Census {
     }
 }
 
+/// A processor that neither parked before the firmware's AML nor took INIT
+/// then: it may still read the startup page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Holder {
+    pub apic: u32,
+    pub firmware_cpu: u32,
+}
+
+/// The startup page when the PEs' processors start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    /// No processor may still read it.
+    Free,
+    /// Its holder took INIT at the second try, and reads nothing.
+    Released(Holder),
+    /// Its holder did not take INIT twice: no processor starts from the page,
+    /// and the boot goes on with the boot processor alone.
+    Held(Holder),
+}
+
+/// The startup's answer to a held page: INIT its holder once more (`init`,
+/// true when delivered). The boot never stops for it.
+pub fn release(holder: Option<Holder>, init: impl FnOnce(u32) -> bool) -> Page {
+    match holder {
+        None => Page::Free,
+        Some(holder) if init(holder.apic) => Page::Released(holder),
+        Some(holder) => Page::Held(holder),
+    }
+}
+
+impl Page {
+    /// Whether processors may start from the page.
+    pub fn usable(self) -> bool {
+        !matches!(self, Self::Held(_))
+    }
+}
+
+impl fmt::Display for Page {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Free => f.write_str("NATIVE STARTUP PAGE free"),
+            Self::Released(Holder { apic, firmware_cpu }) => write!(
+                f,
+                "NATIVE STARTUP PAGE free: processor apic={apic:#x} firmware_cpu={firmware_cpu}, \
+                 which neither parked before the firmware's AML nor took INIT then, took INIT \
+                 now"
+            ),
+            Self::Held(Holder { apic, firmware_cpu }) => write!(
+                f,
+                "NATIVE STARTUP PAGE held: processor apic={apic:#x} firmware_cpu={firmware_cpu} \
+                 neither parked before the firmware's AML nor took INIT, twice, and may still \
+                 read the page: no other processor starts from it, and macOS runs on the boot \
+                 processor alone"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::format;
+
+    #[test]
+    fn a_held_startup_page_leaves_the_boot_processor_alone_and_never_stops_the_boot() {
+        let holder = Holder {
+            apic: 0x0c,
+            firmware_cpu: 6,
+        };
+        let mut sent = None;
+        let page = release(Some(holder), |apic| {
+            sent = Some(apic);
+            false
+        });
+        assert_eq!((page, sent), (Page::Held(holder), Some(0x0c)));
+        assert!(!page.usable());
+        assert_eq!(
+            format!("{page}"),
+            "NATIVE STARTUP PAGE held: processor apic=0xc firmware_cpu=6 neither parked before \
+             the firmware's AML nor took INIT, twice, and may still read the page: no other \
+             processor starts from it, and macOS runs on the boot processor alone"
+        );
+        // INIT delivered at the second try: the page is the startup's again.
+        let page = release(Some(holder), |_| true);
+        assert_eq!(page, Page::Released(holder));
+        assert!(page.usable());
+        assert!(format!("{page}").contains("apic=0xc firmware_cpu=6"));
+        // No holder: no INIT.
+        assert_eq!(release(None, |_| unreachable!()), Page::Free);
+    }
 
     fn intel(leaf5_ecx: u32, leaf5_edx: u32) -> IdleCpuid {
         IdleCpuid {
