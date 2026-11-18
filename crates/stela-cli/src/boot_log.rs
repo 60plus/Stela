@@ -336,7 +336,7 @@ fn find(path: &Path) -> Result<Found> {
     let mut magic = [0u8; 8];
     file.seek(SeekFrom::Start(0))?;
     if file.read_exact(&mut magic).is_ok() && &magic == boot_log::MAGIC {
-        let mut region = vec![0; usize::try_from(end.min(boot_log::LOG_BYTES))?];
+        let mut region = vec![0; usize::try_from(end.min(boot_log::MAX_FILE_BYTES))?];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut region)?;
         let log = boot_log::read(&region).with_context(|| format!("{}", path.display()))?;
@@ -497,23 +497,25 @@ fn stick(read: &mut Reader<'_>, bytes: u64) -> bool {
 }
 
 /// The USB's own log, [`crate::efi::BOOT_LOG`] on the FAT32 volume of a
-/// `bytes`-long partition: the file's first [`boot_log::LOG_BYTES`], which
-/// `stela.efi` writes through its clusters. A file no boot has written is
-/// refused; one whose header does not decode is read raw.
+/// `bytes`-long partition: the region the file's length gives
+/// ([`boot_log::file_region`]), which `stela.efi` writes through its
+/// clusters. A file no boot has written is refused; one whose header does
+/// not decode is read raw.
 fn file_log(read: &mut Reader<'_>, bytes: u64) -> Result<StickLog> {
     let mut volume = Fat32::open(Span { read, bytes }).map_err(|error| anyhow!("{error}"))?;
     let file = volume
         .file(crate::efi::BOOT_LOG)
         .map_err(|error| anyhow!("{error}"))?;
-    ensure!(
-        file.bytes >= boot_log::LOG_BYTES,
-        "{} holds {} bytes, fewer than the log's {}",
-        crate::efi::BOOT_LOG,
-        file.bytes,
-        boot_log::LOG_BYTES
-    );
+    let region_bytes = boot_log::file_region(file.bytes).with_context(|| {
+        format!(
+            "{} holds {} bytes, fewer than the log's {}",
+            crate::efi::BOOT_LOG,
+            file.bytes,
+            boot_log::LOG_BYTES
+        )
+    })?;
     let mut span = volume.into_inner();
-    let mut region = vec![0; boot_log::LOG_BYTES as usize];
+    let mut region = vec![0; usize::try_from(region_bytes)?];
     let mut done = 0;
     for extent in &file.extents {
         let take = usize::try_from(extent.bytes)?.min(region.len() - done);
@@ -1323,6 +1325,34 @@ pub(crate) mod tests {
             error.contains("no EFI/stela/boot.log on a FAT32 volume"),
             "{error}"
         );
+    }
+
+    /// A stick whose log file `stela` made 32 MiB long is read whole, and
+    /// a copy of that file too.
+    #[test]
+    fn boot_log_reads_a_long_log_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = region(&["boot one\n", "boot two\n"]);
+        let long = boot_log::relayout(&old, boot_log::FILE_BYTES).unwrap();
+        let path = dir.path().join("usb.img");
+        disk_image(&path, &[(ESP, &fat_volume(Some(&long)))]);
+        let (found, notes) = find(&path).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let [(_, log)] = &found[..] else {
+            panic!("{}", found.len());
+        };
+        assert_eq!(
+            log.ring_bytes,
+            boot_log::Layout::of(boot_log::FILE_BYTES).ring_bytes
+        );
+        assert_eq!(
+            log.stream,
+            b"=== STELA BOOT 1 ===\nboot one\n=== STELA BOOT 2 ===\nboot two\n"
+        );
+        let copy = dir.path().join("boot.log");
+        std::fs::write(&copy, &long).unwrap();
+        let (found, _) = find(&copy).unwrap();
+        assert_eq!(found[0].1.stream, log.stream);
     }
 
     #[test]

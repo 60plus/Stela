@@ -250,15 +250,7 @@ pub(crate) fn add_mount(
     if let Some(options) = options {
         write_atomic(&esp.join(OPTIONS), options.as_bytes(), false)?;
     }
-    // An existing log keeps its earlier boots. `stela.efi` writes its
-    // clusters wherever the volume put them.
-    if !esp.join(BOOT_LOG).is_file() {
-        write_atomic(
-            &esp.join(BOOT_LOG),
-            &vec![0; boot_log::LOG_BYTES as usize],
-            true,
-        )?;
-    }
+    keep_boot_log(esp, image.len() as u64)?;
     // The loader goes in last, so the stick never boots it without its files.
     write_atomic(&esp.join(LOADER), image, false)?;
     Ok(json!({
@@ -267,6 +259,69 @@ pub(crate) fn add_mount(
         "options": esp.join(OPTIONS).is_file().then(|| esp.join(OPTIONS)),
         "boot_log": esp.join(BOOT_LOG),
     }))
+}
+
+/// Room an EFI partition keeps beside a longer log file: a copy of the
+/// loader, which an update writes before it replaces the old one, and this
+/// margin.
+const LOADER_MARGIN: u64 = 16 << 20;
+
+/// The length to give a `current`-byte log file (0: none yet) on an EFI
+/// partition with `free` bytes free, whose `installed`-byte loader (0: none
+/// yet) a `loader`-byte one replaces: the longest of
+/// [`boot_log::FILE_BYTES`], 16 MiB and 8 MiB that can be written beside
+/// the old file and still leaves room for another copy of the loader and
+/// [`LOADER_MARGIN`] once the new loader is in place, as the next update
+/// needs; else [`boot_log::LOG_BYTES`] for a new file, and `None` to leave
+/// the file as it is.
+pub(crate) fn boot_log_bytes(current: u64, free: u64, loader: u64, installed: u64) -> Option<u64> {
+    let fits = |bytes: u64| {
+        let left = free
+            .checked_sub(bytes - current)
+            .and_then(|left| left.checked_sub(loader.saturating_sub(installed)));
+        free >= bytes && left.is_some_and(|left| left >= loader.saturating_add(LOADER_MARGIN))
+    };
+    let longest = [boot_log::FILE_BYTES, 16 << 20, 8 << 20]
+        .into_iter()
+        .find(|&bytes| bytes > current && fits(bytes));
+    match (current, longest) {
+        (_, Some(bytes)) => Some(bytes),
+        (0, None) => Some(boot_log::LOG_BYTES),
+        (_, None) => None,
+    }
+}
+
+/// Make the USB's log file, or make a shorter one longer with its lines
+/// ([`boot_log::relayout`]), as long as [`boot_log_bytes`] allows for a
+/// `loader`-byte loader. A file whose header does not decode keeps its
+/// bytes for `stela log` to read raw; a blank one is made anew.
+fn keep_boot_log(esp: &Path, loader: u64) -> Result<()> {
+    use crate::setup::host::Host as _;
+    let free = crate::setup::host::System
+        .volume(esp)
+        .map_or(0, |volume| volume.free_bytes);
+    keep_boot_log_in(esp, loader, free)
+}
+
+/// [`keep_boot_log`] on an EFI partition with `free` bytes free.
+fn keep_boot_log_in(esp: &Path, loader: u64, free: u64) -> Result<()> {
+    let path = esp.join(BOOT_LOG);
+    let current = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    let installed = fs::metadata(esp.join(LOADER)).map_or(0, |metadata| metadata.len());
+    let Some(bytes) = boot_log_bytes(current, free, loader, installed) else {
+        return Ok(());
+    };
+    if current == 0 {
+        // `stela.efi` writes its clusters wherever the volume put them.
+        return write_atomic(&path, &vec![0; bytes as usize], true);
+    }
+    let old = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let new = match boot_log::relayout(&old, bytes) {
+        Ok(new) => new,
+        Err(boot_log::HeaderError::Blank) => vec![0; bytes as usize],
+        Err(_) => return Ok(()),
+    };
+    write_atomic(&path, &new, false)
 }
 
 /// Paths relative to the ESP that `install` writes, for reports.
@@ -305,6 +360,74 @@ pub fn uninstall(esp: &Path, owned: bool) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn the_log_file_is_as_long_as_the_efi_partition_keeps_room_for_two_loaders() {
+        // A new stick's 200 MiB EFI partition and a 68 MB loader: 32 MiB.
+        assert_eq!(
+            boot_log_bytes(0, 199 * MIB, 68_400_128, 0),
+            Some(boot_log::FILE_BYTES)
+        );
+        // A loader of 90 MB leaves room for 8 MiB, one of 100 MB for none
+        // longer than the 4 MiB log of older sticks.
+        assert_eq!(boot_log_bytes(0, 199 * MIB, 90_000_000, 0), Some(8 * MIB));
+        assert_eq!(
+            boot_log_bytes(0, 199 * MIB, 100_000_000, 0),
+            Some(boot_log::LOG_BYTES)
+        );
+        // An update of a stick with a 4 MiB log and 127.6 MiB free beside
+        // its 68 MB loader: 32 MiB, and the new loader still fits after.
+        let free = 261_419 * 512;
+        assert_eq!(
+            boot_log_bytes(boot_log::LOG_BYTES, free, 68_400_128, 68_400_128),
+            Some(boot_log::FILE_BYTES)
+        );
+        // Less room: the longest that fits, or the file as it is.
+        assert_eq!(
+            boot_log_bytes(boot_log::LOG_BYTES, 100 * MIB, 68_400_128, 68_400_128),
+            Some(16 * MIB)
+        );
+        assert_eq!(
+            boot_log_bytes(boot_log::LOG_BYTES, 85 * MIB, 68_400_128, 68_400_128),
+            None
+        );
+        assert_eq!(
+            boot_log_bytes(boot_log::FILE_BYTES, 1 << 40, 68_400_128, 68_400_128),
+            None
+        );
+    }
+
+    #[test]
+    fn a_short_log_file_is_made_longer_with_its_lines() {
+        use stela_runtime::pc::boot_log::read;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(MOUNT)).unwrap();
+        let path = temp.path().join(BOOT_LOG);
+        // No file yet: a long one, all zeros.
+        keep_boot_log_in(temp.path(), 0, 1 << 40).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            vec![0; boot_log::FILE_BYTES as usize]
+        );
+        // A 4 MiB log of three boots.
+        let old = crate::boot_log::tests::region(&["boot 1\n", "boot 2\n", "boot 3\n"]);
+        fs::write(&path, &old).unwrap();
+        let before = read(&old).unwrap();
+        assert_eq!(before.boots, 3);
+        keep_boot_log_in(temp.path(), 0, 1 << 40).unwrap();
+        let grown = fs::read(&path).unwrap();
+        assert_eq!(grown.len() as u64, boot_log::FILE_BYTES);
+        let after = read(&grown).unwrap();
+        assert_eq!((after.stream, after.starts), (before.stream, before.starts));
+        // A file whose header does not decode keeps its bytes.
+        let mut torn = old.clone();
+        torn[16] ^= 0xff;
+        fs::write(&path, &torn).unwrap();
+        keep_boot_log_in(temp.path(), 0, 1 << 40).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), torn);
+    }
 
     /// What macOS answers for a rename that keeps an existing file on FAT
     /// and exFAT: ENOTSUP.

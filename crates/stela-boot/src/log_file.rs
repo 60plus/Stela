@@ -15,7 +15,7 @@ use stela_contracts::refuse;
 use stela_drivers::block::{BlockDevice, BlockError, Features, Identity, Shared, Transport};
 use stela_loader::mount_interface::BOOT_LOG_FILE;
 use stela_runtime::pc::{
-    boot_log::{self, LOG_BYTES, Writer},
+    boot_log::{self, Writer, file_region},
     device_starts::{self, Skips},
     fat32::Fat32,
     gpt::Guid,
@@ -157,10 +157,16 @@ fn report(writer: &Writer, through: &str) {
             writer.ring_bytes() >> 10
         ));
     }
+    let layout = writer.layout();
     output::arguments(format_args!(
-        "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x}\n",
+        "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x} ring={} KiB \
+         records={} of {} KiB first and {} KiB last lines\n",
         writer.boots(),
-        writer.head()
+        writer.head(),
+        layout.ring_bytes >> 10,
+        layout.records,
+        layout.first_bytes >> 10,
+        layout.last_bytes >> 10,
     ));
 }
 
@@ -202,15 +208,16 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
         .get_boxed_info::<FileInfo>()
         .map_err(|_| refuse!("the log file's size cannot be read"))?
         .file_size();
-    if size < LOG_BYTES {
-        return Err(refuse!("\\EFI\\stela\\boot.log is shorter than the log"));
-    }
+    let region = file_region(size).ok_or(refuse!(
+        "\\EFI\\stela\\boot.log is shorter than the log",
+        size
+    ))?;
     let identity = Identity {
         transport: Transport::Firmware,
         location: String::from(BOOT_LOG_FILE),
         model: String::new(),
         serial: String::new(),
-        blocks: LOG_BYTES / u64::from(BLOCK),
+        blocks: region / u64::from(BLOCK),
         block_size: BLOCK,
         read_only: false,
         // The firmware's file system may hold writes until a flush.
@@ -232,7 +239,11 @@ fn engine_file(partition: Box<dyn BlockDevice>) -> Result<()> {
     let file = volume
         .file(&BOOT_LOG_FILE.replace('\\', "/"))
         .map_err(|error| refuse!("boot log file: {error}", %error))?;
-    let runs = boot_log::file_runs(&file, block, LOG_BYTES)
+    let region = file_region(file.bytes).ok_or(refuse!(
+        "boot log file is shorter than the log",
+        bytes = file.bytes
+    ))?;
+    let runs = boot_log::file_runs(&file, block, region)
         .map_err(|error| refuse!("boot log file runs: {error}", %error))?;
     let partition = volume.into_inner().into_inner();
     let mut device: Box<dyn BlockDevice> = Box::new(

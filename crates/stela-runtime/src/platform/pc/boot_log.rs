@@ -58,10 +58,14 @@
 //!
 //! A file preallocated on a FAT32 volume can hold a log too: a machine-state
 //! file (`--nor-file`) laid out as the partition is, or the USB's own log
-//! (`stela_loader::mount_interface::BOOT_LOG_FILE`), [`LOG_BYTES`] of the
-//! region alone. Writes reach its blocks directly, never the volume's
-//! directory or FAT: [`file_runs`] gives the block-aligned runs of its
-//! clusters, wherever they lie, that hold the bytes its layout needs.
+//! (`stela_loader::mount_interface::BOOT_LOG_FILE`), the region alone, as
+//! long as the file is ([`file_region`]): [`LOG_BYTES`] on a stick an older
+//! `stela` made, [`FILE_BYTES`] where its EFI partition has room for it.
+//! [`Layout::of`] gives a region of [`LARGE_BYTES`] or more [`LARGE_RECORDS`]
+//! larger records. `stela` makes a file longer with [`relayout`], which keeps
+//! its lines at their positions. Writes reach its blocks directly, never
+//! the volume's directory or FAT: [`file_runs`] gives the block-aligned runs
+//! of its clusters, wherever they lie, that hold the bytes its layout needs.
 use super::fat32;
 use alloc::{collections::VecDeque, format, vec, vec::Vec};
 use core::{
@@ -75,8 +79,32 @@ use stela_soc_data::nor::CAPACITY;
 
 /// Where the region starts in the machine-state partition.
 pub const OFFSET: u64 = CAPACITY as u64 + stela_formats::machine_state::SEP_BYTES;
-/// The region: the header and the ring.
+/// The region on a machine-state partition, and the smallest log file: the
+/// header, the ring and [`RECORDS`] boot records.
 pub const LOG_BYTES: u64 = 4 << 20;
+/// The USB's log file as `stela` makes it, where the stick's 200 MiB EFI
+/// partition keeps room for two loaders beside it. Its ring of about 25 MiB
+/// holds a day's run of a booted desktop (2.8 MB in its first ten minutes,
+/// 3.4 MB in each of the next five ten-minute steps of its first hour,
+/// 0.8 MB in each later hour: `stela_boot_core::beat_pace`), so an
+/// eight-hour run is kept whole and a run of several days keeps its last
+/// day, and its records the first lines of the last [`LARGE_RECORDS`] boots.
+pub const FILE_BYTES: u64 = 32 << 20;
+/// The longest log file a boot writes: a longer one's first bytes.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
+/// A region this long or longer has [`LARGE_RECORDS`] records of
+/// [`LARGE_FIRST_BYTES`] and [`LARGE_LAST_BYTES`].
+pub const LARGE_BYTES: u64 = 16 << 20;
+/// The boot records of a region of [`LARGE_BYTES`] or more.
+pub const LARGE_RECORDS: u32 = 16;
+/// A large record's room for a boot's first lines: up to macOS's start, 56
+/// to 126 KB on the reporters' PCs, 278 KB on a PC whose GPU's firmware
+/// files the bundle lists one record line each (165 KB of it after the
+/// log's per-family budgets), with room to spare.
+pub const LARGE_FIRST_BYTES: u32 = 384 << 10;
+/// A large record's room for a boot's last lines: about a minute of a
+/// booted desktop's lines before it stopped or restarted.
+pub const LARGE_LAST_BYTES: u32 = 64 << 10;
 /// The smallest machine-state partition that holds the log.
 pub const PARTITION_BYTES: u64 = OFFSET + LOG_BYTES;
 pub const HEADER_BYTES: u64 = 4096;
@@ -115,18 +143,22 @@ pub struct Layout {
 
 impl Layout {
     /// The layout a writer gives a `region`-byte region: [`RECORDS`]
-    /// records in a whole log's, none in a shorter one.
+    /// records in a whole log's, [`LARGE_RECORDS`] larger ones from
+    /// [`LARGE_BYTES`], none in a shorter one.
     pub const fn of(region: u64) -> Self {
-        let area = RECORDS as u64 * (FIRST_BYTES as u64 + LAST_BYTES as u64);
-        if region >= LOG_BYTES {
-            Self {
-                ring_bytes: region - HEADER_BYTES - area,
-                records: RECORDS,
-                first_bytes: FIRST_BYTES,
-                last_bytes: LAST_BYTES,
-            }
+        let (records, first_bytes, last_bytes) = if region >= LARGE_BYTES {
+            (LARGE_RECORDS, LARGE_FIRST_BYTES, LARGE_LAST_BYTES)
+        } else if region >= LOG_BYTES {
+            (RECORDS, FIRST_BYTES, LAST_BYTES)
         } else {
-            Self::ring_only(region)
+            return Self::ring_only(region);
+        };
+        let area = records as u64 * (first_bytes as u64 + last_bytes as u64);
+        Self {
+            ring_bytes: region - HEADER_BYTES - area,
+            records,
+            first_bytes,
+            last_bytes,
         }
     }
 
@@ -278,6 +310,22 @@ impl fmt::Display for Unkept {
 }
 
 impl core::error::Error for Unkept {}
+
+/// The region a `bytes`-long log file holds: its whole 4 KiB pages, up to
+/// [`MAX_FILE_BYTES`]; `None` for a file shorter than [`LOG_BYTES`]. The
+/// firmware's path to the file and Stela's own give the same file the same
+/// region, so they agree on its layout.
+pub const fn file_region(bytes: u64) -> Option<u64> {
+    if bytes < LOG_BYTES {
+        return None;
+    }
+    let bytes = if bytes > MAX_FILE_BYTES {
+        MAX_FILE_BYTES
+    } else {
+        bytes
+    };
+    Some(bytes - bytes % HEADER_BYTES)
+}
 
 /// The runs of `file`'s blocks that hold its first `needed` bytes, each a
 /// first block and a count, in order: `file` is on a partition of
@@ -1334,16 +1382,18 @@ pub struct Log {
     pub boots: u64,
     pub head: u64,
     pub ring_bytes: u64,
-    /// The valid stream, oldest byte first.
+    /// The valid stream, oldest byte first: the ring's, from its first
+    /// byte a boot wrote.
     pub stream: Vec<u8>,
     /// The boots with a record, oldest first; none in a version 1 log.
     pub starts: Vec<BootStart>,
 }
 
 impl Log {
-    /// The stream bytes the ring has overwritten.
+    /// The stream bytes the ring no longer holds: those it has overwritten,
+    /// and those a longer file's ring never got ([`relayout`]).
     pub fn overwritten(&self) -> u64 {
-        self.head.saturating_sub(self.ring_bytes)
+        self.head.saturating_sub(self.stream.len() as u64)
     }
 
     /// The records of the boots whose first lines the stream no longer
@@ -1371,6 +1421,9 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     if bytes <= HEADER_BYTES {
         return Err(HeaderError::Short { bytes });
     }
+    // A log file's region: its whole pages up to the longest a boot writes.
+    let bytes = file_region(bytes).unwrap_or(bytes);
+    let region = &region[..bytes as usize];
     let header = Header::decode(&region[..HEADER_BYTES as usize], bytes)?;
     let (head, layout) = (header.head, header.layout);
     let ring_bytes = layout.ring_bytes;
@@ -1382,6 +1435,11 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let mut stream = Vec::with_capacity(len);
     stream.extend_from_slice(&ring[at..at + first]);
     stream.extend_from_slice(&ring[..len - first]);
+    // Bytes no boot wrote are zero, and lines are text: a ring that a
+    // longer file gave more room than its stream ([`relayout`]) starts
+    // with them.
+    let unwritten = stream.iter().take_while(|&&byte| byte == 0).count();
+    stream.drain(..unwritten);
     let mut starts: Vec<BootStart> = header
         .records
         .iter()
@@ -1410,6 +1468,69 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
         stream,
         starts,
     })
+}
+
+/// The log `old` holds (of either version), laid out in a `bytes`-long
+/// region for a log file made longer: every stream byte at its position,
+/// the boot count, and each kept boot's record, in the record its boot
+/// number gives in the new layout, its lines cut at a line's end where a
+/// record is smaller. A stream longer than the new ring keeps its newest
+/// bytes. A blank or invalid `old` is refused by name.
+pub fn relayout(old: &[u8], bytes: u64) -> Result<Vec<u8>, HeaderError> {
+    let log = read(old)?;
+    let layout = Layout::of(bytes);
+    if bytes <= HEADER_BYTES || !layout.fits(bytes, HEADER_BYTES) {
+        return Err(HeaderError::Short { bytes });
+    }
+    let mut region = vec![0; bytes as usize];
+    let ring = layout.ring_bytes;
+    let kept = log.stream.len().min(ring as usize);
+    let stream = &log.stream[log.stream.len() - kept..];
+    for (offset, &byte) in stream.iter().enumerate() {
+        let at = log.head - kept as u64 + offset as u64;
+        region[(HEADER_BYTES + at % ring) as usize] = byte;
+    }
+    let mut records = vec![Record::default(); layout.records as usize];
+    for start in &log.starts {
+        let index = (start.boot % u64::from(layout.records.max(1))) as usize;
+        let Some(record) = records.get_mut(index) else {
+            continue;
+        };
+        let cut = |lines: &[u8], room: u32| -> usize {
+            match lines.len() <= room as usize {
+                true => lines.len(),
+                false => whole_lines(&lines[..room as usize]).len(),
+            }
+        };
+        let first = cut(&start.first, layout.first_bytes);
+        // The newest last lines that fit, from a line's start when cut.
+        let mut last =
+            &start.last[start.last.len() - start.last.len().min(layout.last_bytes as usize)..];
+        if last.len() < start.last.len()
+            && let Some(end) = last.iter().position(|&byte| byte == b'\n')
+        {
+            last = &last[end + 1..];
+        }
+        let at = layout.record_at(index) as usize;
+        region[at..at + first].copy_from_slice(&start.first[..first]);
+        let after = at + layout.first_bytes as usize;
+        region[after..after + last.len()].copy_from_slice(last);
+        *record = Record {
+            boot: start.boot,
+            start: start.start,
+            first: first as u32,
+            last: last.len() as u32,
+        };
+    }
+    Header {
+        version: VERSION,
+        head: log.head,
+        boots: log.boots,
+        layout,
+        records,
+    }
+    .encode(&mut region[..HEADER_BYTES as usize]);
+    Ok(region)
 }
 
 /// The newest bytes of the stream the log on `device` holds, oldest first,

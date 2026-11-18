@@ -893,3 +893,119 @@ fn a_failed_store_s_lines_are_written_by_the_next() {
         }
     }
 }
+
+#[test]
+fn a_log_file_s_region_is_its_whole_pages_up_to_the_longest() {
+    assert_eq!(file_region(LOG_BYTES - 1), None);
+    assert_eq!(file_region(LOG_BYTES), Some(LOG_BYTES));
+    assert_eq!(file_region(LOG_BYTES + 100), Some(LOG_BYTES));
+    assert_eq!(file_region(FILE_BYTES), Some(FILE_BYTES));
+    assert_eq!(file_region((33 << 20) + 4095), Some(33 << 20));
+    assert_eq!(file_region(1 << 30), Some(MAX_FILE_BYTES));
+    // The region a machine-state partition holds keeps its layout, so
+    // every log written before stays readable.
+    assert_eq!(Layout::of(LOG_BYTES).ring_bytes, 3_141_632);
+    assert_eq!(Layout::of(LOG_BYTES).records, RECORDS);
+    // A long file: larger records for more boots, the rest ring.
+    let large = Layout::of(FILE_BYTES);
+    assert_eq!(
+        (large.records, large.first_bytes, large.last_bytes),
+        (LARGE_RECORDS, 384 << 10, 64 << 10)
+    );
+    assert_eq!(
+        large.ring_bytes,
+        FILE_BYTES - HEADER_BYTES - ((16 * 448) << 10)
+    );
+    for region in [LARGE_BYTES, FILE_BYTES, 20 << 20, MAX_FILE_BYTES] {
+        for block in [512, 4096] {
+            assert!(Layout::of(region).fits(region, block), "{region} {block}");
+        }
+    }
+    // Its header names every record in its first block.
+    assert!(FIELDS + LARGE_RECORDS as usize * RECORD_FIELDS + 32 <= 512);
+}
+
+/// A boot on a long log file keeps up to 384 KiB of its first lines, all
+/// it prints before macOS starts, past the ring's turn.
+#[test]
+fn a_long_log_file_keeps_each_boot_s_first_lines_whole() {
+    let mut disk = Recorder::new(FILE_BYTES, 512);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert_eq!(writer.layout(), Layout::of(FILE_BYTES));
+    // A head of 300 KB, then more than the ring.
+    let head = lines(0, 25_000);
+    writer.append(&head);
+    writer.flush(&mut disk).unwrap();
+    let ring = writer.ring_bytes() as usize;
+    let mut written = head.len();
+    let mut next = 25_000;
+    while written < ring + (1 << 20) {
+        let chunk = lines(next, 20_000);
+        next += 20_000;
+        written += chunk.len();
+        writer.append(&chunk);
+        writer.flush(&mut disk).unwrap();
+    }
+    let log = disk.log().unwrap();
+    assert_eq!(log.ring_bytes, ring as u64);
+    assert!(log.overwritten() > 0);
+    let [start] = &log.starts[..] else {
+        panic!("{}", log.starts.len());
+    };
+    let mut expected = b"=== STELA BOOT 1 ===\n".to_vec();
+    expected.extend_from_slice(&head);
+    assert!(start.first.len() > head.len() && start.first.starts_with(&expected));
+    assert_eq!(log.kept_starts().count(), 1);
+}
+
+/// `stela` makes a 4 MiB log file 32 MiB long: every line it held stays
+/// at its position, each kept boot's record goes with it, and the next
+/// boot writes on.
+#[test]
+fn a_log_laid_out_again_in_a_longer_file_keeps_its_lines_and_records() {
+    let mut disk = Recorder::new(LOG_BYTES, 512);
+    // Ten boots of 600 KB each: the 3 MiB ring has turned, eight records.
+    let mut next = 0;
+    for _ in 0..10 {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        for _ in 0..5 {
+            writer.append(&lines(next, 10_000));
+            next += 10_000;
+            writer.flush(&mut disk).unwrap();
+        }
+    }
+    let old = disk.log().unwrap();
+    assert_eq!(old.starts.len(), 8);
+    assert!(old.overwritten() > 0);
+    let grown = relayout(&disk.disk.bytes, FILE_BYTES).unwrap();
+    let new = read(&grown).unwrap();
+    assert_eq!((new.boots, new.head), (old.boots, old.head));
+    assert_eq!(new.ring_bytes, Layout::of(FILE_BYTES).ring_bytes);
+    assert_eq!(new.stream, old.stream);
+    assert_eq!(new.starts, old.starts);
+    // The next boot opens it as it is and fills the last boot's record.
+    let mut disk = Recorder::new(FILE_BYTES, 512);
+    disk.disk.bytes.copy_from_slice(&grown);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert!(writer.fresh().is_none());
+    writer.append(b"after the change\n");
+    writer.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert!(log.stream.starts_with(&old.stream));
+    assert!(
+        log.stream
+            .ends_with(b"=== STELA BOOT 11 ===\nafter the change\n")
+    );
+    assert_eq!(log.starts.len(), 9);
+    assert!(!log.starts[7].last.is_empty());
+    // A version 1 log is laid out too, without records.
+    let stream = lines(0, 6000);
+    let v1 = version_1(LOG_BYTES, 512, &stream, 3);
+    let grown = read(&relayout(&v1.disk.bytes, FILE_BYTES).unwrap()).unwrap();
+    assert_eq!((grown.boots, grown.stream), (3, stream));
+    // A blank file is refused by name.
+    assert_eq!(
+        relayout(&vec![0; LOG_BYTES as usize], FILE_BYTES),
+        Err(HeaderError::Blank)
+    );
+}
