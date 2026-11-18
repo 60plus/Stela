@@ -122,7 +122,7 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
     };
     // SAFETY: interrupts are masked since the trampoline; the tables are
     // this processor's and leaked, and nothing used the trampoline's own.
-    unsafe { interrupts::install_on(tables, interrupt) };
+    unsafe { interrupts::install_parked(tables, interrupt) };
     if parking.x2apic {
         // SAFETY: CPL0 with interrupts masked; this processor makes no APIC
         // handle.

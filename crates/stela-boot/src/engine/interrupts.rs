@@ -571,6 +571,25 @@ pub(crate) unsafe fn enable_avx() {
 /// for its whole lifetime, including its parked state. Interrupts are disabled;
 /// no native execution/handler can still refer to preceding tables or GS state.
 pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
+    // SAFETY: the caller's.
+    unsafe { install_tables(tables, handler, false) }
+}
+
+/// [`install_on`] for a processor that only idles parked: it takes no
+/// processor index and no heap cache of the running processors'
+/// (`host::local::activate`).
+///
+/// # Safety
+/// As [`install_on`], and the processor runs nothing but its idle loop and
+/// the fatal report.
+pub(crate) unsafe fn install_parked(tables: &'static mut Tables, handler: Handler) {
+    // SAFETY: the caller's.
+    unsafe { install_tables(tables, handler, true) }
+}
+
+/// # Safety
+/// As [`install_on`].
+unsafe fn install_tables(tables: &'static mut Tables, handler: Handler, parked: bool) {
     if tables.xstate.is_some() {
         output::fatal("native xstate descriptor owner cannot be reinstalled");
     }
@@ -643,7 +662,7 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
         // Loading a GS selector above resets its base; establish the private
         // CPL0 record after GDT/segment setup, before making our IDT active.
         let retained_tables = tables as *const Tables;
-        host::local::activate(&mut tables.local, handler, retained_tables);
+        host::local::activate(&mut tables.local, handler, retained_tables, parked);
         let idt = &raw mut tables.idt;
         let table = &stela_vector_table;
         for (&vector, &handler) in VECTOR_NUMBERS.iter().zip(table) {
