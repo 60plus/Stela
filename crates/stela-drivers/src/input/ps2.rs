@@ -129,6 +129,39 @@ pub fn describe_keyboard_path(translated: Option<bool>) -> &'static str {
     }
 }
 
+/// The SMBIOS chassis types Linux's `atkbd_is_portable_device` lists:
+/// portable, laptop, notebook, sub-notebook, convertible and detachable.
+const PORTABLE_CHASSIS: [u8; 6] = [8, 9, 10, 14, 31, 32];
+
+/// How a start decided a keyboard is behind the keyboard port, as Linux's
+/// `atkbd_probe` decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardPresence {
+    /// It answered GETID with a keyboard's two ID bytes.
+    Id,
+    /// GETID failed, and it acknowledged Set LEDs.
+    Leds,
+    /// No GETID was sent: the port is translated and the firmware reports
+    /// a portable chassis of this SMBIOS type, where Linux sends none.
+    Assumed { chassis_type: u8 },
+}
+
+/// The keyboard presence check a start took, for the boot log.
+pub fn describe_presence(presence: Option<KeyboardPresence>) -> alloc::string::String {
+    use alloc::{format, string::String};
+    match presence {
+        Some(KeyboardPresence::Id) => String::from("keyboard found by its GETID answer"),
+        Some(KeyboardPresence::Leds) => {
+            String::from("keyboard found by Set LEDs after GETID failed")
+        }
+        Some(KeyboardPresence::Assumed { chassis_type }) => format!(
+            "keyboard taken as present without GETID, a translated port in portable chassis \
+             type {chassis_type}"
+        ),
+        None => String::from("no keyboard presence check"),
+    }
+}
+
 /// Ordered, exclusively owned byte operations on the i8042 register pair.
 pub trait Registers {
     fn status(&mut self) -> u8;
@@ -198,6 +231,10 @@ pub struct Config {
     /// Query F0 00 after acknowledged Set 2 selection. Some laptop embedded
     /// keyboards ignore this optional query; native startup leaves it off.
     pub query_scan_set: bool,
+    /// The SMBIOS chassis type the firmware reports, as Linux's DMI
+    /// chassis type reads it. A translated keyboard in a portable chassis
+    /// is not sent GETID, as Linux's `atkbd_skip_getid` decides.
+    pub chassis_type: Option<u8>,
     pub io_timeout_us: u64,
     pub command_timeout_us: u64,
     pub reset_timeout_us: u64,
@@ -213,6 +250,7 @@ impl Default for Config {
             wheel: true,
             reset_on_start: true,
             query_scan_set: true,
+            chassis_type: None,
             io_timeout_us: 500_000,
             command_timeout_us: 200_000,
             reset_timeout_us: 1_000_000,
@@ -460,6 +498,8 @@ pub struct Controller<R = PortIo, T = Clock> {
     last_status: Option<u8>,
     /// The configuration byte the firmware left, as the first start read it.
     firmware_config: Option<u8>,
+    /// How the last start found the keyboard, `None` before it did.
+    keyboard_presence: Option<KeyboardPresence>,
 }
 
 /// The psmouse protocol probe the first initialization runs on the mouse port.
@@ -515,6 +555,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             bytes_read: [0; 2],
             last_status: None,
             firmware_config: None,
+            keyboard_presence: None,
         })
     }
     /// Select the mouse port's protocol as Linux `psmouse_extensions` does
@@ -928,6 +969,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(())
     }
     fn initialize_inner(&mut self) -> Result<(), ErrorKind> {
+        self.keyboard_presence = None;
         self.command(DISABLE_KEYBOARD)?;
         self.command(DISABLE_MOUSE)?;
         // Discard only pre-handoff bytes while both ports are disabled. A
@@ -1025,14 +1067,15 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
     }
     /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
-    /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
-    /// and the rest (reporting disable, Set 2 selection, LEDs, typematic)
-    /// tried and gone on without when the keyboard does not acknowledge
-    /// them. Behind
-    /// a translating controller no scan-set command is sent, as Linux's
-    /// `atkbd_select_set` sends none there. Untranslated, Set 2 selection is
-    /// tried, and a keyboard that refuses it is taken to report Set 2, the
-    /// set firmware and Linux both leave it in.
+    /// unless asked; GETID, or Set LEDs when GETID fails, to prove a
+    /// keyboard is there, and neither on a translated port in a portable
+    /// chassis, as `atkbd_skip_getid` decides; and the rest (reporting
+    /// disable, Set 2 selection, LEDs, typematic) tried and gone on without
+    /// when the keyboard does not acknowledge them. Behind a translating
+    /// controller no scan-set command is sent, as Linux's `atkbd_select_set`
+    /// sends none there. Untranslated, Set 2 selection is tried, and a
+    /// keyboard that refuses it is taken to report Set 2, the set firmware
+    /// and Linux both leave it in.
     fn start_keyboard(&mut self) -> Result<(), ErrorKind> {
         self.command(ENABLE_KEYBOARD)?;
         // Firmware may have left this keyboard reporting an unknown scan
@@ -1042,13 +1085,21 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.reset_device(Port::Keyboard)?;
             self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
         }
-        let leds_set = if self.keyboard_id()? {
-            false
-        } else {
-            self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
-            true
-        };
         let translated = self.controller_config.unwrap_or(0) & TRANSLATION != 0;
+        let portable = self
+            .config
+            .chassis_type
+            .filter(|chassis_type| translated && PORTABLE_CHASSIS.contains(chassis_type));
+        let presence = match portable {
+            Some(chassis_type) => KeyboardPresence::Assumed { chassis_type },
+            None if self.keyboard_id()? => KeyboardPresence::Id,
+            None => {
+                self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
+                KeyboardPresence::Leds
+            }
+        };
+        self.keyboard_presence = Some(presence);
+        let leds_set = presence == KeyboardPresence::Leds;
         if !translated {
             self.optional_keyboard(SET_SCAN, &[2])?;
         }
@@ -1090,9 +1141,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Err(kind) => Err(kind),
         }
     }
-    /// Linux `atkbd_probe`'s GETID: whether the keyboard acknowledged it and
-    /// sent an ID. A keyboard ID's first byte is one `ps2_is_keyboard_id`
-    /// lists and a second byte follows it, which a keyboard may leave out.
+    /// Linux `atkbd_probe`'s GETID: whether it succeeded with a keyboard's
+    /// ID. GETID fails, for the Set LEDs check, when it is not acknowledged
+    /// or an ID byte does not come. A first byte that `ps2_is_keyboard_id`
+    /// does not list ends GETID with a device that is no keyboard, which
+    /// Linux's atkbd does not take.
     fn keyboard_id(&mut self) -> Result<bool, ErrorKind> {
         match self.device_command(Port::Keyboard, GET_ID, &[]) {
             Ok(()) => {}
@@ -1105,13 +1158,21 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Err(ErrorKind::Timeout(Phase::Response)) => return Ok(false),
             Err(kind) => return Err(kind),
         };
-        if matches!(first, 0xab | 0xac | 0x2b | 0x5d | 0x60 | 0x47) {
-            match self.response(Port::Keyboard, self.timer.start(), timeout) {
-                Ok(_) | Err(ErrorKind::Timeout(Phase::Response)) => {}
-                Err(kind) => return Err(kind),
-            }
+        if !matches!(first, 0xab | 0xac | 0x2b | 0x5d | 0x60 | 0x47) {
+            return Err(ErrorKind::DeviceReply {
+                port: Port::Keyboard,
+                received: first,
+            });
         }
-        Ok(true)
+        match self.response(Port::Keyboard, self.timer.start(), timeout) {
+            Ok(_) => Ok(true),
+            Err(ErrorKind::Timeout(Phase::Response)) => Ok(false),
+            Err(kind) => Err(kind),
+        }
+    }
+    /// How the last start found the keyboard.
+    pub fn keyboard_presence(&self) -> Option<KeyboardPresence> {
+        self.keyboard_presence
     }
     /// Keyboard commands the keyboard did not acknowledge at its start, which
     /// the start went on without, as Linux's atkbd goes on without them.

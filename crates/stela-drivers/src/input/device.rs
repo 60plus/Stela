@@ -36,6 +36,8 @@ pub struct Ps2Counters {
     /// Whether keyboard bytes arrive translated to set 1, as the firmware
     /// left the controller; `None` before the first start.
     pub translated: Option<bool>,
+    /// How the start found the keyboard; `None` without a keyboard start.
+    pub keyboard_presence: Option<super::ps2::KeyboardPresence>,
 }
 
 /// An I²C-HID device on whichever bus and interrupt pin probe found it.
@@ -156,6 +158,7 @@ impl InputDevice {
             config,
             firmware_config: controller.firmware_config(),
             translated: controller.translated(),
+            keyboard_presence: controller.keyboard_presence(),
         })
     }
 

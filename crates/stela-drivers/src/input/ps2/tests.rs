@@ -6,6 +6,7 @@ use alloc::{rc::Rc, vec};
 use core::cell::{Cell, RefCell};
 mod elantech_tests;
 mod observation_tests;
+mod presence_tests;
 mod timing_tests;
 mod translation_tests;
 
@@ -213,6 +214,10 @@ struct Hardware {
     /// The controller loops a byte back to the auxiliary port's output.
     aux_loop: bool,
     loop_write: bool,
+    /// The keyboard answers no command, yet sends its keys.
+    keyboard_mute: bool,
+    /// The keyboard's GETID answer after its ACK.
+    keyboard_id: Vec<u8>,
     busy_forever: bool,
     flood: bool,
     resend: Option<(Port, u8, usize)>,
@@ -259,6 +264,8 @@ impl Hardware {
             unsettled_config: VecDeque::new(),
             aux_loop: true,
             loop_write: false,
+            keyboard_mute: false,
+            keyboard_id: vec![0xab, 0x83],
             busy_forever: false,
             flood: false,
             resend: None,
@@ -315,6 +322,9 @@ impl Hardware {
         if port == Port::Mouse { 1 } else { 0 }
     }
     fn device(&mut self, port: Port, data: u8) {
+        if port == Port::Keyboard && self.keyboard_mute {
+            return;
+        }
         if port == Port::Mouse
             && data == DISABLE_REPORTING
             && self.scanning[1]
@@ -563,8 +573,9 @@ impl Hardware {
             }
             // An MF2 keyboard's ID, unless it does not answer GETID.
             GET_ID if self.no_ack != Some((port, GET_ID)) => {
-                self.emit(port, 0xab);
-                self.emit(port, 0x83);
+                for byte in self.keyboard_id.clone() {
+                    self.emit(port, byte);
+                }
             }
             GET_ID => {}
             // A mouse's status: disabled, resolution 2, 100 reports a second.
