@@ -858,8 +858,8 @@ pub(super) const HOME_SLICES_PER_SECOND: u64 = 250;
 
 /// Seconds between heartbeat lines, which locate a guest that runs without
 /// output: every one a full beat for a boot's first ten minutes and under
-/// `--profile`, then a full beat once a minute and a short line between
-/// (`stela_boot_core::beat_pace`).
+/// `--profile`, then a full beat once a minute, and after an hour once in
+/// ten minutes, with a short line between (`stela_boot_core::beat_pace`).
 pub(super) const BEAT_SECONDS: u64 = beat_pace::BEAT_SECONDS;
 
 /// The counter when the guest first ran in this boot, which the beat's
