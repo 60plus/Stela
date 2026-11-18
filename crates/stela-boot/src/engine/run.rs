@@ -1437,6 +1437,8 @@ pub(super) struct Heartbeat {
     pub(super) pe_counts: Vec<parallel::Counts>,
     /// The host package's energy counter at the last beat (`PES CLOCK`).
     pub(super) package_energy: stela_boot_core::host_clock::PackageEnergy,
+    /// `HOST CLOCK ALL BUSY` was written.
+    pub(super) all_busy_written: bool,
     /// The shared count at the last beat, 0 before the first.
     pub(super) clock_count: u64,
     /// Lock waits at the last beat: the devices', by call, and the heap's.
@@ -1521,6 +1523,7 @@ impl Heartbeat {
             retired: machine.retired_instructions(),
             pe_counts: parallel::counts(machine),
             package_energy: stela_boot_core::host_clock::PackageEnergy::new(),
+            all_busy_written: false,
             clock_count: 0,
             lock_waits: ([0; Call::ALL.len()], 0),
             lock_times: Default::default(),
@@ -2455,6 +2458,34 @@ impl Heartbeat {
                 "{}\n",
                 stela_boot_core::exit_times::pes_exit_time(tsc_hz / 1000, &pe_exits)
             ));
+            // Once, the clock with every PE running at least 80 % of the beat
+            // against the boot's single-core clock.
+            if !self.all_busy_written {
+                let deltas: Vec<_> = pe_clocks
+                    .iter()
+                    .map(|clock| {
+                        clock.now.counters.then(|| {
+                            (
+                                clock.now.actual.wrapping_sub(clock.before.actual),
+                                clock.now.reference.wrapping_sub(clock.before.reference),
+                            )
+                        })
+                    })
+                    .collect();
+                if let Some((mhz, least)) =
+                    stela_boot_core::host_speed::all_busy_mhz(tsc_hz, elapsed, &deltas, 80)
+                {
+                    self.all_busy_written = true;
+                    output::arguments(format_args!(
+                        "{}",
+                        stela_boot_core::host_speed::all_busy_line(
+                            mhz,
+                            super::speed::single_core_hz(),
+                            least
+                        )
+                    ));
+                }
+            }
             // This core's package: one RAPL counter read a beat.
             let package_milliwatts = host::pmu::package_energy().and_then(|(unit, counter)| {
                 self.package_energy
