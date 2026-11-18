@@ -22,6 +22,8 @@ static u8 bound_spent;
 static u64 bound_skew;
 static struct stela_acpi_location bound_location;
 static u8 hardware_enabled;
+/* The namespace's device initialization ran: _INI runs once per device. */
+static u8 devices_initialized;
 static u8 arbitration_ready;
 static u8 core_started;
 static void *allocation_lock;
@@ -263,6 +265,7 @@ acpi_status stela_acpi_start(const struct stela_acpi_services *input, u8 hardwar
     /* A bound begun before the start counts from here, its first time read. */
     if (bound_ticks && !bound_end) bound_end = services.timer(CTX) + bound_ticks;
     hardware_enabled = 0;
+    devices_initialized = 0;
     __atomic_store_n(&arbitration_ready, 0, __ATOMIC_RELEASE);
     core_started = 0;
     bound_skew = 0;
@@ -291,8 +294,28 @@ acpi_status stela_acpi_start(const struct stela_acpi_services *input, u8 hardwar
     status = acpi_enable_subsystem(flags);
     if (ACPI_FAILURE(status)) return status;
     if (hardware) __atomic_store_n(&arbitration_ready, 1, __ATOMIC_RELEASE);
+    if (hardware) devices_initialized = 1;
     status = acpi_initialize_objects(hardware ? 0 : ACPI_NO_DEVICE_INIT);
     if (ACPI_SUCCESS(status) && hardware) hardware_enabled = 1;
+    if (ACPI_SUCCESS(status) && !stela_acpi_namespace_valid()) return AE_SUPPORT;
+    return status;
+}
+/* The namespace's device initialization without ACPI mode, events or their
+ * handlers, as acpi_initialize_objects runs it at an operating system's
+ * start: \_INI, \_SB._INI, _REG for the default address spaces still under
+ * ACPICA's default handlers, then _STA and _INI of every present device.
+ * Firmware sets what its other methods branch on here (the operating system
+ * it found through _OSI, a device's pins and addresses), so a namespace that
+ * skipped it describes devices as for an operating system without ACPI
+ * support. No SCI, GPE, fixed event or EmbeddedControl handler is needed: a
+ * method that reaches an operation region without a handler ends with its
+ * error, as it does when called alone. It runs once: a later hardware
+ * activation does not run _INI again. */
+acpi_status stela_acpi_initialize_devices(void) {
+    if (!active) return AE_NOT_EXIST;
+    if (devices_initialized) return AE_ALREADY_EXISTS;
+    devices_initialized = 1;
+    acpi_status status = acpi_initialize_objects(0);
     if (ACPI_SUCCESS(status) && !stela_acpi_namespace_valid()) return AE_SUPPORT;
     return status;
 }
@@ -315,7 +338,11 @@ acpi_status stela_acpi_enable_hardware(void) {
     __atomic_store_n(&arbitration_ready, 1, __ATOMIC_RELEASE);
     status = activate_retained_contexts();
     if (ACPI_FAILURE(status)) return status;
-    status = acpi_initialize_objects(0);
+    /* _INI runs once per device: a namespace whose devices were initialized
+     * before this activation keeps that initialization. */
+    u32 flags = devices_initialized ? ACPI_NO_DEVICE_INIT : 0;
+    devices_initialized = 1;
+    status = acpi_initialize_objects(flags);
     if (ACPI_SUCCESS(status)) hardware_enabled = 1;
     return status;
 }

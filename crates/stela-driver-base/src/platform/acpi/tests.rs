@@ -39,6 +39,174 @@ fn failed_hardware_activation_never_publishes_success_or_retries() {
     assert!(counts.destroyed.load(Ordering::SeqCst));
 }
 
+/// `op`, then the AML package length of what follows it, then `body`.
+fn package(op: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut aml = op.to_vec();
+    match body.len() + 1 {
+        length @ ..=0x3f => aml.push(length as u8),
+        _ => {
+            let length = body.len() + 2;
+            assert!(length < 0x1000);
+            aml.extend_from_slice(&[0x40 | (length & 0x0f) as u8, (length >> 4) as u8]);
+        }
+    }
+    aml.extend_from_slice(body);
+    aml
+}
+
+/// `Name (name, Buffer () { bytes })`.
+fn named_buffer(name: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x0a, bytes.len() as u8];
+    body.extend_from_slice(bytes);
+    let mut aml = vec![0x08];
+    aml.extend_from_slice(name);
+    aml.extend_from_slice(&package(&[0x11], &body));
+    aml
+}
+
+/// `Method (name, 0) { body }`.
+fn method(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut inner = name.to_vec();
+    inner.push(0);
+    inner.extend_from_slice(body);
+    package(&[0x14], &inner)
+}
+
+/// A touchpad as laptop firmware describes one, whose `_CRS` depends on
+/// the namespace's initialization:
+///
+/// ```asl
+/// Name (OSYS, 0x07D0)
+/// Method (_INI) { If (_OSI ("Windows 2012")) { Store (0x07DC, OSYS) } }
+/// Device (TPD0) {
+///     Name (_HID, "STLA0010")
+///     Name (SBFI, ResourceTemplate () { Interrupt (...) { 22 } })
+///     Name (SBFB, ResourceTemplate () {
+///         I2cSerialBusV2 (0, ControllerInitiated, 400000, AddressingMode7Bit, "I2C0")
+///         Interrupt (...) { 22 }
+///     })
+///     Name (BADR, Zero)
+///     Method (_INI) { Store (0x2C, BADR) }
+///     Method (_STA) { Return (0x0F) }
+///     Method (_CRS) {
+///         If (LLess (OSYS, 0x07DC)) { Return (SBFI) }
+///         CreateWordField (SBFB, 16, ADR0)
+///         Store (BADR, ADR0)
+///         Return (SBFB)
+///     }
+/// }
+/// Device (NCRS) { Name (_HID, "STLA0011") }
+/// ```
+fn touchpad_aml() -> Vec<u8> {
+    const INTERRUPT: [u8; 9] = [0x89, 6, 0, 0x1d, 1, 22, 0, 0, 0];
+    const END: [u8; 2] = [0x79, 0];
+    let mut aml = vec![0x08, b'O', b'S', b'Y', b'S', 0x0b, 0xd0, 0x07];
+    let mut found = b"_OSI\x0dWindows 2012\0".to_vec();
+    found.extend_from_slice(&[0x70, 0x0b, 0xdc, 0x07]);
+    found.extend_from_slice(b"OSYS");
+    aml.extend_from_slice(&method(b"_INI", &package(&[0xa0], &found)));
+    let mut device = b"TPD0".to_vec();
+    device.extend_from_slice(b"\x08_HID\x0dSTLA0010\0");
+    device.extend_from_slice(&named_buffer(b"SBFI", &[&INTERRUPT[..], &END].concat()));
+    let mut serial = vec![0x8e, 20, 0, 2, 0, 1, 2, 0, 0, 1, 6, 0];
+    serial.extend_from_slice(&400_000u32.to_le_bytes());
+    serial.extend_from_slice(&[0, 0]);
+    serial.extend_from_slice(b"I2C0\0");
+    assert_eq!(serial.len(), 23);
+    device.extend_from_slice(&named_buffer(
+        b"SBFB",
+        &[&serial[..], &INTERRUPT, &END].concat(),
+    ));
+    device.extend_from_slice(b"\x08BADR\0");
+    device.extend_from_slice(&method(b"_INI", b"\x70\x0a\x2cBADR"));
+    device.extend_from_slice(&method(b"_STA", &[0xa4, 0x0a, 0x0f]));
+    let mut crs = package(&[0xa0], b"\x95OSYS\x0b\xdc\x07\xa4SBFI");
+    crs.extend_from_slice(b"\x8bSBFB\x0a\x10ADR0");
+    crs.extend_from_slice(b"\x70BADRADR0");
+    crs.extend_from_slice(b"\xa4SBFB");
+    device.extend_from_slice(&method(b"_CRS", &crs));
+    aml.extend_from_slice(&package(&[0x5b, 0x82], &device));
+    aml.extend_from_slice(&package(&[0x5b, 0x82], b"NCRS\x08_HID\x0dSTLA0011\0"));
+    aml
+}
+
+#[test]
+fn device_initialization_runs_ini_once_and_crs_then_holds_the_i2c_connection() {
+    use resources::{DeviceResources, Resource, SerialKind};
+    let _serial = TEST_SERIAL.lock().unwrap();
+    let mut dsdt = include_bytes!("fixtures/namespace.aml").to_vec();
+    dsdt.extend_from_slice(&touchpad_aml());
+    let length = dsdt.len() as u32;
+    dsdt[4..8].copy_from_slice(&length.to_le_bytes());
+    checksum(&mut dsdt, 9);
+    let (provider, counts) = fixture_dsdt(dsdt);
+    // SAFETY: test provider owns all services; singleton serialized.
+    let session = unsafe { Session::start(provider, Mode::InterpreterOnly) }.unwrap();
+    let touchpad = session.handle("\\TPD0").unwrap();
+    let ran = || {
+        session
+            .handle("\\_SB.UCSI")
+            .unwrap()
+            .evaluate(Some("INIC"), &[])
+            .unwrap()
+    };
+    let connection = || {
+        resources::evaluate(touchpad, "_CRS")
+            .unwrap()
+            .into_iter()
+            .find_map(|descriptor| match descriptor.resource {
+                Resource::Serial(serial) => Some(serial.kind),
+                _ => None,
+            })
+    };
+    // A namespace that was only loaded answers as for an operating system
+    // that never looked: an interrupt and no I2C connection.
+    assert_eq!(ran(), Some(Value::Integer(0)));
+    assert_eq!(resources::evaluate(touchpad, "_CRS").unwrap().len(), 1);
+    assert_eq!(connection(), None);
+    session.initialize_devices().unwrap();
+    // \_INI recorded the operating system and the device's _INI its address.
+    assert_eq!(ran(), Some(Value::Integer(1)));
+    assert_eq!(
+        connection(),
+        Some(SerialKind::I2c {
+            address: 0x2c,
+            ten_bit: false
+        })
+    );
+    assert_eq!(
+        DeviceResources::inspect(touchpad)
+            .unwrap()
+            .descriptors()
+            .len(),
+        2
+    );
+    // Once per session, and without ACPI mode, events or a port write.
+    assert_eq!(session.initialize_devices(), Err(Error(7)));
+    assert_eq!(ran(), Some(Value::Integer(1)));
+    assert!(!session.hardware_enabled());
+    assert_eq!(counts.port_writes.load(Ordering::SeqCst), 0);
+    // A failed inspection names what was evaluated and ACPICA's status.
+    let bare = session.handle("\\NCRS").unwrap();
+    let Err(error) = DeviceResources::inspect(bare) else {
+        panic!("a device without _CRS was inspected");
+    };
+    assert_eq!(
+        error,
+        resources::Error::Method {
+            method: "_CRS",
+            status: Error(5)
+        }
+    );
+    assert_eq!(std::format!("{error}"), "_CRS: AE_NOT_FOUND");
+    let hidden = session.handle("\\_SB.HIDE").unwrap();
+    assert!(matches!(
+        DeviceResources::inspect(hidden),
+        Err(resources::Error::Unavailable(0))
+    ));
+    session.shutdown().unwrap();
+}
+
 #[test]
 fn a_status_is_named_as_acpica_names_it() {
     assert_eq!(Error(5).name(), Some("AE_NOT_FOUND"));

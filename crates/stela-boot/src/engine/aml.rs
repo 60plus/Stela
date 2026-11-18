@@ -1275,6 +1275,36 @@ impl HostAcpi {
         })))
     }
 
+    /// The namespace's device initialization in namespace mode: `\_INI`,
+    /// `\_SB._INI`, then `_STA` and `_INI` of every present device, which an
+    /// operating system runs before it looks for a device and hardware mode
+    /// ([`Self::activate`]) runs itself. Firmware records there which
+    /// operating system `_OSI` found and sets devices' pins and addresses;
+    /// without it a laptop's touchpad `_CRS` holds no I2C connection. It
+    /// runs before the PCI census, where AML may write PCI configuration as
+    /// it does under Linux, bounded like every firmware call, and reported.
+    pub(super) fn initialize_devices(&'static self) {
+        if self.capabilities != 0 {
+            return;
+        }
+        match self.firmware(
+            "device initialization",
+            "devices are described as far as it got",
+            true,
+            |session| session.initialize_devices(),
+        ) {
+            Some(Ok(())) => {
+                output::arguments(format_args!("ACPI firmware devices initialized (_INI)\n"));
+            }
+            Some(Err(error)) => output::arguments(format_args!(
+                "UNSUPPORTED ACPI device initialization: {error}; devices are described as for an \
+                 operating system without ACPI support\n"
+            )),
+            // Reported by the bounded call.
+            None => {}
+        }
+    }
+
     /// Hardware mode, once the PCI census and containment have taken the
     /// SCI's route: `prepared_sci`, which an interpreter-only namespace
     /// drops. Reported either way.

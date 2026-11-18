@@ -2709,6 +2709,12 @@ fn start_platform(
         handoff.tsc_hz,
         work.as_ref().ok().copied(),
     );
+    if let Some(acpi) = host_acpi {
+        // As an operating system does before it looks for any device.
+        static ACPI_DEVICES: &str = "initializing the firmware's ACPI devices (_INI)";
+        super::step_watchdog::stage(&ACPI_DEVICES);
+        acpi.initialize_devices();
+    }
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
     );

@@ -217,6 +217,7 @@ unsafe extern "C" {
     fn stela_acpi_bound_begin(ticks: u64);
     fn stela_acpi_bound_end(out: *mut RawLocation) -> u8;
     fn stela_acpi_enable_hardware() -> Status;
+    fn stela_acpi_initialize_devices() -> Status;
     fn stela_acpi_status_name(status: Status) -> *const c_char;
     fn stela_acpi_guard_enter(out: *mut *mut c_void, epoch: *mut u64) -> Status;
     fn stela_acpi_guard_leave(guard: *mut c_void);
@@ -409,6 +410,23 @@ impl Session {
         guard.check()?;
         self.hardware.set(HardwareState::Enabled);
         Ok(())
+    }
+    /// Initialize the namespace's devices without ACPI mode or events, as
+    /// an operating system's start does before it looks for devices: `\_INI`,
+    /// `\_SB._INI`, `_REG` for the default address spaces, then `_STA` and
+    /// `_INI` of every present device. Firmware sets there what its other
+    /// methods branch on: the operating system `_OSI` reported, and devices'
+    /// pins, addresses and IDs. Without it `_CRS`, `_STA` and `_DSM` answer
+    /// as for an operating system that knows no ACPI devices. It needs none
+    /// of the hardware capabilities; a method that reaches a region without a
+    /// handler (the embedded controller's) ends with its error. It runs once
+    /// per session, and a later [`Self::enable_hardware`] does not run `_INI`
+    /// again; a second call answers `ALREADY_EXISTS`.
+    pub fn initialize_devices(&self) -> Result<(), Error> {
+        let guard = self.guard()?;
+        // SAFETY: the live session owns ACPICA and the native provider.
+        checked(unsafe { stela_acpi_initialize_devices() })?;
+        guard.check()
     }
     /// True only after this provider's C activation succeeded, while its
     /// original namespace remains valid. No caller can manufacture this witness.
