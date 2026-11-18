@@ -15,7 +15,7 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering},
 };
-use stela_boot_core::firmware_runtime::Regions;
+use stela_boot_core::firmware_runtime::{Regions, Return};
 use stela_boot_core::running_record::{self, Running};
 use stela_boot_core::stop_record::{
     ATTRIBUTES, FirmwareCall, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR,
@@ -45,9 +45,9 @@ pub(crate) struct Services {
     query_variable_info: u64,
     /// This boot's number in the USB's log; 0 without one.
     boot: u64,
-    /// One more than the firmware entry this start came from
-    /// (`BootCurrent`, section 3.3); 0 where the firmware names none.
-    entry: u64,
+    /// How a restart comes back to the firmware entry this start came
+    /// from (`BootCurrent`, section 3.3): `Return::encode`.
+    restart: u64,
 }
 
 impl Services {
@@ -58,14 +58,19 @@ impl Services {
         if services.set_variable == 0 {
             return services;
         }
-        let entry = runtime::get_variable_boxed(
-            uefi::cstr16!("BootCurrent"),
-            &VariableVendor::GLOBAL_VARIABLE,
-        )
-        .ok()
-        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
-        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
-        Self { entry, ..services }
+        let variable = |name: &CStr16| {
+            runtime::get_variable_boxed(name, &VariableVendor::GLOBAL_VARIABLE)
+                .ok()
+                .map(|(value, _)| value)
+        };
+        let current = variable(uefi::cstr16!("BootCurrent"))
+            .and_then(|value| <[u8; 2]>::try_from(&*value).ok())
+            .map(u16::from_le_bytes);
+        let order = variable(uefi::cstr16!("BootOrder")).unwrap_or_default();
+        Self {
+            restart: Return::decide(current, &order).encode(),
+            ..services
+        }
     }
 
     /// [`Self::capture`] without the firmware entry this start came from,
@@ -88,7 +93,7 @@ impl Services {
             set_variable: runtime.set_variable as usize as u64,
             query_variable_info: runtime.query_variable_info as usize as u64,
             boot: 0,
-            entry: 0,
+            restart: Return::Unnamed.encode(),
         }
     }
 }
@@ -96,7 +101,7 @@ impl Services {
 static SET_VARIABLE: AtomicU64 = AtomicU64::new(0);
 static QUERY_VARIABLE_INFO: AtomicU64 = AtomicU64::new(0);
 static BOOT: AtomicU64 = AtomicU64::new(0);
-static ENTRY: AtomicU64 = AtomicU64::new(0);
+static RESTART: AtomicU64 = AtomicU64::new(0);
 /// The root the firmware's services are called in; zero for the tables
 /// the processor has, the firmware's own.
 static ROOT: AtomicU64 = AtomicU64::new(0);
@@ -107,7 +112,7 @@ static ROOT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn arm(services: Services, root: Option<u64>) {
     ROOT.store(root.unwrap_or(0), Ordering::Relaxed);
     BOOT.store(services.boot, Ordering::Relaxed);
-    ENTRY.store(services.entry, Ordering::Relaxed);
+    RESTART.store(services.restart, Ordering::Relaxed);
     QUERY_VARIABLE_INFO.store(services.query_variable_info, Ordering::Relaxed);
     SET_VARIABLE.store(services.set_variable, Ordering::Release);
 }
@@ -168,6 +173,9 @@ pub(crate) fn tell_unfinished(log: [u8; 16], carried: Option<u64>) {
     else {
         return;
     };
+    if running_record::variable_service_faulted(&running, boot(), &log, &newest) {
+        FAULTED_BEFORE.store(true, Ordering::Relaxed);
+    }
     let Some(found) = running_record::unfinished(&running, boot(), &log, carried, &newest) else {
         return;
     };
@@ -210,6 +218,10 @@ pub(crate) fn mark_running(log: Option<[u8; 16]>) {
                 boot,
                 log,
                 seconds: u32::try_from(seconds).unwrap_or(u32::MAX),
+                flags: match FAULTED_BEFORE.load(Ordering::Relaxed) {
+                    true => running_record::VARIABLE_FAULT,
+                    false => 0,
+                },
             };
             runtime::set_variable(name, &VariableVendor(VENDOR), attributes, &record.encode())
                 .err()
@@ -313,22 +325,31 @@ pub(crate) fn services() -> Services {
             QUERY_VARIABLE_INFO.load(Ordering::Relaxed)
         },
         boot: BOOT.load(Ordering::Relaxed),
-        entry: ENTRY.load(Ordering::Relaxed),
+        restart: RESTART.load(Ordering::Relaxed),
     }
 }
 
 /// Ask the firmware to start the entry this start came from at the next
 /// start (`BootNext`), for a restart macOS asked for: the firmware's own
 /// order may put another system first, and a restart must come back here.
-/// The entry's number where the firmware took it; nothing is asked where the
-/// firmware named no entry or its services are out of reach.
-pub(crate) fn return_at_restart() -> Option<u16> {
+/// Nothing is written where the entry is first in the firmware's order,
+/// where `BootNext` was written before the firmware's exit, or where the
+/// firmware named no entry or its services are out of reach. The `POWER`
+/// line that says which.
+pub(crate) fn return_at_restart() -> String {
     /// `EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS`.
     const BOOT_NEXT_ATTRIBUTES: u32 = 0x7;
-    let entry = u16::try_from(ENTRY.load(Ordering::Relaxed).checked_sub(1)?).ok()?;
+    let entry = match Return::decode(RESTART.load(Ordering::Relaxed)) {
+        Return::AtRestart(entry) => entry,
+        other => return other.line().unwrap_or_default(),
+    };
     let set = SET_VARIABLE.load(Ordering::Acquire) as usize;
     if set == 0 {
-        return None;
+        return format!(
+            "POWER the firmware chooses what starts after the restart: its variable service is \
+             not called after its exit in this boot, as a line above says, so BootNext for its \
+             entry Boot{entry:04X} is not written\n"
+        );
     }
     // SAFETY: the firmware's entry, as `Services::capture` read it from its
     // runtime services table; code addresses fit a pointer.
@@ -348,19 +369,76 @@ pub(crate) fn return_at_restart() -> Option<u16> {
             )
         }
     };
-    let status = in_firmware(FirmwareCall::BootNext, store);
-    (status == SUCCESS).then_some(entry)
+    match in_firmware(FirmwareCall::BootNext, store) {
+        SUCCESS => {
+            format!("POWER the firmware starts its entry Boot{entry:04X} again after the restart\n")
+        }
+        status => format!(
+            "POWER the firmware chooses what starts after the restart: it refused BootNext for \
+             its entry Boot{entry:04X} (status {status:#x})\n"
+        ),
+    }
 }
 
 /// The firmware's variable services are not called after its exit in this
 /// boot: [`services`] hands the engine none.
 static AFTER_EXIT_REFUSED: AtomicBool = AtomicBool::new(false);
+/// The runtime variable service faulted after the exit on this PC, in the
+/// last boot or an earlier one (`running_record::variable_service_faulted`).
+static FAULTED_BEFORE: AtomicBool = AtomicBool::new(false);
 
 /// From the firmware's exit on, this boot calls none of its variable
 /// services: a stop keeps no record in the firmware, and a restart writes
 /// no `BootNext` then.
 pub(crate) fn refuse_after_exit() {
     AFTER_EXIT_REFUSED.store(true, Ordering::Relaxed);
+}
+
+/// Before the firmware's exit, on a PC whose runtime variable service
+/// faulted in an earlier boot: call it only while boot services run. A
+/// restart that needs `BootNext` has it written now, while boot services
+/// run; the firmware then starts the entry again at the next start however
+/// this boot ends. Called once, before [`mark_running`], which keeps the
+/// PC's mark.
+pub(crate) fn before_exit() {
+    if !FAULTED_BEFORE.load(Ordering::Relaxed) {
+        return;
+    }
+    refuse_after_exit();
+    output::arguments(format_args!(
+        "FIRMWARE VARIABLE SERVICE faulted after the firmware's exit in an earlier boot on this \
+         PC, which can leave its variable store half written: this boot calls it only before \
+         the exit, and a stop keeps no record in the firmware\n"
+    ));
+    let Return::AtRestart(entry) = Return::decode(RESTART.load(Ordering::Relaxed)) else {
+        return;
+    };
+    /// `EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS`.
+    const BOOT_NEXT_ATTRIBUTES: u32 = 0x7;
+    let written = runtime::set_variable(
+        uefi::cstr16!("BootNext"),
+        &VariableVendor::GLOBAL_VARIABLE,
+        VariableAttributes::from_bits_retain(BOOT_NEXT_ATTRIBUTES),
+        &entry.to_le_bytes(),
+    );
+    let restart = match written {
+        Ok(()) => {
+            output::arguments(format_args!(
+                "FIRMWARE BootNext set to Boot{entry:04X} before the exit: a restart comes back \
+                 here, and so does the next start after a power-off or a stop\n"
+            ));
+            Return::BeforeExit(entry)
+        }
+        Err(error) => {
+            output::arguments(format_args!(
+                "FIRMWARE BootNext for Boot{entry:04X} refused before the exit ({:?}): the \
+                 firmware chooses what starts after a restart\n",
+                error.status()
+            ));
+            Return::Refused(entry)
+        }
+    };
+    RESTART.store(restart.encode(), Ordering::Relaxed);
 }
 
 /// No stop has tried to write the record.

@@ -1,6 +1,7 @@
 //! What Stela knows of the firmware's runtime services after their boot
 //! services end: the regions the firmware's memory map marks
-//! `EFI_MEMORY_RUNTIME`, and how the loader's tables map each one.
+//! `EFI_MEMORY_RUNTIME`, how the loader's tables map each one, and how a
+//! restart comes back to the firmware entry this start came from.
 //!
 //! Stela never calls `SetVirtualAddressMap`, so the services run at their
 //! physical addresses in the loader's root, which must map every runtime
@@ -276,6 +277,90 @@ impl Regions {
     }
 }
 
+/// How a restart comes back to the firmware entry this start came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Return {
+    /// The firmware named no entry for this start (`BootCurrent`): it
+    /// chooses what starts.
+    Unnamed,
+    /// The entry is first in the firmware's `BootOrder`, which starts it
+    /// again: no variable is written.
+    First(u16),
+    /// `BootNext` is written at the restart, through the runtime services.
+    AtRestart(u16),
+    /// `BootNext` was written before the firmware's exit, as this PC's
+    /// runtime variable service faulted in an earlier boot.
+    BeforeExit(u16),
+    /// This PC's runtime variable service faulted in an earlier boot and
+    /// the firmware refused `BootNext` before its exit: nothing is written,
+    /// the firmware chooses.
+    Refused(u16),
+}
+
+impl Return {
+    /// From `BootCurrent`, if the firmware has it, and `BootOrder`'s bytes.
+    pub fn decide(current: Option<u16>, order: &[u8]) -> Self {
+        let Some(current) = current else {
+            return Self::Unnamed;
+        };
+        let first = order
+            .get(..2)
+            .map(|first| u16::from_le_bytes([first[0], first[1]]));
+        match first {
+            Some(first) if first == current => Self::First(current),
+            _ => Self::AtRestart(current),
+        }
+    }
+
+    /// For the handoff: kind in bits 16 and up, entry below.
+    pub const fn encode(self) -> u64 {
+        let (kind, entry) = match self {
+            Self::Unnamed => (0, 0),
+            Self::First(entry) => (1, entry),
+            Self::AtRestart(entry) => (2, entry),
+            Self::BeforeExit(entry) => (3, entry),
+            Self::Refused(entry) => (4, entry),
+        };
+        (kind << 16) | entry as u64
+    }
+
+    pub const fn decode(value: u64) -> Self {
+        let entry = value as u16;
+        match value >> 16 {
+            1 => Self::First(entry),
+            2 => Self::AtRestart(entry),
+            3 => Self::BeforeExit(entry),
+            4 => Self::Refused(entry),
+            _ => Self::Unnamed,
+        }
+    }
+
+    /// The `POWER ...` line a restart writes, where no runtime call is
+    /// made; `None` for [`Self::AtRestart`], whose line follows the call.
+    pub fn line(self) -> Option<String> {
+        Some(match self {
+            Self::AtRestart(_) => return None,
+            Self::Unnamed => String::from(
+                "POWER the firmware chooses what starts after the restart: it named no entry for \
+                 this start\n",
+            ),
+            Self::First(entry) => format!(
+                "POWER the firmware starts its entry Boot{entry:04X} again after the restart: it \
+                 is first in the firmware's boot order, so no variable is written\n"
+            ),
+            Self::BeforeExit(entry) => format!(
+                "POWER the firmware starts its entry Boot{entry:04X} again after the restart, \
+                 by the BootNext written before its exit\n"
+            ),
+            Self::Refused(entry) => format!(
+                "POWER the firmware chooses what starts after the restart: it refused BootNext \
+                 for its entry Boot{entry:04X} before its exit, and its variable service is not \
+                 called after the exit on this PC\n"
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +450,31 @@ mod tests {
             regions
                 .place(0x10)
                 .contains("(and 3 more Stela did not keep)")
+        );
+    }
+
+    #[test]
+    fn a_restart_writes_boot_next_only_where_the_firmware_would_start_another_entry() {
+        assert_eq!(Return::decide(None, &[0, 0]), Return::Unnamed);
+        assert_eq!(Return::decide(Some(3), &[3, 0, 1, 0]), Return::First(3));
+        assert_eq!(Return::decide(Some(3), &[1, 0, 3, 0]), Return::AtRestart(3));
+        assert_eq!(Return::decide(Some(3), &[]), Return::AtRestart(3));
+        assert_eq!(Return::decide(Some(0x103), &[3, 1]), Return::First(0x103));
+        for value in [
+            Return::Unnamed,
+            Return::First(0),
+            Return::AtRestart(0xffff),
+            Return::BeforeExit(7),
+            Return::Refused(2),
+        ] {
+            assert_eq!(Return::decode(value.encode()), value);
+        }
+        assert_eq!(Return::AtRestart(1).line(), None);
+        assert!(
+            Return::First(0)
+                .line()
+                .unwrap()
+                .contains("Boot0000 again after the restart: it is first")
         );
     }
 }

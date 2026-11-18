@@ -33,7 +33,14 @@
 //! | 16 | 8 | the boot's number in the USB's log |
 //! | 24 | 16 | the GUID of the log's partition |
 //! | 40 | 4 | seconds since the PC started, at the write |
-//! | 44 | 4 | reserved, zero |
+//! | 44 | 4 | flags: [`VARIABLE_FAULT`] |
+//!
+//! A boot on a PC whose runtime variable service faulted
+//! ([`variable_service_faulted`]) sets [`VARIABLE_FAULT`], and every later
+//! boot there keeps it: each fault can leave the firmware's variable store
+//! half written, so on that PC Stela calls the service only while boot
+//! services run. Older versions, which want the word zero, read such a
+//! record as none.
 use alloc::{format, string::String};
 use stela_contracts::crc::crc32_ieee;
 
@@ -70,7 +77,13 @@ pub struct Running {
     pub log: [u8; 16],
     /// Seconds since the PC started when it was written.
     pub seconds: u32,
+    /// [`VARIABLE_FAULT`] or none.
+    pub flags: u32,
 }
+
+/// The firmware's runtime variable service faulted on this PC, in the boot
+/// the record names or an earlier one.
+pub const VARIABLE_FAULT: u32 = 1;
 
 impl Running {
     pub fn encode(&self) -> [u8; BYTES] {
@@ -80,6 +93,7 @@ impl Running {
         bytes[16..24].copy_from_slice(&self.boot.to_le_bytes());
         bytes[24..40].copy_from_slice(&self.log);
         bytes[40..44].copy_from_slice(&self.seconds.to_le_bytes());
+        bytes[44..48].copy_from_slice(&self.flags.to_le_bytes());
         let checksum = crc32_ieee(&bytes[16..]);
         bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
         bytes
@@ -93,7 +107,7 @@ impl Running {
             || &bytes[..8] != MAGIC
             || word(8) != VERSION
             || word(12) != crc32_ieee(&bytes[16..])
-            || word(44) != 0
+            || word(44) & !VARIABLE_FAULT != 0
         {
             return None;
         }
@@ -101,6 +115,7 @@ impl Running {
             boot: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
             log: bytes[24..40].try_into().expect("16 bytes"),
             seconds: word(40),
+            flags: word(44),
         })
     }
 }
@@ -137,6 +152,33 @@ pub fn enough(newest: &[u8]) -> bool {
     newest.len() >= TAIL_BYTES
         || text.contains(BOOT_MARKER)
         || ENDS.iter().any(|end| text.contains(end))
+}
+
+/// Whether the boot `running` names, the one before boot `this_boot` of
+/// the log on partition `this_log`, stopped on a fault inside the
+/// firmware's variable service, as `newest`, the log's newest lines from
+/// before this boot's own, show; or the record says an earlier boot on
+/// this PC did.
+pub fn variable_service_faulted(
+    running: &Running,
+    this_boot: u64,
+    this_log: &[u8; 16],
+    newest: &[u8],
+) -> bool {
+    if running.flags & VARIABLE_FAULT != 0 {
+        return true;
+    }
+    if running.log != *this_log || running.boot.checked_add(1) != Some(this_boot) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(newest);
+    let lines = text.rfind(BOOT_MARKER).map_or(&text[..], |at| &text[at..]);
+    lines.lines().any(|line| {
+        stamped(line)
+            .1
+            .strip_prefix("STELA FATAL ")
+            .is_some_and(|reason| reason.starts_with(crate::stop_record::FAULT_WORDS))
+    })
 }
 
 /// The step watchdog of the boot that ended, as its lines say.
@@ -335,7 +377,63 @@ mod tests {
             boot,
             log: LOG,
             seconds: 41,
+            flags: 0,
         }
+    }
+
+    #[test]
+    fn a_fault_in_the_variable_service_is_found_and_kept_for_the_pc() {
+        let faulted = "=== STELA BOOT 12 ===\n\
+            [ 2317.000] STEP Restarting the PC t=2317.000\n\
+            [ 2317.523] STELA FATAL x86 exception inside the PC firmware's variable service, \
+            which Stela called to start Stela again after the restart macOS asked for \
+            (vector=14 error=0x0 rip=0x777274ed cr2=0xffd0c04c): the PC does not restart by \
+            itself\n";
+        assert!(variable_service_faulted(
+            &running(12),
+            13,
+            &LOG,
+            faulted.as_bytes()
+        ));
+        // Another USB's log, an older boot, or another stop: not this PC's.
+        assert!(!variable_service_faulted(
+            &running(12),
+            13,
+            &[1; 16],
+            faulted.as_bytes()
+        ));
+        assert!(!variable_service_faulted(
+            &running(11),
+            13,
+            &LOG,
+            faulted.as_bytes()
+        ));
+        assert!(!variable_service_faulted(
+            &running(12),
+            13,
+            &LOG,
+            HUNG_AT_EXIT.as_bytes()
+        ));
+        // A fault in an earlier boot of the boot before this one is not it.
+        let earlier = alloc::format!("{faulted}=== STELA BOOT 12 ===\nSTELA RESTART code=0x15\n");
+        assert!(!variable_service_faulted(
+            &running(12),
+            13,
+            &LOG,
+            earlier.as_bytes()
+        ));
+        // The record's flag holds on any USB, after any boot.
+        let flagged = Running {
+            flags: VARIABLE_FAULT,
+            ..running(3)
+        };
+        assert!(variable_service_faulted(&flagged, 40, &[1; 16], b""));
+        assert_eq!(Running::decode(&flagged.encode()), Some(flagged));
+        let mut unknown = flagged.encode();
+        unknown[44] = 2;
+        let checksum = crc32_ieee(&unknown[16..]);
+        unknown[12..16].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(Running::decode(&unknown), None);
     }
 
     #[test]
