@@ -1874,9 +1874,9 @@ struct Installed {
     libc_clock: client::LibcClock,
     #[cfg(feature = "nvk")]
     heap_bytes: u64,
-    /// Clients' mappings with their sizes in pages, by address. For tasks.
+    /// Clients' mappings, by address. For tasks.
     #[cfg(feature = "nvk")]
-    mappings: RefCell<BTreeMap<u64, (stela_linux::client::Mapping, usize)>>,
+    mappings: RefCell<BTreeMap<u64, client::ClientMap>>,
     /// Mesa's running threads, by the bottom of their stacks. Only Linux
     /// entries, under the host drivers' lock, read and change it.
     #[cfg(feature = "nvk")]

@@ -25,6 +25,7 @@ pub mod bundle;
 pub mod bundle_repair;
 pub mod chain_check;
 pub mod chosen_disk;
+pub mod client_fault;
 pub mod console_lines;
 #[cfg(feature = "native-acpi")]
 pub mod crs;
