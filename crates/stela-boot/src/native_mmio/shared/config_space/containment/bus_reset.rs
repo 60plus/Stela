@@ -214,10 +214,9 @@ impl Source {
                 break;
             };
             let ltr = match &fabric.slots[index].forwarding {
-                Some(Forwarding::Open { config, .. }) => substates::ltr(config)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default(),
+                Some(Forwarding::Open { config, .. }) => {
+                    substates::ltr(config).ok().flatten().unwrap_or_default()
+                }
                 _ => substates::Ltr::default(),
             };
             chain.push(ltr);
