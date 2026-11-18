@@ -1429,6 +1429,8 @@ pub(super) struct Heartbeat {
     pub(super) retired: u128,
     /// Each PE's counts at the last beat.
     pub(super) pe_counts: Vec<parallel::Counts>,
+    /// The host package's energy counter at the last beat (`PES CLOCK`).
+    pub(super) package_energy: stela_boot_core::host_clock::PackageEnergy,
     /// The shared count at the last beat, 0 before the first.
     pub(super) clock_count: u64,
     /// Lock waits at the last beat: the devices', by call, and the heap's.
@@ -1512,6 +1514,7 @@ impl Heartbeat {
             line: Beat::at(machine, now),
             retired: machine.retired_instructions(),
             pe_counts: parallel::counts(machine),
+            package_energy: stela_boot_core::host_clock::PackageEnergy::new(),
             clock_count: 0,
             lock_waits: ([0; Call::ALL.len()], 0),
             lock_times: Default::default(),
@@ -2446,9 +2449,19 @@ impl Heartbeat {
                 "{}\n",
                 stela_boot_core::exit_times::pes_exit_time(tsc_hz / 1000, &pe_exits)
             ));
+            // This core's package: one RAPL counter read a beat.
+            let package_milliwatts = host::pmu::package_energy().and_then(|(unit, counter)| {
+                self.package_energy
+                    .sample(unit, counter, host::rdtsc(), tsc_hz)
+            });
             output::arguments(format_args!(
                 "{}\n",
-                stela_boot_core::host_clock::pes_clock(tsc_hz, elapsed, &pe_clocks)
+                stela_boot_core::host_clock::pes_clock(
+                    tsc_hz,
+                    elapsed,
+                    &pe_clocks,
+                    package_milliwatts
+                )
             ));
             output::arguments(format_args!("{fetches}\n"));
             let mut cache = None;

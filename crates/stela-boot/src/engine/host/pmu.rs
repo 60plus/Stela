@@ -184,6 +184,48 @@ impl stela_boot_core::host_performance::Registers for PerformanceRegisters {
     }
 }
 
+/// Where this host keeps its package energy counter: 0 before the probe,
+/// 1 none, 2 Intel's model-specific RAPL registers, 3 AMD's.
+static PACKAGE_ENERGY: AtomicU32 = AtomicU32::new(0);
+
+/// This processor's package energy unit register and counter
+/// (`stela_boot_core::host_clock::PackageEnergy`), where it has them: AMD's
+/// where CPUID enumerates RAPL, Intel's where a probe of both registers
+/// succeeds; found once for every processor, which share a vendor.
+pub(crate) fn package_energy() -> Option<(u64, u32)> {
+    use stela_boot_core::host_clock::{
+        AMD_PACKAGE_ENERGY, AMD_RAPL_UNIT, INTEL_PACKAGE_ENERGY, INTEL_RAPL_UNIT,
+    };
+    let source = match PACKAGE_ENERGY.load(Relaxed) {
+        0 => {
+            let identity = __cpuid(0);
+            // "GenuineIntel".
+            let intel = (identity.ebx, identity.edx, identity.ecx)
+                == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+            let source = if AMD_RAPL_UNIT.implemented() {
+                3
+            } else if intel
+                && read(INTEL_RAPL_UNIT).is_some()
+                && read(INTEL_PACKAGE_ENERGY).is_some()
+            {
+                2
+            } else {
+                1
+            };
+            PACKAGE_ENERGY.store(source, Relaxed);
+            source
+        }
+        source => source,
+    };
+    match source {
+        2 => Some((read(INTEL_RAPL_UNIT)?, read(INTEL_PACKAGE_ENERGY)? as u32)),
+        // SAFETY: CPUID 8000_0007H:EDX[14] enumerates both registers, and
+        // reading them has no effect.
+        3 => unsafe { Some((AMD_RAPL_UNIT.read(), AMD_PACKAGE_ENERGY.read() as u32)) },
+        _ => None,
+    }
+}
+
 /// The SMI counter's register (`stela_boot_core::smi`), probed once for
 /// every processor, which share a vendor: `u32::MAX` before the probe, 0
 /// where there is none.
