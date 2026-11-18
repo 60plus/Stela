@@ -134,6 +134,7 @@ fn poll_to_failure(input: &mut UsbInput) {
 fn two_failures_seconds_apart_on_an_idle_keyboard_keep_it_running() {
     let (mut input, hardware, shared, _dma) = numbered_keyboard();
     let clock = shared.borrow().clock;
+    assert!(input.name.ends_with("interface 4)"), "{}", input.name);
     assert!(input.take_first_error().is_none());
     // More transaction errors than the controller's soft retries absorb.
     hardware.borrow_mut().transaction_errors[3] = 5;
@@ -168,6 +169,7 @@ fn two_failures_seconds_apart_on_an_idle_keyboard_keep_it_running() {
             pressed: true
         }]
     );
+    assert!(input.stop_cause().is_none());
 }
 
 /// An endpoint that fails for a whole second is tried again once a second,
@@ -866,3 +868,19 @@ fn retired_identity_refuses_old_hid_control_poll_and_restart_without_dma_mutatio
 mod delimiter;
 mod sparse;
 pub(super) mod touch;
+
+/// A device that left names that as the cause its removal reports.
+#[test]
+fn a_departed_device_says_so_as_its_stop_cause() {
+    let (mut input, _hardware, shared, _dma) = numbered_keyboard();
+    assert!(input.poll().is_empty());
+    let id = shared.borrow().test_device_id(1).unwrap();
+    shared.borrow_mut().quarantine_slot(id);
+    assert!(input.poll().is_empty());
+    assert!(input.failed());
+    let cause = input.stop_cause().unwrap();
+    assert!(
+        cause.starts_with("the device left its port or was reset ("),
+        "{cause}"
+    );
+}

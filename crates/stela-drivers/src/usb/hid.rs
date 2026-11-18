@@ -318,6 +318,8 @@ pub struct UsbInput {
     failed: bool,
     /// The first transfer failure was handed to the log.
     error_reported: bool,
+    /// Why polling stopped for good.
+    stop_cause: Option<String>,
     pub name: String,
 }
 
@@ -505,7 +507,13 @@ impl UsbInput {
             receiver: None,
             failed: false,
             error_reported: false,
-            name: format!("{} ({})", device.name(), device.location),
+            stop_cause: None,
+            name: format!(
+                "{} ({} interface {})",
+                device.name(),
+                device.location,
+                interface.number
+            ),
         }))
     }
 
@@ -532,7 +540,11 @@ impl UsbInput {
                 let (releases, events) = self.translator.release();
                 self.pending.hid.inputs.extend(releases);
                 self.pending.hid.events.extend(events);
-                self.fault(error);
+                let cause = format!(
+                    "the device left its port or was reset ({})",
+                    super::xhci::explain(&error)
+                );
+                self.fault(error, cause);
             }
         }
         let now = self.controller.borrow().clock.now_us();
@@ -557,7 +569,11 @@ impl UsbInput {
                             trb
                         }
                         Err(error) => {
-                            self.fault(error);
+                            let cause = format!(
+                                "a transfer could not be queued: {}",
+                                super::xhci::explain(&error)
+                            );
+                            self.fault(error, cause);
                             break;
                         }
                     }
@@ -638,7 +654,12 @@ impl UsbInput {
                     // stops the interface: a transfer that keeps failing
                     // is tried again for as long as the device stays.
                     if let Err(recovery) = recovered {
-                        self.fault(recovery);
+                        let cause = format!(
+                            "the endpoint could not be made ready again ({}) after {}",
+                            super::xhci::explain(&recovery),
+                            super::xhci::explain(&error)
+                        );
+                        self.fault(recovery, cause);
                     }
                     break;
                 }
@@ -655,8 +676,11 @@ impl UsbInput {
         core::mem::take(&mut self.pending)
     }
 
-    fn fault(&mut self, error: BlockError) {
+    /// Stop polling for good with `error`; `cause` says why in the log's
+    /// words, and the first cause stays.
+    fn fault(&mut self, error: BlockError, cause: String) {
         self.error.get_or_insert(error);
+        self.stop_cause.get_or_insert(cause);
         self.failed = true;
         self.state = State::Faulted;
         self.invalidate_touch();
@@ -677,6 +701,11 @@ impl UsbInput {
     /// could not be made ready again after a failure.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// Why polling stopped for good, once it has.
+    pub fn stop_cause(&self) -> Option<&str> {
+        self.stop_cause.as_deref()
     }
 
     /// The first transfer failure, the first time it is asked for after it

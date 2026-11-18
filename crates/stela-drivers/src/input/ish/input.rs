@@ -162,4 +162,9 @@ impl<C: Configuration, R: Registers, T: Time> IshInput<C, R, T> {
     pub fn stopped(&self) -> bool {
         self.native.failure().is_some()
     }
+
+    /// The failure that stopped the ISH.
+    pub fn failure(&self) -> Option<Error> {
+        self.native.failure()
+    }
 }

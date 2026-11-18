@@ -88,6 +88,8 @@ pub struct BootInput {
     window_us: u64,
     clock: Clock,
     failed: bool,
+    /// The failure that stopped the device.
+    error: Option<Error>,
 }
 
 impl BootInput {
@@ -139,6 +141,7 @@ impl BootInput {
             window_us: (u64::from(pipe_interval) * 125 * 8).max(MINIMUM_WINDOW_US),
             clock,
             failed: false,
+            error: None,
         })
     }
 
@@ -159,8 +162,9 @@ impl BootInput {
                     self.translator.translate(report, &mut events, &mut inputs);
                 }
                 Ok(None) => break,
-                Err(_) => {
+                Err(error) => {
                     self.failed = true;
+                    self.error = Some(error);
                     inputs.extend(self.translator.release().0);
                     break;
                 }
@@ -234,5 +238,10 @@ impl BootInput {
     /// Whether the device stopped and is no longer read.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// The failure that stopped the device.
+    pub fn stop_error(&self) -> Option<Error> {
+        self.error
     }
 }

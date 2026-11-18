@@ -42,7 +42,11 @@ impl UsbInput {
             .device(self.id)
             .and_then(|mut device| device.cancel(self.endpoint.dci()));
         if let Err(error) = result {
-            self.fault(error.clone());
+            let cause = format!(
+                "its waiting transfer could not be cancelled: {}",
+                crate::usb::xhci::explain(&error)
+            );
+            self.fault(error.clone(), cause);
             return Err(error);
         }
         self.queued = None;
@@ -71,10 +75,15 @@ impl UsbInput {
             .device(self.id)
             .and_then(|mut device| device.endpoint_ready(self.endpoint.dci()));
         if let Err(error) = result {
-            self.fault(error.clone());
+            let cause = format!(
+                "its endpoint was not ready to restart: {}",
+                crate::usb::xhci::explain(&error)
+            );
+            self.fault(error.clone(), cause);
             return Err(error);
         }
         self.failed = false;
+        self.stop_cause = None;
         self.state = State::Running;
         self.restart_receiver();
         Ok(())

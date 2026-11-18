@@ -37,12 +37,15 @@ use stela_drivers::input::{HeldInputs, Input, InputDevice};
 use stela_soc::machine::AppleDevices;
 
 /// What was reported of one device, each kind once, and when it was read.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Reported {
     /// The device's identity while it is read ([`HeldInputs`]).
     id: u64,
     failed: bool,
     leds: bool,
+    /// The device's last polling failure, for the line that says why it
+    /// stopped when the device holds no cause of its own.
+    last_failure: Option<alloc::string::String>,
     /// The keyboard LEDs last wanted have not reached the device yet.
     leds_due: bool,
     /// The counter when the device was last polled, and when a poll last
@@ -290,10 +293,12 @@ impl HostInput {
             if pending.len() != before {
                 reported.active = now;
             }
-            if let Err(error) = polled
-                && !core::mem::replace(&mut reported.failed, true)
-            {
-                output::arguments(format_args!("INPUT {}: {error}\n", device.name()));
+            if let Err(error) = polled {
+                let error = alloc::format!("{error}");
+                if !core::mem::replace(&mut reported.failed, true) {
+                    output::arguments(format_args!("INPUT {}: {error}\n", device.name()));
+                }
+                reported.last_failure = Some(error);
             }
             stopped |= device.stopped();
             // A poll can take milliseconds in a hypervisor: a posted GPU call
@@ -355,11 +360,22 @@ impl HostInput {
                 continue;
             };
             let device = self.inputs.devices.remove(index);
-            self.reported.remove(index);
+            let reported = self.reported.remove(index);
             let name = device.name();
+            let cause = stop_cause(device.stop_cause(), reported.last_failure);
             drop(device);
             drop(root);
-            output::arguments(format_args!("INPUT {name} stopped and removed\n"));
+            output::arguments(format_args!("INPUT {name} stopped and removed: {cause}\n"));
         }
     }
+}
+
+/// Why a device stopped, for its removal's line: the cause the device
+/// holds, else its last polling failure, else that neither is known.
+fn stop_cause(
+    held: Option<alloc::string::String>,
+    last_failure: Option<alloc::string::String>,
+) -> alloc::string::String {
+    held.or(last_failure)
+        .unwrap_or_else(|| alloc::string::String::from("the device recorded no cause"))
 }

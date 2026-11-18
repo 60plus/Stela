@@ -145,7 +145,7 @@ fn hub_location(seen: &Seen) -> String {
 fn input_named<'a>(seen: &'a mut Seen, location: &str) -> &'a mut hid::UsbInput {
     seen.inputs
         .iter_mut()
-        .find(|input| input.name.ends_with(&format!("{location})")))
+        .find(|input| input.name.contains(&format!("({location} interface ")))
         .unwrap_or_else(|| panic!("no input at {location}"))
 }
 
@@ -254,7 +254,7 @@ fn a_device_behind_a_hub_that_stops_answering_is_dropped_at_every_step() {
         assert_eq!(seen.failures.len(), 1, "{answers}: {:?}", seen.failures);
         assert!(seen.failures[0].0.contains(".2"), "{:?}", seen.failures);
         assert_eq!(seen.inputs.len(), 1, "{answers}");
-        assert!(seen.inputs[0].name.ends_with(".1)"));
+        assert!(seen.inputs[0].name.contains(".1 interface "));
         assert!(late.settle().failures.is_empty(), "{answers}");
     }
 }

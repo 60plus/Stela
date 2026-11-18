@@ -133,6 +133,24 @@ impl InputDevice {
         }
     }
 
+    /// Why the device stopped, when it holds the cause: the failure that
+    /// ended its transfers, or that its device left.
+    pub fn stop_cause(&self) -> Option<String> {
+        match self {
+            Self::Usb(device) => device.stop_cause().map(String::from),
+            Self::Ehci(device) => device.stop_error().map(|error| format!("{error}")),
+            Self::I2cHid(device) => device
+                .device()
+                .first_error()
+                .map(|error| format!("{error}")),
+            Self::Ish(device) => device.failure().map(|error| format!("Intel ISH {error:?}")),
+            Self::Virtio(device) => device
+                .broken
+                .then(|| String::from("the virtio device asked for a reset")),
+            Self::Ps2(_) | Self::Touchpad(_) => None,
+        }
+    }
+
     /// Whether the device stopped and is no longer read.
     pub fn stopped(&self) -> bool {
         match self {
