@@ -507,6 +507,8 @@ struct Sink {
     began: Option<u64>,
     /// The store's request in progress on the device.
     request: Option<Submission>,
+    /// Stores that failed in a row; the next store writes what they did not.
+    failures: u32,
 }
 
 impl Sink {
@@ -568,6 +570,11 @@ fn passed(deadline: u64) -> bool {
 const MACHINE_FLUSH_SECONDS: u64 = 5;
 /// Seconds between the USB log's stores while the engine runs.
 const USB_FLUSH_SECONDS: u64 = 10;
+/// Stores that may fail in a row before a log closes for the boot: a
+/// stick that times out once, or for half a minute, loses no line, as each
+/// store writes what the failed ones did not (`Writer::completed`); one
+/// that is gone is closed within a minute.
+const FAILED_STORES: u32 = 6;
 
 /// The BSP's counter on any core (`engine::host::rdtsc`): log times and
 /// flush deadlines are compared across cores.
@@ -878,6 +885,7 @@ pub fn add_log(
             ticks: 0,
             began: None,
             request: None,
+            failures: 0,
         })
     });
     Ok(())
@@ -960,7 +968,10 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         return;
     }
     let mut failed = Vec::new();
+    let mut retried = Vec::new();
     let mut late = Vec::new();
+    // A store of this call failed: its lines are not on the device yet.
+    let mut unstored = false;
     // One deadline for every log's store.
     let started = rdtsc();
     let deadline = wait.then(|| {
@@ -1006,6 +1017,21 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
                     if wait && !done {
                         late.push(sink.kind);
                     }
+                    if done && sink.failures != 0 {
+                        retried.push(Retry::Stored(sink.kind, sink.failures));
+                        sink.failures = 0;
+                    }
+                    index += 1;
+                }
+                Err(error) if sink.failures + 1 < FAILED_STORES => {
+                    unstored = true;
+                    sink.failures += 1;
+                    sink.began = None;
+                    // The next store waits its interval, as a due one does.
+                    sink.flushed = rdtsc();
+                    if sink.failures == 1 {
+                        retried.push(Retry::Failed(sink.kind, error));
+                    }
                     index += 1;
                 }
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
@@ -1017,7 +1043,24 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         );
     });
     if wait {
-        UNSTORED.store(reached.is_none() || !late.is_empty(), Ordering::Relaxed);
+        UNSTORED.store(
+            reached.is_none() || !late.is_empty() || unstored,
+            Ordering::Relaxed,
+        );
+    }
+    for retry in retried {
+        match retry {
+            Retry::Failed(kind, error) => arguments(format_args!(
+                "BOOT LOG {} store failed: {error}; the next stores write its lines, and the log \
+                 closes after {FAILED_STORES} failures in a row\n",
+                kind.name()
+            )),
+            Retry::Stored(kind, failures) => arguments(format_args!(
+                "BOOT LOG {} stored again after {failures} failed stores, with every line they \
+                 held\n",
+                kind.name()
+            )),
+        }
     }
     for (kind, error) in failed {
         log_lost(kind, error);
@@ -1034,6 +1077,13 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             millis_since(started)
         ));
     }
+}
+
+/// A log store that failed and will be tried again, or that went through
+/// after failures.
+enum Retry {
+    Failed(Log, BlockError),
+    Stored(Log, u32),
 }
 
 /// The counter now, for [`millis_since`].

@@ -862,3 +862,34 @@ fn a_record_that_does_not_start_with_its_boot_is_not_read() {
     disk.disk.bytes[at..at + 12].copy_from_slice(b"line 000999\n");
     assert!(disk.log().unwrap().starts.is_empty());
 }
+
+/// A store that fails part way, as a USB stick that times out once, loses
+/// no line: the next store writes the ring blocks it did not, before the
+/// header that counts them.
+#[test]
+fn a_failed_store_s_lines_are_written_by_the_next() {
+    for block in [512, 4096] {
+        for allowed in 0..4 {
+            let mut disk = small_disk(block);
+            let mut writer = open_small(&mut disk, true);
+            writer.append(&lines(0, 100));
+            writer.flush(&mut disk).unwrap();
+            // Several blocks of lines, the ring turned past its end.
+            writer.append(&lines(100, 3000));
+            disk.writes_left = Some(allowed);
+            assert_eq!(writer.flush(&mut disk), Err(BlockError::Timeout));
+            disk.writes_left = None;
+            writer.append(&lines(3100, 10));
+            writer.flush(&mut disk).unwrap();
+            let mut stream = b"=== STELA BOOT 1 ===\n".to_vec();
+            stream.extend_from_slice(&lines(0, 3110));
+            let log = disk.log().unwrap();
+            let ring = SMALL.ring_bytes as usize;
+            assert_eq!(
+                text(&log),
+                String::from_utf8(stream[stream.len() - ring..].to_vec()).unwrap(),
+                "{block} {allowed}"
+            );
+        }
+    }
+}

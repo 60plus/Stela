@@ -816,6 +816,9 @@ pub struct Writer {
     /// Record blocks the next store writes before its header, which names
     /// their lengths.
     record_writes: Vec<(u64, Vec<u8>)>,
+    /// Ring blocks a failed store did not write, which the next writes
+    /// first: the ring's head moved past them already.
+    ring_writes: Vec<(u64, Vec<u8>)>,
     /// The header on the device names this boot's record as this boot's.
     /// Until it does, the record's room may still be named as an older
     /// boot's, or hold the bytes a version 1 log's conversion moves, and
@@ -932,6 +935,7 @@ impl Writer {
             records: header.records,
             capture: None,
             record_writes: Vec::new(),
+            ring_writes: Vec::new(),
             // A resumed boot's record is named by the header it found.
             claimed: !new_boot,
             // A converted log's header is still to be written.
@@ -1143,8 +1147,21 @@ impl Writer {
         }
         self.close_full_record();
         let mut remaining = self.pending.bytes();
-        if remaining == 0 && self.durable == Some(self.ring.head) && self.record_writes.is_empty() {
+        if remaining == 0
+            && self.durable == Some(self.ring.head)
+            && self.record_writes.is_empty()
+            && self.ring_writes.is_empty()
+        {
             return false;
+        }
+        // A failed store's ring blocks first: this store's own write the
+        // same blocks again where they share them, with newer bytes.
+        for (lba, data) in self.ring_writes.drain(..) {
+            self.steps.push_back(Step::Blocks {
+                lba,
+                data,
+                tail: false,
+            });
         }
         let mut writes = Vec::new();
         let ring = &mut self.ring;
@@ -1197,17 +1214,14 @@ impl Writer {
         let ring = &self.ring;
         let step = self.steps.pop_front()?;
         let (request, step) = match step {
+            // The step keeps its data: a failed store queues it again.
             Step::Blocks { lba, data, tail } => (
                 Request::Write {
                     lba,
-                    data,
+                    data: data.clone(),
                     durable: true,
                 },
-                Step::Blocks {
-                    lba,
-                    data: Vec::new(),
-                    tail,
-                },
+                Step::Blocks { lba, data, tail },
             ),
             Step::ReadTail => (
                 Request::Read {
@@ -1256,21 +1270,23 @@ impl Writer {
     }
 
     /// The running request finished with `finished`. A failure ends the
-    /// store: the next starts over from what the device then holds, and
-    /// writes the boot records this one did not, before the header that
-    /// names their lengths.
+    /// store: the next writes the ring blocks and boot records this one did
+    /// not, before the header that names them; the head's own block and
+    /// the header are written from what they then hold.
     pub fn completed(&mut self, finished: Finished) -> Result<(), BlockError> {
         let step = self.running.take();
         let data = match finished {
             Ok(data) => data,
             Err(error) => {
-                let unwritten = step.into_iter().chain(self.steps.drain(..));
-                let records: Vec<_> = unwritten
-                    .filter_map(|step| match step {
-                        Step::Record { lba, data } => Some((lba, data)),
-                        _ => None,
-                    })
-                    .collect();
+                let (mut ring, mut records) = (Vec::new(), Vec::new());
+                for step in step.into_iter().chain(self.steps.drain(..)) {
+                    match step {
+                        Step::Blocks { lba, data, .. } => ring.push((lba, data)),
+                        Step::Record { lba, data } => records.push((lba, data)),
+                        Step::ReadTail | Step::Tail | Step::Header => {}
+                    }
+                }
+                self.ring_writes.splice(0..0, ring);
                 self.record_writes.splice(0..0, records);
                 return Err(error);
             }
