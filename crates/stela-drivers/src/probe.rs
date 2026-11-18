@@ -166,6 +166,14 @@ pub enum PlatformError {
     Refused(&'static str),
     Ps2(input::ps2::Error),
     Native(ServiceError),
+    /// A PCI function's memory BAR, as the firmware left it, could not be
+    /// mapped.
+    PciBar {
+        index: u8,
+        base: u64,
+        bytes: u64,
+        error: ServiceError,
+    },
     I2c(crate::bus::i2c::Error),
     Lpss(crate::bus::lpss::Error),
     LpssAttach(crate::bus::lpss::AttachError),
@@ -208,6 +216,24 @@ impl fmt::Display for PlatformError {
             Self::Refused(why) => f.write_str(why),
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
+            // Stela assigns no PCI BARs: one the firmware left at 0 stays
+            // unmapped where Linux would assign it.
+            Self::PciBar {
+                index,
+                base: 0,
+                bytes,
+                error,
+            } => write!(
+                f,
+                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware, and Stela assigns \
+                 none yet: {error}"
+            ),
+            Self::PciBar {
+                index,
+                base,
+                bytes,
+                error,
+            } => write!(f, "BAR{index} at {base:#x} ({bytes:#x} bytes): {error}"),
             Self::I2c(error) => write!(f, "I2C controller: {error:?}"),
             Self::Lpss(error) => write!(f, "LPSS: {error:?}"),
             Self::LpssAttach(error) => write!(f, "LPSS I2C attach: {error:?}"),
@@ -4181,6 +4207,25 @@ mod tests {
         assert_eq!(
             format!("{through}"),
             "its I2C controller: I2C controller behind a PCI bridge"
+        );
+    }
+    /// A BAR that could not be mapped is named with where the firmware left
+    /// it, so a report tells an unassigned BAR from one outside the windows.
+    #[test]
+    fn an_unmapped_bar_says_where_the_firmware_left_it() {
+        let bar = |base| PlatformError::PciBar {
+            index: 0,
+            base,
+            bytes: 0x1000,
+            error: ServiceError::Refused("outside"),
+        };
+        assert_eq!(
+            format!("{}", bar(0x40_1700_0000)),
+            "BAR0 at 0x4017000000 (0x1000 bytes): outside"
+        );
+        assert!(
+            format!("{}", bar(0))
+                .starts_with("BAR0 (0x1000 bytes) left unassigned by the firmware")
         );
     }
 }

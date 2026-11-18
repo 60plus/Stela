@@ -864,7 +864,20 @@ mod attach {
             }
         };
         let mapped = match bars[0] {
-            Some(bar @ Bar::Memory { .. }) => services.map_bar(address, bar).map_err(native),
+            Some(
+                bar @ Bar::Memory {
+                    address: base,
+                    size: bytes,
+                    ..
+                },
+            ) => services
+                .map_bar(address, bar)
+                .map_err(|error| PlatformError::PciBar {
+                    index: 0,
+                    base,
+                    bytes,
+                    error,
+                }),
             _ => Err(native(ServiceError::Refused("missing memory BAR"))),
         };
         let mapping = match mapped {
