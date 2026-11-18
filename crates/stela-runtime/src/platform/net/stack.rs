@@ -6,7 +6,7 @@ mod automatic;
 mod client;
 pub use client::{HttpPost, HttpRequest, HttpTransfer, TlsUnavailable};
 mod dad;
-mod dhcp;
+pub mod dhcp;
 mod rdnss;
 mod tls;
 use super::{Clock, ClockError, Ipv4, NetError, http};

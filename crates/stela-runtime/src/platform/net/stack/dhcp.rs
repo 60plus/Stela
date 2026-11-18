@@ -4,7 +4,8 @@
 //! (`socket::dhcpv4::Socket::process` and `parse_ack`). smoltcp says why
 //! only in debug output, which no build prints, so a network that answered
 //! is told apart from one that did not and from an adapter that dropped or
-//! damaged the answers.
+//! damaged the answers. [`GuestDhcp`] does the same for a bridged guest's
+//! own DHCP client, by the window it went unanswered.
 use alloc::{format, string::String};
 use core::net::Ipv4Addr;
 
@@ -315,6 +316,168 @@ impl DhcpLog {
     }
 }
 
+/// How long a bridged guest's DHCP client goes without an offer or ACK
+/// after its first DISCOVER or REQUEST before [`GuestDhcp`] reports the
+/// window: past macOS's first retransmissions (RFC 2131 section 4.1).
+pub const GUEST_WAIT_MS: u64 = 10_000;
+/// Unanswered windows reported one by one; after these, one in
+/// [`GUEST_REPORT_EVERY`].
+const GUEST_REPORTS: u32 = 3;
+const GUEST_REPORT_EVERY: u32 = 6;
+
+/// One unanswered stretch of a bridged guest's DHCP exchange: what the
+/// guest sent and what the host adapter received meanwhile.
+#[derive(Default)]
+struct Window {
+    started: u64,
+    /// The client hardware address of the guest's first message.
+    client: [u8; 6],
+    /// The transaction of the guest's last DISCOVER or REQUEST.
+    xid: u32,
+    discovers: u32,
+    requests: u32,
+    frames: u32,
+    broadcasts: u32,
+    tagged: u32,
+    offers: u32,
+    acks: u32,
+    naks: u32,
+    other: u32,
+    broadcast: u32,
+    unicast: u32,
+    others: u32,
+    checksum: u32,
+    other_xid: u32,
+}
+
+/// What a bridged guest's own DHCP client sent through the host adapter
+/// and what that adapter received while no offer or ACK of the guest's
+/// transaction came back. A guest that gets no address then shows whether
+/// the host adapter received nothing at all, received broadcasts but no
+/// server reply, or received replies that were damaged or of another
+/// transaction. Headers only, no address is kept or logged.
+#[derive(Default)]
+pub struct GuestDhcp {
+    window: Option<Window>,
+    reported: u32,
+}
+
+impl GuestDhcp {
+    /// A frame the guest sent, at `now` milliseconds.
+    pub fn outbound(&mut self, frame: &[u8], now: u64) {
+        let Some((message, _)) = message(frame, CLIENT_PORT, SERVER_PORT) else {
+            return;
+        };
+        if message.bootp[0] != 1 || !matches!(message.kind, Some(DISCOVER | REQUEST)) {
+            return;
+        }
+        let window = self.window.get_or_insert_with(|| Window {
+            started: now,
+            client: message.chaddr().try_into().unwrap(),
+            ..Window::default()
+        });
+        let count = match message.kind {
+            Some(DISCOVER) => &mut window.discovers,
+            _ => &mut window.requests,
+        };
+        *count = count.saturating_add(1);
+        window.xid = message.xid();
+    }
+
+    /// A frame the host adapter received for the guest. An offer or ACK of
+    /// the guest's transaction ends the window unreported.
+    pub fn inbound(&mut self, frame: &[u8]) {
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
+        window.frames = window.frames.saturating_add(1);
+        if frame.get(..6) == Some(&[0xff; 6]) {
+            window.broadcasts = window.broadcasts.saturating_add(1);
+        }
+        if frame.get(12..14) == Some(&ETHERTYPE_VLAN) {
+            window.tagged = window.tagged.saturating_add(1);
+        }
+        let Some((message, _)) = message(frame, SERVER_PORT, CLIENT_PORT) else {
+            return;
+        };
+        if message.bootp[0] != 2 {
+            return;
+        }
+        if message.chaddr() != window.client {
+            window.others = window.others.saturating_add(1);
+            return;
+        }
+        let count = match message.kind {
+            Some(OFFER) => &mut window.offers,
+            Some(ACK) => &mut window.acks,
+            Some(NAK) => &mut window.naks,
+            _ => &mut window.other,
+        };
+        *count = count.saturating_add(1);
+        let destination = match message.broadcast {
+            true => &mut window.broadcast,
+            false => &mut window.unicast,
+        };
+        *destination = destination.saturating_add(1);
+        if !message.checksums {
+            window.checksum = window.checksum.saturating_add(1);
+        } else if message.xid() != window.xid {
+            window.other_xid = window.other_xid.saturating_add(1);
+        } else if matches!(message.kind, Some(OFFER | ACK)) {
+            self.window = None;
+        }
+    }
+
+    /// The line for a window that went [`GUEST_WAIT_MS`] without an
+    /// answer by `now`, with the host adapter's `link`; the window then
+    /// ends, and the guest's next message opens another. The first
+    /// [`GUEST_REPORTS`] windows are each reported, later ones one in
+    /// [`GUEST_REPORT_EVERY`].
+    pub fn overdue(&mut self, now: u64, link: Option<bool>) -> Option<String> {
+        if self
+            .window
+            .as_ref()
+            .is_none_or(|window| now.saturating_sub(window.started) < GUEST_WAIT_MS)
+        {
+            return None;
+        }
+        let w = self.window.take()?;
+        self.reported = self.reported.saturating_add(1);
+        if self.reported > GUEST_REPORTS
+            && !(self.reported - GUEST_REPORTS).is_multiple_of(GUEST_REPORT_EVERY)
+        {
+            return None;
+        }
+        Some(format!(
+            "no offer or ack in {} s (window {}): guest sent discover={} request={}; host \
+             adapter received frames={} broadcast={} vlan_tagged={}, replies for the guest \
+             offer={} ack={} nak={} other={} (broadcast={} unicast={}) bad_checksum={} \
+             other_xid={}, for_other_clients={}; host_link={}",
+            now.saturating_sub(w.started) / 1000,
+            self.reported,
+            w.discovers,
+            w.requests,
+            w.frames,
+            w.broadcasts,
+            w.tagged,
+            w.offers,
+            w.acks,
+            w.naks,
+            w.other,
+            w.broadcast,
+            w.unicast,
+            w.checksum,
+            w.other_xid,
+            w.others,
+            match link {
+                Some(true) => "up",
+                Some(false) => "down",
+                None => "unknown",
+            },
+        ))
+    }
+}
+
 /// smoltcp's `x_is_unicast` for IPv4.
 fn unicast(address: Ipv4Addr) -> bool {
     !(address.is_broadcast() || address.is_multicast() || address.is_unspecified())
@@ -446,5 +609,49 @@ pub(super) mod tests {
             "{}",
             log.summary()
         );
+    }
+
+    /// A guest whose DISCOVERs go unanswered gets one line per window with
+    /// what came in meanwhile; an offer of its transaction ends the window
+    /// unreported, and later windows are reported one in six.
+    #[test]
+    fn an_unanswered_guest_dhcp_window_says_what_the_host_adapter_received() {
+        let mut guest = GuestDhcp::default();
+        let other = [2, 0, 0, 0, 0, 9];
+        guest.inbound(&frame(67, 68, OFFER, 7, MAC, true, &SERVER_ID));
+        assert_eq!(guest.overdue(60_000, Some(true)), None);
+        guest.outbound(&frame(68, 67, DISCOVER, 7, MAC, true, &[]), 1_000);
+        guest.outbound(&frame(68, 67, DISCOVER, 7, MAC, true, &[]), 5_000);
+        guest.inbound(&frame(67, 68, OFFER, 8, MAC, false, &SERVER_ID));
+        guest.inbound(&frame(67, 68, OFFER, 3, other, true, &SERVER_ID));
+        assert_eq!(guest.overdue(10_999, Some(true)), None);
+        assert_eq!(
+            guest.overdue(11_000, Some(true)).as_deref(),
+            Some(
+                "no offer or ack in 10 s (window 1): guest sent discover=2 request=0; host \
+                 adapter received frames=2 broadcast=1 vlan_tagged=0, replies for the guest \
+                 offer=1 ack=0 nak=0 other=0 (broadcast=0 unicast=1) bad_checksum=0 \
+                 other_xid=1, for_other_clients=1; host_link=up"
+            )
+        );
+        assert_eq!(guest.overdue(30_000, Some(true)), None);
+
+        // Answered: no line.
+        guest.outbound(&frame(68, 67, DISCOVER, 9, MAC, true, &[]), 40_000);
+        guest.inbound(&frame(67, 68, OFFER, 9, MAC, true, &SERVER_ID));
+        assert_eq!(guest.overdue(60_000, Some(true)), None);
+
+        let mut lines = 0;
+        for window in 0..14u64 {
+            let at = 100_000 + window * 20_000;
+            guest.outbound(&frame(68, 67, REQUEST, 9, MAC, true, &[]), at);
+            if let Some(line) = guest.overdue(at + GUEST_WAIT_MS, None) {
+                assert!(line.ends_with("host_link=unknown"), "{line}");
+                assert!(line.contains("request=1;"), "{line}");
+                lines += 1;
+            }
+        }
+        // Windows 2 and 3, then 9 and 15.
+        assert_eq!(lines, 4);
     }
 }
