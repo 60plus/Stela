@@ -374,7 +374,6 @@ pub fn begin(title: &str) {
     output::flush_log();
 }
 
-/// Show how far the running step has come, such as `182 of 484 MB`.
 /// The running step's detail; empty without one.
 pub fn detail() -> String {
     with(|state| state.running.as_ref().map(|running| running.detail.clone()))
@@ -382,6 +381,7 @@ pub fn detail() -> String {
         .unwrap_or_default()
 }
 
+/// Show how far the running step has come, such as `182 of 484 MB`.
 pub fn progress(detail: &str) {
     with(|state| {
         state.detail_ends(detail);
