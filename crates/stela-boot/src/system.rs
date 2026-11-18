@@ -547,10 +547,17 @@ impl Runtime {
     /// added at its exit, after the tables were built. Each is logged and
     /// kept for the fault lines; whether there was one.
     fn added_at_exit(&mut self, entries: impl Iterator<Item = (u64, u64, u32, u64)>) -> bool {
+        // Every region the map declared before the tables were built is
+        // mapped, also those past the ones kept for the fault lines.
+        let declared: Vec<(u64, u64)> = self
+            .descriptors
+            .iter()
+            .map(|&(start, pages, _, _)| (start, pages))
+            .collect();
         let mut added = false;
         for (start, pages, kind, attributes) in entries {
             if attributes & firmware_map::MEMORY_RUNTIME == 0
-                || self.regions.reaches(start, pages, &self.ram)
+                || firmware_runtime::reached(start, pages, &declared, &self.ram)
             {
                 continue;
             }

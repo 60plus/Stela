@@ -201,6 +201,20 @@ pub fn plan(
     }
 }
 
+/// Whether the loader's tables reach every byte of `start`, `pages`: pages
+/// in `ram`, or in one of the runtime regions `declared` (start, pages)
+/// the loader mapped, each of them, whether or not [`Regions`] kept it for
+/// the fault lines.
+pub fn reached(start: u64, pages: u64, declared: &[(u64, u64)], ram: &[(u64, u64)]) -> bool {
+    (0..pages).all(|index| {
+        let page = start + index * PAGE;
+        within(ram, page)
+            || declared.iter().any(|&(first, count)| {
+                first <= page && page + PAGE <= first.saturating_add(count.saturating_mul(PAGE))
+            })
+    })
+}
+
 /// The runtime regions a boot keeps for the engine's fault lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -234,20 +248,6 @@ impl Regions {
 
     pub fn iter(&self) -> impl Iterator<Item = &Region> {
         self.regions[..(self.count as usize).min(MAX_REGIONS)].iter()
-    }
-
-    /// Whether the loader's tables reach every byte of `start`, `pages`:
-    /// pages in `ram` or in a kept region that was mapped or lies in RAM.
-    pub fn reaches(&self, start: u64, pages: u64, ram: &[(u64, u64)]) -> bool {
-        (0..pages).all(|index| {
-            let page = start + index * PAGE;
-            within(ram, page)
-                || self.iter().any(|region| {
-                    region.reach() != Reach::AtExit
-                        && region.start <= page
-                        && page + PAGE <= region.end()
-                })
-        })
     }
 
     /// Where `address`, which a firmware call faulted at, lies among the
@@ -428,15 +428,33 @@ mod tests {
 
     #[test]
     fn a_region_listed_only_at_the_exit_is_not_reached() {
-        let mut regions = Regions::default();
-        regions.push(plan(0xffd0_0000, 0x10, 11, 1 << 63, &RAM, &[]));
-        assert!(regions.reaches(0xffd0_4000, 4, &RAM));
+        let declared = [(0xffd0_0000, 0x10)];
+        assert!(reached(0xffd0_4000, 4, &declared, &RAM));
         // Runtime data the firmware took from RAM at its exit is reached.
-        assert!(regions.reaches(0x7000_0000, 4, &RAM));
-        assert!(!regions.reaches(0xff00_0000, 1, &RAM));
+        assert!(reached(0x7000_0000, 4, &declared, &RAM));
+        assert!(!reached(0xff00_0000, 1, &declared, &RAM));
+        let mut regions = Regions::default();
         regions.push(Region::at_exit(0xff00_0000, 1, 11, 1 << 63));
-        assert!(!regions.reaches(0xff00_0000, 1, &RAM));
         assert!(regions.place(0xff00_0010).ends_with("not mapped"));
+    }
+
+    /// A PC with more runtime regions than the fault lines keep: one past
+    /// them, outside RAM and mapped, was taken for a region added at the
+    /// exit, and the variable service was refused after the exit, so a
+    /// restart wrote no BootNext.
+    #[test]
+    fn a_mapped_region_past_the_kept_ones_is_reached_at_the_exit() {
+        let mut regions = Regions::default();
+        let declared: alloc::vec::Vec<(u64, u64)> = (0..MAX_REGIONS as u64 + 6)
+            .map(|index| (0xfe00_0000 + index * 2 * PAGE, 2))
+            .collect();
+        for &(start, pages) in &declared {
+            regions.push(plan(start, pages, 11, 1 << 63 | 1, &RAM, &[]));
+        }
+        assert_eq!(regions.dropped, 6);
+        let &(last, pages) = declared.last().unwrap();
+        assert!(reached(last, pages, &declared, &RAM));
+        assert!(!reached(last + 2 * PAGE, 1, &declared, &RAM));
     }
 
     #[test]
