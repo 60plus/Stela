@@ -1765,10 +1765,39 @@ fn device_control(fd: c_int) -> impl FnMut(u32, *mut c_void) -> i32 {
 /// the window a map or an earlier fault filled, or one Linux unmapped as it
 /// moved the buffer behind it. For the #PF handler, which leaves the fault,
 /// and the fill of the rest of its window, to the faulting context
-/// ([`serve_moved`]).
+/// ([`serve_moved`]). A guard page of a stack in the window is no client's:
+/// that fault is the host code's own, and stops as one.
 pub(in crate::engine) fn client_fault(address: u64) -> bool {
-    installed()
-        .is_some_and(|gpu| gpu.window.contains(address) && MAPPINGS.load(Ordering::Relaxed) != 0)
+    installed().is_some_and(|gpu| {
+        gpu.window.contains(address)
+            && MAPPINGS.load(Ordering::Relaxed) != 0
+            && stack::guard_hit(address).is_none()
+    })
+}
+
+/// For the #PF handler's stop: says, on the port, that `address` is a guard
+/// page of a stack in the window, and which side, before the fault's own
+/// report names the code. It neither allocates nor waits, as the faulting
+/// code may hold the heap's lock.
+pub(in crate::engine) fn note_stack_guard(address: u64) {
+    use core::fmt::Write;
+    let Some(hit) = stack::guard_hit(address) else {
+        return;
+    };
+    let _ = writeln!(
+        crate::serial::Serial,
+        "GPU STACK GUARD fault at {address:#x}: the absent page {} the GPU stack \
+         {:#x}..{:#x} ({} KiB); {}",
+        if hit.above { "above" } else { "below" },
+        hit.usable.start,
+        hit.usable.end,
+        (hit.usable.end - hit.usable.start) >> 10,
+        if hit.above {
+            "code read past the stack's top"
+        } else {
+            "the stack overflowed"
+        },
+    );
 }
 
 /// Client faults served so far, for the report of the first and of each
