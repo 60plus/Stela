@@ -2562,7 +2562,8 @@ impl Heartbeat {
 
 /// The board's code cache since `was`, holding `blocks`, in the plain terms
 /// of `CODE CACHE` (`stela_boot_core::load_lines`): its size, fill, turns
-/// and whole flushes, and what the beat took away and installed again.
+/// and the whole flushes its PEs made, and what the beat took away and
+/// installed again.
 fn code_cache(
     now: &stela_engine::machine::engine::CodeReport,
     was: &stela_engine::machine::engine::CodeReport,
