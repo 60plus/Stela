@@ -174,6 +174,11 @@ fn unpublished_levels_keep_the_firmware_request() {
     let mut registers = Logged::with(&[(AMD_CPPC_ENABLE, 1), (AMD_CPPC_REQ, 0x8000_ff01)]);
     assert_eq!(request(amd(true), &mut registers), Outcome::Unpublished);
     assert!(registers.writes().is_empty());
+    // As amd-pstate checks the levels before it enables CPPC, an empty
+    // capability register leaves CPPC off where the firmware left it off.
+    let mut registers = Logged::with(&[(AMD_CPPC_REQ, 0x8000_ff01)]);
+    assert_eq!(request(amd(true), &mut registers), Outcome::Unpublished);
+    assert!(registers.writes().is_empty(), "{:x?}", registers.writes());
 }
 
 #[test]
@@ -261,6 +266,19 @@ fn the_summary_counts_outcomes_and_the_range_of_levels() {
     assert!(line.contains(" legacy=1 "), "{line}");
     assert!(
         line.contains("highest=166-176 requested_minimum=124 "),
+        "{line}"
+    );
+    // One line, no UNSUPPORTED line, while every processor published levels.
+    assert_eq!(line.lines().count(), 1, "{line}");
+    // Processors with an empty capability register are said once, together.
+    tally.record(Outcome::Unpublished);
+    tally.record(Outcome::Unpublished);
+    let line = tally.summary();
+    assert!(line.contains(" unpublished=2 "), "{line}");
+    let lines: Vec<_> = line.lines().collect();
+    assert_eq!(lines.len(), 2, "{line}");
+    assert!(
+        lines[1].starts_with("UNSUPPORTED host performance request on 2 processors: "),
         "{line}"
     );
 }

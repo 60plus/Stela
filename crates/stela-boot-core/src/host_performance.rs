@@ -15,7 +15,7 @@
 //!   POWER_CTL, which this does not read).
 //! - AMD CPPC through MSRs (amd-pstate `msr_cppc_enable`,
 //!   `amd_pstate_update_min_max_limit`, `amd_pstate_epp_update_limit`):
-//!   CPPC on, maximum the core's highest level, minimum the firmware's
+//!   the published levels checked first, then CPPC on, maximum the core's highest level, minimum the firmware's
 //!   minimum where the request holds nothing else and else the nominal
 //!   level, desired 0 and energy preference 0. Zen parts without the MSR
 //!   interface use ACPI shared-memory CPPC; they are left as firmware set
@@ -196,7 +196,7 @@ pub enum Outcome {
     /// HWP without EPP that firmware left off: left off, as Linux does.
     HwpWithoutEpp,
     /// The capability register published no usable levels; the
-    /// firmware's request stays.
+    /// firmware's request stays, and AMD CPPC is not enabled.
     Unpublished,
     /// Neither interface is enumerated (legacy P-states, AMD shared-memory
     /// CPPC, or a hypervisor that hides them); nothing was touched.
@@ -270,17 +270,21 @@ pub unsafe fn request_with(features: Features, registers: &mut impl Registers) -
     }
     if features.cppc {
         // SAFETY: CPUID 8000_0008H:EBX[27] on an AMD CPU enumerates the CPPC
-        // registers; the enable precedes the request as amd-pstate orders
-        // them. The request keeps its upper bits.
+        // registers. As amd-pstate's per-CPU init, the levels are read and
+        // checked first (`amd_pstate_init_perf`, `amd_pstate_init_freq`)
+        // and CPPC is enabled only for usable ones (`amd_pstate_cppc_enable`),
+        // so an empty capability register leaves CPPC as the firmware left
+        // it. The enable precedes the request. The request keeps its upper
+        // bits.
         unsafe {
-            if registers.read(AMD_CPPC_ENABLE) & 1 == 0 {
-                registers.write(AMD_CPPC_ENABLE, 1);
-            }
             let capabilities = registers.read(AMD_CPPC_CAP1);
             let current = registers.read(AMD_CPPC_REQ);
             let Some((value, bounds)) = amd_request(capabilities, current) else {
                 return Outcome::Unpublished;
             };
+            if registers.read(AMD_CPPC_ENABLE) & 1 == 0 {
+                registers.write(AMD_CPPC_ENABLE, 1);
+            }
             registers.write(AMD_CPPC_REQ, value);
             return Outcome::Cppc {
                 levels: Levels::amd(capabilities),
@@ -354,7 +358,8 @@ impl Tally {
         self.minimum[1].fetch_max(bounds.minimum.into(), Ordering::Relaxed);
     }
 
-    /// The outcomes as one report line.
+    /// The outcomes as one report line, and one `UNSUPPORTED` line when a
+    /// processor published no usable levels.
     pub fn summary(&self) -> String {
         let count = |index: usize| self.outcomes[index].load(Ordering::Relaxed);
         let range = |pair: &[AtomicU32; 2]| {
@@ -368,7 +373,7 @@ impl Tally {
                 (low, high) => format!("{low}-{high}"),
             }
         };
-        format!(
+        let mut line = format!(
             "HOST PERFORMANCE hwp={} cppc={} hwp_without_epp={} unpublished={} legacy={} \
              package_controlled={} highest={} requested_minimum={} preference=performance\n",
             count(0),
@@ -379,7 +384,16 @@ impl Tally {
             self.package.load(Ordering::Relaxed),
             range(&self.highest),
             range(&self.minimum),
-        )
+        );
+        if count(3) != 0 {
+            line.push_str(&format!(
+                "UNSUPPORTED host performance request on {} processors: their HWP or CPPC \
+                 capability register publishes no usable levels, so each keeps the request its \
+                 firmware left and AMD CPPC stays as the firmware set it\n",
+                count(3)
+            ));
+        }
+        line
     }
 }
 
