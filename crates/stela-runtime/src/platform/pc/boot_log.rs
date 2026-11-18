@@ -64,7 +64,11 @@
 //! `stela` made, [`FILE_BYTES`] where its EFI partition has room for it.
 //! [`Layout::of`] gives a region of [`LARGE_BYTES`] or more [`LARGE_RECORDS`]
 //! larger records. `stela` makes a file longer with [`relayout`], which keeps
-//! its lines at their positions. Writes reach its blocks directly, never
+//! its lines at their positions. A loader older than the longer file opens
+//! it as a [`LOG_BYTES`] region and starts a log of that size at its start,
+//! whose header names a smaller region than the file's: [`read`] reads that
+//! log, and a [`Writer`] lays it out in the whole file in place ([`grow`]),
+//! so the boots the older loader wrote stay. Writes reach its blocks directly, never
 //! the volume's directory or FAT: [`file_runs`] gives the block-aligned runs
 //! of its clusters, wherever they lie, that hold the bytes its layout needs.
 use super::fat32;
@@ -326,6 +330,18 @@ pub const fn file_region(bytes: u64) -> Option<u64> {
         bytes
     };
     Some(bytes - bytes % HEADER_BYTES)
+}
+
+/// The region a header names that does not fit a `region`-byte region of
+/// `block`-byte blocks, when it is a smaller one at the region's start: a
+/// log an older loader started in a longer file.
+fn prefix(error: &HeaderError, region: u64, block: u64) -> Option<u64> {
+    let HeaderError::RingSize { recorded, .. } = *error else {
+        return None;
+    };
+    let prefix = recorded.checked_add(HEADER_BYTES)?;
+    (prefix > HEADER_BYTES && prefix < region && prefix.is_multiple_of(block.max(1)))
+        .then_some(prefix)
 }
 
 /// The runs of `file`'s blocks that hold its first `needed` bytes, each a
@@ -854,6 +870,44 @@ fn convert(device: &mut dyn BlockDevice, old: &Header, layout: Layout) -> Result
     })
 }
 
+/// Lay the smaller log at the start of the region on `device`, whose header
+/// names a `prefix`-byte region, out in `layout` in place, as [`relayout`]
+/// lays it out in memory: its kept stream at its positions in the new ring,
+/// zeros in the ring's window before them, and each kept boot's record; the
+/// header that names them, which the caller writes last. `None` when the
+/// smaller region does not read as a log. An interruption leaves the
+/// smaller log's header, and lines it read in the ring's bytes, where its
+/// stream had wrapped, written over by the new layout's.
+fn grow(
+    device: &mut dyn BlockDevice,
+    prefix: u64,
+    layout: Layout,
+) -> Result<Option<Header>, BlockError> {
+    let mut bytes = vec![0; prefix as usize];
+    device.read(0, &mut bytes)?;
+    let Ok(log) = read(&bytes) else {
+        return Ok(None);
+    };
+    drop(bytes);
+    let (pieces, header) = placed(&log, layout);
+    let ring = layout.ring_bytes;
+    let kept = (log.stream.len() as u64).min(ring);
+    let (mut from, to) = (log.head.saturating_sub(ring), log.head - kept);
+    while from < to {
+        let at = from % ring;
+        let run = (to - from).min(ring - at).min(1 << 20);
+        write_region(device, HEADER_BYTES + at, &vec![0; run as usize])?;
+        from += run;
+    }
+    for (offset, bytes) in &pieces {
+        write_region(device, *offset, bytes)?;
+    }
+    if device.identity().features.write_cache {
+        device.flush_cache()?;
+    }
+    Ok(Some(header))
+}
+
 /// The log of one boot: appends wait in memory until a flush stores them.
 pub struct Writer {
     ring: Ring,
@@ -877,6 +931,8 @@ pub struct Writer {
     durable: Option<u64>,
     fresh: Option<HeaderError>,
     converted: bool,
+    /// The smaller region of the log this open laid out in the whole one.
+    grown: Option<u64>,
     pending: Pending<Vec<u8>>,
     /// The store in progress: its steps to come and the one running.
     steps: VecDeque<Step>,
@@ -949,6 +1005,7 @@ impl Writer {
         };
         let mut first = vec![0; block];
         device.read(0, &mut first)?;
+        let mut grown = None;
         let (header, fresh, converted) = match Header::decode(&first, bytes) {
             Ok(header) if header.version == VERSION => (header, None, false),
             Ok(old) => {
@@ -960,7 +1017,19 @@ impl Writer {
                 };
                 (header, None, true)
             }
-            Err(error) => (Header::fresh(layout), Some(error), false),
+            Err(error) => {
+                let laid_out = match prefix(&error, bytes, block as u64) {
+                    Some(smaller) => {
+                        grow(device, smaller, layout)?.inspect(|_| grown = Some(smaller))
+                    }
+                    None => None,
+                };
+                match laid_out {
+                    // Its header is still to be written, as a converted one's.
+                    Some(header) => (header, None, true),
+                    None => (Header::fresh(layout), Some(error), false),
+                }
+            }
         };
         let layout = header.layout;
         let ring_bytes = layout.ring_bytes;
@@ -1001,6 +1070,7 @@ impl Writer {
             durable: (fresh.is_none() && !converted).then_some(head),
             fresh,
             converted,
+            grown,
             pending: Pending::new(vec![0; pending]),
             steps: VecDeque::new(),
             running: None,
@@ -1156,7 +1226,14 @@ impl Writer {
 
     /// Whether this open converted a version 1 log ([`convert`]).
     pub fn converted(&self) -> bool {
-        self.converted
+        self.converted && self.grown.is_none()
+    }
+
+    /// The smaller region of the log an older loader started at the
+    /// region's start, which this open laid out in the whole region
+    /// ([`grow`]), if it did.
+    pub fn grown(&self) -> Option<u64> {
+        self.grown
     }
 
     /// How the region is divided.
@@ -1439,7 +1516,14 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     // A log file's region: its whole pages up to the longest a boot writes.
     let bytes = file_region(bytes).unwrap_or(bytes);
     let region = &region[..bytes as usize];
-    let header = Header::decode(&region[..HEADER_BYTES as usize], bytes)?;
+    let header = match Header::decode(&region[..HEADER_BYTES as usize], bytes) {
+        Ok(header) => header,
+        // A smaller log at the region's start: an older loader's.
+        Err(error) => match prefix(&error, bytes, 1) {
+            Some(smaller) => return read(&region[..smaller as usize]),
+            None => return Err(error),
+        },
+    };
     let (head, layout) = (header.head, header.layout);
     let ring_bytes = layout.ring_bytes;
     let ring = &region[HEADER_BYTES as usize..(HEADER_BYTES + ring_bytes) as usize];
@@ -1502,12 +1586,29 @@ pub fn relayout(old: &[u8], bytes: u64) -> Result<Vec<u8>, HeaderError> {
         return Err(HeaderError::Short { bytes });
     }
     let mut region = vec![0; bytes as usize];
+    let (pieces, header) = placed(&log, layout);
+    for (offset, bytes) in pieces {
+        region[offset as usize..offset as usize + bytes.len()].copy_from_slice(&bytes);
+    }
+    header.encode(&mut region[..HEADER_BYTES as usize]);
+    Ok(region)
+}
+
+/// Where `log` goes in `layout`: its stream's newest bytes at their
+/// positions in the ring and each kept boot's record, in the record its boot
+/// number gives, its lines cut at a line's end where a record is smaller,
+/// each as a byte offset in the region and its bytes; and the header that
+/// names them.
+fn placed(log: &Log, layout: Layout) -> (Vec<(u64, Vec<u8>)>, Header) {
+    let mut pieces = Vec::new();
     let ring = layout.ring_bytes;
     let kept = log.stream.len().min(ring as usize);
     let stream = &log.stream[log.stream.len() - kept..];
-    for (offset, &byte) in stream.iter().enumerate() {
-        let at = log.head - kept as u64 + offset as u64;
-        region[(HEADER_BYTES + at % ring) as usize] = byte;
+    let at = (log.head - kept as u64) % ring;
+    let first = stream.len().min((ring - at) as usize);
+    pieces.push((HEADER_BYTES + at, stream[..first].to_vec()));
+    if first < stream.len() {
+        pieces.push((HEADER_BYTES, stream[first..].to_vec()));
     }
     let mut records = vec![Record::default(); layout.records as usize];
     for start in &log.starts {
@@ -1530,10 +1631,9 @@ pub fn relayout(old: &[u8], bytes: u64) -> Result<Vec<u8>, HeaderError> {
         {
             last = &last[end + 1..];
         }
-        let at = layout.record_at(index) as usize;
-        region[at..at + first].copy_from_slice(&start.first[..first]);
-        let after = at + layout.first_bytes as usize;
-        region[after..after + last.len()].copy_from_slice(last);
+        let at = layout.record_at(index);
+        pieces.push((at, start.first[..first].to_vec()));
+        pieces.push((at + u64::from(layout.first_bytes), last.to_vec()));
         *record = Record {
             boot: start.boot,
             start: start.start,
@@ -1541,15 +1641,14 @@ pub fn relayout(old: &[u8], bytes: u64) -> Result<Vec<u8>, HeaderError> {
             last: last.len() as u32,
         };
     }
-    Header {
+    let header = Header {
         version: VERSION,
         head: log.head,
         boots: log.boots,
         layout,
         records,
-    }
-    .encode(&mut region[..HEADER_BYTES as usize]);
-    Ok(region)
+    };
+    (pieces, header)
 }
 
 /// The newest bytes of the stream the log on `device` holds, oldest first,

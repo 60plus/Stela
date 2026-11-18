@@ -1010,6 +1010,68 @@ fn a_log_laid_out_again_in_a_longer_file_keeps_its_lines_and_records() {
     );
 }
 
+/// A loader older than the longer file opens it as a 4 MiB region and
+/// starts a 4 MiB log at its start. The reader reads that log, and the next
+/// boot lays it out in the whole file in place with its boots, where it
+/// started the file fresh again and they were lost.
+#[test]
+fn a_smaller_log_an_older_loader_started_in_the_file_is_grown_in_place() {
+    for older_boots in [3, 12] {
+        let mut disk = Recorder::new(FILE_BYTES, 512);
+        let mut next = 0;
+        for _ in 0..2 {
+            let mut writer = Writer::open(&mut disk).unwrap();
+            writer.append(&lines(next, 1000));
+            next += 1000;
+            writer.flush(&mut disk).unwrap();
+        }
+        // The older loader sees the file's first 4 MiB, whose header is not
+        // its region's, and starts a log there; twelve boots of 600 KB turn
+        // its ring.
+        let mut older = Recorder::new(LOG_BYTES, 512);
+        older
+            .disk
+            .bytes
+            .copy_from_slice(&disk.disk.bytes[..LOG_BYTES as usize]);
+        for boot in 0..older_boots {
+            let mut writer = Writer::open(&mut older).unwrap();
+            assert_eq!(writer.fresh().is_some(), boot == 0);
+            for _ in 0..5 {
+                writer.append(&lines(next, 10_000));
+                next += 10_000;
+                writer.flush(&mut older).unwrap();
+            }
+        }
+        disk.disk.bytes[..LOG_BYTES as usize].copy_from_slice(&older.disk.bytes);
+        let small = older.log().unwrap();
+        assert_eq!(small.overwritten() > 0, older_boots == 12);
+        assert_eq!(disk.log().unwrap(), small, "read in the whole file");
+        let mut writer = Writer::open(&mut disk).unwrap();
+        assert!(writer.fresh().is_none());
+        assert!(!writer.converted());
+        assert_eq!(writer.grown(), Some(LOG_BYTES));
+        assert_eq!(writer.layout(), Layout::of(FILE_BYTES));
+        writer.append(b"after the older loader\n");
+        writer.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        assert_eq!(log.boots, older_boots + 1);
+        assert_eq!(log.overwritten(), small.overwritten());
+        assert!(log.stream.starts_with(&small.stream));
+        let marker = format!(
+            "=== STELA BOOT {} ===\nafter the older loader\n",
+            older_boots + 1
+        );
+        assert!(log.stream.ends_with(marker.as_bytes()));
+        assert_eq!(log.starts.len(), small.starts.len() + 1);
+        for (grown, kept) in log.starts.iter().zip(&small.starts) {
+            assert_eq!(
+                (grown.boot, grown.start, &grown.first),
+                (kept.boot, kept.start, &kept.first)
+            );
+        }
+    }
+}
+
 /// Each boot's marker says what it is and when it started, and its record
 /// is read with it.
 #[test]

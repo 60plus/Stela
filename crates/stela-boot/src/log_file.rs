@@ -185,6 +185,13 @@ fn report(writer: &Writer, through: &str) {
             writer.ring_bytes() >> 10
         ));
     }
+    if let Some(smaller) = writer.grown() {
+        output::arguments(format_args!(
+            "BOOT LOG FILE grew from the {} KiB log an older loader started at its start to the \
+             whole file: that log's boots stay, the lines before it are gone\n",
+            smaller >> 10
+        ));
+    }
     let layout = writer.layout();
     output::arguments(format_args!(
         "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x} ring={} KiB \
