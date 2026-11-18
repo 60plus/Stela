@@ -210,6 +210,9 @@ struct Hardware {
     translated_break: bool,
     /// Configuration bytes the first reads give instead of the real one.
     unsettled_config: VecDeque<u8>,
+    /// The controller loops a byte back to the auxiliary port's output.
+    aux_loop: bool,
+    loop_write: bool,
     busy_forever: bool,
     flood: bool,
     resend: Option<(Port, u8, usize)>,
@@ -254,6 +257,8 @@ impl Hardware {
             translation_stuck: false,
             translated_break: false,
             unsettled_config: VecDeque::new(),
+            aux_loop: true,
+            loop_write: false,
             busy_forever: false,
             flood: false,
             resend: None,
@@ -659,6 +664,7 @@ impl Registers for Model {
             }
             ENABLE_MOUSE => h.config &= !MOUSE_DISABLED,
             SEND_MOUSE => h.mouse_write = true,
+            AUX_LOOP => h.loop_write = true,
             _ => panic!("unknown controller command {value:x}"),
         }
     }
@@ -667,7 +673,11 @@ impl Registers for Model {
         assert!(!h.input_busy(), "write with IBF set");
         h.busy_until = Some(h.time.get().wrapping_add(1));
         h.writes.push((false, value));
-        if h.config_write {
+        if core::mem::take(&mut h.loop_write) {
+            if h.aux_loop {
+                h.emit(Port::Mouse, value);
+            }
+        } else if h.config_write {
             h.config_write = false;
             h.config = value | if h.translation_stuck { TRANSLATION } else { 0 };
         } else {
@@ -938,15 +948,30 @@ fn the_auxiliary_port_test_passes_with_fa_or_ff_as_linux_accepts() {
             ..Config::default()
         });
         h.borrow_mut().interface_test = reply;
+        h.borrow_mut().aux_loop = false;
         c.initialize().unwrap();
         assert!(!h.borrow().writes.contains(&(true, TEST_KEYBOARD)));
+        assert!(h.borrow().writes.contains(&(true, TEST_MOUSE)));
     }
+    // A controller that loops the byte back is not given the port test,
+    // whose error would not count.
     let (mut c, h) = controller(Config {
         keyboard: false,
         reset_on_start: false,
         ..Config::default()
     });
     h.borrow_mut().interface_test = 1;
+    c.initialize().unwrap();
+    assert!(h.borrow().writes.contains(&(true, AUX_LOOP)));
+    assert!(!h.borrow().writes.contains(&(true, TEST_MOUSE)));
+    assert!(c.is_ready());
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().interface_test = 1;
+    h.borrow_mut().aux_loop = false;
     assert_eq!(
         c.initialize().unwrap_err().kind,
         ErrorKind::ControllerReply {
@@ -1262,7 +1287,10 @@ fn unsupported_interface_or_controller_state_is_read_back_and_refused() {
         let (mut c, h) = controller(Config::default());
         match mode {
             0 => h.borrow_mut().self_test = 0xfc,
-            1 => h.borrow_mut().interface_test = 1,
+            1 => {
+                h.borrow_mut().interface_test = 1;
+                h.borrow_mut().aux_loop = false;
+            }
             2 => h.borrow_mut().translation_stuck = true,
             _ => h.borrow_mut().force_id = Some(5),
         }

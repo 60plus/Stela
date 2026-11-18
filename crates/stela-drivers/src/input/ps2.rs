@@ -48,6 +48,10 @@ const TEST_MOUSE: u8 = 0xa9;
 const DISABLE_MOUSE: u8 = 0xa7;
 const ENABLE_MOUSE: u8 = 0xa8;
 const SEND_MOUSE: u8 = 0xd4;
+/// The next data byte comes back as if the auxiliary port sent it.
+const AUX_LOOP: u8 = 0xd3;
+/// The byte Linux's i8042_check_aux loops back.
+const LOOP_BYTE: u8 = 0x5a;
 const ACK: u8 = 0xfa;
 const RESEND: u8 = 0xfe;
 const RESET: u8 = 0xff;
@@ -953,12 +957,15 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             // Self-test can reset CTR on real controllers; reapply/read it back.
             self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         }
-        // Linux tests neither port at a native start; its auxiliary port
-        // check accepts 0, FA and FF from the controller's port test.
+        // Linux tests neither port at a native start. Its auxiliary port
+        // check loops a byte back through the controller first and runs the
+        // port test only when that fails, "because it's common for chipsets
+        // to return error on perfectly functioning AUX ports"; the test's 0,
+        // FA and FF are then taken.
         if self.config.keyboard && self.config.reset_on_start {
             self.expect_controller(TEST_KEYBOARD, 0)?;
         }
-        if self.config.mouse {
+        if self.config.mouse && !self.aux_loop()? {
             let received = self.controller_response(TEST_MOUSE)?;
             if !matches!(received, 0 | ACK | 0xff) {
                 return Err(ErrorKind::ControllerReply {
@@ -999,6 +1006,23 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.optional_keyboard(ENABLE_REPORTING, &[])?;
         }
         Ok(())
+    }
+    /// Linux's AUX_LOOP in i8042_check_aux: whether the byte written for the
+    /// auxiliary port's output comes back as that port's. The first byte
+    /// either port gives is the answer, as Linux reads it.
+    fn aux_loop(&mut self) -> Result<bool, ErrorKind> {
+        self.command(AUX_LOOP)?;
+        self.write_data(LOOP_BYTE)?;
+        let start = self.timer.start();
+        loop {
+            if let Some(byte) = self.read_byte()? {
+                return Ok(byte.port == Port::Mouse && byte.data == LOOP_BYTE);
+            }
+            if self.expired(start, self.config.io_timeout_us) {
+                return Ok(false);
+            }
+            self.timer.relax();
+        }
     }
     /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
     /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
