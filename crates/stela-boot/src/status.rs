@@ -375,6 +375,13 @@ pub fn begin(title: &str) {
 }
 
 /// Show how far the running step has come, such as `182 of 484 MB`.
+/// The running step's detail; empty without one.
+pub fn detail() -> String {
+    with(|state| state.running.as_ref().map(|running| running.detail.clone()))
+        .flatten()
+        .unwrap_or_default()
+}
+
 pub fn progress(detail: &str) {
     with(|state| {
         state.detail_ends(detail);

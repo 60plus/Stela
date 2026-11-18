@@ -215,6 +215,11 @@ pub(super) unsafe fn park(
     crate::output::arguments(format_args!("{census}\n"));
 }
 
+/// The other processors [`park_before_firmware`] parked, and those it left
+/// in wait-for-SIPI.
+pub(super) static OTHERS_PARKED: AtomicU32 = AtomicU32::new(0);
+pub(super) static OTHERS_WAITING: AtomicU32 = AtomicU32::new(0);
+
 /// A processor that did not park before the firmware's AML did not take
 /// INIT again either: it may still read the startup page, from which no
 /// other processor then starts.
@@ -322,6 +327,11 @@ pub(super) unsafe fn park_before_firmware(
             }
         }
     }
+    OTHERS_PARKED.store((census.mwait + census.halted) as u32, Ordering::Relaxed);
+    OTHERS_WAITING.store(
+        (census.waiting() + census.unreachable) as u32,
+        Ordering::Relaxed,
+    );
     let waits = Box::leak(waits.into_boxed_slice());
     EARLY.1.store(waits.len(), Ordering::Relaxed);
     EARLY.0.store(waits.as_mut_ptr(), Ordering::Release);

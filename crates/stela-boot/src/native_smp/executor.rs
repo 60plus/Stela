@@ -422,6 +422,19 @@ pub(crate) unsafe fn quiesce_firmware_aps(
     Ok(delivered)
 }
 
+/// The PEs' processors started (`start` returned).
+static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Where the processors other than this boot processor are, for a line
+/// about a call into the firmware's system management code.
+pub(crate) fn others() -> stela_boot_core::smi::Others {
+    stela_boot_core::smi::Others {
+        parked: park::OTHERS_PARKED.load(Ordering::Relaxed),
+        waiting: park::OTHERS_WAITING.load(Ordering::Relaxed),
+        started: STARTED.load(Ordering::Relaxed),
+    }
+}
+
 /// Park every enabled processor but the boot processor in an idle loop of
 /// its own before the firmware's AML runs, so that each answers the
 /// firmware's SMIs (`park::park_before_firmware`). A boot processor whose
@@ -794,6 +807,7 @@ pub(crate) unsafe fn start(
             failure.is_some(),
         )
     };
+    STARTED.store(true, Ordering::Relaxed);
     Ok(Executors {
         processors,
         failure: failure.map(|(_, error)| error),
