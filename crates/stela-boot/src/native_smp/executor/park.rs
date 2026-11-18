@@ -10,6 +10,18 @@
 //! second, or faults on the way, may still read the startup page, so no
 //! other processor starts from it: it and the processors after it stay in
 //! wait-for-SIPI as before, the boot goes on and the log line says so.
+//!
+//! Before the firmware's AML first runs, every processor but the boot
+//! processor is parked the same way ([`park_before_firmware`]). In INIT's
+//! wait-for-SIPI state a processor does not take an SMI: the firmware's
+//! system management code then finds it absent, and a handler that waits
+//! for every processor to arrive waits until its own timeout or for good,
+//! with the boot processor inside it, where no watchdog of Stela's can
+//! act. Linux runs the firmware's AML with every other processor in the
+//! firmware's own idle loop or online, never in wait-for-SIPI. A PE's
+//! processor parked there is started from the page again later, by INIT
+//! and SIPI, as the startup always does; one that does not park is sent
+//! INIT again, so it reads nothing, and stays in wait-for-SIPI.
 use super::super::{bootstrap, firmware, memory_types::Image, topology};
 use crate::{
     apic::{self, Apic},
@@ -17,14 +29,14 @@ use crate::{
     handoff::Handoff,
     layout,
 };
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     arch::{
         asm,
         x86_64::{__cpuid, CpuidResult},
     },
     cell::UnsafeCell,
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 use stela_boot_core::parking::{Census, Idle, IdleCpuid, Left, UNPUBLISHED};
 use stela_engine::machine::mmu::placement::Placement;
@@ -156,13 +168,19 @@ pub(super) unsafe fn park(
         unused: unused.clone().count(),
         ..Census::default()
     };
-    census.left = match (startup_failed, handoff.native_resources.sipi) {
+    census.left = match (startup_failed || page_held(), handoff.native_resources.sipi) {
         (true, _) => Some(Left::StartupFailed),
         (false, 0) => Some(Left::NoStartupPage),
         _ => None,
     };
+    let early = early();
     if census.left.is_none() {
         for index in unused {
+            // Parked before the firmware's AML, and not started since.
+            if let Some(idle) = early.get(index).and_then(|&word| Idle::decode(word)) {
+                census.parked(idle);
+                continue;
+            }
             let processor = processors[index];
             let Some(destination) = u32::try_from(processor.apic_id)
                 .ok()
@@ -195,6 +213,135 @@ pub(super) unsafe fn park(
         }
     }
     crate::output::arguments(format_args!("{census}\n"));
+}
+
+/// A processor that did not park before the firmware's AML did not take
+/// INIT again either: it may still read the startup page, from which no
+/// other processor then starts.
+static PAGE_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the startup page may still be read by a processor that did not
+/// park before the firmware's AML.
+pub(super) fn page_held() -> bool {
+    PAGE_HELD.load(Ordering::Acquire)
+}
+
+/// Each processor's wait from [`park_before_firmware`] (`Idle::encode`), by
+/// its index in the capture, `UNPUBLISHED` where it did not park then;
+/// empty before.
+static EARLY: (AtomicPtr<u32>, AtomicUsize) =
+    (AtomicPtr::new(core::ptr::null_mut()), AtomicUsize::new(0));
+
+fn early() -> &'static [u32] {
+    let (pointer, length) = (
+        EARLY.0.load(Ordering::Acquire),
+        EARLY.1.load(Ordering::Relaxed),
+    );
+    if pointer.is_null() {
+        return &[];
+    }
+    // SAFETY: `park_before_firmware` leaked this slice, written once.
+    unsafe { core::slice::from_raw_parts(pointer, length) }
+}
+
+/// Park every enabled processor but the boot processor before the
+/// firmware's AML runs, so each answers an SMI (module documentation),
+/// and log how many did, by their wait. `progress` is called before each
+/// processor's bounded wait.
+///
+/// # Safety
+/// On the boot processor in the engine's root, its host installed, with
+/// interrupts masked, before any processor starts from the startup page
+/// and before the firmware's AML runs. `memory_types` and `pat` are the
+/// boot processor's.
+pub(super) unsafe fn park_before_firmware(
+    handoff: &Handoff,
+    capture: &firmware::Capture,
+    sender: &Apic,
+    memory_types: &Image,
+    pat: u64,
+    progress: fn(),
+) {
+    let cores = handoff.native_resources.cores as usize;
+    let processors = &capture.processors[..capture.processor_count as usize];
+    let Some(boot) = capture.selected.get(..cores.max(1)) else {
+        return;
+    };
+    let Ok(others) = topology::enabled_unselected(processors, &boot[..1]) else {
+        return;
+    };
+    let mut census = Census {
+        unused: others.clone().count(),
+        ..Census::default()
+    };
+    let mut waits: Vec<u32> = vec![UNPUBLISHED; processors.len()];
+    if handoff.native_resources.sipi == 0 {
+        census.left = Some(Left::NoStartupPage);
+    } else {
+        for index in others {
+            // Each processor's wait is bounded on its own (a second).
+            progress();
+            let processor = processors[index];
+            let Some(destination) = u32::try_from(processor.apic_id)
+                .ok()
+                .filter(|&id| sender.validate_init(id, handoff.tsc_hz).is_ok())
+            else {
+                census.unreachable += 1;
+                continue;
+            };
+            // SAFETY: the caller's; every processor started from the page
+            // before parked, or was sent INIT again below.
+            match unsafe {
+                park_one(
+                    handoff,
+                    capture,
+                    sender,
+                    memory_types,
+                    pat,
+                    index,
+                    destination,
+                )
+            } {
+                Some(idle) => {
+                    census.parked(idle);
+                    waits[index] = idle.encode();
+                }
+                None => {
+                    census.left = Some(Left::ParkFailed {
+                        apic: processor.apic_id,
+                    });
+                    // It may still read the startup page: INIT puts it back
+                    // in wait-for-SIPI, where it reads nothing. Without that
+                    // no other processor starts from the page here.
+                    // SAFETY: a validated destination; the BSP alone sends.
+                    if unsafe { sender.init_only(destination, handoff.tsc_hz) }.is_err() {
+                        PAGE_HELD.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let waits = Box::leak(waits.into_boxed_slice());
+    EARLY.1.store(waits.len(), Ordering::Relaxed);
+    EARLY.0.store(waits.as_mut_ptr(), Ordering::Release);
+    crate::output::arguments(format_args!(
+        "NATIVE PARKED BEFORE FIRMWARE {} of {} other processors, so each answers the \
+         firmware's SMIs while its AML runs: mwait={} hlt={} wait_for_sipi={}{}\n",
+        census.mwait + census.halted,
+        census.unused,
+        census.mwait,
+        census.halted,
+        census.waiting(),
+        match census.left {
+            None => alloc::string::String::new(),
+            Some(Left::NoStartupPage) => alloc::string::String::from(" (no startup page)"),
+            Some(Left::ParkFailed { apic }) => {
+                alloc::format!(" (processor {apic:#x} did not reach its idle loop)")
+            }
+            Some(Left::StartupFailed) => alloc::string::String::new(),
+        }
+    ));
 }
 
 /// Start processor `index`, APIC ID `destination`, into [`enter`] and wait

@@ -423,7 +423,7 @@ fn open_host(
         mmio: native_mmio,
         remappers,
         work: kernel_work,
-    } = start_platform(handoff, &mut host_owner, options);
+    } = start_platform(handoff, &mut host_owner, options, native_processors);
     // The signing service is asked only during an install, so a boot that
     // installs nothing leaves the adapter to the guest. An install without a
     // medium partition also streams its remote image.
@@ -2577,6 +2577,7 @@ fn start_platform(
     handoff: &'static Handoff,
     host_owner: &mut host::HostOwner,
     options: &Options,
+    native_processors: Option<&'static crate::native_smp::firmware::Capture>,
 ) -> Platform {
     // The owned MMIO permission the host devices' services map through. A
     // host it cannot check is reported, and those services refuse.
@@ -2602,6 +2603,23 @@ fn start_platform(
     static PCI_FUNCTIONS: &str = "taking over the PC's devices: stopping its PCI functions";
     static CONTROLLERS: &str =
         "taking over the PC's devices: DMA remapping units and interrupt controllers";
+    // First: from here every other processor answers the firmware's SMIs,
+    // which its AML, its services and its handlers of Stela's device
+    // accesses can raise (`park_before_firmware`).
+    static PROCESSORS: &str = "taking over the PC's devices: parking the other processors";
+    takeover_part("other processors", &PROCESSORS);
+    if let Some(capture) = native_processors {
+        // SAFETY: the installed boot processor in the engine's root with
+        // interrupts masked; no processor started from the startup page
+        // and no AML ran yet.
+        unsafe {
+            crate::native_smp::executor::park_before_firmware(
+                handoff,
+                capture,
+                super::step_watchdog::progress,
+            )
+        };
+    }
     takeover_part("memory-mapped registers", &REGISTERS);
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before

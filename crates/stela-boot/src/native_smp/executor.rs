@@ -422,6 +422,58 @@ pub(crate) unsafe fn quiesce_firmware_aps(
     Ok(delivered)
 }
 
+/// Park every enabled processor but the boot processor in an idle loop of
+/// its own before the firmware's AML runs, so that each answers the
+/// firmware's SMIs (`park::park_before_firmware`). A boot processor whose
+/// memory types cannot be read or do not make the startup page and heap
+/// write-back parks none, and says so.
+///
+/// # Safety
+/// On the boot processor in the engine's root, its host installed, with
+/// interrupts masked, before any processor starts from the startup page
+/// and before the firmware's AML runs.
+pub(crate) unsafe fn park_before_firmware(
+    handoff: &'static Handoff,
+    capture: &firmware::Capture,
+    progress: fn(),
+) {
+    let sender = Apic::new(
+        handoff.apic_base,
+        layout::physical(handoff.apic_base & apic::BASE_ADDRESS),
+    );
+    // SAFETY: CPL0, the boot processor; PAT exists under the native floor.
+    let memory = unsafe { firmware::observe() }
+        .map_err(|_| "the boot processor's controls could not be read")
+        .and_then(|source| {
+            let image = super::memory_types::Image::from_snapshot(&source)
+                .map_err(|_| "the boot processor's memory types are not ones Stela copies")?;
+            if image.amd.is_some() {
+                for (physical, bytes) in [
+                    (handoff.heap.physical, handoff.heap.bytes),
+                    (handoff.native_resources.sipi, PAGE),
+                ]
+                .into_iter()
+                .filter(|&(physical, bytes)| physical != 0 && bytes != 0)
+                {
+                    image
+                        .writeback_ram(physical, bytes)
+                        .map_err(|_| "the heap or startup page is not write-back")?;
+                }
+            }
+            Ok((image, source.pat))
+        });
+    match memory {
+        // SAFETY: the caller's; the memory types are the boot processor's.
+        Ok((image, pat)) => unsafe {
+            park::park_before_firmware(handoff, capture, &sender, &image, pat, progress)
+        },
+        Err(why) => crate::output::arguments(format_args!(
+            "NATIVE PARKED BEFORE FIRMWARE none: {why}; the other processors stay in \
+             wait-for-SIPI, where they take no SMI, while the firmware's AML runs\n"
+        )),
+    }
+}
+
 /// Start the selected physical APs using Stela-owned resources after EBS.
 ///
 /// # Safety
@@ -440,6 +492,12 @@ pub(crate) unsafe fn start(
     _fp_qualification: bool,
 ) -> Result<Executors, StartupFailure> {
     let cores = handoff.native_resources.cores as usize;
+    if cores > 1 && park::page_held() {
+        return Err(StartupFailure::Resources(
+            "a processor that did not park before the firmware's AML may still read the \
+             startup page",
+        ));
+    }
     if cores == 0 || cores > capture.core_count as usize {
         return Err(StartupFailure::Resources(
             "the reserved cores are none or more than the processor capture selects",
