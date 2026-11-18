@@ -134,3 +134,36 @@ fn the_controller_line_names_the_keyboard_path_taken() {
         "untranslated as the firmware left it, keys decoded as set 2"
     );
 }
+
+#[test]
+fn the_firmware_configuration_is_taken_once_two_reads_agree() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().config = TRANSLATING_FIRMWARE;
+    h.borrow_mut().unsettled_config = [0x45, 0x47 & !TRANSLATION].into();
+    c.initialize().unwrap();
+    assert_eq!(c.firmware_config(), Some(READ_WITH_PORTS_OFF));
+    let reads = h
+        .borrow()
+        .writes
+        .iter()
+        .take_while(|write| **write != (true, WRITE_CONFIG))
+        .filter(|write| **write == (true, READ_CONFIG))
+        .count();
+    assert_eq!(reads, 4);
+
+    let (mut c, h) = controller(Config::default());
+    h.borrow_mut().unsettled_config = (0..10).map(|n| n & 1).collect();
+    let error = c.initialize().unwrap_err();
+    assert_eq!(
+        error.kind,
+        ErrorKind::ControllerReply {
+            command: READ_CONFIG,
+            received: 1
+        }
+    );
+}

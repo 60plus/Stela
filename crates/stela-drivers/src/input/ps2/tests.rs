@@ -208,6 +208,8 @@ struct Hardware {
     translation_stuck: bool,
     /// A translating controller holds a set-2 F0 for the next byte.
     translated_break: bool,
+    /// Configuration bytes the first reads give instead of the real one.
+    unsettled_config: VecDeque<u8>,
     busy_forever: bool,
     flood: bool,
     resend: Option<(Port, u8, usize)>,
@@ -251,6 +253,7 @@ impl Hardware {
             interface_test: 0,
             translation_stuck: false,
             translated_break: false,
+            unsettled_config: VecDeque::new(),
             busy_forever: false,
             flood: false,
             resend: None,
@@ -628,7 +631,7 @@ impl Registers for Model {
                     h.config & KEYBOARD_DISABLED != 0 || !h.scanning[0],
                     "CTR reply lane is not owned while a keyboard can report"
                 );
-                let config = h.config;
+                let config = h.unsettled_config.pop_front().unwrap_or(h.config);
                 h.reply(config);
             }
             WRITE_CONFIG => h.config_write = true,

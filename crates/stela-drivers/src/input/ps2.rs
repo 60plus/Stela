@@ -704,6 +704,26 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.config.io_timeout_us,
         )
     }
+    /// The configuration byte once two reads in a row agree, as Linux's
+    /// i8042_controller_init reads it, at most ten reads 50 us apart.
+    fn stable_config(&mut self) -> Result<u8, ErrorKind> {
+        let mut last = self.controller_response(READ_CONFIG)?;
+        for _ in 1..10 {
+            let start = self.timer.start();
+            while !self.expired(start, 50) {
+                self.timer.relax();
+            }
+            let config = self.controller_response(READ_CONFIG)?;
+            if config == last {
+                return Ok(config);
+            }
+            last = config;
+        }
+        Err(ErrorKind::ControllerReply {
+            command: READ_CONFIG,
+            received: last,
+        })
+    }
     fn set_config(&mut self, value: u8) -> Result<(), ErrorKind> {
         self.command(WRITE_CONFIG)?;
         self.write_data(value)?;
@@ -918,7 +938,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             self.timer.relax();
         }
-        let config = self.controller_response(READ_CONFIG)?;
+        let config = self.stable_config()?;
         self.controller_config = Some(config);
         let firmware = *self.firmware_config.get_or_insert(config);
         // Translation stays as the firmware left it, as Linux's
