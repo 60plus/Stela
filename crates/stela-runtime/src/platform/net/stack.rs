@@ -398,6 +398,17 @@ impl<L: Link, C: Clock> Stack<L, C> {
         ))
     }
 
+    /// Whether DHCP is getting a new lease for one lost less than
+    /// [`DHCP_WAIT_US`] ago: IPv4 is expected back, so a lookup waits for
+    /// it rather than failing.
+    fn ipv4_pending(&self, now: u64) -> bool {
+        self.dhcp.is_some()
+            && self.config.is_none()
+            && self
+                .lost_at
+                .is_some_and(|at| now.saturating_sub(at) < DHCP_WAIT_US)
+    }
+
     /// Gives the interface `address`/`prefix` and the default router
     /// `router` by hand instead of by DHCP. IPv6 autoconfiguration goes on.
     pub fn set_ipv4(
@@ -628,7 +639,10 @@ impl<L: Link, C: Clock> Stack<L, C> {
     /// An address found in the last [`RESOLVED_US`] is used again; IPv6 is
     /// asked first when it is ready, then IPv4; and a lookup that fails falls
     /// back to the last address the name had, so one lost reply does not end
-    /// a long download.
+    /// a long download. While DHCP gets back a lease lost less than
+    /// [`DHCP_WAIT_US`] ago, a failed lookup waits for it and asks again,
+    /// so a lease that lapses at its renewal does not end one either. Each
+    /// failure is noted with what the name's cached address was.
     fn resolve(&mut self, lookup: &mut Lookup) -> Result<Option<IpAddress>, NetError> {
         if let Ok(address) = lookup.name.parse() {
             return Ok(Some(address));
@@ -657,11 +671,47 @@ impl<L: Link, C: Clock> Stack<L, C> {
             Err(error @ NetError::Clock(_)) => return Err(error),
             Err(error) => error,
         };
-        match known {
-            Some(index) if self.address_usable(self.resolved[index].1) => {
-                Ok(Some(self.resolved[index].1))
+        let cached = known.map(|index| (self.resolved[index].1, self.resolved[index].2));
+        let usable = cached.is_some_and(|(address, _)| self.address_usable(address));
+        let pending = self.ipv4_pending(now);
+        let line = alloc::format!(
+            "DNS {} failed: {failure}; cached {}, usable={usable} (ipv4 config present={}, \
+             ipv6 global ready={}, lease lost {})",
+            lookup.name,
+            match cached {
+                Some((IpAddress::Ipv4(_), at)) =>
+                    alloc::format!("IPv4 address {} s old", now.wrapping_sub(at) / 1_000_000),
+                Some((IpAddress::Ipv6(_), at)) =>
+                    alloc::format!("IPv6 address {} s old", now.wrapping_sub(at) / 1_000_000),
+                None => String::from("none"),
+            },
+            self.config.is_some(),
+            self.ipv6_global_ready(),
+            match (self.lost_at, pending) {
+                (Some(at), true) => alloc::format!(
+                    "{} s ago, waiting for the next",
+                    now.saturating_sub(at) / 1_000_000
+                ),
+                (Some(at), false) => alloc::format!("{} s ago", now.saturating_sub(at) / 1_000_000),
+                (None, _) => String::from("never"),
+            },
+        );
+        self.note(line);
+        match cached {
+            Some((address, _)) if usable => Ok(Some(address)),
+            _ if pending => {
+                self.await_lease(lookup);
+                Ok(None)
             }
             _ => Err(failure),
+        }
+    }
+
+    /// Keep `lookup` waiting until the lease DHCP is getting back is due:
+    /// [`DHCP_WAIT_US`] after the last was lost.
+    fn await_lease(&self, lookup: &mut Lookup) {
+        if let Some(at) = self.lost_at {
+            lookup.deadline = lookup.deadline.max(at.saturating_add(DHCP_WAIT_US));
         }
     }
 
@@ -675,6 +725,9 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 DnsQueryType::A
             } else if !lookup.ipv4_only && self.ipv6_ready() {
                 DnsQueryType::Aaaa
+            } else if self.ipv4_pending(now) {
+                self.await_lease(lookup);
+                return Ok(None);
             } else if now >= lookup.deadline {
                 return Err(NetError::Dns(alloc::format!(
                     "{}: no reachable address family",

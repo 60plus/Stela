@@ -911,3 +911,55 @@ fn a_dhcp_lease_and_its_loss_are_noted() {
     stack.set_ipv4(CLIENT_IP, 24, None).unwrap();
     assert_eq!(stack.dhcp_summary(), None);
 }
+
+/// LOG-3: a lease lost at its renewal no longer fails the lookup of a name
+/// with a cached IPv4 address: it waits for the next lease and then uses
+/// the cached address, where it failed at once and ended a 25 GB download.
+/// A lease that does not come back within the DHCP wait still fails it.
+#[test]
+fn a_lookup_waits_for_a_lost_lease_and_then_uses_the_cached_address() {
+    let (mut stack, answering, clock) = dhcpd(true);
+    stack.dhcp().unwrap();
+    let address = IpAddress::Ipv4(SERVER_IP);
+    let now = stack.now().unwrap();
+    stack
+        .resolved
+        .push((String::from("cdn.example"), address, now));
+    answering.set(false);
+    let dhcp = stack.dhcp.unwrap();
+    stack.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+    stack.poll().unwrap();
+    assert!(stack.config().is_none());
+    let mut lookup = Lookup {
+        name: String::from("cdn.example"),
+        port: 80,
+        buffer: 0,
+        raw: false,
+        query: None,
+        asked: 0,
+        ipv4_only: false,
+        deadline: 0,
+    };
+    assert_eq!(stack.resolve(&mut lookup), Ok(None));
+    assert!(lookup.deadline >= clock.0.get() + DHCP_WAIT_US - 1_000_000);
+    answering.set(true);
+    while stack.config().is_none() {
+        stack.poll().unwrap();
+    }
+    assert_eq!(stack.resolve(&mut lookup), Ok(Some(address)));
+    // A lease that stays away past the wait: the lookup fails, and says
+    // what the cached address was.
+    answering.set(false);
+    stack.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+    stack.poll().unwrap();
+    clock.0.set(clock.0.get() + DHCP_WAIT_US);
+    stack.take_notes();
+    assert!(matches!(stack.resolve(&mut lookup), Err(NetError::Dns(_))));
+    let notes = stack.take_notes();
+    assert!(
+        notes.iter().any(|line| line.starts_with("DNS cdn.example failed: ")
+            && line.contains("cached IPv4 address ")
+            && line.contains("usable=false (ipv4 config present=false, ipv6 global ready=false, lease lost 60 s ago)")),
+        "{notes:?}"
+    );
+}
