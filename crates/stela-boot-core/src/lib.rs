@@ -73,6 +73,7 @@ pub mod irq_context;
 pub mod linux_pump;
 pub mod load_lines;
 pub mod loader_lines;
+pub mod log_budget;
 pub mod log_sinks;
 pub mod machine_check;
 pub mod madt;

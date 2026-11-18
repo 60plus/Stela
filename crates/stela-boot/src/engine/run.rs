@@ -1033,11 +1033,14 @@ pub(super) fn run<H: Host>(
         let due = now - heartbeat.beat.at;
         if heartbeat.stage.is_some() {
             // The beat's later reports, one bounded stage per boundary.
+            let _periodic = output::periodic();
             host_work(machine, "beat step", |machine| {
                 heartbeat.step(machine, tsc_hz)
             });
             continue;
         }
+        // The beat's reports, whose size their pace bounds, pass the log's
+        // per-family budgets (`output::periodic`).
         match beat_pace::due(
             now.wrapping_sub(ran_since),
             due,
@@ -1047,12 +1050,14 @@ pub(super) fn run<H: Host>(
             quiet,
         ) {
             beat_pace::Due::Full => {
+                let _periodic = output::periodic();
                 host_work(machine, "beat", |machine| {
                     heartbeat.beat(machine, &mut service, now, tsc_hz)
                 });
                 output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
             }
             beat_pace::Due::Short => {
+                let _periodic = output::periodic();
                 host_work(machine, "beat", |machine| {
                     heartbeat.short_beat(machine, now)
                 });
@@ -1067,6 +1072,7 @@ pub(super) fn run<H: Host>(
                 .compare_exchange(ident_at, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            let _periodic = output::periodic();
             super::ident::report();
         }
     }

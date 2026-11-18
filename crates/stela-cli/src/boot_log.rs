@@ -736,6 +736,14 @@ pub(crate) fn summary(log: &Log) -> String {
             duration_text(seconds)
         );
     }
+    let left_out = left_out_notes(&log.stream);
+    if left_out != 0 {
+        let _ = write!(
+            text,
+            "; {left_out} lines say where lines were left out of it (BOOT LOG THINNED, \
+             [boot log dropped, BOOT LOG busy)"
+        );
+    }
     if log.overwritten() != 0 {
         text.push_str("; older lines were overwritten");
         let kept: Vec<u64> = log.kept_starts().map(|(start, _)| start.boot).collect();
@@ -754,6 +762,32 @@ pub(crate) fn summary(log: &Log) -> String {
     }
     text.push('\n');
     text
+}
+
+/// The lines of `stream` that say a boot left lines out of its log: a
+/// family past its budget (`stela_boot_core::log_budget`), a buffer that
+/// overflowed between stores (`boot_log::Pending`), or writes that found
+/// the log held elsewhere.
+fn left_out_notes(stream: &[u8]) -> usize {
+    const NOTES: [&[u8]; 3] = [
+        b"BOOT LOG THINNED ",
+        b"[boot log dropped ",
+        b"BOOT LOG busy: ",
+    ];
+    stream
+        .split(|&byte| byte == b'\n')
+        .filter(|line| {
+            // After the line's stamp, if any.
+            let text = match line.strip_prefix(b"[") {
+                Some(rest) if stamp(line).is_some() => rest
+                    .iter()
+                    .position(|&byte| byte == b']')
+                    .map_or(*line, |end| rest[end + 1..].trim_ascii_start()),
+                _ => line,
+            };
+            NOTES.iter().any(|note| text.starts_with(note))
+        })
+        .count()
 }
 
 /// End every device skip the stick's boot log at `path` holds (`pc::device_starts`):
@@ -1536,6 +1570,9 @@ pub(crate) mod tests {
             duration_text(seconds)
         );
         assert_eq!(said, expected);
+        // Lines that say others were left out are counted.
+        let notes = b"[   1.000] BOOT LOG THINNED \"GUEST|\": 3 lines\n[boot log dropped 12 bytes]\nGUEST| BOOT LOG THINNED\n";
+        assert_eq!(left_out_notes(notes), 2);
         let mut written = Vec::new();
         write_log(&mut written, &log).unwrap();
         let text = String::from_utf8(written).unwrap();
