@@ -159,6 +159,31 @@ pub(crate) fn read(index: u32) -> Option<u64> {
     (unsafe { stela_pmu_rdmsr(index, &mut value) } == 0).then_some(value)
 }
 
+/// This processor's performance registers for
+/// [`stela_boot_core::host_performance`], whose model-specific ratio
+/// registers are probed: a refused read is `None`, a refused write has no
+/// effect. Needs this core's exception handler (`interrupts::interrupt`),
+/// which resumes the probe.
+pub(crate) struct PerformanceRegisters;
+
+impl stela_boot_core::host_performance::Registers for PerformanceRegisters {
+    unsafe fn read(&mut self, msr: stela_boot_core::msr::Msr) -> u64 {
+        // SAFETY: the caller's contract.
+        unsafe { msr.read() }
+    }
+
+    /// A write the processor refuses (#GP, as a hypervisor may answer a
+    /// switch it does not model) leaves the register as it was, which the
+    /// request reads back where it matters (turbo).
+    unsafe fn write(&mut self, msr: stela_boot_core::msr::Msr, value: u64) {
+        write(msr.index, value);
+    }
+
+    unsafe fn probe(&mut self, index: u32) -> Option<u64> {
+        read(index)
+    }
+}
+
 /// The SMI counter's register (`stela_boot_core::smi`), probed once for
 /// every processor, which share a vendor: `u32::MAX` before the probe, 0
 /// where there is none.

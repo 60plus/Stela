@@ -245,7 +245,11 @@ fn start(handoff: u64) -> Started {
     // off and its descriptors installed; nothing else writes its P-state
     // registers. After the stop record is armed, so that a fault here
     // leaves its report. The APs ask for theirs when they are ready.
-    unsafe { stela_boot_core::host_performance::request_full_performance() };
+    unsafe {
+        stela_boot_core::host_performance::request_full_performance(
+            &mut host::pmu::PerformanceRegisters,
+        )
+    };
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.

@@ -295,7 +295,11 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
         // SAFETY: CPL0 on this ready AP with interrupts masked and its own
         // descriptors installed, before it runs a PE; nothing else writes
         // its P-state registers.
-        unsafe { stela_boot_core::host_performance::request_full_performance() };
+        unsafe {
+            stela_boot_core::host_performance::request_full_performance(
+                &mut host::pmu::PerformanceRegisters,
+            )
+        };
         Ok(owner)
     })()
     .and_then(|owner| {
