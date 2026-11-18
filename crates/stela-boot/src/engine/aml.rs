@@ -1311,9 +1311,14 @@ impl HostAcpi {
     pub(super) fn activate(&'static self, prepared_sci: Option<sci::Prepared>) {
         if self.capabilities == 0 {
             // No hardware callback may take the route in namespace mode: it
-            // is dropped here.
+            // is dropped here. The line says whose gap this is: the provider
+            // has no ACPI interrupt, event and deferred-work services yet
+            // (`start_entered`), whatever the PC.
             output::arguments(format_args!(
-                "UNSUPPORTED ACPI hardware activation: native firmware services are not qualified\n"
+                "UNSUPPORTED ACPI hardware mode: not implemented in Stela yet, on any PC (no ACPI \
+                 interrupt, ACPI events or deferred firmware work); off because of it: the \
+                 embedded controller and what firmware reads through it (battery, AC adapter, \
+                 lid), ACPI device notifications and USB-C port reports (UCSI)\n"
             ));
             return;
         }
