@@ -41,7 +41,7 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-use stela_boot_core::parking::{Census, Holder, Idle, IdleCpuid, Left, Page, UNPUBLISHED};
+use stela_boot_core::parking::{Census, Early, Holder, Idle, IdleCpuid, Left, Page, UNPUBLISHED};
 use stela_engine::machine::mmu::placement::Placement;
 
 /// A parked processor's stack: its descriptor installation runs on it, then
@@ -51,8 +51,9 @@ const STACK_BYTES: usize = 32 * 1024;
 const STARTING: u8 = 0;
 const PARKED: u8 = 1;
 
-/// What one parked processor takes at entry. Leaked with its tables and
-/// stack, which an NMI or machine check still enters for the whole boot.
+/// What one parked processor takes at entry. Kept with its tables and stack
+/// while it may run there, which an NMI or machine check still enters: for
+/// the whole boot, or until it runs a PE on its own ([`reclaim`]).
 struct Parking {
     tables: UnsafeCell<Option<&'static mut interrupts::Tables>>,
     /// The boot processor runs x2APIC, which this one then takes too.
@@ -65,6 +66,14 @@ struct Parking {
 // SAFETY: the boot processor fills `tables` and `x2apic` before the SIPI;
 // only the parked processor takes `tables`, once. The rest are atomics.
 unsafe impl Sync for Parking {}
+
+/// A parked processor's heap allocations, never dropped in place: freeing
+/// one gives the memory back without running anything of it.
+struct Resources {
+    stack: *mut [u8],
+    tables: *mut core::mem::ManuallyDrop<interrupts::Tables>,
+    parking: *mut Parking,
+}
 
 /// The line MONITOR arms. Nothing writes it.
 #[repr(align(64))]
@@ -177,6 +186,7 @@ pub(super) unsafe fn park(
         _ => None,
     };
     let early = early();
+    let mut flush = true;
     if census.left.is_none() {
         for index in unused {
             // Parked before the firmware's AML, and not started since.
@@ -203,9 +213,11 @@ pub(super) unsafe fn park(
                     pat,
                     index,
                     destination,
+                    core::mem::take(&mut flush),
                 )
             } {
-                Some(idle) => census.parked(idle),
+                // It stays parked on them for the boot.
+                Some((idle, _)) => census.parked(idle),
                 None => {
                     census.left = Some(Left::ParkFailed {
                         apic: processor.apic_id,
@@ -268,6 +280,37 @@ pub(super) unsafe fn release_page(sender: &Apic, tsc_hz: u64) -> Page {
 static EARLY: (AtomicPtr<u32>, AtomicUsize) =
     (AtomicPtr::new(core::ptr::null_mut()), AtomicUsize::new(0));
 
+/// What each processor [`park_before_firmware`] parked runs on, until
+/// [`reclaim`] gives it back; null before.
+static EARLY_RESOURCES: AtomicPtr<Early<Resources>> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Free what processor `index` of the capture ran on while parked before
+/// the firmware's AML, when it did.
+///
+/// # Safety
+/// On the boot processor, after processor `index` took INIT and SIPI again
+/// and reported ready on its own stack and descriptors: it never runs on
+/// what it parked on again.
+pub(super) unsafe fn reclaim(index: usize) {
+    let early = EARLY_RESOURCES.load(Ordering::Acquire);
+    if early.is_null() {
+        return;
+    }
+    // SAFETY: leaked by `park_before_firmware`; only the boot processor
+    // reaches it, one call at a time.
+    let Some(resources) = unsafe { &mut *early }.started(index) else {
+        return;
+    };
+    // SAFETY: each a leaked box of this type, which the caller's processor no
+    // longer runs on and nothing else reaches; the tables are freed as
+    // they are, without dropping their contents.
+    unsafe {
+        drop(Box::from_raw(resources.stack));
+        drop(Box::from_raw(resources.tables));
+        drop(Box::from_raw(resources.parking));
+    }
+}
+
 fn early() -> &'static [u32] {
     let (pointer, length) = (
         EARLY.0.load(Ordering::Acquire),
@@ -311,6 +354,8 @@ pub(super) unsafe fn park_before_firmware(
         ..Census::default()
     };
     let mut waits: Vec<u32> = vec![UNPUBLISHED; processors.len()];
+    let mut kept = Early::new(processors.len());
+    let mut flush = true;
     if handoff.native_resources.sipi == 0 {
         census.left = Some(Left::NoStartupPage);
     } else {
@@ -336,11 +381,13 @@ pub(super) unsafe fn park_before_firmware(
                     pat,
                     index,
                     destination,
+                    core::mem::take(&mut flush),
                 )
             } {
-                Some(idle) => {
+                Some((idle, resources)) => {
                     census.parked(idle);
                     waits[index] = idle.encode();
+                    kept.parked(index, resources);
                 }
                 None => {
                     census.left = Some(Left::ParkFailed {
@@ -366,6 +413,7 @@ pub(super) unsafe fn park_before_firmware(
         (census.waiting() + census.unreachable) as u32,
         Ordering::Relaxed,
     );
+    EARLY_RESOURCES.store(Box::into_raw(Box::new(kept)), Ordering::Release);
     let waits = Box::leak(waits.into_boxed_slice());
     EARLY.1.store(waits.len(), Ordering::Relaxed);
     EARLY.0.store(waits.as_mut_ptr(), Ordering::Release);
@@ -389,10 +437,13 @@ pub(super) unsafe fn park_before_firmware(
 }
 
 /// Start processor `index`, APIC ID `destination`, into [`enter`] and wait
-/// a second at most for its wait; `None` when it did not park.
+/// a second at most for its wait; `None` when it did not park, which leaves
+/// what it may run on leaked. `flush` stores the log before the startup,
+/// once for a pass: a reset during the first startup leaves its line last.
 ///
 /// # Safety
 /// As [`park`], and no processor reads the startup page.
+#[allow(clippy::too_many_arguments)]
 unsafe fn park_one(
     handoff: &Handoff,
     capture: &firmware::Capture,
@@ -401,7 +452,8 @@ unsafe fn park_one(
     pat: u64,
     index: usize,
     destination: u32,
-) -> Option<Idle> {
+    flush: bool,
+) -> Option<(Idle, Resources)> {
     let processor = capture.processors[index];
     // The trampoline checks an AMD processor's signature: its own where
     // the firmware's snapshot has one, else the boot processor's.
@@ -410,21 +462,28 @@ unsafe fn park_one(
         .position(|&selected| selected as usize == index)
         .unwrap_or(0);
     let signature = capture.snapshots[slot].get(1, 0)?.eax;
-    let stack = Box::leak(vec![0u8; STACK_BYTES].into_boxed_slice());
-    let stack_top = (stack.as_mut_ptr() as u64 + STACK_BYTES as u64) & !15;
-    let parking: &'static Parking = Box::leak(Box::new(Parking {
-        tables: UnsafeCell::new(Some(Box::leak(Box::new(interrupts::Tables::new())))),
+    let stack = Box::into_raw(vec![0u8; STACK_BYTES].into_boxed_slice());
+    let stack_top = (stack as *mut u8 as u64 + STACK_BYTES as u64) & !15;
+    let tables = Box::into_raw(Box::new(core::mem::ManuallyDrop::new(
+        interrupts::Tables::new(),
+    )));
+    let parking = Box::into_raw(Box::new(Parking {
+        // SAFETY: a fresh box, which only the parked processor reaches.
+        tables: UnsafeCell::new(Some(unsafe { &mut **tables })),
         x2apic: handoff.apic_base & apic::X2APIC_MODE != 0,
         status: AtomicU8::new(STARTING),
         idle: AtomicU32::new(UNPUBLISHED),
     }));
+    // SAFETY: freed only by `reclaim`, once the processor runs elsewhere.
+    let parking: &'static Parking = unsafe { &*parking };
     let physical = handoff.native_resources.sipi;
     crate::output::arguments(format_args!(
         "NATIVE PARK apic={destination:#x} firmware_cpu={}\n",
         processor.processor_number,
     ));
-    // A reset during the startup leaves this line as the last.
-    crate::output::flush_log();
+    if flush {
+        crate::output::flush_log();
+    }
     // SAFETY: the caller's: the page is owned and no processor reads it; the
     // stack, argument and tables are leaked heap in the shared physmap,
     // which `handoff.root` maps.
@@ -456,7 +515,13 @@ unsafe fn park_one(
             _ => return None,
         }
         if parking.status.load(Ordering::Acquire) == PARKED {
-            return Idle::decode(parking.idle.load(Ordering::Relaxed));
+            let resources = Resources {
+                stack,
+                tables,
+                parking: parking as *const Parking as *mut Parking,
+            };
+            return Idle::decode(parking.idle.load(Ordering::Relaxed))
+                .map(|idle| (idle, resources));
         }
         if apic::rdtsc().wrapping_sub(since) >= handoff.tsc_hz {
             return None;

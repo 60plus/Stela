@@ -807,6 +807,11 @@ pub(crate) unsafe fn start(
         core::hint::spin_loop();
     }
     crate::output::flush_log();
+    for processor in &processors {
+        // SAFETY: it took INIT and SIPI since it parked, and is ready on its
+        // own stack and descriptors.
+        unsafe { park::reclaim(capture.selected[processor.slot] as usize) };
+    }
     processors.sort_unstable_by_key(|processor| processor.slot);
     failed.sort_unstable_by_key(|(slot, _)| *slot);
     let failure = failed.into_iter().next();
