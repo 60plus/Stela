@@ -391,3 +391,41 @@ fn a_boot_s_end_passes_a_spent_budget() {
     assert!(names_an_end(b"STELA FATAL x"));
     assert!(!names_an_end(b"STEP Restarting"));
 }
+
+/// A long install's step lines all pass, where they shared one family's
+/// budget and the next start could name an older step as the last.
+#[test]
+fn every_step_line_passes_a_spent_budget() {
+    let (mut gate, mut log) = (Gate::new(), Log::default());
+    let detail = alloc::format!("STEP DETAIL Copying {} ms=1\n", "x".repeat(1000));
+    let long = "y".repeat(1000);
+    for step in 0..BURST_BYTES / 1000 + 10 {
+        write(
+            &mut gate,
+            &mut log,
+            &alloc::format!("STEP Installing part {step} {long} t=1.000\n"),
+            Some(1000),
+            false,
+        );
+        write(&mut gate, &mut log, &detail, Some(1000), false);
+        write(
+            &mut gate,
+            &mut log,
+            &alloc::format!("STEP o Installing part {step} ms=1\n"),
+            Some(1000),
+            false,
+        );
+    }
+    let last = log.lines().len();
+    write(
+        &mut gate,
+        &mut log,
+        "STEP Restarting the PC t=2.000\n",
+        Some(1000),
+        false,
+    );
+    assert_eq!(log.lines().len(), last + 1);
+    assert_eq!(last, 3 * (BURST_BYTES as usize / 1000 + 10));
+    assert!(names_a_step(b"STEP WATCHDOG on"));
+    assert!(!names_a_step(b"STEPS x"));
+}

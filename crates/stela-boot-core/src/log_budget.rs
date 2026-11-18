@@ -34,7 +34,10 @@
 //! the guest went down ([`names_an_end`]): the lines the next start reads
 //! for how this boot ended (`running_record::ENDS`), and the guest's panic,
 //! from its `panic(` line, [`PANIC_LINES`] lines, which a guest that
-//! flooded its console before it panicked would otherwise lose.
+//! flooded its console before it panicked would otherwise lose. The step
+//! lines ([`names_a_step`]) are too: the next start names the last step
+//! begun from them (`running_record::unfinished`), and they are few, a
+//! step's begin and end and its details, which the status thins itself.
 //!
 //! [`Gate`] applies the budgets to output that arrives in pieces: it holds
 //! a line's first [`KEY_BYTES`] until they name its family, and its user
@@ -76,6 +79,13 @@ pub fn names_an_end(start: &[u8]) -> bool {
     crate::running_record::ENDS
         .iter()
         .any(|end| start.starts_with(end.as_bytes()))
+}
+
+/// Whether a line that starts with `start` is a step's (`STEP <title>
+/// t=`, `STEP <mark> <title> ms=`, `STEP DETAIL`, `STEP WATCHDOG`), which
+/// the next start reads for the step a boot stopped in.
+pub fn names_a_step(start: &[u8]) -> bool {
+    start.starts_with(b"STEP ")
 }
 
 /// Whether a line that starts with `start` begins the guest's panic: the
@@ -455,7 +465,7 @@ impl Gate {
         if panic {
             self.panic_lines -= 1;
         }
-        let exempt = self.held_exempt || panic || names_an_end(start);
+        let exempt = self.held_exempt || panic || names_an_end(start) || names_a_step(start);
         self.held_len = 0;
         let Some(now) = now.filter(|_| !exempt) else {
             self.line = Line::Keep(None);
