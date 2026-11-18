@@ -3,8 +3,9 @@
 //! such as a device a driver took long to start; but a detail that counts
 //! (the guest's executed blocks, replaced each second for as long as macOS
 //! runs) would then write one line a second, a fifth of a long boot's log.
-//! So a detail whose shape (its text with each run of digits as `#`) is the
-//! one last logged in its step is logged only:
+//! So each shape of detail (its text with each run of digits as `#`) is
+//! remembered for the step, the last [`SHAPES`] of them, and a detail of a
+//! shape the step logged before is logged only:
 //!
 //! - when it was held [`LONG_MILLIS`] or more, or at least twice as long as
 //!   the last one logged of its shape: a stall, or a device slower than the
@@ -13,9 +14,11 @@
 //! - when it is the step's last detail.
 //!
 //! Every other detail is counted, and the next line of the shape says how
-//! many like it were not logged. The first detail of a step and each
-//! change of shape are always logged.
-use alloc::string::String;
+//! many like it were not logged. A shape's first detail in a step is
+//! always logged. The boot progress names the stage the sampled instruction
+//! was in, so its shape changes back and forth between a few stages every
+//! second or two: each of those shapes keeps its own minute.
+use alloc::{string::String, vec::Vec};
 
 /// The shortest hold of a detail worth a line.
 pub const LOG_MILLIS: u64 = 250;
@@ -23,14 +26,23 @@ pub const LOG_MILLIS: u64 = 250;
 pub const LONG_MILLIS: u64 = 5_000;
 /// The longest a shape goes without a line while its details are held.
 pub const REPEAT_MILLIS: u64 = 60_000;
+/// The most shapes a step remembers; a new one beyond them takes the place
+/// of the one logged longest ago.
+pub const SHAPES: usize = 8;
 
-/// What the step's last logged detail was, and what was left out since.
+/// One shape's last logged detail, and what was left out since.
 #[derive(Debug)]
-pub struct Thinning {
-    shape: String,
+struct Shape {
+    text: String,
     held: u64,
     logged_at: u64,
     unlogged: u32,
+}
+
+/// The shapes the running step logged.
+#[derive(Debug)]
+pub struct Thinning {
+    shapes: Vec<Shape>,
 }
 
 /// Whether `detail`'s shape is `shape`: the same text, each run of digits
@@ -58,18 +70,12 @@ impl Default for Thinning {
 
 impl Thinning {
     pub const fn new() -> Self {
-        Self {
-            shape: String::new(),
-            held: 0,
-            logged_at: 0,
-            unlogged: 0,
-        }
+        Self { shapes: Vec::new() }
     }
 
-    /// A step begins: its first detail is logged whatever came before.
+    /// A step begins: each shape's first detail is logged again.
     pub fn begin(&mut self) {
-        self.shape.clear();
-        self.unlogged = 0;
+        self.shapes.clear();
     }
 
     /// The running step's `detail`, held `held` ms, ended at `now` ms on
@@ -80,22 +86,43 @@ impl Thinning {
         if detail.is_empty() || held < LOG_MILLIS {
             return None;
         }
-        let logged = self.shape.is_empty() || !same_shape(&self.shape, detail);
-        if !logged
-            && !last
+        let Some(shape) = self
+            .shapes
+            .iter_mut()
+            .find(|shape| same_shape(&shape.text, detail))
+        else {
+            if self.shapes.len() >= SHAPES
+                && let Some(oldest) = self
+                    .shapes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, shape)| shape.logged_at)
+                    .map(|(index, _)| index)
+            {
+                self.shapes.swap_remove(oldest);
+            }
+            self.shapes.push(Shape {
+                text: String::from(detail),
+                held,
+                logged_at: now,
+                unlogged: 0,
+            });
+            return Some(0);
+        };
+        if !last
             && held < LONG_MILLIS
-            && held < self.held.saturating_mul(2)
-            && now.saturating_sub(self.logged_at) < REPEAT_MILLIS
+            && held < shape.held.saturating_mul(2)
+            && now.saturating_sub(shape.logged_at) < REPEAT_MILLIS
         {
-            self.unlogged = self.unlogged.saturating_add(1);
+            shape.unlogged = shape.unlogged.saturating_add(1);
             return None;
         }
-        let unlogged = if logged { 0 } else { self.unlogged };
-        self.shape.clear();
-        self.shape.push_str(detail);
-        self.held = held;
-        self.logged_at = now;
-        self.unlogged = 0;
+        let unlogged = shape.unlogged;
+        shape.text.clear();
+        shape.text.push_str(detail);
+        shape.held = held;
+        shape.logged_at = now;
+        shape.unlogged = 0;
         Some(unlogged)
     }
 }
@@ -128,6 +155,54 @@ mod tests {
         assert_eq!(logged[9], (541, 59));
         // The step's last detail, whenever it comes.
         assert_eq!(logged[10], (600, 58));
+    }
+
+    /// The boot progress as a VM boot logged it: the sampled stage flips
+    /// between three every second or two. Each stage keeps its own minute:
+    /// 31 lines in ten minutes, not one a second.
+    #[test]
+    fn alternating_stages_are_each_logged_once_a_minute() {
+        let stages = ["macOS kernel", "Boot execution", "Secure monitor (SPTM)"];
+        let mut thinning = Thinning::default();
+        thinning.begin();
+        let mut logged = Vec::new();
+        for second in 1..=600u64 {
+            let stage = stages[(second % 3) as usize];
+            let detail = format!(
+                "{stage} | {} blocks executed, {}/s",
+                second * 1_000_000,
+                1_000_000 + second % 7
+            );
+            if let Some(unlogged) = thinning.ended(&detail, 1_000, second * 1_000, second == 600) {
+                logged.push((second, unlogged));
+            }
+        }
+        assert_eq!(logged.len(), 31, "{logged:?}");
+        // Each stage's first, then a minute after it with the 19 left out.
+        assert_eq!(&logged[..3], [(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(&logged[3..6], [(61, 19), (62, 19), (63, 19)]);
+        assert_eq!(logged[30], (600, 18));
+    }
+
+    /// More shapes than a step remembers: the one logged longest ago goes,
+    /// and its next detail is logged as a first.
+    #[test]
+    fn a_shape_beyond_the_remembered_ones_replaces_the_oldest() {
+        let mut thinning = Thinning::default();
+        let shape = |index: usize| format!("{} | 1 blocks", "x".repeat(index + 1));
+        for index in 0..SHAPES {
+            assert_eq!(
+                thinning.ended(&shape(index), 1_000, index as u64, false),
+                Some(0)
+            );
+        }
+        // All remembered: counted.
+        assert_eq!(thinning.ended(&shape(1), 1_000, 100, false), None);
+        // One more shape takes the oldest's place (shape 0).
+        assert_eq!(thinning.ended(&shape(SHAPES), 1_000, 200, false), Some(0));
+        assert_eq!(thinning.ended(&shape(0), 1_000, 300, false), Some(0));
+        // Shape 1 was logged longest ago now and went; shape 2 stays.
+        assert_eq!(thinning.ended(&shape(2), 1_000, 400, false), None);
     }
 
     #[test]
