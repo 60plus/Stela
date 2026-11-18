@@ -33,6 +33,9 @@ pub struct Ps2Counters {
     pub config: Option<u8>,
     /// The configuration byte the firmware left.
     pub firmware_config: Option<u8>,
+    /// Whether keyboard bytes arrive translated to set 1, as the firmware
+    /// left the controller; `None` before the first start.
+    pub translated: Option<bool>,
 }
 
 /// An I²C-HID device on whichever bus and interrupt pin probe found it.
@@ -152,6 +155,7 @@ impl InputDevice {
             status,
             config,
             firmware_config: controller.firmware_config(),
+            translated: controller.translated(),
         })
     }
 

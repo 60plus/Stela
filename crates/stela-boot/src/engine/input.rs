@@ -416,7 +416,8 @@ fn stop_cause(
 /// `INPUT <name> controller: status .., configuration ..` for an i8042 at
 /// its first poll and whenever its standing status bits or its
 /// configuration byte change, so a log says whether its keyboard port was
-/// on, translated and interrupting while it was polled.
+/// on, translated and interrupting while it was polled, and which set its
+/// keys are decoded as.
 fn controller_change(device: &InputDevice, reported: &mut Reported) {
     let Some(counters) = device.ps2_counters() else {
         return;
@@ -436,11 +437,14 @@ fn controller_change(device: &InputDevice, reported: &mut Reported) {
     let firmware = counters
         .firmware_config
         .map_or_else(alloc::string::String::new, |config| {
-            alloc::format!("; the firmware left configuration {config:02x}")
+            alloc::format!(
+                "; the firmware left configuration {config:02x}, read with both ports disabled"
+            )
         });
     output::arguments(format_args!(
-        "INPUT {} controller: {}{firmware}\n",
+        "INPUT {} controller: {}{firmware}; {}\n",
         device.name(),
-        stela_drivers::input::ps2::describe_controller(Some(status), counters.config)
+        stela_drivers::input::ps2::describe_controller(Some(status), counters.config),
+        stela_drivers::input::ps2::describe_keyboard_path(counters.translated)
     ));
 }

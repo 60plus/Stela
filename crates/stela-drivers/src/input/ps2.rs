@@ -115,6 +115,16 @@ pub fn describe_controller(status: Option<u8>, config: Option<u8>) -> alloc::str
     format!("{status}, {config}")
 }
 
+/// Which way keyboard bytes reach the decoder, for the boot log: translated
+/// to set 1 as the firmware left the controller, or untranslated set 2.
+pub fn describe_keyboard_path(translated: Option<bool>) -> &'static str {
+    match translated {
+        Some(true) => "translation kept as the firmware left it, keys decoded as set 1",
+        Some(false) => "untranslated as the firmware left it, keys decoded as set 2",
+        None => "keyboard path not chosen yet",
+    }
+}
+
 /// Ordered, exclusively owned byte operations on the i8042 register pair.
 pub trait Registers {
     fn status(&mut self) -> u8;
@@ -1078,7 +1088,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     pub fn controller_state(&self) -> (Option<u8>, Option<u8>) {
         (self.last_status, self.controller_config)
     }
-    /// The configuration byte the firmware left, as the first start read it.
+    /// The configuration byte the firmware left, as the first start read it
+    /// once it had disabled both ports.
     pub fn firmware_config(&self) -> Option<u8> {
         self.firmware_config
     }

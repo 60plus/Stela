@@ -110,3 +110,27 @@ fn translated_led_replies_are_replies_and_a_key_between_them_is_kept() {
     assert_eq!(c.poll().unwrap(), [key(4, false)]);
     assert_eq!(c.framing_errors(), 0);
 }
+
+#[test]
+fn the_controller_line_names_the_keyboard_path_taken() {
+    let (c, _) = translated(false);
+    assert_eq!(
+        describe_keyboard_path(c.translated()),
+        "translation kept as the firmware left it, keys decoded as set 1"
+    );
+    let (mut c, _) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    assert_eq!(
+        describe_keyboard_path(c.translated()),
+        "keyboard path not chosen yet"
+    );
+    c.initialize().unwrap();
+    assert_eq!(
+        describe_keyboard_path(c.translated()),
+        "untranslated as the firmware left it, keys decoded as set 2"
+    );
+}
