@@ -175,6 +175,9 @@ pub enum PlatformError {
     Touchpad(input::touchpad::Error),
     #[cfg(feature = "native-acpi")]
     Gpio(crate::bus::gpio::native::Error),
+    /// The GPIO line of a device's interrupt could not be taken or read.
+    #[cfg(feature = "native-acpi")]
+    GpioLine(crate::bus::gpio::native::Error),
     /// The embedded controller's operation regions could not be installed.
     #[cfg(feature = "native-acpi")]
     Ec(crate::platform::ec::binding::Failure),
@@ -210,6 +213,8 @@ impl fmt::Display for PlatformError {
             Self::Touchpad(error) => error.fmt(f),
             #[cfg(feature = "native-acpi")]
             Self::Gpio(error) => write!(f, "GPIO controller: {error:?}"),
+            #[cfg(feature = "native-acpi")]
+            Self::GpioLine(error) => write!(f, "GPIO interrupt line: {error:?}"),
             #[cfg(feature = "native-acpi")]
             Self::Ec(error) => write!(f, "embedded controller: {error:?}"),
             #[cfg(feature = "native-acpi")]

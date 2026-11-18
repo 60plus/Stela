@@ -493,6 +493,73 @@ fn native_supplier_dynamic_claim_preserves_direction_and_restores_before_reuse()
     assert_eq!(drops.get(), 1);
 }
 
+/// A touchpad's interrupt line as firmware arms it for the device's
+/// driver: a GPIO input routed to the IOAPIC, inverted, enabled, with its
+/// configuration locked. Linux `pinctrl-intel` takes it as it is; the
+/// ordinary claim, which serves AML's GpioIo, still refuses it.
+#[test]
+fn an_interrupt_line_the_firmware_armed_and_locked_is_taken_masked_sampled_and_restored() {
+    const ARMED: u32 = (1 << 23) | (1 << 20) | 0x100 | 2;
+    let (transport, state, drops) = peer(modern(), 0x94);
+    let mut controller = Controller::new(transport, modern(), &[]).unwrap();
+    {
+        let mut state = state.borrow_mut();
+        state.words.insert((0, 0x1010), ARMED);
+        state.words.insert((0, 0x120), 0b10); // its interrupt enable
+        state.words.insert((0, 0xa0), 0b10); // its configuration lock
+    }
+    assert_eq!(controller.capture(1), Err(Error::FirmwareInterrupt));
+    assert!(!controller.is_claimed(1));
+    state.borrow_mut().trace.clear();
+    controller.capture_interrupt_line(1).unwrap();
+    assert!(writes(&state).is_empty(), "taking the line writes nothing");
+    controller.sample_interrupt_line(1).unwrap();
+    assert_eq!(
+        writes(&state),
+        [(0, 0x120, 0)],
+        "only its interrupt enable is cleared"
+    );
+    assert_eq!(state.borrow().words[&(0, 0x1010)], ARMED);
+    assert_eq!(controller.value(1), Ok(true), "the line's level is read");
+    controller.release_pad(1).unwrap();
+    assert_eq!(state.borrow().words[&(0, 0x120)], 0b10);
+    assert_eq!(state.borrow().words[&(0, 0x1010)], ARMED);
+    assert!(!controller.has_claims());
+    controller.retire().unwrap();
+    drop(controller);
+    assert_eq!(drops.get(), 1);
+}
+
+/// An interrupt line left in a native function becomes a GPIO input when
+/// its configuration is open, and is refused when it is locked: its level
+/// cannot be read there.
+#[test]
+fn an_interrupt_line_in_a_native_function_is_made_an_input_unless_locked() {
+    let native = 0x100 | (1 << 10);
+    let (transport, state, _) = peer(modern(), 0x94);
+    let mut controller = Controller::new(transport, modern(), &[]).unwrap();
+    state.borrow_mut().words.insert((0, 0x1010), native);
+    controller.capture_interrupt_line(1).unwrap();
+    controller.sample_interrupt_line(1).unwrap();
+    assert_eq!(
+        state.borrow().words[&(0, 0x1010)] & (15 << 10 | 0x300),
+        0x100
+    );
+    assert_eq!(controller.value(1), Ok(false));
+
+    let (transport, state, _) = peer(modern(), 0x94);
+    let mut controller = Controller::new(transport, modern(), &[]).unwrap();
+    {
+        let mut state = state.borrow_mut();
+        state.words.insert((0, 0x1010), native);
+        state.words.insert((0, 0xa0), 0b10);
+    }
+    controller.capture_interrupt_line(1).unwrap();
+    state.borrow_mut().trace.clear();
+    assert_eq!(controller.sample_interrupt_line(1), Err(Error::Locked));
+    assert!(writes(&state).is_empty());
+}
+
 #[test]
 fn native_supplier_failed_request_keeps_snapshot_and_failed_restore_keeps_claim() {
     let (transport, state, drops) = peer(modern(), 0x94);

@@ -168,6 +168,72 @@ impl Device {
     pub fn first_error(&self) -> Option<&Error> {
         self.first_error.as_ref()
     }
+    /// Take `pin` as the interrupt line a device's `_CRS` names (GpioInt),
+    /// for a driver that samples its level: the line is taken with the
+    /// wake and interrupt controls the firmware armed on it, as Linux's
+    /// pin controllers take it, then masked and made an input where it is
+    /// not. The ordinary [`NativeController::request`] refuses such a line,
+    /// since it serves AML's GpioIo connections. The failure is the
+    /// controller's own, not an ACPI status; a line taken and then refused
+    /// is given back as it was found.
+    pub fn request_interrupt_line(&mut self, pin: u16) -> Result<(), Error> {
+        if self.retired {
+            return Err(Error::Retired);
+        }
+        let result = match &mut self.engine {
+            Engine::Intel(controller) => (|| {
+                let pad = controller
+                    .profile()
+                    .gpio_to_pad(pin)
+                    .ok_or(intel::Error::InvalidPad)?;
+                controller.capture_interrupt_line(pad)?;
+                let sampled = controller.sample_interrupt_line(pad);
+                if sampled.is_err() {
+                    // The line goes back as it was found; the first
+                    // failure is the one reported.
+                    let _ = controller.release_pad(pad);
+                }
+                sampled
+            })()
+            .map_err(Error::Intel),
+            Engine::Amd(controller) => (|| {
+                let pad = amd::Pad::new(u8::try_from(pin).map_err(|_| amd::Error::InvalidPad)?)?;
+                controller.capture_interrupt_line(pad)?;
+                let sampled = controller.sample_interrupt_line(pad);
+                if sampled.is_err() {
+                    let _ = controller.release_pad(pad);
+                }
+                sampled
+            })()
+            .map_err(Error::Amd),
+        };
+        if let Err(error) = &result {
+            self.first_error.get_or_insert(error.clone());
+        }
+        result
+    }
+    /// The level of `pin`, a line [`Self::request_interrupt_line`] took. A
+    /// failure is kept as [`Self::first_error`] too.
+    pub fn level(&mut self, pin: u16) -> Result<bool, Error> {
+        if self.retired {
+            return Err(Error::Retired);
+        }
+        let result = match &mut self.engine {
+            Engine::Intel(controller) => controller
+                .profile()
+                .gpio_to_pad(pin)
+                .ok_or(Error::Intel(intel::Error::InvalidPad))
+                .and_then(|pad| controller.value(pad).map_err(Error::Intel)),
+            Engine::Amd(controller) => u8::try_from(pin)
+                .map_err(|_| Error::Amd(amd::Error::InvalidPad))
+                .and_then(|number| amd::Pad::new(number).map_err(Error::Amd))
+                .and_then(|pad| controller.input(pad).map_err(Error::Amd)),
+        };
+        if let Err(error) = &result {
+            self.first_error.get_or_insert(error.clone());
+        }
+        result
+    }
     /// Mask `pin`'s interrupt at the controller and acknowledge any status
     /// it latched, so the line raises no CPU interrupt while a driver samples
     /// its level.

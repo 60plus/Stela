@@ -73,7 +73,6 @@ pub(crate) struct Pin {
     pub controller: String,
     pub pin: u16,
     pub active_low: bool,
-    pub debounce_us: u32,
 }
 
 /// One I²C device's connection, as its `_CRS` gives it.
@@ -153,7 +152,6 @@ pub(crate) fn connection(descriptors: &[Descriptor]) -> Result<Connection, Platf
                 controller: gpio.source.path.clone(),
                 pin,
                 active_low,
-                debounce_us: u32::from(gpio.debounce) * 10,
             })
         }
         None if apic => None,
@@ -277,10 +275,7 @@ mod attach {
         },
         platform::acpi::{
             Argument, Handle, Session,
-            resources::{
-                DeviceResources, MemoryReservation,
-                gpio::{Direction, LinePolicy, NativeController},
-            },
+            resources::{DeviceResources, MemoryReservation},
         },
         probe::{Devices, NativeServices, ServiceError},
     };
@@ -341,11 +336,12 @@ mod attach {
                 .map_err(|_| InterruptError::Unavailable)
         }
         fn asserted(&mut self) -> Result<bool, InterruptError> {
+            // The controller keeps the failure itself (`first_error`).
             let level = self
                 .controller
                 .borrow_mut()
-                .read(self.pin)
-                .map_err(|error| InterruptError::Hardware(error.0))?;
+                .level(self.pin)
+                .map_err(|_| InterruptError::Hardware(1))?;
             Ok(level != self.active_low)
         }
     }
@@ -541,24 +537,19 @@ mod attach {
             Some(pin) => {
                 let gpio = handle.child(&pin.controller).map_err(acpi)?;
                 let gpio = gpio_controller(services, gpio, shared)?;
-                let mut interrupt = PinInterrupt {
+                let interrupt = PinInterrupt {
                     controller: gpio,
                     pin: pin.pin,
                     active_low: pin.active_low,
                 };
+                // The line the firmware armed for this device's driver is
+                // taken as Linux's pin controllers take it, masked, and
+                // sampled; its debounce stays as the firmware set it.
                 interrupt
                     .controller
                     .borrow_mut()
-                    .request(
-                        interrupt.pin,
-                        LinePolicy {
-                            direction: Direction::Input,
-                            debounce_us: pin.debounce_us,
-                        },
-                    )
-                    .map_err(acpi)?;
-                hid_i2c::Interrupt::mask_and_drain(&mut interrupt)
-                    .map_err(|_| PlatformError::Refused("the interrupt pin could not be masked"))?;
+                    .request_interrupt_line(interrupt.pin)
+                    .map_err(PlatformError::GpioLine)?;
                 Box::new(interrupt)
             }
             // Only HID-over-I²C defines an empty input register, which makes
@@ -976,7 +967,6 @@ mod tests {
                     controller: String::from("\\_SB.GPI0"),
                     pin: 0x37,
                     active_low: true,
-                    debounce_us: 50,
                 }),
             }
         );
@@ -1053,7 +1043,6 @@ mod tests {
                 controller: String::from("\\_SB.GPI0"),
                 pin: 0x37,
                 active_low: true,
-                debounce_us: 50,
             })
         );
     }

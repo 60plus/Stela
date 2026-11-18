@@ -144,6 +144,17 @@ impl<R: RegisterIo> Controller<R> {
         contains(&self.owned, pad)
     }
     pub(in crate::bus::gpio) fn capture(&mut self, pad: Pad) -> Result<(), Error> {
+        self.capture_as(pad, false)
+    }
+    /// Take the line a device's `_CRS` names as its interrupt (GpioInt),
+    /// with the wake and interrupt controls the firmware armed on it for
+    /// that device's driver: Linux `pinctrl-amd` takes such a line as it
+    /// finds it. Nothing is written; the controls are saved as found, and
+    /// the release puts them back.
+    pub(in crate::bus::gpio) fn capture_interrupt_line(&mut self, pad: Pad) -> Result<(), Error> {
+        self.capture_as(pad, true)
+    }
+    fn capture_as(&mut self, pad: Pad, firmware_armed: bool) -> Result<(), Error> {
         if self.retired {
             return Err(Error::Retired);
         }
@@ -154,15 +165,38 @@ impl<R: RegisterIo> Controller<R> {
             return Err(Error::InvalidPad);
         }
         let value = self.read(pad)?;
-        if value & WAKE_POLICY != 0 {
+        if !firmware_armed && value & WAKE_POLICY != 0 {
             return Err(Error::FirmwareWake);
         }
-        if value & (ENABLE | UNMASK) != 0 {
+        if !firmware_armed && value & (ENABLE | UNMASK) != 0 {
             return Err(Error::FirmwareInterrupt);
         }
         self.saved[usize::from(pad.0)] = value & !(STATUS | INPUT);
         self.saved_mux[usize::from(pad.0)] = None;
         insert(&mut self.owned, pad);
+        Ok(())
+    }
+    /// Make a captured interrupt line one whose level a driver samples:
+    /// masked, so it raises no CPU interrupt, and an input. Only a control
+    /// that differs is written, so a line the firmware left as a masked
+    /// input is not written at all; its debounce stays as the firmware
+    /// programmed it, since no interrupt is taken from it.
+    pub(in crate::bus::gpio) fn sample_interrupt_line(&mut self, pad: Pad) -> Result<(), Error> {
+        self.check(pad)?;
+        // The enable bit can read clear for a while after a write to any
+        // pad's debounce (see `reads_back`); writing that reading back
+        // would disarm the line. The captured value says what it holds.
+        let enable = self.saved[usize::from(pad.0)] & ENABLE;
+        let value = (self.read(pad)? & !STATUS) | enable;
+        let wanted = value & !(UNMASK | OUTPUT);
+        if wanted == value {
+            return Ok(());
+        }
+        self.write(pad, wanted)?;
+        if !self.reads_back(pad, wanted)? {
+            self.fault = true;
+            return Err(Error::Readback);
+        }
         Ok(())
     }
     pub(in crate::bus::gpio) fn claim_debounce(
@@ -198,7 +232,7 @@ impl<R: RegisterIo> Controller<R> {
         }
         let saved = self.saved[usize::from(pad.0)];
         self.write(pad, saved)?;
-        if self.read(pad)? & !(STATUS | INPUT) != saved {
+        if !self.reads_back(pad, saved)? {
             return Err(Error::Readback);
         }
         self.owned[usize::from(pad.0) / 64] &= !(1 << (pad.0 % 64));
@@ -239,14 +273,29 @@ impl<R: RegisterIo> Controller<R> {
         let before = self.read(pad)?;
         let wanted = (before & !(mask | STATUS)) | value;
         self.write(pad, wanted)?;
-        let after = self.read(pad)?;
         // Compare all stable controls, not just requested bits. Never infer
         // an acknowledgement from the local shadow or a successful write.
-        if after & !(INPUT | STATUS) != wanted & !(INPUT | STATUS) {
+        if !self.reads_back(pad, wanted)? {
             self.fault = true;
             return Err(Error::Readback);
         }
         Ok(())
+    }
+    /// Whether `pad`'s stable controls read back as `wanted`, just written.
+    /// A write to a pad can hide every pad's enable bit for a while
+    /// (MaskStsEn clear, which Linux `amd_gpio_irq_set_type` waits out): an
+    /// enable bit that was written set and reads clear is read again, a
+    /// bounded number of times, before it counts as a difference.
+    fn reads_back(&mut self, pad: Pad, wanted: u32) -> Result<bool, Error> {
+        let stable = !(INPUT | STATUS);
+        let mut after = self.read(pad)?;
+        for _ in 1..SETTLE_READS {
+            if wanted & ENABLE == 0 || (after ^ wanted) & stable != ENABLE {
+                break;
+            }
+            after = self.read(pad)?;
+        }
+        Ok(after & stable == wanted & stable)
     }
     pub fn input(&mut self, pad: Pad) -> Result<bool, Error> {
         self.check(pad)?;
@@ -536,7 +585,7 @@ impl<R: RegisterIo> Controller<R> {
             }
             let saved = self.saved[usize::from(number)];
             self.write(pad, saved)?;
-            if self.read(pad)? & !(STATUS | INPUT) != saved {
+            if !self.reads_back(pad, saved)? {
                 return Err(Error::Readback);
             }
         }

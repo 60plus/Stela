@@ -91,6 +91,9 @@ impl LiveCommunity {
 struct Saved {
     pin: u16,
     words: [u32; 3],
+    /// The pad's interrupt enable as found: set only on an interrupt line
+    /// the firmware armed ([`Controller::capture_interrupt_line`]).
+    enabled: bool,
 }
 
 /// Serialized process/deferred protocol owner. No public constructor exists:
@@ -241,6 +244,58 @@ impl<R: RegisterIo> Controller<R> {
         self.saved.push(snapshot);
         Ok(())
     }
+    /// Take the line a device's `_CRS` names as its interrupt (GpioInt),
+    /// with the interrupt route and enable the firmware armed on it for
+    /// that device's driver: Linux `pinctrl-intel` takes a host-owned pad as
+    /// it finds it. Nothing is written; the pad is saved as found, and the
+    /// release puts it back.
+    pub(in crate::bus::gpio) fn capture_interrupt_line(&mut self, pin: u16) -> Result<(), Error> {
+        if self.retired {
+            return Err(Error::Retired);
+        }
+        if self.fault {
+            return Err(Error::Faulted);
+        }
+        if self.is_claimed(pin) {
+            return Err(Error::InvalidPad);
+        }
+        self.saved.try_reserve(1).map_err(|_| Error::Allocation)?;
+        let snapshot = self.snapshot_as(pin, true)?;
+        self.saved.push(snapshot);
+        Ok(())
+    }
+    /// Make a captured interrupt line one whose level a driver samples:
+    /// masked, so it raises no CPU interrupt, and a GPIO input. Only what
+    /// differs is written, so a pad the firmware left as a masked GPIO
+    /// input is not written at all, whether or not its configuration is
+    /// locked; a locked pad that is no GPIO input is refused, since its
+    /// level cannot be read. The pad's interrupt routes and debounce stay as
+    /// the firmware programmed them, since no interrupt is taken from it.
+    pub(in crate::bus::gpio) fn sample_interrupt_line(&mut self, pin: u16) -> Result<(), Error> {
+        let (community, group) = self.check(pin)?;
+        self.host_owner(community, group, pin)?;
+        let descriptor = community.descriptor;
+        let enabled = self.read(
+            descriptor.bar,
+            descriptor.enable + usize::from(group.register) * 4,
+        )? & (1 << (pin - group.first))
+            != 0;
+        if enabled {
+            self.mask(community, group, pin, true)?;
+        }
+        let value = self.read(descriptor.bar, community.cfg(pin, 0))?;
+        if value & (MODE | RX_DISABLE) == 0 && value & TX_DISABLE != 0 {
+            return Ok(());
+        }
+        self.unlocked(community, group, pin, true, false)?;
+        self.update(
+            community,
+            pin,
+            0,
+            MODE | RX_DISABLE | TX_DISABLE,
+            TX_DISABLE,
+        )
+    }
     pub(in crate::bus::gpio) fn claim_debounce(
         &mut self,
         pin: u16,
@@ -304,6 +359,9 @@ impl<R: RegisterIo> Controller<R> {
             }
             self.update(community, pin, 0, !RX, saved.words[0])?;
         }
+        if saved.enabled {
+            self.mask(community, group, pin, false)?;
+        }
         self.saved.remove(index);
         Ok(())
     }
@@ -311,14 +369,19 @@ impl<R: RegisterIo> Controller<R> {
 impl<R: RegisterIo> Controller<R> {
     #[cfg(any(test, feature = "native-acpi"))]
     fn snapshot(&mut self, pin: u16) -> Result<Saved, Error> {
+        self.snapshot_as(pin, false)
+    }
+    #[cfg(any(test, feature = "native-acpi"))]
+    fn snapshot_as(&mut self, pin: u16, firmware_armed: bool) -> Result<Saved, Error> {
         let (community, group) = self.locate(pin)?;
         self.host_owner(community, group, pin)?;
         let value = self.read(community.descriptor.bar, community.cfg(pin, 0))?;
         let enabled = self.read(
             community.descriptor.bar,
             community.descriptor.enable + usize::from(group.register) * 4,
-        )?;
-        if value & ROUTES != 0 || enabled & (1 << (pin - group.first)) != 0 {
+        )? & (1 << (pin - group.first))
+            != 0;
+        if !firmware_armed && (value & ROUTES != 0 || enabled) {
             return Err(Error::FirmwareInterrupt);
         }
         let mut words = [
@@ -329,7 +392,11 @@ impl<R: RegisterIo> Controller<R> {
         if community.revision >= 0x92 {
             words[2] = self.read(community.descriptor.bar, community.cfg(pin, 8))?;
         }
-        Ok(Saved { pin, words })
+        Ok(Saved {
+            pin,
+            words,
+            enabled,
+        })
     }
     fn locate(&self, pin: u16) -> Result<(LiveCommunity, Group), Error> {
         self.communities
@@ -793,22 +860,24 @@ impl<R: RegisterIo> Controller<R> {
                 ];
                 // Read-only use of a locked GPIO need not change it to restore
                 // identical controls. No lock is bypassed for a real change.
-                if current == saved.words {
-                    continue;
+                if current != saved.words {
+                    self.unlocked(community, group, saved.pin, true, true)?;
+                    self.update(
+                        community,
+                        saved.pin,
+                        0,
+                        TX_DISABLE | RX_DISABLE,
+                        TX_DISABLE | RX_DISABLE,
+                    )?;
+                    self.update(community, saved.pin, 4, u32::MAX, saved.words[1])?;
+                    if community.revision >= 0x92 {
+                        self.update(community, saved.pin, 8, u32::MAX, saved.words[2])?;
+                    }
+                    self.update(community, saved.pin, 0, !RX, saved.words[0])?;
                 }
-                self.unlocked(community, group, saved.pin, true, true)?;
-                self.update(
-                    community,
-                    saved.pin,
-                    0,
-                    TX_DISABLE | RX_DISABLE,
-                    TX_DISABLE | RX_DISABLE,
-                )?;
-                self.update(community, saved.pin, 4, u32::MAX, saved.words[1])?;
-                if community.revision >= 0x92 {
-                    self.update(community, saved.pin, 8, u32::MAX, saved.words[2])?;
+                if saved.enabled {
+                    self.mask(community, group, saved.pin, false)?;
                 }
-                self.update(community, saved.pin, 0, !RX, saved.words[0])?;
             }
             self.restored = true;
         }

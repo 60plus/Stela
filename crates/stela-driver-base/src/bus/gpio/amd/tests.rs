@@ -62,6 +62,67 @@ fn native_supplier_precapture_refusal_has_no_claim_and_failed_release_keeps_owne
     }
 }
 
+/// A touchpad's interrupt line as firmware arms it for the device's
+/// driver: a low level interrupt, enabled and unmasked, that wakes from
+/// S0i3, pulled up. Linux `pinctrl-amd` takes it; the ordinary claim, which
+/// serves AML's GpioIo, still refuses it.
+#[test]
+fn an_interrupt_line_the_firmware_armed_is_taken_masked_sampled_and_restored() {
+    const ARMED: u32 = (1 << 20) | (1 << 13) | (1 << 12) | (1 << 11) | (1 << 9) | (1 << 8);
+    for profile in profiles() {
+        for delay in [0, 3] {
+            let (mut controller, state, drops) = setup(profile, &[]);
+            {
+                let mut state = state.borrow_mut();
+                state.pads[9] = ARMED | 0x1001_0000;
+                // Another line the firmware keeps for itself.
+                state.pads[3] = (1 << 13) | (1 << 12) | (1 << 11);
+            }
+            assert_eq!(controller.capture(p(9)), Err(Error::FirmwareWake));
+            assert!(!controller.is_claimed(p(9)));
+            state.borrow_mut().trace.clear();
+            controller.capture_interrupt_line(p(9)).unwrap();
+            assert!(controller.is_claimed(p(9)));
+            assert!(
+                state
+                    .borrow()
+                    .trace
+                    .iter()
+                    .all(|access| matches!(access, Access::Read32(_))),
+                "taking the line writes nothing"
+            );
+            // The enable bit reads clear for a few reads after a write.
+            state.borrow_mut().delay = delay;
+            controller.sample_interrupt_line(p(9)).unwrap();
+            assert!(!controller.faulted());
+            assert_eq!(
+                state.borrow().pads[9] & !0x3001_0000,
+                ARMED & !(1 << 12),
+                "only the mask bit changed"
+            );
+            let writes = |state: &State| {
+                state
+                    .trace
+                    .iter()
+                    .filter(|access| matches!(access, Access::Write32(..)))
+                    .count()
+            };
+            assert_eq!(writes(&state.borrow()), 1);
+            assert!(controller.input(p(9)).unwrap(), "the line's level is read");
+            // Sampling a line that is already a masked input writes nothing.
+            controller.sample_interrupt_line(p(9)).unwrap();
+            assert_eq!(writes(&state.borrow()), 1);
+            assert_eq!(state.borrow().pads[3], (1 << 13) | (1 << 12) | (1 << 11));
+            state.borrow_mut().delay = delay;
+            controller.release_pad(p(9)).unwrap();
+            assert_eq!(state.borrow().pads[9] & !0x3001_0000, ARMED);
+            controller.retire().unwrap();
+            drop(controller);
+            assert_eq!(drops.get(), 1);
+        }
+    }
+}
+
 #[test]
 fn controller_wide_settlement_preserves_each_unowned_firmware_wake_source() {
     for profile in profiles() {
