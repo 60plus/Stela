@@ -20,6 +20,23 @@ fn translated(mouse: bool) -> (Controller<Model, Time>, Rc<RefCell<Hardware>>) {
     (c, h)
 }
 
+/// A keyboard alone behind a translating controller, `change` made to the
+/// hardware before the start.
+fn translated_with(
+    change: impl FnOnce(&mut Hardware),
+) -> (Controller<Model, Time>, Rc<RefCell<Hardware>>) {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().config = TRANSLATING_FIRMWARE;
+    change(&mut h.borrow_mut());
+    c.initialize().unwrap();
+    (c, h)
+}
+
 fn key(usage: u8, pressed: bool) -> Input {
     Input::Key { usage, pressed }
 }
@@ -133,6 +150,41 @@ fn the_controller_line_names_the_keyboard_path_taken() {
         describe_keyboard_path(c.translated()),
         "untranslated as the firmware left it, keys decoded as set 2"
     );
+}
+
+#[test]
+fn typematic_follows_the_leds_as_linux_sets_it_and_its_replies_are_no_keys() {
+    let data = |h: &Rc<RefCell<Hardware>>| -> Vec<u8> {
+        h.borrow()
+            .writes
+            .iter()
+            .filter_map(|&(command, byte)| (!command).then_some(byte))
+            .collect()
+    };
+    for translate in [true, false] {
+        let (mut c, h) = controller(Config {
+            mouse: false,
+            reset_on_start: false,
+            query_scan_set: false,
+            ..Config::default()
+        });
+        if translate {
+            h.borrow_mut().config = TRANSLATING_FIRMWARE;
+        }
+        c.initialize().unwrap();
+        let data = data(&h);
+        let leds = data.windows(2).position(|w| w == [SET_LEDS, 0]);
+        let rate = data.windows(2).position(|w| w == [SET_RATE, 0]);
+        assert!(leds.is_some() && leds < rate, "{data:02x?}");
+        assert!(c.poll().unwrap().is_empty());
+        assert_eq!(c.framing_errors(), 0);
+        assert!(c.refused_commands().is_empty());
+    }
+    // A keyboard that refuses the LEDs is not sent the rate, as atkbd stops.
+    let (mut c, h) = translated_with(|h| h.no_ack = Some((Port::Keyboard, SET_LEDS)));
+    assert!(c.is_ready());
+    assert!(!data(&h).contains(&SET_RATE));
+    assert!(c.poll().unwrap().is_empty());
 }
 
 #[test]

@@ -1002,8 +1002,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     }
     /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
     /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
-    /// and the rest (reporting disable, Set 2 selection, LEDs) tried and
-    /// gone on without when the keyboard does not acknowledge them. Behind
+    /// and the rest (reporting disable, Set 2 selection, LEDs, typematic)
+    /// tried and gone on without when the keyboard does not acknowledge
+    /// them. Behind
     /// a translating controller no scan-set command is sent, as Linux's
     /// `atkbd_select_set` sends none there. Untranslated, Set 2 selection is
     /// tried, and a keyboard that refuses it is taken to report Set 2, the
@@ -1038,8 +1039,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(ErrorKind::UnsupportedScanSet(scan));
             }
         }
-        if !leds_set {
-            self.optional_keyboard(SET_LEDS, &[0])?;
+        // Linux's atkbd_reset_state: LEDs off, then typematic rate and delay
+        // at their fastest, unless the LEDs were refused.
+        let leds = leds_set || self.optional_keyboard(SET_LEDS, &[0])?;
+        if leds {
+            self.optional_keyboard(SET_RATE, &[0])?;
         }
         Ok(())
     }
