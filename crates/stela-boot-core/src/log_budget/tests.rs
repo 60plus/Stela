@@ -337,3 +337,57 @@ fn the_guest_console_keeps_a_boot_s_lines_and_thins_a_flood_past_its_burst() {
         &text[text.len() - 300..]
     );
 }
+
+/// A guest that floods its console and then panics: its panic report, from
+/// the `panic(` line on, is kept past the console's spent budget, where it
+/// was left out and the log lacked the one report that named the failure.
+/// The flood before it stays thinned.
+#[test]
+fn a_guest_panic_passes_a_spent_console_budget() {
+    let (mut gate, mut log) = (Gate::new(), Log::default());
+    let flood = alloc::format!("GUEST| {}\n", "x".repeat(1000));
+    for _ in 0..GUEST_BURST_BYTES / 1000 + 10 {
+        write(&mut gate, &mut log, &flood, Some(1000), false);
+    }
+    let before = log.0.len();
+    write(&mut gate, &mut log, &flood, Some(1000), false);
+    assert_eq!(log.0.len(), before, "the flood is thinned");
+    let panic = [
+        "GUEST| panic(cpu 2 caller 0xfffffe0012345678): \"Kernel data abort\"\n",
+        "GUEST| Debugger message: panic\n",
+        "GUEST|   lr: 0xfffffe0012345678  fp: 0xfffffe8001234560\n",
+    ];
+    for line in panic {
+        write(&mut gate, &mut log, line, Some(1000), false);
+    }
+    let text = log.text();
+    for line in panic {
+        assert!(text.contains(&alloc::format!("|{line}")), "{line}");
+    }
+    assert!(begins_guest_panic(b"GUEST|panic(cpu 0"));
+    assert!(!begins_guest_panic(b"GUEST| kernel panic"));
+}
+
+/// The lines the next start reads for how a boot ended pass a spent
+/// budget, where a restart's line could be left out and the next start
+/// said the boot hung.
+#[test]
+fn a_boot_s_end_passes_a_spent_budget() {
+    let (mut gate, mut log) = (Gate::new(), Log::default());
+    let line = alloc::format!("STELA RESTART code=0x15 {}\n", "x".repeat(1000));
+    for _ in 0..BURST_BYTES / 1000 + 10 {
+        write(&mut gate, &mut log, &line, Some(1000), false);
+    }
+    let kept = log.lines().len();
+    write(&mut gate, &mut log, &line, Some(1000), false);
+    write(
+        &mut gate,
+        &mut log,
+        "POWER powering off through the firmware\n",
+        Some(1000),
+        false,
+    );
+    assert_eq!(log.lines().len(), kept + 2);
+    assert!(names_an_end(b"STELA FATAL x"));
+    assert!(!names_an_end(b"STEP Restarting"));
+}

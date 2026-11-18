@@ -30,7 +30,11 @@
 //! The heartbeat's reports, whose size the beat's pace bounds
 //! (`beat_pace`), and every line once a stop began, are `exempt`: they are
 //! kept and cost nothing. So are lines before the counter's rate is known,
-//! the first fraction of a second.
+//! the first fraction of a second, and the lines that say how the boot or
+//! the guest went down ([`names_an_end`]): the lines the next start reads
+//! for how this boot ended (`running_record::ENDS`), and the guest's panic,
+//! from its `panic(` line, [`PANIC_LINES`] lines, which a guest that
+//! flooded its console before it panicked would otherwise lose.
 //!
 //! [`Gate`] applies the budgets to output that arrives in pieces: it holds
 //! a line's first [`KEY_BYTES`] until they name its family, and its user
@@ -62,6 +66,26 @@ pub const LONG_RATE_BYTES_PER_SECOND: i64 = 32;
 pub const SUMMARY_SECONDS: u64 = 60;
 /// A family's count is said once its last left-out line is this old.
 const SETTLED_MILLIS: u64 = 1000;
+/// The guest's lines kept from its panic line on, whatever its budget: a
+/// panic's report, its backtrace and its loaded extensions, with room.
+pub const PANIC_LINES: u32 = 2048;
+
+/// Whether a line that starts with `start` (its text after the stamp) says
+/// how this boot ended, as the next start reads it (`running_record::ENDS`).
+pub fn names_an_end(start: &[u8]) -> bool {
+    crate::running_record::ENDS
+        .iter()
+        .any(|end| start.starts_with(end.as_bytes()))
+}
+
+/// Whether a line that starts with `start` begins the guest's panic: the
+/// guest console's `panic(cpu ...)` line.
+pub fn begins_guest_panic(start: &[u8]) -> bool {
+    start.strip_prefix(GUEST).is_some_and(|text| {
+        let text = &text[text.iter().take_while(|&&byte| byte == b' ').count()..];
+        text.starts_with(b"panic(")
+    })
+}
 
 /// A family's name: up to [`KEY_BYTES`] of a line's start.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -323,6 +347,8 @@ pub struct Gate {
     line: Line,
     /// The held line is exempt.
     held_exempt: bool,
+    /// The guest's lines still kept for its panic ([`PANIC_LINES`]).
+    panic_lines: u32,
     /// The earliest time a count may be due; `u64::MAX` with none waiting.
     next_due: u64,
 }
@@ -358,6 +384,7 @@ impl Gate {
             held_len: 0,
             line: Line::Start,
             held_exempt: false,
+            panic_lines: 0,
             next_due: u64::MAX,
         }
     }
@@ -419,8 +446,16 @@ impl Gate {
 
     /// Decide the line whose first bytes are held, and hand them on.
     fn decide(&mut self, now: Option<u64>, out: &mut dyn FnMut(Piece<'_>)) {
-        let exempt = self.held_exempt;
         let held_len = self.held_len;
+        let start = &self.held[..held_len];
+        if begins_guest_panic(start) {
+            self.panic_lines = PANIC_LINES;
+        }
+        let panic = self.panic_lines != 0 && start.starts_with(GUEST);
+        if panic {
+            self.panic_lines -= 1;
+        }
+        let exempt = self.held_exempt || panic || names_an_end(start);
         self.held_len = 0;
         let Some(now) = now.filter(|_| !exempt) else {
             self.line = Line::Keep(None);
