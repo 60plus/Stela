@@ -862,9 +862,8 @@ mod hosted {
 
     /// The figures on the machine running the tests, with its TSC rate in
     /// `STELA_TSC_HZ`: `cargo test -p stela-boot-core --lib hosted --
-    /// --ignored --nocapture`.
+    /// --nocapture` prints the line.
     #[test]
-    #[ignore = "measures the host; run by hand"]
     fn calibrate_this_host() {
         let tsc_hz = std::env::var("STELA_TSC_HZ")
             .ok()
