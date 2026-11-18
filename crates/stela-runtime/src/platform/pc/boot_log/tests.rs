@@ -332,7 +332,7 @@ fn a_pending_overflow_is_reported_in_the_stream() {
 
     // The writer's own buffer between flushes.
     let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, 512);
-    let mut writer = Writer::with_pending(&mut disk, 64, true).unwrap();
+    let mut writer = Writer::with_pending(&mut disk, 64, Some("")).unwrap();
     for line in 0..10 {
         writer.append(format!("line {line:02}\n").as_bytes());
     }
@@ -513,7 +513,7 @@ fn small_disk(block: u32) -> Recorder {
 }
 
 fn open_small(disk: &mut Recorder, new_boot: bool) -> Writer {
-    Writer::with_layout(disk, PENDING_BYTES, new_boot, SMALL).unwrap()
+    Writer::with_layout(disk, PENDING_BYTES, new_boot.then_some(""), SMALL).unwrap()
 }
 
 /// `count` numbered lines of 12 bytes from `from`.
@@ -1008,4 +1008,38 @@ fn a_log_laid_out_again_in_a_longer_file_keeps_its_lines_and_records() {
         relayout(&vec![0; LOG_BYTES as usize], FILE_BYTES),
         Err(HeaderError::Blank)
     );
+}
+
+/// Each boot's marker says what it is and when it started, and its record
+/// is read with it.
+#[test]
+fn a_boot_s_marker_carries_its_note_and_its_record_is_read_with_it() {
+    let mut disk = small_disk(512);
+    let mut writer = Writer::with_layout(
+        &mut disk,
+        PENDING_BYTES,
+        Some("version=9.9.9 firmware_clock=2026-11-18 01:44:12"),
+        SMALL,
+    )
+    .unwrap();
+    writer.append(&lines(0, 400));
+    writer.flush(&mut disk).unwrap();
+    writer.append(b"more\n");
+    writer.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert!(log.stream.starts_with(
+        b"=== STELA BOOT 1 === version=9.9.9 firmware_clock=2026-11-18 01:44:12\nline 000000\n"
+    ));
+    let [start] = &log.starts[..] else {
+        panic!("{}", log.starts.len());
+    };
+    assert!(
+        start
+            .first
+            .starts_with(b"=== STELA BOOT 1 === version=9.9.9")
+    );
+    // Another boot's number with a note does not pass for this one's.
+    let at = SMALL.record_at(1) as usize;
+    disk.disk.bytes[at..at + 22].copy_from_slice(b"=== STELA BOOT 10 === ");
+    assert!(disk.log().unwrap().starts.is_empty());
 }

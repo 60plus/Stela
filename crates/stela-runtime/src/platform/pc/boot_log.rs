@@ -49,7 +49,8 @@
 //! version and starts a fresh log; it never reads one as the other.
 //!
 //! [`Writer`] opens the log once per boot, counts the boot and appends a
-//! `=== STELA BOOT n ===` line. Appends wait in a bounded [`Pending`]
+//! `=== STELA BOOT n ===` line, with a note after it on what the boot is
+//! and when it started ([`Writer::open_noted`]). Appends wait in a bounded [`Pending`]
 //! buffer; a flush writes the changed ring blocks, makes them durable, then
 //! writes the header and makes it durable, so the header never counts bytes
 //! the ring does not hold. Once the ring has wrapped, an interrupted flush can
@@ -888,20 +889,29 @@ impl Writer {
     /// line. A blank or invalid header starts a fresh log ([`Writer::fresh`]);
     /// a version 1 log is converted ([`Writer::converted`]).
     pub fn open(device: &mut dyn BlockDevice) -> Result<Self, BlockError> {
-        Self::with_pending(device, PENDING_BYTES, true)
+        Self::open_noted(device, "")
+    }
+
+    /// [`Self::open`], with `note` after the marker on its line: what the
+    /// boot is and when it started (`=== STELA BOOT 12 === version=0.5.0
+    /// firmware_clock=2026-11-18 01:44:12`), so each boot in the log says
+    /// so where it begins, whatever the ring kept of its first lines.
+    pub fn open_noted(device: &mut dyn BlockDevice, note: &str) -> Result<Self, BlockError> {
+        Self::with_pending(device, PENDING_BYTES, Some(note))
     }
 
     /// Open the log again later in the same boot, as the system engine does
     /// after the loader wrote it: the boot is not counted again and gets no
     /// second marker line.
     pub fn resume(device: &mut dyn BlockDevice) -> Result<Self, BlockError> {
-        Self::with_pending(device, PENDING_BYTES, false)
+        Self::with_pending(device, PENDING_BYTES, None)
     }
 
+    /// A new boot with the note after its marker, or the same boot again.
     fn with_pending(
         device: &mut dyn BlockDevice,
         pending: usize,
-        new_boot: bool,
+        new_boot: Option<&str>,
     ) -> Result<Self, BlockError> {
         let identity = device.identity();
         let region = identity
@@ -915,9 +925,10 @@ impl Writer {
     fn with_layout(
         device: &mut dyn BlockDevice,
         pending: usize,
-        new_boot: bool,
+        noted: Option<&str>,
         layout: Layout,
     ) -> Result<Self, BlockError> {
+        let new_boot = noted.is_some();
         let identity = device.identity();
         let block = identity.block_size as usize;
         if block == 0 || !(HEADER_BYTES as usize).is_multiple_of(block) {
@@ -997,9 +1008,13 @@ impl Writer {
         if last != b'\n' {
             writer.append(b"\n");
         }
-        if new_boot {
+        if let Some(note) = noted {
             writer.begin_record(device)?;
-            writer.append(format!("=== STELA BOOT {} ===\n", writer.boots).as_bytes());
+            let marker = match note.trim() {
+                "" => format!("=== STELA BOOT {} ===\n", writer.boots),
+                note => format!("=== STELA BOOT {} === {note}\n", writer.boots),
+            };
+            writer.append(marker.as_bytes());
         } else {
             writer.resume_record(device)?;
         }
@@ -1449,10 +1464,14 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
             let at = layout.record_at(index) as usize;
             let last = at + layout.first_bytes as usize;
             let first = &region[at..at + record.first as usize];
-            // First lines start with their boot's marker: other bytes are
-            // a record a write did not finish, never another boot's lines.
-            let marker = format!("=== STELA BOOT {} ===\n", record.boot);
-            (first.is_empty() || first.starts_with(marker.as_bytes())).then(|| BootStart {
+            // First lines start with their boot's marker, and its note:
+            // other bytes are a record a write did not finish, never
+            // another boot's lines.
+            let marker = format!("=== STELA BOOT {} ===", record.boot);
+            let marked = first
+                .strip_prefix(marker.as_bytes())
+                .is_some_and(|rest| matches!(rest.first(), Some(b'\n' | b' ')));
+            (first.is_empty() || marked).then(|| BootStart {
                 boot: record.boot,
                 start: record.start,
                 first: first.to_vec(),

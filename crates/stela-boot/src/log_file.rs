@@ -55,7 +55,7 @@ pub fn open() -> Option<Guid> {
             .unwrap_or_default();
             crate::stop_record::keep_last_run(running, newest);
         }
-        let writer = Writer::open(&mut *device)
+        let writer = Writer::open_noted(&mut *device, &boot_note())
             .map_err(|error| refuse!("firmware boot log: {error}", %error))?;
         report(&writer, "firmware");
         crate::stop_record::set_boot(writer.boots());
@@ -76,6 +76,34 @@ pub fn open() -> Option<Guid> {
         }
         opened => finish(opened).flatten(),
     }
+}
+
+/// What the boot's marker line says after its number: the version, and
+/// the firmware's clock as it reads it, a local time on most PCs (its zone
+/// in minutes where the firmware names one).
+fn boot_note() -> String {
+    let clock = match uefi::runtime::get_time() {
+        Ok(time) => {
+            let mut clock = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                time.year(),
+                time.month(),
+                time.day(),
+                time.hour(),
+                time.minute(),
+                time.second()
+            );
+            if let Some(zone) = time.time_zone() {
+                clock.push_str(&format!(" zone_minutes={zone}"));
+            }
+            clock
+        }
+        Err(error) => format!("unread ({:?})", error.status()),
+    };
+    format!(
+        "version={} firmware_clock={clock}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// The PCI functions an earlier boot did not finish starting, or skipped
