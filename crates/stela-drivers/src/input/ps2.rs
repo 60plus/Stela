@@ -910,14 +910,18 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         let config = self.controller_response(READ_CONFIG)?;
         self.controller_config = Some(config);
-        self.firmware_config.get_or_insert(config);
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
+        let firmware = *self.firmware_config.get_or_insert(config);
+        // Translation stays as the firmware left it, as Linux's
+        // i8042_controller_init leaves it by default: clearing it "can
+        // confuse notebook BIOSes". The keyboard's bytes are decoded as the
+        // set the controller then hands over.
+        let config = (config & !TRANSLATION) | (firmware & TRANSLATION);
+        self.keyboard.set_translated(config & TRANSLATION != 0);
+        self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         if self.config.reset_on_start {
             self.expect_controller(SELF_TEST, 0x55)?;
             // Self-test can reset CTR on real controllers; reapply/read it back.
-            self.set_config(
-                (config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED,
-            )?;
+            self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         }
         // Linux tests neither port at a native start; its auxiliary port
         // check accepts 0, FA and FF from the controller's port test.
@@ -933,7 +937,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 });
             }
         }
-        let enabled = (config & !(IRQ_BITS | TRANSLATION | KEYBOARD_DISABLED | MOUSE_DISABLED))
+        let enabled = (config & !(IRQ_BITS | KEYBOARD_DISABLED | MOUSE_DISABLED))
             | if self.config.keyboard {
                 0
             } else {
@@ -969,10 +973,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
     /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
     /// and the rest (reporting disable, Set 2 selection, LEDs) tried and
-    /// gone on without when the keyboard does not acknowledge them. Linux
-    /// sends no scan-set command at all for Set 2; the selection here is
-    /// tried because translation is off, and a keyboard that refuses it is
-    /// taken to report Set 2, the set firmware and Linux both leave it in.
+    /// gone on without when the keyboard does not acknowledge them. Behind
+    /// a translating controller no scan-set command is sent, as Linux's
+    /// `atkbd_select_set` sends none there. Untranslated, Set 2 selection is
+    /// tried, and a keyboard that refuses it is taken to report Set 2, the
+    /// set firmware and Linux both leave it in.
     fn start_keyboard(&mut self) -> Result<(), ErrorKind> {
         self.command(ENABLE_KEYBOARD)?;
         // Firmware may have left this keyboard reporting an unknown scan
@@ -988,8 +993,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
             true
         };
-        self.optional_keyboard(SET_SCAN, &[2])?;
-        if self.config.query_scan_set {
+        let translated = self.controller_config.unwrap_or(0) & TRANSLATION != 0;
+        if !translated {
+            self.optional_keyboard(SET_SCAN, &[2])?;
+        }
+        if self.config.query_scan_set && !translated {
             self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
             let scan = self.response(
                 Port::Keyboard,
@@ -1073,6 +1081,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// The configuration byte the firmware left, as the first start read it.
     pub fn firmware_config(&self) -> Option<u8> {
         self.firmware_config
+    }
+    /// Whether the keyboard's bytes arrive translated to set 1, as the
+    /// firmware left the controller; `None` before the first start read
+    /// its configuration.
+    pub fn translated(&self) -> Option<bool> {
+        self.firmware_config.map(|config| config & TRANSLATION != 0)
     }
     /// Set up the mouse's selected protocol, its reporting still disabled.
     fn set_up_mouse(&mut self) -> Result<(), ErrorKind> {
@@ -1227,7 +1241,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Some(value) => value,
             None => self.controller_response(READ_CONFIG)?,
         };
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)
+        self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)
     }
     /// Contain a failure while running: a failure of one port's device
     /// disables that port alone while the other is configured; anything

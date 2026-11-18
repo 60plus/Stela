@@ -7,6 +7,7 @@ use core::cell::{Cell, RefCell};
 mod elantech_tests;
 mod observation_tests;
 mod timing_tests;
+mod translation_tests;
 
 #[test]
 fn idle_poll_reads_status_once_and_still_checks_a_silent_prefix() {
@@ -168,6 +169,18 @@ fn a_mouse_port_sending_only_framed_bytes_fails_alone() {
 }
 mod synaptics_tests;
 
+/// The set-1 code an i8042 translates each set-2 code below 0x80 to.
+const I8042_TRANSLATION: [u8; 128] = [
+    0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+    0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a, 0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+    0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c, 0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e, 0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+    0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60, 0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+    0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e, 0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b, 0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+    0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45, 0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+];
+
 #[derive(Clone)]
 struct Model(Rc<RefCell<Hardware>>);
 struct Hardware {
@@ -193,6 +206,8 @@ struct Hardware {
     after_self_test: Vec<u8>,
     interface_test: u8,
     translation_stuck: bool,
+    /// A translating controller holds a set-2 F0 for the next byte.
+    translated_break: bool,
     busy_forever: bool,
     flood: bool,
     resend: Option<(Port, u8, usize)>,
@@ -217,7 +232,7 @@ impl Hardware {
             time,
             busy_until: None,
             output: VecDeque::new(),
-            config: TRANSLATION | IRQ_BITS,
+            config: IRQ_BITS,
             config_write: false,
             mouse_write: false,
             argument: [None, None],
@@ -235,6 +250,7 @@ impl Hardware {
             after_self_test: Vec::new(),
             interface_test: 0,
             translation_stuck: false,
+            translated_break: false,
             busy_forever: false,
             flood: false,
             resend: None,
@@ -252,8 +268,33 @@ impl Hardware {
             delay_at_read: alloc::collections::BTreeMap::new(),
         }
     }
+    /// A byte the device sends; a translating controller hands a keyboard
+    /// byte over in set 1, with a set-2 F0 folded into the next byte's bit 7.
     fn emit(&mut self, port: Port, data: u8) {
+        if port == Port::Keyboard && self.config & TRANSLATION != 0 {
+            if data == 0xf0 {
+                self.translated_break = true;
+                return;
+            }
+            let data = match data {
+                0..0x80 => I8042_TRANSLATION[usize::from(data)],
+                0x83 => 0x41,
+                0x84 => 0x54,
+                _ => data,
+            };
+            let release = if core::mem::take(&mut self.translated_break) {
+                0x80
+            } else {
+                0
+            };
+            self.output.push_back((port, data | release, 0));
+            return;
+        }
         self.output.push_back((port, data, 0));
+    }
+    /// A byte the controller itself answers with, never translated.
+    fn reply(&mut self, data: u8) {
+        self.output.push_back((Port::Keyboard, data, 0));
     }
     fn input_busy(&self) -> bool {
         self.busy_forever
@@ -588,20 +629,20 @@ impl Registers for Model {
                     "CTR reply lane is not owned while a keyboard can report"
                 );
                 let config = h.config;
-                h.emit(Port::Keyboard, config);
+                h.reply(config);
             }
             WRITE_CONFIG => h.config_write = true,
             SELF_TEST => {
                 let reply = h.self_test;
                 h.config = TRANSLATION | IRQ_BITS;
-                h.emit(Port::Keyboard, reply);
+                h.reply(reply);
                 for byte in core::mem::take(&mut h.after_self_test) {
                     h.emit(Port::Keyboard, byte);
                 }
             }
             TEST_KEYBOARD | TEST_MOUSE => {
                 let reply = h.interface_test;
-                h.emit(Port::Keyboard, reply);
+                h.reply(reply);
             }
             DISABLE_KEYBOARD => h.config |= KEYBOARD_DISABLED,
             DISABLE_MOUSE => h.config |= MOUSE_DISABLED,
@@ -638,11 +679,7 @@ impl Registers for Model {
                 KEYBOARD_DISABLED
             };
             assert_eq!(h.config & bit, 0, "device command while clock disabled");
-            assert_eq!(
-                h.config & (IRQ_BITS | TRANSLATION),
-                0,
-                "IRQs/translation must be disabled"
-            );
+            assert_eq!(h.config & IRQ_BITS, 0, "IRQs must be disabled");
             h.device(port, value);
         }
     }
@@ -1421,9 +1458,11 @@ fn already_reporting_keyboard_cannot_alias_ctr_or_publish_old_scan_set_bytes() {
     h.borrow_mut().keyboard_on_enable = vec![0x0c, 0x1e, 0xe0, 0xf0];
     h.borrow_mut().after_self_test = vec![0x0c];
     c.initialize().unwrap();
-    assert_eq!(h.borrow().config, 4);
+    // The firmware's translation stays; its interrupts do not.
+    assert_eq!(h.borrow().config, TRANSLATION | 4);
     assert!(c.poll().unwrap().is_empty());
-    assert_eq!(c.discarded_before_start(), 5);
+    // The translating controller holds the old F0 for the next byte.
+    assert_eq!(c.discarded_before_start(), 4);
     // The first owned set2 input still decodes with fresh framing.
     emit(&h, Port::Keyboard, &[0x1c, 0xf0, 0x1c]);
     assert_eq!(
