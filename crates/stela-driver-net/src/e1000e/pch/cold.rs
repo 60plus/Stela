@@ -105,7 +105,6 @@ pub enum Error {
     LtrLimit(u16),
     HostIdentityNotObserved,
     SmbusMode,
-    PowerCycleTimeout,
     UlpState,
     /// The Intel ME did not take the PHY out of ULP when asked.
     MeUlpTimeout,
@@ -170,7 +169,6 @@ impl core::fmt::Display for Error {
                 f.write_str("this PC's SMBIOS identity, which it needs, was not read")
             }
             Self::SmbusMode => f.write_str("the PHY stays in SMBus mode"),
-            Self::PowerCycleTimeout => f.write_str("the PHY power cycle (LANPHYPC) did not finish"),
             Self::UlpState => f.write_str("the PHY stays in its ultra-low-power state"),
             Self::MeUlpTimeout => {
                 f.write_str("the Intel ME did not take the PHY out of its low-power state")

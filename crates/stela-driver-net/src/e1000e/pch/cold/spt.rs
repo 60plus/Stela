@@ -225,8 +225,14 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         self.identity = self.phy.identify()?;
         Ok(())
     }
+    /// `e1000_disable_ulp_lpt_lp` with `force` for an adapter the Intel ME
+    /// does not manage: a LANPHYPC toggle, which waits up to 100 ms for its
+    /// power cycle to be reported done and 30 ms more and goes on either
+    /// way, as `e1000_toggle_lanphypc_pch_lpt` does, then SMBus unforced in
+    /// the PHY and the MAC, K1 back on and the PHY's ULP configuration
+    /// cleared.
     fn spt_ulp_exit(&mut self) -> Result<(), Error> {
-        let cycle_done = self.phy.transaction(|p| {
+        self.phy.transaction(|p| {
             let value = p.read_mac(super::FEXTNVM3)?;
             p.write_mac(
                 super::FEXTNVM3,
@@ -239,18 +245,13 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.wait_minimum(10)?;
             p.write_mac(super::CTRL, value & !LANPHYPC_OVERRIDE)?;
             p.read_mac(super::STATUS)?;
-            let mut done = false;
             for _ in 0..=20 {
                 p.wait_minimum(5_000)?;
                 if p.read_mac(CTRL_EXT)? & POWER_CYCLE_DONE != 0 {
-                    done = true;
                     break;
                 }
             }
             p.wait_minimum(30_000)?;
-            if !done {
-                return Ok(false);
-            }
             p.retry_enabled = false;
             // A mode-switch MDIC error is a source-defined transition, not an
             // access/removal fault. Only the exact CV_SMB_CTRL response may
@@ -284,11 +285,8 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.access(ULP_CONFIG, Some(value | ULP_START))?;
             let value = p.read_mac(FEXTNVM7)?;
             p.write_mac(FEXTNVM7, value & !DISABLE_SMB_PERST)?;
-            Ok(true)
+            Ok(())
         })?;
-        if !cycle_done {
-            return Err(Error::PowerCycleTimeout);
-        }
         Ok(())
     }
 }

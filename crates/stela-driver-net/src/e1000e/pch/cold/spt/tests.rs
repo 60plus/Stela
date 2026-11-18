@@ -226,18 +226,27 @@ fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() 
     }
 }
 
-/// `e1000_init_phy_workarounds_pchlan`: a ULP exit whose power cycle never
-/// reports done is noted, as Linux logs "Failed to disable ULP", and the
-/// start goes on to the PHY access checks, which settle it.
+/// `e1000_toggle_lanphypc_pch_lpt` waits up to 100 ms for the power cycle
+/// to be reported done and goes on either way: a cycle that never reports
+/// done still unforces SMBus, turns K1 back on and clears the PHY's ULP
+/// configuration, where the exit stopped there and left the PHY configured
+/// for ULP.
 #[test]
-fn a_ulp_exit_that_fails_is_noted_and_the_start_goes_on() {
+fn a_power_cycle_never_reported_done_still_takes_the_phy_out_of_ulp() {
     let (state, _, io, timer) = fixture_spt();
     state.borrow_mut().power_stuck = true;
     let controller = start_spt(0x156f, io, timer).unwrap();
-    assert!(controller.ulp_exit_failed());
+    assert!(!controller.ulp_exit_failed());
     assert!(!controller.is_poisoned());
+    {
+        let m = state.borrow();
+        assert_eq!(m.phy[&(1, 779, 16)] & ULP_CLEAR, 0);
+        assert_eq!(m.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
+        assert_eq!(m.mac[&FEXTNVM7] & DISABLE_SMB_PERST, 0);
+    }
     drop(controller);
 }
+
 #[test]
 fn ulp_mode_switch_recovers_only_the_specific_mdi_transition_and_verifies_state() {
     let (state, released, io, timer) = fixture_spt();
