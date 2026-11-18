@@ -13,8 +13,9 @@ use crate::output;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering},
 };
+use stela_boot_core::firmware_runtime::Regions;
 use stela_boot_core::running_record::{self, Running};
 use stela_boot_core::stop_record::{
     ATTRIBUTES, FirmwareCall, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR,
@@ -269,14 +270,48 @@ pub(crate) fn take_firmware_call() -> FirmwareCall {
         return FirmwareCall::None;
     }
     CALL.store(FirmwareCall::None as u64, Ordering::Release);
+    // A fault inside the service may have left its store half written:
+    // nothing calls it again in this boot.
+    SET_VARIABLE.store(0, Ordering::Release);
     kind
 }
 
-/// What [`arm`] was given, with the boot's number, for the engine.
+/// The runtime regions the loader's root maps, for a fault's line; set once
+/// by the engine from its handoff.
+static REGIONS: AtomicPtr<Regions> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Keep the loader's record of the firmware's runtime regions.
+pub(crate) fn set_regions(regions: &'static Regions) {
+    REGIONS.store(core::ptr::from_ref(regions).cast_mut(), Ordering::Release);
+}
+
+/// Where `address`, which a firmware call faulted at, lies among the
+/// runtime regions the firmware declared (`Regions::place`).
+pub(crate) fn fault_place(address: u64) -> String {
+    let regions = REGIONS.load(Ordering::Acquire);
+    if regions.is_null() {
+        return String::from("the firmware's runtime regions are unknown here");
+    }
+    // SAFETY: `set_regions` stored a 'static reference.
+    unsafe { &*regions }.place(address)
+}
+
+/// What [`arm`] was given, with the boot's number, for the engine: without
+/// the variable services where they are not to be called after the
+/// firmware's exit ([`refuse_after_exit`]).
 pub(crate) fn services() -> Services {
+    let refused = AFTER_EXIT_REFUSED.load(Ordering::Relaxed);
     Services {
-        set_variable: SET_VARIABLE.load(Ordering::Acquire),
-        query_variable_info: QUERY_VARIABLE_INFO.load(Ordering::Relaxed),
+        set_variable: if refused {
+            0
+        } else {
+            SET_VARIABLE.load(Ordering::Acquire)
+        },
+        query_variable_info: if refused {
+            0
+        } else {
+            QUERY_VARIABLE_INFO.load(Ordering::Relaxed)
+        },
         boot: BOOT.load(Ordering::Relaxed),
         entry: ENTRY.load(Ordering::Relaxed),
     }
@@ -315,6 +350,17 @@ pub(crate) fn return_at_restart() -> Option<u16> {
     };
     let status = in_firmware(FirmwareCall::BootNext, store);
     (status == SUCCESS).then_some(entry)
+}
+
+/// The firmware's variable services are not called after its exit in this
+/// boot: [`services`] hands the engine none.
+static AFTER_EXIT_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// From the firmware's exit on, this boot calls none of its variable
+/// services: a stop keeps no record in the firmware, and a restart writes
+/// no `BootNext` then.
+pub(crate) fn refuse_after_exit() {
+    AFTER_EXIT_REFUSED.store(true, Ordering::Relaxed);
 }
 
 /// No stop has tried to write the record.
@@ -360,7 +406,7 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
         SET_VARIABLE.load(Ordering::Acquire) as usize,
         QUERY_VARIABLE_INFO.load(Ordering::Relaxed) as usize,
     );
-    if set == 0 || query == 0 {
+    if set == 0 || query == 0 || AFTER_EXIT_REFUSED.load(Ordering::Relaxed) {
         return false;
     }
     // SAFETY: the firmware's entries, as `Services::capture` read them from

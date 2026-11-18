@@ -843,13 +843,15 @@ pub fn fatal(frame: &Frame) -> ! {
     // a restart calls, is the firmware's: the stop it came from, if any, is
     // on the line before.
     if let Some(reason) = crate::stop_record::take_firmware_call().fault_reason(&alloc::format!(
-        "vector={} error={:#x} rip={:#x} cr2={:#x} rax={:#x} cr3={:#x}",
+        "vector={} error={:#x} rip={:#x} cr2={:#x} rax={:#x} cr3={:#x}; {}",
         frame.vector,
         frame.error,
         frame.rip,
         cr2(),
         frame.rax,
-        cr3()
+        cr3(),
+        // A page fault's address; any other vector's rip.
+        crate::stop_record::fault_place(if frame.vector == 14 { cr2() } else { frame.rip })
     )) {
         output::fatal(reason)
     }

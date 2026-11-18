@@ -226,6 +226,7 @@ fn start(handoff: u64) -> Started {
     // From here a stop the USB's log cannot keep leaves its record in the
     // firmware; an earlier one has only the screen.
     crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
+    crate::stop_record::set_regions(&handoff.runtime_regions);
     layout::set(handoff.placement);
     // Before this image's first line: the loader's lines that no log stored.
     let lines = handoff
