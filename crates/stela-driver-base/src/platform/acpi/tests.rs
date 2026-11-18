@@ -40,6 +40,39 @@ fn failed_hardware_activation_never_publishes_success_or_retries() {
 }
 
 #[test]
+fn a_status_is_named_as_acpica_names_it() {
+    assert_eq!(Error(5).name(), Some("AE_NOT_FOUND"));
+    assert_eq!(std::format!("{}", Error(7)), "AE_ALREADY_EXISTS");
+    assert_eq!(std::format!("{}", Error(0x3001)), "AE_AML_BAD_OPCODE");
+    assert_eq!(std::format!("{}", SUPPORT), "AE_SUPPORT");
+    assert_eq!(Error(0x0fff).name(), None);
+    assert_eq!(std::format!("{}", Error(0x0fff)), "ACPICA status 0xfff");
+}
+
+/// A failed evaluation names the method and ACPICA's status; an absent
+/// device names the value its `_STA` returned.
+#[test]
+fn a_failed_evaluation_names_the_method_and_the_status() {
+    let error = resources::Error::from(Error(5)).of("_CRS");
+    assert_eq!(
+        error,
+        resources::Error::Method {
+            method: "_CRS",
+            status: Error(5)
+        }
+    );
+    assert_eq!(std::format!("{error}"), "_CRS: AE_NOT_FOUND");
+    assert_eq!(
+        resources::Error::Unavailable(0).of("_STA"),
+        resources::Error::Unavailable(0)
+    );
+    assert_eq!(
+        std::format!("{}", resources::Error::Unavailable(0)),
+        "_STA: 0x0, the firmware says the device is absent or off"
+    );
+}
+
+#[test]
 fn sleep_preparation_evaluates_s5_and_runs_pts() {
     let _serial = TEST_SERIAL.lock().unwrap();
     let mut dsdt = include_bytes!("fixtures/namespace.aml").to_vec();

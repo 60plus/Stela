@@ -528,6 +528,11 @@ impl Prepared {
         for (location, error) in &devices.platform_failures {
             output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
         }
+        for (location, status) in &devices.platform_absent {
+            output::arguments(format_args!(
+                "PLATFORM ABSENT {location}: its _STA is {status:#x}, not fitted or off\n"
+            ));
+        }
         for (location, why) in &devices.platform_unsupported {
             output::arguments(format_args!("PLATFORM UNSUPPORTED {location}: {why}\n"));
         }

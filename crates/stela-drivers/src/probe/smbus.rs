@@ -167,7 +167,7 @@ pub(super) unsafe fn attach(
         _ => {
             if session
                 .io_regions_overlapping(window.clone())
-                .map_err(PlatformError::AcpiMethod)?
+                .map_err(|error| PlatformError::AcpiMethod("I/O region search", error))?
                 != 0
             {
                 return Err(PlatformError::Refused(

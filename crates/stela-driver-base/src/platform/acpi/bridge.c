@@ -296,6 +296,12 @@ acpi_status stela_acpi_start(const struct stela_acpi_services *input, u8 hardwar
     if (ACPI_SUCCESS(status) && !stela_acpi_namespace_valid()) return AE_SUPPORT;
     return status;
 }
+/* ACPICA's name of `status` (AE_NOT_FOUND), or null for a code it does not
+ * define. A table lookup: it needs no session and logs nothing. */
+const char *stela_acpi_status_name(acpi_status status) {
+    const struct acpi_exception_info *info = acpi_ut_validate_exception(status);
+    return info ? info->name : 0;
+}
 acpi_status stela_acpi_enable_hardware(void) {
     if (!active) return AE_NOT_EXIST;
     if (hardware_enabled) return AE_ALREADY_EXISTS;

@@ -52,6 +52,7 @@ struct stela_acpi_services {
 #define STELA_ACPI_FULL_CAPABILITIES 15ull /* SCI, deferred work, regions, IRQ-safe allocation */
 acpi_status stela_acpi_start(const struct stela_acpi_services *, u8);
 acpi_status stela_acpi_stop(void);
+const char *stela_acpi_status_name(acpi_status);
 acpi_status stela_acpi_preflight_wait_events(void);
 acpi_status stela_acpi_evaluate(acpi_handle, const char *, union acpi_object *, u32, struct acpi_buffer *);
 acpi_status stela_acpi_walk(const char *, acpi_walk_callback, void *);

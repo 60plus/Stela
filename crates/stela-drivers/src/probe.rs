@@ -178,6 +178,8 @@ pub enum PlatformError {
     /// The GPIO line of a device's interrupt could not be taken or read.
     #[cfg(feature = "native-acpi")]
     GpioLine(crate::bus::gpio::native::Error),
+    /// What a device depends on, such as its bus controller, failed.
+    Through(&'static str, Box<PlatformError>),
     /// The embedded controller's operation regions could not be installed.
     #[cfg(feature = "native-acpi")]
     Ec(crate::platform::ec::binding::Failure),
@@ -189,9 +191,10 @@ pub enum PlatformError {
     Smbus(crate::bus::smbus::Error),
     #[cfg(feature = "native-acpi")]
     Ucsi(crate::usb::typec::ucsi::acpi::attachment::Error),
-    /// Finding a device or evaluating its method failed.
+    /// Evaluating the named method, or the named namespace or table lookup,
+    /// ended with ACPICA's status.
     #[cfg(feature = "native-acpi")]
-    AcpiMethod(crate::platform::acpi::Error),
+    AcpiMethod(&'static str, crate::platform::acpi::Error),
 }
 
 impl fmt::Display for PlatformError {
@@ -201,7 +204,7 @@ impl fmt::Display for PlatformError {
             Self::Config(error) => error.fmt(f),
             Self::PciCapability(error) => write!(f, "PCI capability: {error:?}"),
             #[cfg(feature = "native-acpi")]
-            Self::Acpi(error) => write!(f, "ACPI: {error:?}"),
+            Self::Acpi(error) => write!(f, "ACPI {error}"),
             Self::Refused(why) => f.write_str(why),
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
@@ -215,6 +218,7 @@ impl fmt::Display for PlatformError {
             Self::Gpio(error) => write!(f, "GPIO controller: {error:?}"),
             #[cfg(feature = "native-acpi")]
             Self::GpioLine(error) => write!(f, "GPIO interrupt line: {error:?}"),
+            Self::Through(what, error) => write!(f, "{what}: {error}"),
             #[cfg(feature = "native-acpi")]
             Self::Ec(error) => write!(f, "embedded controller: {error:?}"),
             #[cfg(feature = "native-acpi")]
@@ -225,7 +229,7 @@ impl fmt::Display for PlatformError {
             #[cfg(feature = "native-acpi")]
             Self::Ucsi(error) => write!(f, "UCSI: {error:?}"),
             #[cfg(feature = "native-acpi")]
-            Self::AcpiMethod(error) => write!(f, "ACPI method: {error:?}"),
+            Self::AcpiMethod(what, error) => write!(f, "ACPI {what}: {error}"),
         }
     }
 }
@@ -833,6 +837,10 @@ pub struct Devices {
     /// brought up or handed over, by location, such as
     /// `0000:00:1d.0 EHCI handoff`.
     pub platform_failures: Vec<(String, PlatformError)>,
+    /// ACPI devices a driver here takes whose `_STA` says they are not
+    /// fitted or are off, with the value it returned. Firmware lists every
+    /// part a model may carry; an operating system skips these.
+    pub platform_absent: Vec<(String, u64)>,
     /// Objects that must stay alive while the devices they set up exist,
     /// including attaches that failed, such as the Intel VMD hierarchy behind
     /// its NVMe controller and a failed controller's mappings and DMA domain.
@@ -4139,5 +4147,40 @@ mod tests {
         }
         let device: Error = BlockError::Device { status: 0x1234 }.into();
         assert_eq!(format!("{device}"), "device status 0x1234");
+    }
+
+    /// A platform failure names the ACPI method it evaluated and ACPICA's
+    /// status by name, and what the device depends on when that failed.
+    #[cfg(feature = "native-acpi")]
+    #[test]
+    fn platform_failures_name_the_method_and_the_status() {
+        use crate::platform::acpi::{Error as Status, resources};
+        assert_eq!(
+            format!("{}", PlatformError::AcpiMethod("_PS0", Status(5))),
+            "ACPI _PS0: AE_NOT_FOUND"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                PlatformError::Acpi(resources::Error::Acpi(Status(1)).of("_CRS"))
+            ),
+            "ACPI _CRS: AE_ERROR"
+        );
+        assert_eq!(
+            format!("{}", PlatformError::Acpi(resources::Error::Unavailable(0))),
+            "ACPI _STA: 0x0, the firmware says the device is absent or off"
+        );
+        let line = PlatformError::GpioLine(crate::bus::gpio::native::Error::Amd(
+            crate::bus::gpio::amd::Error::Readback,
+        ));
+        assert_eq!(format!("{line}"), "GPIO interrupt line: Amd(Readback)");
+        let through = PlatformError::Through(
+            "its I2C controller",
+            Box::new(PlatformError::Refused("I2C controller behind a PCI bridge")),
+        );
+        assert_eq!(
+            format!("{through}"),
+            "its I2C controller: I2C controller behind a PCI bridge"
+        );
     }
 }

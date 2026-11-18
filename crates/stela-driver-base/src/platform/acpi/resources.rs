@@ -21,7 +21,13 @@ use alloc::{string::String, vec::Vec};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     Acpi(super::Error),
+    /// Evaluating `method` of the device ended with `status`.
+    Method {
+        method: &'static str,
+        status: super::Error,
+    },
     InvalidObject(&'static str),
+    /// The device's `_STA` says it is absent or off: the value it returned.
     Unavailable(u64),
     Truncated,
     Malformed,
@@ -45,6 +51,42 @@ pub enum Error {
 impl From<super::Error> for Error {
     fn from(error: super::Error) -> Self {
         Self::Acpi(error)
+    }
+}
+impl Error {
+    /// `self` as the failure of evaluating `method`, when it is ACPICA's
+    /// status and names no method yet.
+    pub fn of(self, method: &'static str) -> Self {
+        match self {
+            Self::Acpi(status) => Self::Method { method, status },
+            other => other,
+        }
+    }
+}
+/// The failure in the log's words: the method evaluated and ACPICA's name
+/// of the status, where the failure has them.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Acpi(status) => write!(f, "{status}"),
+            Self::Method { method, status } => write!(f, "{method}: {status}"),
+            Self::InvalidObject(method) => {
+                write!(f, "{method}: not the kind of object ACPI gives it")
+            }
+            Self::Unavailable(status) => write!(
+                f,
+                "_STA: {status:#x}, the firmware says the device is absent or off"
+            ),
+            Self::Unsupported { tag, revision } => write!(
+                f,
+                "resource descriptor {tag:#x} revision {revision} is not decoded"
+            ),
+            Self::Retirement { primary, cleanup } => match primary {
+                Some(primary) => write!(f, "{primary}, then the release failed: {cleanup}"),
+                None => write!(f, "the release failed: {cleanup}"),
+            },
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 

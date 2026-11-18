@@ -111,19 +111,20 @@ pub(super) fn attach_i8042(
             handles.extend(
                 session
                     .devices(hid)
-                    .map_err(|error| PlatformError::Acpi(error.into()))?,
+                    .map_err(|error| PlatformError::AcpiMethod("device search", error))?,
             );
         }
         Ok(handles)
     };
     // The `_HID` and `_CID`s ACPICA reads for a device's PnP IDs.
     let pnp_ids = |device: Handle<'_>| -> Result<Vec<String>, PlatformError> {
-        let acpi = |error: crate::platform::acpi::Error| PlatformError::Acpi(error.into());
-        let mut ids: Vec<String> = hardware_id(device.evaluate(Some("_HID"), &[]).map_err(acpi)?)
-            .into_iter()
-            .collect();
+        let acpi = |what| move |error| PlatformError::AcpiMethod(what, error);
+        let mut ids: Vec<String> =
+            hardware_id(device.evaluate(Some("_HID"), &[]).map_err(acpi("_HID"))?)
+                .into_iter()
+                .collect();
         if device.child("_CID").is_ok() {
-            match device.evaluate(Some("_CID"), &[]).map_err(acpi)? {
+            match device.evaluate(Some("_CID"), &[]).map_err(acpi("_CID"))? {
                 Some(Value::Package(cids)) => {
                     ids.extend(cids.into_iter().filter_map(|cid| hardware_id(Some(cid))));
                 }
@@ -138,7 +139,9 @@ pub(super) fn attach_i8042(
         let mice = found(ids::I8042_MOUSE)?;
         let mut io = Vec::new();
         for device in keyboards.iter().chain(&mice).take(1) {
-            for descriptor in resources::evaluate(*device, "_CRS").map_err(PlatformError::Acpi)? {
+            for descriptor in resources::evaluate(*device, "_CRS")
+                .map_err(|error| PlatformError::Acpi(error.of("_CRS")))?
+            {
                 if let Resource::Address(address) = descriptor.resource
                     && address.space == Space::Io
                     && address.minimum_fixed
@@ -152,7 +155,7 @@ pub(super) fn attach_i8042(
             && fadt_expects_i8042(
                 session
                     .table(b"FACP")
-                    .map_err(|error| PlatformError::Acpi(error.into()))?
+                    .map_err(|error| PlatformError::AcpiMethod("FADT lookup", error))?
                     .as_deref(),
             );
         let Some(config) = i8042(direct || !keyboards.is_empty(), !mice.is_empty(), &io)? else {

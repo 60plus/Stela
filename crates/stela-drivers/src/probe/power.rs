@@ -69,9 +69,12 @@ pub unsafe fn install_embedded_controller(
         reason = "discovery retains typed platform causes inline in the diagnostic collection"
     )]
     let from_ecdt = || -> Result<Option<Device<'static>>, (String, PlatformError)> {
-        let Some(table) = session
-            .table(b"ECDT")
-            .map_err(|error| (String::from("ECDT"), PlatformError::AcpiMethod(error)))?
+        let Some(table) = session.table(b"ECDT").map_err(|error| {
+            (
+                String::from("ECDT"),
+                PlatformError::AcpiMethod("table lookup", error),
+            )
+        })?
         else {
             return Ok(None);
         };
@@ -81,12 +84,20 @@ pub unsafe fn install_embedded_controller(
                 PlatformError::EcDiscovery(DiscoveryError::Malformed("ECDT")),
             )
         })?;
-        let handle = session
-            .handle(ecdt.path)
-            .map_err(|error| (String::from(ecdt.path), PlatformError::AcpiMethod(error)))?;
+        let handle = session.handle(ecdt.path).map_err(|error| {
+            (
+                String::from(ecdt.path),
+                PlatformError::AcpiMethod("namespace lookup", error),
+            )
+        })?;
         let fadt = session
             .table(b"FACP")
-            .map_err(|error| (String::from("FACP"), PlatformError::AcpiMethod(error)))?
+            .map_err(|error| {
+                (
+                    String::from("FACP"),
+                    PlatformError::AcpiMethod("table lookup", error),
+                )
+            })?
             .ok_or_else(|| {
                 (
                     String::from("FACP"),
@@ -116,9 +127,10 @@ pub unsafe fn install_embedded_controller(
         let handles = match session.devices(EC) {
             Ok(handles) => handles,
             Err(error) => {
-                result
-                    .failures
-                    .push((String::from(EC), PlatformError::AcpiMethod(error)));
+                result.failures.push((
+                    String::from(EC),
+                    PlatformError::AcpiMethod("device search", error),
+                ));
                 return None;
             }
         };
@@ -181,13 +193,17 @@ pub(super) fn attach_power(session: &'static Session, devices: &mut Devices) {
         Err(error) => fail(
             devices,
             String::from(BATTERY),
-            PlatformError::AcpiMethod(error),
+            PlatformError::AcpiMethod("device search", error),
         ),
     }
     let first = |devices: &mut Devices, id: &str| match session.devices(id) {
         Ok(handles) => handles.into_iter().next(),
         Err(error) => {
-            fail(devices, String::from(id), PlatformError::AcpiMethod(error));
+            fail(
+                devices,
+                String::from(id),
+                PlatformError::AcpiMethod("device search", error),
+            );
             None
         }
     };
@@ -196,11 +212,11 @@ pub(super) fn attach_power(session: &'static Session, devices: &mut Devices) {
         match AcAdapter::attach(handle) {
             Ok(mut ac) => {
                 if let Err(error) = ac.refresh() {
-                    fail(devices, at, PlatformError::AcpiMethod(error));
+                    fail(devices, at, PlatformError::AcpiMethod("_PSR", error));
                 }
                 devices.power.ac = Some(ac);
             }
-            Err(error) => fail(devices, at, PlatformError::AcpiMethod(error)),
+            Err(error) => fail(devices, at, PlatformError::AcpiMethod("_PSR", error)),
         }
     }
     if let Some(handle) = first(devices, LID) {
@@ -208,11 +224,11 @@ pub(super) fn attach_power(session: &'static Session, devices: &mut Devices) {
         match Lid::attach(handle) {
             Ok(mut lid) => {
                 if let Err(error) = lid.refresh() {
-                    fail(devices, at, PlatformError::AcpiMethod(error));
+                    fail(devices, at, PlatformError::AcpiMethod("_LID", error));
                 }
                 devices.power.lid = Some(lid);
             }
-            Err(error) => fail(devices, at, PlatformError::AcpiMethod(error)),
+            Err(error) => fail(devices, at, PlatformError::AcpiMethod("_LID", error)),
         }
     }
 }

@@ -410,7 +410,7 @@ mod attach {
                 }
                 Err(error) => devices
                     .platform_failures
-                    .push((format!("{id} devices"), PlatformError::Acpi(error.into()))),
+                    .push((format!("{id} devices"), acpi("device search")(error))),
             }
         }
         let mut shared = Shared {
@@ -431,13 +431,21 @@ mod attach {
             ) {
                 Ok(Some(input)) => devices.inputs.push(input),
                 Ok(None) => {}
+                // Firmware lists every touchpad a model may carry and marks
+                // the one fitted in `_STA`; the others are no failure.
+                Err(PlatformError::Acpi(crate::platform::acpi::resources::Error::Unavailable(
+                    status,
+                ))) => {
+                    devices.platform_absent.push((location, status));
+                }
                 Err(error) => devices.platform_failures.push((location, error)),
             }
         }
     }
 
-    fn acpi(error: crate::platform::acpi::Error) -> PlatformError {
-        PlatformError::Acpi(error.into())
+    /// The failure of evaluating or looking up `what`.
+    fn acpi(what: &'static str) -> impl Fn(crate::platform::acpi::Error) -> PlatformError {
+        move |error| PlatformError::AcpiMethod(what, error)
     }
 
     fn native(error: ServiceError) -> PlatformError {
@@ -447,7 +455,11 @@ mod attach {
     /// Whether `handle` is one of the devices `hids` lists.
     fn listed(session: &Session, handle: Handle<'_>, hids: &[&str]) -> Result<bool, PlatformError> {
         for hid in hids {
-            if session.devices(hid).map_err(acpi)?.contains(&handle) {
+            if session
+                .devices(hid)
+                .map_err(acpi("device search"))?
+                .contains(&handle)
+            {
                 return Ok(true);
             }
         }
@@ -460,13 +472,13 @@ mod attach {
     fn power_on(handle: Handle<'_>) -> Result<(), PlatformError> {
         let present = |method: &str| handle.child(method).is_ok();
         if present("_PSC")
-            && handle.evaluate(Some("_PSC"), &[]).map_err(acpi)? == Some(Value::Integer(0))
+            && handle.evaluate(Some("_PSC"), &[]).map_err(acpi("_PSC"))? == Some(Value::Integer(0))
         {
             return Ok(());
         }
         if present("_PR0") {
             let Some(Value::Package(resources)) =
-                handle.evaluate(Some("_PR0"), &[]).map_err(acpi)?
+                handle.evaluate(Some("_PR0"), &[]).map_err(acpi("_PR0"))?
             else {
                 return Err(PlatformError::Refused("_PR0 is not a package"));
             };
@@ -475,13 +487,19 @@ mod attach {
                     return Err(PlatformError::Refused("_PR0 holds a non-reference"));
                 };
                 let resource = resource.handle;
-                if resource.evaluate(Some("_STA"), &[]).map_err(acpi)? != Some(Value::Integer(1)) {
-                    resource.evaluate(Some("_ON"), &[]).map_err(acpi)?;
+                if resource
+                    .evaluate(Some("_STA"), &[])
+                    .map_err(acpi("power resource _STA"))?
+                    != Some(Value::Integer(1))
+                {
+                    resource
+                        .evaluate(Some("_ON"), &[])
+                        .map_err(acpi("power resource _ON"))?;
                 }
             }
         }
         if present("_PS0") {
-            handle.evaluate(Some("_PS0"), &[]).map_err(acpi)?;
+            handle.evaluate(Some("_PS0"), &[]).map_err(acpi("_PS0"))?;
         }
         Ok(())
     }
@@ -526,17 +544,24 @@ mod attach {
                             Argument::Package(&[]),
                         ],
                     )
-                    .map_err(acpi)?,
+                    .map_err(acpi("_DSM (HID descriptor address)"))?,
             )?
         } else {
             0
         };
-        let controller = handle.child(&connection.controller).map_err(acpi)?;
-        let bus = bus(services, session, clock, controller, shared, owners)?;
+        let controller = handle
+            .child(&connection.controller)
+            .map_err(acpi("I2C controller named by _CRS"))?;
+        let through = |what| move |error| PlatformError::Through(what, Box::new(error));
+        let bus = bus(services, session, clock, controller, shared, owners)
+            .map_err(through("its I2C controller"))?;
         let interrupt: Box<dyn hid_i2c::Interrupt> = match &connection.interrupt {
             Some(pin) => {
-                let gpio = handle.child(&pin.controller).map_err(acpi)?;
-                let gpio = gpio_controller(services, gpio, shared)?;
+                let gpio = handle
+                    .child(&pin.controller)
+                    .map_err(acpi("GPIO controller named by _CRS"))?;
+                let gpio = gpio_controller(services, gpio, shared)
+                    .map_err(through("its GPIO controller"))?;
                 let interrupt = PinInterrupt {
                     controller: gpio,
                     pin: pin.pin,
@@ -642,7 +667,7 @@ mod attach {
         shared: &mut Shared,
         owners: &mut Vec<Box<dyn core::any::Any>>,
     ) -> Result<SharedBus, PlatformError> {
-        let path = controller.path().map_err(acpi)?;
+        let path = controller.path().map_err(acpi("namespace path"))?;
         if let Some((_, bus)) = shared.buses.iter().find(|(at, _)| *at == path) {
             return Ok(bus.clone());
         }
@@ -725,18 +750,20 @@ mod attach {
     }
 
     /// A DesignWare timing method's counts, when the controller has it.
-    fn method(controller: Handle<'_>, name: &str) -> Result<Option<Counts>, PlatformError> {
+    fn method(controller: Handle<'_>, name: &'static str) -> Result<Option<Counts>, PlatformError> {
         if controller.child(name).is_err() {
             return Ok(None);
         }
-        Ok(counts(controller.evaluate(Some(name), &[]).map_err(acpi)?))
+        Ok(counts(
+            controller.evaluate(Some(name), &[]).map_err(acpi(name))?,
+        ))
     }
 
     /// The connection speeds of every device on `controller`'s bus, as Linux
     /// `i2c_acpi_find_bus_speed` walks the namespace for them.
     fn speeds(session: &Session, controller: Handle<'_>) -> Result<Vec<u32>, PlatformError> {
         let mut speeds = Vec::new();
-        for device in session.all_devices().map_err(acpi)? {
+        for device in session.all_devices().map_err(acpi("device search"))? {
             if device.child("_CRS").is_err() {
                 continue;
             }
@@ -767,28 +794,31 @@ mod attach {
         config: impl Fn(timing::Board) -> i2c::Config,
         owners: &mut Vec<Box<dyn core::any::Any>>,
     ) -> Result<lpss::I2c<lpss::NativeRegisters, Clock>, PlatformError> {
-        let integer = |handle: Handle<'_>, name: &str| -> Result<Option<u64>, PlatformError> {
-            if handle.child(name).is_err() {
-                return Ok(None);
-            }
-            match handle.evaluate(Some(name), &[]).map_err(acpi)? {
-                Some(Value::Integer(value)) => Ok(Some(value)),
-                _ => Err(PlatformError::Refused(
-                    "ACPI integer object is not an integer",
-                )),
-            }
-        };
+        let integer =
+            |handle: Handle<'_>, name: &'static str| -> Result<Option<u64>, PlatformError> {
+                if handle.child(name).is_err() {
+                    return Ok(None);
+                }
+                match handle.evaluate(Some(name), &[]).map_err(acpi(name))? {
+                    Some(Value::Integer(value)) => Ok(Some(value)),
+                    _ => Err(PlatformError::Refused(
+                        "ACPI integer object is not an integer",
+                    )),
+                }
+            };
         let adr = integer(controller, "_ADR")?.ok_or(PlatformError::Refused(
             "I2C controller is neither on PCI nor an AMD controller",
         ))?;
-        let path = controller.path().map_err(acpi)?;
+        let path = controller.path().map_err(acpi("namespace path"))?;
         let parent =
             path.rsplit_once('.')
                 .map(|(parent, _)| parent)
                 .ok_or(PlatformError::Refused(
                     "I2C controller at the namespace root",
                 ))?;
-        let parent = session.handle(parent).map_err(acpi)?;
+        let parent = session
+            .handle(parent)
+            .map_err(acpi("PCI root of the I2C controller"))?;
         if !listed(session, parent, &["PNP0A08", "PNP0A03"])? {
             return Err(PlatformError::Refused("I2C controller behind a PCI bridge"));
         }
@@ -877,11 +907,11 @@ mod attach {
         handle: Handle<'_>,
         shared: &mut Shared,
     ) -> Result<Rc<RefCell<gpio::native::Device>>, PlatformError> {
-        let path = handle.path().map_err(acpi)?;
+        let path = handle.path().map_err(acpi("namespace path"))?;
         if let Some((_, gpio)) = shared.gpios.iter().find(|(at, _)| *at == path) {
             return Ok(gpio.clone());
         }
-        let hid = hardware_id(handle.evaluate(Some("_HID"), &[]).map_err(acpi)?)
+        let hid = hardware_id(handle.evaluate(Some("_HID"), &[]).map_err(acpi("_HID"))?)
             .ok_or(PlatformError::Refused("GPIO controller without a _HID"))?;
         let device = DeviceResources::inspect(handle).map_err(PlatformError::Acpi)?;
         let authority = services.authority().map_err(native)?;

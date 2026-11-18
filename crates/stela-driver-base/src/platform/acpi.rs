@@ -62,6 +62,29 @@ pub const NOT_FOUND: Error = Error(0x0005);
 pub const BAD_PARAMETER: Error = Error(0x1001);
 pub const ALREADY_EXISTS: Error = Error(0x0007);
 pub const LIMIT: Error = Error(0x0010);
+impl Error {
+    /// ACPICA's name of the status, as its own messages print it
+    /// (`AE_NOT_FOUND`), or `None` for a code ACPICA does not define.
+    pub fn name(self) -> Option<&'static str> {
+        // SAFETY: a lookup in ACPICA's constant exception tables, which
+        // needs no session; the name it returns is a static C string.
+        let name = unsafe { stela_acpi_status_name(self.0) };
+        if name.is_null() {
+            return None;
+        }
+        // SAFETY: non-null, static and NUL-terminated, as above.
+        unsafe { core::ffi::CStr::from_ptr(name) }.to_str().ok()
+    }
+}
+/// The status by ACPICA's name, or its number when ACPICA has no name for it.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "ACPICA status {:#x}", self.0),
+        }
+    }
+}
 fn checked(status: Status) -> Result<(), Error> {
     if status == 0 {
         Ok(())
@@ -194,6 +217,7 @@ unsafe extern "C" {
     fn stela_acpi_bound_begin(ticks: u64);
     fn stela_acpi_bound_end(out: *mut RawLocation) -> u8;
     fn stela_acpi_enable_hardware() -> Status;
+    fn stela_acpi_status_name(status: Status) -> *const c_char;
     fn stela_acpi_guard_enter(out: *mut *mut c_void, epoch: *mut u64) -> Status;
     fn stela_acpi_guard_leave(guard: *mut c_void);
     fn stela_acpi_namespace_valid() -> u8;

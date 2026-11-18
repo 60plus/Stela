@@ -36,14 +36,17 @@ impl<'a> DeviceResources<'a> {
             Ok(Some(Value::Integer(status))) if status & 0x0b == 0x0b => {}
             Ok(Some(Value::Integer(status))) => return Err(Error::Unavailable(status)),
             Ok(_) => return Err(Error::InvalidObject("_STA")),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(Error::from(error).of("_STA")),
         }
+        // Each failure names what was evaluated.
         Ok(Self {
             identity: DeviceIdentity(Arc::new(())),
             handle,
-            path: handle.path()?,
-            descriptors: evaluate(handle, "_CRS")?,
-            dependencies: super::dependencies(handle)?,
+            path: handle
+                .path()
+                .map_err(|error| Error::from(error).of("namespace path"))?,
+            descriptors: evaluate(handle, "_CRS").map_err(|error| error.of("_CRS"))?,
+            dependencies: super::dependencies(handle).map_err(|error| error.of("_DEP"))?,
         })
     }
     pub fn handle(&self) -> Handle<'a> {
