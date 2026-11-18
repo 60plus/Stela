@@ -350,7 +350,7 @@ pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
 
 /// The words that start the stop line of a fault inside a firmware
 /// variable call ([`FirmwareCall::fault_reason`]), which the next start
-/// looks for (`running_record::variable_service_faulted`).
+/// looks for (`running_record::variable_service`).
 pub const FAULT_WORDS: &str = "x86 exception inside the PC firmware's variable service";
 
 /// The firmware variable call a processor is inside, as Stela makes them

@@ -13,10 +13,10 @@ use crate::output;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::firmware_runtime::{Regions, Return};
-use stela_boot_core::running_record::{self, Running};
+use stela_boot_core::running_record::{self, Running, VariableService};
 use stela_boot_core::stop_record::{
     ATTRIBUTES, FirmwareCall, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR,
     carried_notice, fitting, piece_name, pieces, read, stop_reason,
@@ -173,9 +173,15 @@ pub(crate) fn tell_unfinished(log: [u8; 16], carried: Option<u64>) {
     else {
         return;
     };
-    if running_record::variable_service_faulted(&running, boot(), &log, &newest) {
-        FAULTED_BEFORE.store(true, Ordering::Relaxed);
-    }
+    let (service, flags) = running_record::variable_service(
+        &running,
+        boot(),
+        &log,
+        &newest,
+        env!("CARGO_PKG_VERSION"),
+    );
+    SERVICE.store(service as u8, Ordering::Relaxed);
+    FLAGS.store(flags, Ordering::Relaxed);
     let Some(found) = running_record::unfinished(&running, boot(), &log, carried, &newest) else {
         return;
     };
@@ -218,10 +224,7 @@ pub(crate) fn mark_running(log: Option<[u8; 16]>) {
                 boot,
                 log,
                 seconds: u32::try_from(seconds).unwrap_or(u32::MAX),
-                flags: match FAULTED_BEFORE.load(Ordering::Relaxed) {
-                    true => running_record::VARIABLE_FAULT,
-                    false => 0,
-                },
+                flags: FLAGS.load(Ordering::Relaxed),
             };
             runtime::set_variable(name, &VariableVendor(VENDOR), attributes, &record.encode())
                 .err()
@@ -383,9 +386,11 @@ pub(crate) fn return_at_restart() -> String {
 /// The firmware's variable services are not called after its exit in this
 /// boot: [`services`] hands the engine none.
 static AFTER_EXIT_REFUSED: AtomicBool = AtomicBool::new(false);
-/// The runtime variable service faulted after the exit on this PC, in the
-/// last boot or an earlier one (`running_record::variable_service_faulted`).
-static FAULTED_BEFORE: AtomicBool = AtomicBool::new(false);
+/// How this boot calls the runtime variable service
+/// (`running_record::variable_service`), as its discriminant, and the
+/// flags its record keeps.
+static SERVICE: AtomicU8 = AtomicU8::new(VariableService::Trusted as u8);
+static FLAGS: AtomicU32 = AtomicU32::new(0);
 
 /// From the firmware's exit on, this boot calls none of its variable
 /// services: a stop keeps no record in the firmware, and a restart writes
@@ -395,13 +400,22 @@ pub(crate) fn refuse_after_exit() {
 }
 
 /// Before the firmware's exit, on a PC whose runtime variable service
-/// faulted in an earlier boot: call it only while boot services run. A
-/// restart that needs `BootNext` has it written now, while boot services
-/// run; the firmware then starts the entry again at the next start however
-/// this boot ends. Called once, before [`mark_running`], which keeps the
-/// PC's mark.
+/// faulted in an earlier boot under this version: call it only while boot
+/// services run. A restart that needs `BootNext` has it written now, while
+/// boot services run; the firmware then starts the entry again at the next
+/// start however this boot ends. Under another version the boot calls it
+/// after the exit as any boot does, and says so. Called once, before
+/// [`mark_running`], which keeps the PC's mark.
 pub(crate) fn before_exit() {
-    if !FAULTED_BEFORE.load(Ordering::Relaxed) {
+    let service = SERVICE.load(Ordering::Relaxed);
+    if service == VariableService::Tried as u8 {
+        output::arguments(format_args!(
+            "FIRMWARE VARIABLE SERVICE faulted after the firmware's exit under another version \
+             on this PC: this boot calls it after the exit again, and the next start clears the \
+             mark once a call there answers\n"
+        ));
+    }
+    if service != VariableService::Avoided as u8 {
         return;
     }
     refuse_after_exit();
