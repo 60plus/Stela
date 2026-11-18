@@ -415,12 +415,14 @@ mod tests {
              head=0x8000\n\
              [   33.500] STEP o Taking control of the other processors ms=2496\n\
              [   33.600] STEP Starting the GPU t=33.600\n\
-             [   35.000] STEP DETAIL loading its firmware ms=1400\n\
+             [   34.000] STEP DETAIL loading its firmware 1 ms=400\n\
+             [   35.000] STEP DETAIL loading its firmware 3 ms=1400 unlogged_like_it=1\n\
              [   95.250] LINUX <6> nouveau 0000:01:00.0: still waiting\n"
         );
         let found = unfinished(&running(12), 13, &LOG, None, log.as_bytes()).unwrap();
         assert_eq!(found.stage, "Starting the GPU");
-        assert_eq!(found.detail, "loading its firmware");
+        // A thinned detail's count of those left out is not part of it.
+        assert_eq!(found.detail, "loading its firmware 3");
         assert_eq!(
             (found.seconds, found.unkept, found.after),
             (Some(61), false, false)
@@ -429,7 +431,7 @@ mod tests {
         assert_eq!(
             found.line(),
             "PREVIOUS BOOT ended without a stop (boot 12): last stage \"Starting the GPU\", \
-             past \"loading its firmware\", watchdog=on, 61 s in the stage by the log's last \
+             past \"loading its firmware 3\", watchdog=on, 61 s in the stage by the log's last \
              line\n"
         );
         assert!(
