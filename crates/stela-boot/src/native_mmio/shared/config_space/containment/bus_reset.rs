@@ -138,18 +138,27 @@ impl Source {
     /// Whether [`Self::reset_parent_bus`] would find a bus it may reset for
     /// the cold requester at `address`. Reads only.
     pub(crate) fn parent_bus_reset_available(&self, address: Address) -> bool {
+        self.parent_bus_reset_refusal(address).is_none()
+    }
+
+    /// Why [`Self::reset_parent_bus`] would refuse the cold requester at
+    /// `address` now; `None` when it would find a bus it may reset. Reads
+    /// only.
+    pub(crate) fn parent_bus_reset_refusal(&self, address: Address) -> Option<&'static str> {
         let Ok(cohort) = self.pci_slots.0.try_borrow() else {
-            return false;
+            return Some("the PCI fabric is busy");
         };
         let Cohort::Parked(fabric) = &*cohort else {
-            return false;
+            return Some("the PCI fabric is not contained");
         };
-        members(fabric, address).is_ok_and(|(parent, _)| {
-            fabric.slots[parent]
-                .forwarding
-                .as_ref()
-                .is_some_and(|forwarding| forwarding.check().is_ok())
-        })
+        let (parent, _) = match members(fabric, address) {
+            Ok(members) => members,
+            Err(why) => return Some(why),
+        };
+        match &fabric.slots[parent].forwarding {
+            Some(forwarding) if forwarding.check().is_ok() => None,
+            _ => Some("the bridge's forwarding changed"),
+        }
     }
 
     /// Set the L1 PM Substates of the link above the cold requester at
