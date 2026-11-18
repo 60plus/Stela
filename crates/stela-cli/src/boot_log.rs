@@ -20,7 +20,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-use stela_contracts::masked::mask_line;
+use stela_contracts::masked::{mask_line, mask_stored_line};
 use stela_drivers::block::{BlockDevice, BlockError, Identity, Transport};
 use stela_formats::payload::ReadAt;
 use stela_runtime::pc::{
@@ -139,9 +139,9 @@ pub(crate) fn write_logs(
 ) -> Result<()> {
     let replaced = output.is_some_and(Path::exists);
     let mut sink: Box<dyn Write> = match output {
-        Some(path) => Box::new(
+        Some(path) => Box::new(std::io::BufWriter::new(
             File::create(path).with_context(|| format!("cannot create {}", path.display()))?,
-        ),
+        )),
         None => Box::new(std::io::stdout().lock()),
     };
     for note in notes {
@@ -190,12 +190,36 @@ pub(crate) fn write_logs(
     Ok(())
 }
 
+/// `bytes`, each line with the identifiers that lines older Stela versions
+/// wrote in full in a tag's place ([`mask_stored_line`]), as a boot now
+/// writes them: a stick keeps lines from before. A line that is not UTF-8
+/// is written as it is unless its readable text holds one.
+fn write_masked(sink: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        let (text, end) = match line.strip_suffix(b"\n") {
+            Some(text) => (text, &b"\n"[..]),
+            None => (line, &b""[..]),
+        };
+        let masked = match std::str::from_utf8(text) {
+            Ok(text) => mask_stored_line(text).into_owned().into_bytes(),
+            Err(_) => match mask_stored_line(&String::from_utf8_lossy(text)) {
+                std::borrow::Cow::Owned(masked) => masked.into_bytes(),
+                std::borrow::Cow::Borrowed(_) => text.to_vec(),
+            },
+        };
+        sink.write_all(&masked)?;
+        sink.write_all(end)?;
+    }
+    Ok(())
+}
+
 /// A log's lines: first what its boot records keep of the boots whose
 /// first lines the log has since overwritten (`Log::kept_starts`), each
-/// boot under a line naming it, then the stream as it was written.
+/// boot under a line naming it, then the stream as it was written, with
+/// identifiers masked ([`write_masked`]).
 fn write_log(sink: &mut dyn Write, log: &Log) -> std::io::Result<()> {
     let ended_line = |sink: &mut dyn Write, bytes: &[u8]| -> std::io::Result<()> {
-        sink.write_all(bytes)?;
+        write_masked(sink, bytes)?;
         match bytes.last() {
             Some(b'\n') | None => Ok(()),
             Some(_) => sink.write_all(b"\n"),
@@ -237,7 +261,7 @@ fn write_log(sink: &mut dyn Write, log: &Log) -> std::io::Result<()> {
             "=== THE LOG, every line it still holds, oldest first ==="
         )?;
     }
-    sink.write_all(&log.stream)
+    write_masked(sink, &log.stream)
 }
 
 /// The milliseconds since the PC started that a log line begins with,
@@ -1405,6 +1429,26 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains(&format!("/home/{tag}) ===")), "{text}");
+
+        // Lines an older boot wrote with whole serials and MAC addresses
+        // are written masked, as a boot now writes them; the rest as they
+        // were.
+        let old = "STORAGE DEVICE Nvme at 0000:01:00.0 serial=\"S4EWNX0R123456Z\" model=\"SSD\"\n\
+                   NETWORK candidate driver=r8169 adapter=0000:03:00.0 mac=00:e0:4c:12:34:5e\n\
+                   HOST DISK IO serial=..456Z reads=3\n";
+        let logs = [(String::new(), boot_log::read(&region(&[old])).unwrap())];
+        write_logs(&logs, false, &[], Some(&output)).unwrap();
+        let text = String::from_utf8(std::fs::read(&output).unwrap()).unwrap();
+        assert!(!text.contains("S4EWNX0R123456Z"), "{text}");
+        assert!(!text.contains("12:34:5e"), "{text}");
+        assert!(
+            text.ends_with(
+                "STORAGE DEVICE Nvme at 0000:01:00.0 serial=\"..456Z\" model=\"SSD\"\n\
+                 NETWORK candidate driver=r8169 adapter=0000:03:00.0 mac=00:e0:4c:..:..:5e\n\
+                 HOST DISK IO serial=..456Z reads=3\n"
+            ),
+            "{text}"
+        );
     }
 
     /// A boot that ran until the log overwrote its own first lines: they
