@@ -118,6 +118,8 @@ impl<R: lpt::LptRegisters, D: Delay + Clone> Controller<R, D> {
             profile: profile(limits),
             config_read: Some(R::read_config16),
             ulp_exit_failed: false,
+            ulp_exit: None,
+            lanphypc_done: None,
         })
     }
 }
@@ -173,6 +175,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             self.spt_ulp_exit()
         };
         self.ulp_exit_failed = exit.is_err();
+        self.ulp_exit = Some((if managed { "me" } else { "lanphypc" }, exit.err()));
         self.recover_phy_access(managed)?;
         self.identity = self.phy.identify()?;
         // The donor releases SWFLAG before this hardware PHY reset. No PHY
@@ -232,7 +235,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// the PHY and the MAC, K1 back on and the PHY's ULP configuration
     /// cleared.
     fn spt_ulp_exit(&mut self) -> Result<(), Error> {
-        self.phy.transaction(|p| {
+        let cycle_done = self.phy.transaction(|p| {
             let value = p.read_mac(super::FEXTNVM3)?;
             p.write_mac(
                 super::FEXTNVM3,
@@ -245,9 +248,11 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.wait_minimum(10)?;
             p.write_mac(super::CTRL, value & !LANPHYPC_OVERRIDE)?;
             p.read_mac(super::STATUS)?;
+            let mut done = false;
             for _ in 0..=20 {
                 p.wait_minimum(5_000)?;
                 if p.read_mac(CTRL_EXT)? & POWER_CYCLE_DONE != 0 {
+                    done = true;
                     break;
                 }
             }
@@ -285,8 +290,9 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.access(ULP_CONFIG, Some(value | ULP_START))?;
             let value = p.read_mac(FEXTNVM7)?;
             p.write_mac(FEXTNVM7, value & !DISABLE_SMB_PERST)?;
-            Ok(())
+            Ok(done)
         })?;
+        self.lanphypc_done = Some(cycle_done);
         Ok(())
     }
 }

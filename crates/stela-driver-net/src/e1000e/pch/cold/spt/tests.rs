@@ -229,13 +229,13 @@ fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() 
 /// `e1000_toggle_lanphypc_pch_lpt` waits up to 100 ms for the power cycle
 /// to be reported done and goes on either way: a cycle that never reports
 /// done still unforces SMBus, turns K1 back on and clears the PHY's ULP
-/// configuration, where the exit stopped there and left the PHY configured
-/// for ULP.
+/// configuration, and the state line says the cycle was not seen, where
+/// the exit stopped there and left the PHY configured for ULP.
 #[test]
 fn a_power_cycle_never_reported_done_still_takes_the_phy_out_of_ulp() {
     let (state, _, io, timer) = fixture_spt();
     state.borrow_mut().power_stuck = true;
-    let controller = start_spt(0x156f, io, timer).unwrap();
+    let mut controller = start_spt(0x156f, io, timer).unwrap();
     assert!(!controller.ulp_exit_failed());
     assert!(!controller.is_poisoned());
     {
@@ -244,9 +244,42 @@ fn a_power_cycle_never_reported_done_still_takes_the_phy_out_of_ulp() {
         assert_eq!(m.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
         assert_eq!(m.mac[&FEXTNVM7] & DISABLE_SMB_PERST, 0);
     }
+    let line = controller.state();
+    assert!(
+        line.ends_with(" ulp_exit=lanphypc:ok lanphypc=no-lpcd"),
+        "{line}"
+    );
     drop(controller);
 }
 
+/// The state line a link that stays down logs: the PHY's words, the MAC's
+/// and the ME's state, and how the PHY left ULP.
+#[test]
+fn the_state_line_gives_the_phy_words_the_me_state_and_the_ulp_exit() {
+    let (_, _, io, timer) = fixture_spt();
+    let mut controller = start_spt(0x156f, io, timer).unwrap();
+    let line = controller.state();
+    for part in [
+        "phy=I217:0x015400a0 bmcr=",
+        " bmsr=",
+        " anar=",
+        " anlpar=",
+        " gbcr=",
+        " gbsr=",
+        " ulp_config=",
+        " smb_control=",
+        " ctrl_ext=",
+        " (force_smbus=0 lpcd=",
+        " fwsm=",
+        " (me_valid=",
+        " phy_ctrl=",
+        " ulp_exit=lanphypc:ok lanphypc=done",
+    ] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert_eq!(line.matches(" bmsr=").count(), 1, "{line}");
+    drop(controller);
+}
 #[test]
 fn ulp_mode_switch_recovers_only_the_specific_mdi_transition_and_verifies_state() {
     let (state, released, io, timer) = fixture_spt();
