@@ -8,8 +8,8 @@
 //!   extensions, 8000_0001H:ECX[22]): per level the size (ways x partitions
 //!   x line x sets) and the most logical processors that share it
 //!   (EAX[25:14] + 1), as Linux's `cpuid4_cache_lookup_regs` decodes them.
-//! - Calibrations, once per core class before the PEs start, on a core of
-//!   that class: a fixed loop of 14 instructions in four independent
+//! - Calibrations, once per core class before the PEs start, on a ready
+//!   core of that class, each within [`BOUND_MS`]: a fixed loop of 14 instructions in four independent
 //!   chains (instructions per second, and per cycle at the core's measured
 //!   clock); a pointer chase over half the L3 (its load latency); a pointer
 //!   chase over a buffer eight times the L3, 32-128 MiB (memory latency);
@@ -341,6 +341,9 @@ pub struct Speed {
     pub memory_ps: u64,
     pub random_ps: u64,
     pub buffer_bytes: u64,
+    /// The time bound ended the calibration before its last figure, which
+    /// it and the figures after it leave out.
+    pub cut: bool,
 }
 
 fn size(bytes: u64) -> String {
@@ -375,7 +378,7 @@ impl Speed {
             .then(|| u128::from(self.instructions_per_s) * 100 / u128::from(self.core_hz));
         format!(
             "HOST SPEED class={class} l2={} l3={} core_mhz={} compute_mips={} ipc={} l3_ns={} \
-             memory_ns={} random_ns={} buffer={}\n",
+             memory_ns={} random_ns={} buffer={}{}\n",
             cache(self.l2),
             cache(self.l3),
             self.core_hz / 1_000_000,
@@ -392,6 +395,11 @@ impl Speed {
                 String::from("-")
             } else {
                 size(self.buffer_bytes)
+            },
+            if self.cut {
+                format!(" cut_at_ms={BOUND_MS}")
+            } else {
+                String::new()
             },
         )
     }
@@ -415,9 +423,15 @@ const LINE_WORDS: usize = 8;
 /// it up streams.
 pub fn chain(buffer: &mut [u64]) {
     let lines = buffer.len() / LINE_WORDS;
+    chain_lines(buffer, 0..lines);
+}
+
+/// [`chain`]'s writes for the lines in `part`.
+fn chain_lines(buffer: &mut [u64], part: core::ops::Range<usize>) {
+    let lines = buffer.len() / LINE_WORDS;
     debug_assert!(lines.is_power_of_two());
     let mask = lines as u64 - 1;
-    for line in 0..lines {
+    for line in part {
         let next = (6_364_136_223_846_793_005u64)
             .wrapping_mul(line as u64)
             .wrapping_add(1_442_695_040_888_963_407)
@@ -500,14 +514,38 @@ pub fn compute(iterations: u64) {
     core::hint::black_box((a, b, c, d));
 }
 
-/// Calibrate the calling core with `buffer` (at least 32 MiB of words, a
-/// power of two of lines, or empty to skip the memory figures), its TSC at
-/// `tsc_hz` and `now` a TSC read. The fastest of a few runs counts for the
-/// loop and the in-cache chase; memory figures take one run.
+/// How long a calibration runs at most. Each of its steps, and each 1 MiB
+/// part of setting up its large buffer, begins only within it; the figures
+/// it did not reach are left out (`Speed::cut`). A step takes a few
+/// milliseconds at most, so the calibration ends within about this.
+pub const BOUND_MS: u64 = 400;
+/// The words of one part of the large buffer's setup.
+const PART_WORDS: usize = (1 << 20) / 8;
+
+/// Calibrate the calling core within [`BOUND_MS`], its TSC at `tsc_hz` and
+/// `now` a TSC read. `buffer` holds the large buffer's `words` (at least 32
+/// MiB of words, a power of two of lines, or none to skip the memory
+/// figures), reserved and not yet written. The fastest of a few runs counts
+/// for the loop and the in-cache chase; memory figures take one run.
 #[cfg(target_arch = "x86_64")]
-pub fn calibrate(buffer: &mut [u64], tsc_hz: u64, now: impl Fn() -> u64) -> Speed {
+pub fn calibrate(buffer: &mut Vec<u64>, words: usize, tsc_hz: u64, now: impl Fn() -> u64) -> Speed {
+    let started = now();
+    let bound = tsc_hz / 1000 * BOUND_MS;
+    let within = || now().wrapping_sub(started) < bound;
     let (l2, l3) = host_levels();
-    let core_hz = crate::guest_timeouts::measure_core_hz(tsc_hz);
+    let mut speed = Speed {
+        l2,
+        l3,
+        cut: true,
+        ..Speed::default()
+    };
+    if !within() {
+        return speed;
+    }
+    speed.core_hz = crate::guest_timeouts::measure_core_hz(tsc_hz);
+    if !within() {
+        return speed;
+    }
     const ITERATIONS: u64 = 200_000;
     let loop_ticks = (0..4)
         .map(|_| {
@@ -517,7 +555,7 @@ pub fn calibrate(buffer: &mut [u64], tsc_hz: u64, now: impl Fn() -> u64) -> Spee
         })
         .min()
         .unwrap_or(0);
-    let instructions_per_s = if loop_ticks == 0 {
+    speed.instructions_per_s = if loop_ticks == 0 {
         0
     } else {
         u64::try_from(
@@ -526,18 +564,29 @@ pub fn calibrate(buffer: &mut [u64], tsc_hz: u64, now: impl Fn() -> u64) -> Spee
         )
         .unwrap_or(u64::MAX)
     };
-    let mut speed = Speed {
-        l2,
-        l3,
-        core_hz,
-        instructions_per_s,
-        ..Speed::default()
-    };
-    let words = buffer.len();
     if words < (32 << 20) / 8 || !(words / LINE_WORDS).is_power_of_two() {
+        speed.cut = false;
         return speed;
     }
+    // Written in parts, each begun within the bound.
+    buffer.clear();
+    while buffer.len() < words {
+        if !within() {
+            return speed;
+        }
+        let part = (words - buffer.len()).min(PART_WORDS);
+        buffer.resize(buffer.len() + part, 0);
+    }
     speed.buffer_bytes = (words * 8) as u64;
+    let chained = |buffer: &mut [u64]| {
+        let lines = buffer.len() / LINE_WORDS;
+        (0..lines).step_by(PART_WORDS / LINE_WORDS).all(|first| {
+            within() && {
+                chain_lines(buffer, first..(first + PART_WORDS / LINE_WORDS).min(lines));
+                true
+            }
+        })
+    };
     // Half the L3 at the buffer's start: chained, walked once to load it,
     // then timed.
     let l3_words = (l3.map_or(8 << 20, |cache| cache.bytes / 2) / 8)
@@ -545,7 +594,9 @@ pub fn calibrate(buffer: &mut [u64], tsc_hz: u64, now: impl Fn() -> u64) -> Spee
         .min(words as u64 / 2) as usize;
     {
         let near = &mut buffer[..l3_words];
-        chain(near);
+        if !chained(near) {
+            return speed;
+        }
         let lines = (l3_words / LINE_WORDS) as u64;
         chase(near, lines);
         let loads = lines.min(100_000);
@@ -559,15 +610,21 @@ pub fn calibrate(buffer: &mut [u64], tsc_hz: u64, now: impl Fn() -> u64) -> Spee
             .unwrap_or(0);
         speed.l3_ps = per_load(ticks, tsc_hz, loads);
     }
-    chain(buffer);
+    if !chained(buffer) {
+        return speed;
+    }
     const FAR_LOADS: u64 = 20_000;
     let start = now();
     chase(buffer, FAR_LOADS);
     speed.memory_ps = per_load(now().wrapping_sub(start), tsc_hz, FAR_LOADS);
+    if !within() {
+        return speed;
+    }
     const SCATTER_LOADS: u64 = 80_000;
     let start = now();
     scatter(buffer, SCATTER_LOADS);
     speed.random_ps = per_load(now().wrapping_sub(start), tsc_hz, SCATTER_LOADS);
+    speed.cut = false;
     speed
 }
 
@@ -811,6 +868,7 @@ mod tests {
             memory_ps: 104_300,
             random_ps: 9_870,
             buffer_bytes: 128 << 20,
+            cut: false,
         };
         assert_eq!(
             speed.line("all"),
@@ -821,6 +879,11 @@ mod tests {
             Speed::default().line("efficiency"),
             "HOST SPEED class=efficiency l2=- l3=- core_mhz=0 compute_mips=0 ipc=- l3_ns=- \
              memory_ns=- random_ns=- buffer=-\n"
+        );
+        assert!(
+            Speed { cut: true, ..speed }
+                .line("all")
+                .ends_with(" buffer=128M cut_at_ms=400\n")
         );
     }
 
@@ -870,9 +933,60 @@ mod hosted {
             .and_then(|value| value.parse().ok())
             .unwrap_or(4_700_000_000);
         let (_, l3) = host_levels();
-        let mut buffer = alloc::vec![0u64; buffer_bytes(l3.map(|cache| cache.bytes)) as usize / 8];
-        let speed = calibrate(&mut buffer, tsc_hz, tsc);
+        let words = buffer_bytes(l3.map(|cache| cache.bytes)) as usize / 8;
+        let mut buffer = Vec::with_capacity(words);
+        let speed = calibrate(&mut buffer, words, tsc_hz, tsc);
         std::print!("{}", speed.line("all"));
         assert!(speed.instructions_per_s > 0);
+    }
+
+    /// A clock at 1 GHz that moves `step` ticks at each read, and its reads.
+    fn stepping(step: u64) -> (impl Fn() -> u64, std::rc::Rc<core::cell::Cell<u64>>) {
+        let reads = std::rc::Rc::new(core::cell::Cell::new(0u64));
+        let counted = reads.clone();
+        (
+            move || {
+                counted.set(counted.get() + 1);
+                counted.get() * step
+            },
+            reads,
+        )
+    }
+
+    #[test]
+    fn a_calibration_ends_at_its_time_bound() {
+        let words = (32 << 20) / 8;
+        // Each read 30 ms on: the bound passes while the buffer is set up,
+        // which stops after a few parts, and every memory figure is left
+        // out.
+        let (now, reads) = stepping(30_000_000);
+        let mut buffer = Vec::with_capacity(words);
+        let speed = calibrate(&mut buffer, words, 1_000_000_000, now);
+        assert!(speed.cut);
+        assert!(buffer.len() < words, "{} words written", buffer.len());
+        assert_eq!(
+            (
+                speed.buffer_bytes,
+                speed.l3_ps,
+                speed.memory_ps,
+                speed.random_ps
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(reads.get() < 20, "{} clock reads", reads.get());
+        // A bound already spent: nothing is measured.
+        let (now, _) = stepping(1_000_000_000);
+        let speed = calibrate(&mut Vec::new(), words, 1_000_000_000, now);
+        assert_eq!(
+            (speed.cut, speed.core_hz, speed.instructions_per_s),
+            (true, 0, 0)
+        );
+        // A clock 1 us on at each read: every figure, uncut.
+        let (now, _) = stepping(1000);
+        let mut buffer = Vec::with_capacity(words);
+        let speed = calibrate(&mut buffer, words, 1_000_000_000, now);
+        assert!(!speed.cut);
+        assert_eq!(speed.buffer_bytes, 32 << 20);
+        assert!(speed.memory_ps > 0 && speed.random_ps > 0);
     }
 }

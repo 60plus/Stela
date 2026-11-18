@@ -84,6 +84,8 @@ struct Argument {
     doorbells: UnsafeCell<Option<&'static core::sync::atomic::AtomicU64>>,
     refusal: UnsafeCell<Option<Refusal>>,
     status: AtomicU8,
+    /// Its core class's index (`speed::class`), published before READY.
+    class: AtomicU8,
     tsc: tsc_sync::Sync,
     mailbox: mailbox::Mailbox,
 }
@@ -300,9 +302,12 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
                 &mut host::pmu::PerformanceRegisters,
             )
         };
-        // The first AP of a core class the boot processor is not measures
-        // it, before it reports ready (`HOST SPEED`).
-        crate::engine::speed::calibrate_once();
+        // Its class, which the first ready AP of measures once every AP
+        // started (`measure_classes`).
+        argument.class.store(
+            crate::engine::speed::class().index() as u8,
+            Ordering::Relaxed,
+        );
         Ok(owner)
     })()
     .and_then(|owner| {
@@ -668,6 +673,7 @@ pub(crate) unsafe fn start(
                 doorbells: UnsafeCell::new(None),
                 refusal: UnsafeCell::new(None),
                 status: AtomicU8::new(STARTING),
+                class: AtomicU8::new(0),
                 tsc: tsc_sync::Sync::new(
                     handoff.tsc_hz,
                     stela_boot_core::tsc::sync::round_millis(
@@ -802,6 +808,7 @@ pub(crate) unsafe fn start(
         // their mailbox loop, answering shootdowns, and run no PE.
         processors.retain(|processor| processor.slot < *first);
     }
+    measure_classes(&processors, &sender, handoff.tsc_hz);
     // SAFETY: every started AP is ready, or failed and then nothing starts
     // from the page again; the memory types are the BSP's, checked above.
     unsafe {
@@ -819,6 +826,22 @@ pub(crate) unsafe fn start(
         processors,
         failure: failure.map(|(_, error)| error),
     })
+}
+
+/// The first PE's AP of each core class no processor measured measures it
+/// (`HOST SPEED`), one at a time, each within the calibration's own bound.
+/// Every AP is ready or left out by now, so this takes no AP's startup
+/// second, and only the boot processor waits on it.
+fn measure_classes(processors: &[Processor], sender: &Apic, tsc_hz: u64) {
+    for processor in processors {
+        let index = processor.argument.class.load(Ordering::Relaxed);
+        let Some(&class) = stela_boot_core::host_performance::Class::ALL.get(index as usize) else {
+            continue;
+        };
+        if crate::engine::speed::claim(class) {
+            processor.measure(class, sender, tsc_hz);
+        }
+    }
 }
 
 /// A started AP that is not ready yet.
