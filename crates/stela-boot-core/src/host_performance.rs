@@ -143,18 +143,18 @@ pub enum Class {
 }
 
 impl Class {
-    const ALL: [Self; 4] = [
+    pub const ALL: [Self; 4] = [
         Self::Uniform,
         Self::Performance,
         Self::Efficiency,
         Self::LowPower,
     ];
 
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self as usize
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Uniform => "all",
             Self::Performance => "performance",

@@ -300,6 +300,9 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
                 &mut host::pmu::PerformanceRegisters,
             )
         };
+        // The first AP of a core class the boot processor is not measures
+        // it, before it reports ready (`HOST SPEED`).
+        crate::engine::speed::calibrate_once();
         Ok(owner)
     })()
     .and_then(|owner| {

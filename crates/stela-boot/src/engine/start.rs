@@ -18,6 +18,7 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
         MODELED_CORE_HZ, lock_scale, lock_scale_arguments, measure_core_hz,
     };
     let core_hz = measure_core_hz(tsc_hz);
+    super::speed::set_single_core_hz(core_hz);
     let scale = lock_scale(core_hz);
     output::arguments(format_args!(
         "GUEST TIMEOUTS lock_scale={scale} core_hz={core_hz} tsc_hz={tsc_hz} \
@@ -260,6 +261,9 @@ fn start(handoff: u64) -> Started {
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
     output::keep_stop_reserve();
     super::large_blocks::install();
+    // Before any AP: the boot processor's class, its caches, clock and
+    // memory, with its heap's buffer (`HOST SPEED`).
+    super::speed::calibrate_once();
     // SAFETY: this loader-owned private seed is held in the shared physmap,
     // exclusively consumed here before any native service is published.
     if let Err(error) = unsafe { crate::random::initialize(handoff.random_seed) } {
@@ -939,8 +943,9 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         full_profile.processors.len().max(1),
     ));
     output::arguments(format_args!(
-        "{}",
-        stela_boot_core::host_performance::summary()
+        "{}{}",
+        stela_boot_core::host_performance::summary(),
+        super::speed::lines()
     ));
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
