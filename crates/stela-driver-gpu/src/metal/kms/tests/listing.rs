@@ -332,3 +332,156 @@ fn the_line_shows_the_edid_timing_blocks_linux_lists_no_mode_from() {
         assert!(!line.contains("EDID") || line.ends_with("and 22 more bytes]"));
     }
 }
+
+/// An 18-byte detailed timing of `width` by `height` active pixels with
+/// `h_blank` and `v_blank` more, at `clock` kHz.
+fn dtd(clock: u32, (width, h_blank): (u32, u32), (height, v_blank): (u32, u32)) -> [u8; 18] {
+    let ten = (clock / 10) as u16;
+    let byte = |value: u32| value as u8;
+    let mut timing = [0u8; 18];
+    timing[..2].copy_from_slice(&ten.to_le_bytes());
+    timing[2] = byte(width);
+    timing[3] = byte(h_blank);
+    timing[4] = byte(width >> 8 << 4 | h_blank >> 8);
+    timing[5] = byte(height);
+    timing[6] = byte(v_blank);
+    timing[7] = byte(height >> 8 << 4 | v_blank >> 8);
+    // Sync offsets and widths: 8 and 32 pixels, 3 and 5 lines.
+    timing[8..11].copy_from_slice(&[8, 32, 0x35]);
+    timing[17] = 0x1e;
+    timing
+}
+
+/// A DisplayID type I (10 kHz) or type VII (kHz) detailed timing.
+fn displayid_timing(
+    clock: u32,
+    (width, h_blank): (u32, u32),
+    (height, v_blank): (u32, u32),
+) -> [u8; 20] {
+    let mut timing = [0u8; 20];
+    timing[..3].copy_from_slice(&(clock - 1).to_le_bytes()[..3]);
+    for (at, value) in [
+        (4, width),
+        (6, h_blank),
+        (8, 8),
+        (10, 32),
+        (12, height),
+        (14, v_blank),
+        (16, 3),
+        (18, 5),
+    ] {
+        timing[at..at + 2].copy_from_slice(&((value - 1) as u16).to_le_bytes());
+    }
+    timing
+}
+
+/// A mode of `width` by `height` at `clock` kHz with these totals.
+fn totalled(width: u16, height: u16, clock: u32, h_total: u16, v_total: u16) -> ModeInfo {
+    ModeInfo {
+        clock,
+        timing_h: [0, 0, h_total, 0],
+        timing_v: [0, 0, v_total, 0],
+        ..mode(width, height, 0)
+    }
+}
+
+/// The monitor's EDID: 1920x1080 at 60 Hz in the base block, at 144 Hz in
+/// its CTA extension after HDMI's blocks `hdmi`, and at 320 Hz (type I)
+/// and 2560x1440 at 360 Hz (type VII) in a DisplayID extension.
+fn fast_monitor(hdmi: &[&[u8]]) -> Vec<u8> {
+    let mut cta = vec![0x02, 0x03, 0, 0];
+    for block in hdmi {
+        cta.extend(*block);
+    }
+    cta[2] = cta.len() as u8;
+    cta.extend(dtd(356_400, (1920, 280), (1080, 45)));
+    let mut blocks = vec![0x03, 0x00, 20];
+    blocks.extend(displayid_timing(74_624, (1920, 80), (1080, 86)));
+    blocks.extend([0x22, 0x00, 20]);
+    blocks.extend(displayid_timing(1_449_360, (2560, 80), (1440, 85)));
+    let mut displayid = vec![0x70, 0x12, blocks.len() as u8, 0, 0];
+    displayid.extend(blocks);
+    let mut edid = edid_with(&[&cta, &displayid]);
+    edid[54..72].copy_from_slice(&dtd(148_500, (1920, 280), (1080, 45)));
+    edid
+}
+
+/// HDMI's vendor block with a 340 MHz TMDS clock, and the HDMI Forum's
+/// with 600 MHz and SCDC.
+const HDMI_VSDB: [u8; 8] = [0x67, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x44];
+const HF_VSDB: [u8; 8] = [0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0x80, 0x00];
+
+#[test]
+fn the_line_names_each_edid_timing_the_driver_lists_no_mode_for_and_the_link_limit_it_passes() {
+    let line = |kind: u32, edid: Vec<u8>, driver: &'static [u8]| {
+        // Linux listed the 60 and 144 Hz timings only.
+        let mut card = Card::new(vec![
+            totalled(1920, 1080, 148_500, 2200, 1125),
+            totalled(1920, 1080, 356_400, 2200, 1125),
+        ]);
+        card.ports = [(kind, 1), (kind, 1)];
+        card.edids[1] = Some(edid);
+        card.driver = driver;
+        let mut display = Display::take(&mut card, (1920, 1080)).unwrap();
+        let line = lines(&mut display).remove(0);
+        let at = line.find("; EDID timings").map_or(line.len(), |at| at + 2);
+        String::from(&line[at..])
+    };
+    let scrambled = fast_monitor(&[&HDMI_VSDB, &HF_VSDB]);
+    // HDMI with scrambling: 594 MHz, under the monitor's 600.
+    assert_eq!(
+        line(11, scrambled.clone(), b"nouveau"),
+        "EDID timings Linux lists no mode for: 1920x1080 320 at 746.24 MHz, past the 594 MHz \
+         TMDS clock nouveau allows this HDMI monitor; HDMI 2.1's FRL links, which carry more, \
+         nouveau does not drive, 2560x1440 360 at 1449.36 MHz, past the 594 MHz TMDS clock \
+         nouveau allows this HDMI monitor; HDMI 2.1's FRL links, which carry more, nouveau \
+         does not drive"
+    );
+    // DisplayPort: 1440 MHz at 6 bits a colour on 4 lanes of HBR3.
+    assert_eq!(
+        line(10, scrambled.clone(), b"nouveau"),
+        "EDID timings Linux lists no mode for: 1920x1080 320 at 746.24 MHz, within 4 lanes of \
+         HBR3 at 6 bits a colour, so the monitor's link offers fewer lanes or a lower rate, or \
+         an adapter limits the clock, 2560x1440 360 at 1449.36 MHz, past what nouveau's \
+         DisplayPort carries, 4 lanes of HBR3 at 6 bits a colour (1440 MHz); nouveau has no \
+         DSC and no UHBR"
+    );
+    // Another driver: the timings, no reason.
+    assert_eq!(
+        line(11, scrambled, b"amdgpu"),
+        "EDID timings Linux lists no mode for: 1920x1080 320 at 746.24 MHz, not listed by the \
+         driver, 2560x1440 360 at 1449.36 MHz, not listed by the driver"
+    );
+    // HDMI without the Forum's block: 340 MHz.
+    let plain = line(11, fast_monitor(&[&HDMI_VSDB]), b"nouveau");
+    assert!(
+        plain.contains("1920x1080 320 at 746.24 MHz, past the 340 MHz TMDS clock"),
+        "{plain}"
+    );
+    // No HDMI block: single-link TMDS.
+    let dvi = line(3, fast_monitor(&[]), b"nouveau");
+    assert!(
+        dvi.contains("1920x1080 320 at 746.24 MHz, past single-link TMDS's 165 MHz"),
+        "{dvi}"
+    );
+
+    // Every timing listed, as on a usual monitor: nothing is added.
+    let mut card = Card::new(vec![totalled(1920, 1080, 148_500, 2200, 1125)]);
+    let mut edid = edid_with(&[]);
+    edid[54..72].copy_from_slice(&dtd(148_500, (1920, 280), (1080, 45)));
+    // A stereo timing Linux makes no mode of.
+    let mut stereo = dtd(148_500, (1280, 280), (1024, 45));
+    stereo[17] |= 0x20;
+    edid[72..90].copy_from_slice(&stereo);
+    card.edids[1] = Some(edid);
+    let mut display = Display::take(&mut card, (1920, 1080)).unwrap();
+    assert_eq!(
+        lines(&mut display),
+        [
+            "Unknown-0 connected, gives the picture 1920x1080; modes: runs: 1920x1080 60; EDID \
+             timings Linux lists no mode for: 1280x1024 89.048 at 148.5 MHz, a timing Linux \
+             takes as invalid (stereo, or no sync width)"
+        ]
+    );
+    assert_eq!(size_of::<Version>(), 64);
+}

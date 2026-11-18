@@ -72,6 +72,8 @@ struct Card {
     /// connector are refused.
     refused_light: Option<u32>,
     flip_error: Option<i64>,
+    /// The driver's name `DRM_IOCTL_VERSION` gives.
+    driver: &'static [u8],
     /// Whether a request completes on the processor making it.
     immediate: bool,
     /// Flips requested, whether the engine took them or was busy.
@@ -138,6 +140,7 @@ impl Card {
             refused_crtc: None,
             refused_light: None,
             flip_error: None,
+            driver: b"nouveau",
             immediate: true,
             flip_requests: 0,
             flips: Vec::new(),
@@ -238,6 +241,12 @@ unsafe impl Drm for &mut Card {
                         self.mode_changes -= 1;
                         connector.mode_count += 1;
                     }
+                }
+                VERSION => {
+                    let version = &mut *argument.cast::<Version>();
+                    let bytes = self.driver.len().min(version.name_bytes as usize);
+                    ptr::copy_nonoverlapping(self.driver.as_ptr(), version.name as *mut u8, bytes);
+                    version.name_bytes = self.driver.len() as u64;
                 }
                 GET_ENCODER => {
                     let encoder = &mut *argument.cast::<Encoder>();

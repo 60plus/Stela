@@ -12,6 +12,9 @@ use core::fmt;
 const LISTED_MODES: usize = 96;
 /// The most bytes a line shows of EDID timing blocks read as no mode.
 const UNREAD_BYTES: usize = 96;
+/// The most EDID timings without a mode a line names; the rest are
+/// counted.
+const MISSED_TIMINGS: usize = 16;
 
 /// Why a size some output lists is not the picture's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +155,87 @@ struct Unread {
     bytes: Vec<u8>,
 }
 
+/// A detailed timing of the monitor's EDID that Linux makes a mode of, as
+/// its EDID parser computes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Timing {
+    size: (u32, u32),
+    /// In millihertz.
+    refresh: u32,
+    /// The pixel clock in kilohertz.
+    clock: u32,
+    /// Linux makes no mode of it: a stereo timing or one with no sync
+    /// width (`drm_mode_detailed`).
+    invalid: bool,
+}
+
+/// Why the driver lists no mode for a timing of the monitor's EDID, as far
+/// as the boot log can tell: nouveau's checks of a mode against its output
+/// (`nouveau_connector_mode_valid`), with the monitor's limits read from
+/// its EDID as Linux reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Missed {
+    /// Linux takes the timing as invalid.
+    Invalid,
+    /// Past the TMDS clock in kilohertz nouveau allows this HDMI monitor:
+    /// 594 MHz with scrambling, else 340 MHz, or less where the EDID says
+    /// so. HDMI 2.1's FRL links, which carry more, nouveau does not drive.
+    Hdmi(u32),
+    /// Past single-link TMDS's 165 MHz for a monitor whose EDID has no
+    /// HDMI block, twice that on an output with dual-link DVI.
+    Dvi,
+    /// Past what nouveau's DisplayPort carries at all: the mode at 6 bits
+    /// a colour against 4 lanes of HBR3, without DSC.
+    DisplayPort,
+    /// Within that: the monitor's link offers fewer lanes or a lower rate,
+    /// or something else between them limits the clock.
+    Link,
+    /// The driver is not nouveau, or the connector not one of these kinds.
+    Unknown,
+}
+
+impl fmt::Display for Missed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => {
+                f.write_str("a timing Linux takes as invalid (stereo, or no sync width)")
+            }
+            Self::Hdmi(link) => write!(
+                f,
+                "past the {} MHz TMDS clock nouveau allows this HDMI monitor; HDMI 2.1's FRL \
+                 links, which carry more, nouveau does not drive",
+                Hertz(*link)
+            ),
+            Self::Dvi => f.write_str(
+                "past single-link TMDS's 165 MHz for a monitor with no HDMI block (twice that \
+                 on a dual-link DVI output)",
+            ),
+            Self::DisplayPort => f.write_str(
+                "past what nouveau's DisplayPort carries, 4 lanes of HBR3 at 6 bits a colour \
+                 (1440 MHz); nouveau has no DSC and no UHBR",
+            ),
+            Self::Link => f.write_str(
+                "within 4 lanes of HBR3 at 6 bits a colour, so the monitor's link offers fewer \
+                 lanes or a lower rate, or an adapter limits the clock",
+            ),
+            Self::Unknown => f.write_str("not listed by the driver"),
+        }
+    }
+}
+
+/// `DRM_MODE_CONNECTOR_*` kinds nouveau drives as TMDS (DVI-I, DVI-D,
+/// HDMI-A, HDMI-B) and as DisplayPort (DP, eDP).
+const TMDS_PORTS: [u32; 4] = [2, 3, 11, 12];
+const DP_PORTS: [u32; 2] = [10, 14];
+/// nouveau's limits from Turing on (`get_tmds_link_bandwidth`) and the
+/// most its DisplayPort trains: 4 lanes of HBR3, 810000 kilobytes a second
+/// each, checked at 6 bits a colour (`nv50_dp_mode_valid`).
+const SCRAMBLED_TMDS: u32 = 594_000;
+const PLAIN_TMDS: u32 = 340_000;
+const SINGLE_LINK_TMDS: u32 = 165_000;
+const DP_BYTES: u64 = 4 * 810_000;
+const DP_MIN_BITS: u64 = 6 * 3;
+
 /// One connector as read, shown as its boot log line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
@@ -162,13 +246,15 @@ pub struct Listing {
     picture: (u32, u32),
     role: Role,
     modes: Vec<Listed>,
+    /// The EDID's detailed timings the driver lists no mode for, and why.
+    missed: Vec<(Timing, Missed)>,
     unread: Vec<Unread>,
 }
 
 impl Listing {
     /// Connector `connector` at `port` with `modes`, each with its verdict
     /// in `verdicts`, showing a `picture` as `role` says; `edid` is the
-    /// connector's, when it has one.
+    /// connector's, when it has one, and `nouveau` whether its driver is.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         connector: u32,
@@ -179,7 +265,23 @@ impl Listing {
         modes: &[ModeInfo],
         verdicts: &[Verdict],
         edid: Option<&[u8]>,
+        nouveau: bool,
     ) -> Self {
+        let modes: Vec<Listed> = modes
+            .iter()
+            .zip(verdicts)
+            .map(|(mode, &verdict)| Listed {
+                size: size_of_mode(mode),
+                interlaced: mode.flags & INTERLACED != 0,
+                preferred: mode.kind & PREFERRED != 0,
+                refresh: refresh(mode),
+                verdict,
+            })
+            .collect();
+        let missed = match (edid, connected) {
+            (Some(edid), true) => missed(edid, &modes, port.kind, nouveau),
+            _ => Vec::new(),
+        };
         Self {
             connector,
             port,
@@ -187,17 +289,8 @@ impl Listing {
             lit,
             picture,
             role,
-            modes: modes
-                .iter()
-                .zip(verdicts)
-                .map(|(mode, &verdict)| Listed {
-                    size: size_of_mode(mode),
-                    interlaced: mode.flags & INTERLACED != 0,
-                    preferred: mode.kind & PREFERRED != 0,
-                    refresh: refresh(mode),
-                    verdict,
-                })
-                .collect(),
+            modes,
+            missed,
             unread: edid.map(unread).unwrap_or_default(),
         }
     }
@@ -279,8 +372,15 @@ pub(super) fn follows(
 /// EDID's extension tags: CTA-861 and DisplayID.
 const CTA_EXTENSION: u8 = 0x02;
 const DISPLAYID_EXTENSION: u8 = 0x70;
-/// A CTA data block's tag for an extended tag in its first byte.
+/// A CTA data block's tag for an extended tag in its first byte, and for
+/// a vendor's block, whose first three bytes are its IEEE OUI, low byte
+/// first: HDMI's and the HDMI Forum's.
 const CTA_EXTENDED: u8 = 7;
+const CTA_VENDOR: u8 = 3;
+const HDMI_OUI: [u8; 3] = [0x03, 0x0c, 0x00];
+const HDMI_FORUM_OUI: [u8; 3] = [0xd8, 0x5d, 0xc4];
+/// The HDMI Forum's sink capability data block's extended tag.
+const CTA_HF_SCDB: u8 = 0x79;
 /// CTA-861's extended tags of the DisplayID type VII, VIII and X video
 /// timing data blocks, none of which Linux reads.
 const CTA_TIMINGS: [u8; 3] = [0x22, 0x23, 0x2a];
@@ -289,6 +389,9 @@ const CTA_TIMINGS: [u8; 3] = [0x22, 0x23, 0x2a];
 const DISPLAYID_UNREAD: [u8; 4] = [0x04, 0x05, 0x06, 0x23];
 /// DisplayID's type IX and type X formula timing blocks.
 const DISPLAYID_FORMULA: [u8; 2] = [0x24, 0x2a];
+/// DisplayID's type I and type VII detailed timing blocks, which Linux
+/// reads.
+const DISPLAYID_DETAILED: [u8; 2] = [0x03, 0x22];
 
 /// The timing blocks of `edid`'s extensions that Linux lists no mode from
 /// (`drm_edid.c`, `add_displayid_detailed_modes` and `add_cea_modes`): a
@@ -309,9 +412,11 @@ fn unread(edid: &[u8]) -> Vec<Unread> {
     unread
 }
 
-/// [`unread`] for one DisplayID extension block: a section header of four
-/// bytes after the tag, then data blocks of a tag, a revision and a length.
-fn displayid_unread(extension: &[u8], unread: &mut Vec<Unread>) {
+/// Each data block of one DisplayID extension block, as its tag, its
+/// revision and its bytes: a section header of four bytes after the
+/// extension's tag, then data blocks of a tag, a revision and a length.
+/// A block past the section ends the read, as Linux's iterator does.
+fn displayid_blocks(extension: &[u8], mut each: impl FnMut(u8, u8, &[u8])) {
     let end = (5 + usize::from(extension[2])).min(extension.len() - 1);
     let mut at = 5;
     while at + 3 <= end {
@@ -323,6 +428,206 @@ fn displayid_unread(extension: &[u8], unread: &mut Vec<Unread>) {
             return;
         }
         at += 3 + bytes.len();
+        each(tag, revision, bytes);
+    }
+}
+
+/// Each data block of one CTA-861 extension block, as its tag and its
+/// payload: data blocks from its fifth byte to its detailed timings, each
+/// a tag and a length in one byte.
+fn cta_blocks(extension: &[u8], mut each: impl FnMut(u8, &[u8])) {
+    let end = usize::from(extension[2]).min(extension.len() - 1);
+    let mut at = 4;
+    while at < end {
+        let (tag, length) = (extension[at] >> 5, usize::from(extension[at] & 0x1f));
+        let Some(bytes) = extension.get(at + 1..at + 1 + length) else {
+            return;
+        };
+        if at + 1 + length > end {
+            return;
+        }
+        at += 1 + length;
+        each(tag, bytes);
+    }
+}
+
+/// The timing of an 18-byte EDID detailed timing descriptor, as Linux's
+/// `drm_mode_detailed` reads it; none for a display descriptor, an
+/// interlaced timing or one under 64 pixels a side, which Linux ignores.
+fn detailed(descriptor: &[u8]) -> Option<Timing> {
+    let clock = u32::from(u16::from_le_bytes([descriptor[0], descriptor[1]])) * 10;
+    let high = |byte: u8, shift: u32| u32::from(byte) << shift;
+    let width = u32::from(descriptor[2]) | high(descriptor[4] & 0xf0, 4);
+    let h_blank = u32::from(descriptor[3]) | high(descriptor[4] & 0x0f, 8);
+    let height = u32::from(descriptor[5]) | high(descriptor[7] & 0xf0, 4);
+    let v_blank = u32::from(descriptor[6]) | high(descriptor[7] & 0x0f, 8);
+    let h_sync = u32::from(descriptor[9]) | high(descriptor[11] & 0x30, 4);
+    let v_sync = u32::from(descriptor[10] & 0x0f) | high(descriptor[11] & 0x03, 4);
+    let misc = descriptor[17];
+    if clock == 0 || width < 64 || height < 64 || misc & 0x80 != 0 {
+        return None;
+    }
+    Some(Timing {
+        size: (width, height),
+        refresh: rate(clock, width + h_blank, height + v_blank),
+        clock,
+        invalid: misc & 0x20 != 0 || h_sync == 0 || v_sync == 0,
+    })
+}
+
+/// The timing of a DisplayID type I or type VII detailed timing descriptor
+/// of 20 bytes, as Linux's `drm_mode_displayid_detailed` reads it: each
+/// field one less than its value, the clock in 10 kHz for type I and in
+/// kHz for type VII.
+fn displayid_detailed(descriptor: &[u8], type_7: bool) -> Option<Timing> {
+    let field = |at: usize| u32::from(u16::from_le_bytes([descriptor[at], descriptor[at + 1]]));
+    let clock = (u32::from_le_bytes([descriptor[0], descriptor[1], descriptor[2], 0]) + 1)
+        * if type_7 { 1 } else { 10 };
+    let (width, h_blank) = (field(4) + 1, field(6) + 1);
+    let (height, v_blank) = (field(12) + 1, field(14) + 1);
+    if width < 64 || height < 64 {
+        return None;
+    }
+    Some(Timing {
+        size: (width, height),
+        refresh: rate(clock, width + h_blank, height + v_blank),
+        clock,
+        invalid: false,
+    })
+}
+
+/// The refresh in millihertz of a `clock` kilohertz timing of `h_total`
+/// by `v_total` pixels, rounded as [`refresh`].
+fn rate(clock: u32, h_total: u32, v_total: u32) -> u32 {
+    let total = u64::from(h_total) * u64::from(v_total);
+    u32::try_from((u64::from(clock) * 1_000_000 + total / 2) / total.max(1)).unwrap_or(u32::MAX)
+}
+
+/// The detailed timings of `edid` Linux makes modes of: the base block's,
+/// the CTA extension's, and the type I and type VII timings of DisplayID
+/// extensions, each once.
+fn timings(edid: &[u8]) -> Vec<Timing> {
+    let mut timings: Vec<Timing> = Vec::new();
+    let mut add = |timing: Option<Timing>| {
+        if let Some(timing) = timing
+            && !timings
+                .iter()
+                .any(|seen| (seen.size, seen.refresh) == (timing.size, timing.refresh))
+        {
+            timings.push(timing);
+        }
+    };
+    let blocks = edid.as_chunks::<128>().0;
+    if let Some(base) = blocks.first() {
+        for descriptor in base[54..126].as_chunks::<18>().0 {
+            add(detailed(descriptor));
+        }
+    }
+    for extension in blocks.iter().skip(1) {
+        match extension[0] {
+            // `cea_for_each_detailed_block`.
+            CTA_EXTENSION if (4..=127).contains(&extension[2]) => {
+                let start = usize::from(extension[2]);
+                for descriptor in extension[start..127].as_chunks::<18>().0 {
+                    add(detailed(descriptor));
+                }
+            }
+            // `add_displayid_detailed_1_modes`: whole descriptors only.
+            DISPLAYID_EXTENSION => displayid_blocks(extension, |tag, _, bytes| {
+                if DISPLAYID_DETAILED.contains(&tag) && bytes.len() % 20 == 0 {
+                    for descriptor in bytes.as_chunks::<20>().0 {
+                        add(displayid_detailed(descriptor, tag == DISPLAYID_DETAILED[1]));
+                    }
+                }
+            }),
+            _ => {}
+        }
+    }
+    timings
+}
+
+/// The TMDS clock in kilohertz nouveau allows a monitor with `edid` on an
+/// HDMI or DVI output (`get_tmds_link_bandwidth`), from the CTA blocks
+/// Linux reads for it (`drm_parse_hdmi_vsdb_video`,
+/// `drm_parse_hdmi_forum_scds`); none for a monitor with no HDMI block.
+fn hdmi_tmds(edid: &[u8]) -> Option<u32> {
+    let (mut hdmi, mut max, mut scdc, mut scrambling) = (false, 0, false, false);
+    for extension in edid.as_chunks::<128>().0.iter().skip(1) {
+        if extension[0] != CTA_EXTENSION {
+            continue;
+        }
+        cta_blocks(extension, |tag, payload| {
+            let vendor = |oui: [u8; 3]| tag == CTA_VENDOR && payload.get(..3) == Some(&oui);
+            if vendor(HDMI_OUI) && payload.len() >= 5 {
+                hdmi = true;
+                if let Some(&clock) = payload.get(6) {
+                    max = u32::from(clock) * 5000;
+                }
+            } else if (vendor(HDMI_FORUM_OUI)
+                || (tag == CTA_EXTENDED && payload.first() == Some(&CTA_HF_SCDB)))
+                && payload.len() >= 7
+            {
+                // The block's bytes 5 and 6, counting its tag byte.
+                scdc |= payload[5] & 0x80 != 0;
+                if payload[4] != 0 {
+                    let clock = u32::from(payload[4]) * 5000;
+                    if clock > PLAIN_TMDS {
+                        max = clock;
+                    }
+                    scrambling |= scdc;
+                }
+            }
+        });
+    }
+    let link = if scrambling {
+        SCRAMBLED_TMDS
+    } else {
+        PLAIN_TMDS
+    };
+    hdmi.then(|| if max != 0 { max.min(link) } else { link })
+}
+
+/// The detailed timings of `edid` for which a connector of `kind` lists
+/// none of `modes`, each with why; the reason is nouveau's where `nouveau`
+/// drives it. A mode of the timing's size and refresh, to half a hertz,
+/// is its own.
+fn missed(edid: &[u8], modes: &[Listed], kind: u32, nouveau: bool) -> Vec<(Timing, Missed)> {
+    let tmds = hdmi_tmds(edid);
+    timings(edid)
+        .into_iter()
+        .filter(|timing| {
+            !modes.iter().any(|mode| {
+                !mode.interlaced
+                    && mode.size == timing.size
+                    && mode.refresh.abs_diff(timing.refresh) <= 500
+            })
+        })
+        .map(|timing| {
+            let why = match (nouveau, tmds) {
+                _ if timing.invalid => Missed::Invalid,
+                (false, _) => Missed::Unknown,
+                (true, Some(link)) if TMDS_PORTS.contains(&kind) && timing.clock > link => {
+                    Missed::Hdmi(link)
+                }
+                (true, None) if TMDS_PORTS.contains(&kind) && timing.clock > SINGLE_LINK_TMDS => {
+                    Missed::Dvi
+                }
+                (true, _) if DP_PORTS.contains(&kind) => {
+                    match u64::from(timing.clock) * DP_MIN_BITS > DP_BYTES * 8 {
+                        true => Missed::DisplayPort,
+                        false => Missed::Link,
+                    }
+                }
+                (true, _) => Missed::Unknown,
+            };
+            (timing, why)
+        })
+        .collect()
+}
+
+/// [`unread`] for one DisplayID extension block.
+fn displayid_unread(extension: &[u8], unread: &mut Vec<Unread>) {
+    displayid_blocks(extension, |tag, revision, bytes| {
         let descriptor = 6 + usize::from(revision >> 4 & 7);
         let formula = DISPLAYID_FORMULA.contains(&tag)
             && (descriptor != 6
@@ -338,23 +643,12 @@ fn displayid_unread(extension: &[u8], unread: &mut Vec<Unread>) {
                 bytes: bytes.to_vec(),
             });
         }
-    }
+    });
 }
 
-/// [`unread`] for one CTA-861 extension block: data blocks from its fifth
-/// byte to its detailed timings, each a tag and a length in one byte.
+/// [`unread`] for one CTA-861 extension block.
 fn cta_unread(extension: &[u8], unread: &mut Vec<Unread>) {
-    let end = usize::from(extension[2]).min(extension.len() - 1);
-    let mut at = 4;
-    while at < end {
-        let (tag, length) = (extension[at] >> 5, usize::from(extension[at] & 0x1f));
-        let Some(bytes) = extension.get(at + 1..at + 1 + length) else {
-            return;
-        };
-        if at + 1 + length > end {
-            return;
-        }
-        at += 1 + length;
+    cta_blocks(extension, |tag, bytes| {
         if let (CTA_EXTENDED, Some((&extended, bytes))) = (tag, bytes.split_first())
             && CTA_TIMINGS.contains(&extended)
         {
@@ -365,7 +659,7 @@ fn cta_unread(extension: &[u8], unread: &mut Vec<Unread>) {
                 bytes: bytes.to_vec(),
             });
         }
-    }
+    });
 }
 
 /// A refresh in millihertz as hertz, with the decimals it has.
@@ -455,6 +749,25 @@ impl fmt::Display for Listing {
         }
         if self.modes.len() > named.len() {
             write!(f, "; and {} more", self.modes.len() - named.len())?;
+        }
+        if !self.missed.is_empty() {
+            f.write_str("; EDID timings Linux lists no mode for:")?;
+        }
+        let missed = &self.missed[..self.missed.len().min(MISSED_TIMINGS)];
+        for (index, (timing, why)) in missed.iter().enumerate() {
+            if index != 0 {
+                f.write_str(",")?;
+            }
+            let (width, height) = timing.size;
+            write!(
+                f,
+                " {width}x{height} {} at {} MHz, {why}",
+                Hertz(timing.refresh),
+                Hertz(timing.clock)
+            )?;
+        }
+        if self.missed.len() > missed.len() {
+            write!(f, ", and {} more", self.missed.len() - missed.len())?;
         }
         if !self.unread.is_empty() {
             f.write_str("; EDID timing blocks Linux lists no mode from:")?;

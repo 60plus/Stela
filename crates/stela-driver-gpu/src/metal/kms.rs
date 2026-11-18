@@ -82,6 +82,7 @@ const GET_PROPERTY: u32 = request::<PropertyInfo>(0xaa);
 const OBJECT_PROPERTIES: u32 = request::<ObjectProperties>(0xb9);
 const SET_OBJECT_PROPERTY: u32 = request::<SetProperty>(0xba);
 const GET_BLOB: u32 = request::<Blob>(0xac);
+const VERSION: u32 = request::<Version>(0x00);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -140,6 +141,23 @@ pub struct ModeInfo {
     flags: u32,
     kind: u32,
     name: [[u8; 8]; 4],
+}
+
+/// `struct drm_version`: the driver's name, date and description, each
+/// copied into a buffer of the given length, which is set to its whole
+/// length.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct Version {
+    major: i32,
+    minor: i32,
+    patch: i32,
+    name_bytes: u64,
+    name: u64,
+    date_bytes: u64,
+    date: u64,
+    description_bytes: u64,
+    description: u64,
 }
 
 /// `struct drm_mode_get_connector`.
@@ -1225,6 +1243,21 @@ fn follow<D: Drm>(
     })
 }
 
+/// Whether `drm`'s driver is Linux's nouveau, whose checks of a mode
+/// against its output the boot log names ([`Listing`]).
+fn nouveau<D: Drm>(drm: &mut D) -> bool {
+    const NAME: &[u8] = b"nouveau";
+    let mut name = [0u8; 16];
+    let mut version = Version {
+        name_bytes: name.len() as u64,
+        name: name.as_mut_ptr() as u64,
+        ..Version::default()
+    };
+    call(drm, VERSION, &mut version).is_ok()
+        && version.name_bytes == NAME.len() as u64
+        && name.starts_with(NAME)
+}
+
 /// Connector `id`, read as `found`, as the boot log names it: showing a
 /// `picture` as `role` says, each of its modes with its verdict.
 fn listed<D: Drm>(
@@ -1238,6 +1271,7 @@ fn listed<D: Drm>(
     // Read without a probe; one the connector cannot give leaves the line
     // without its EDID's part.
     let edid = edid(drm, id).ok().flatten();
+    let nouveau = nouveau(drm);
     Listing::new(
         id,
         Port {
@@ -1250,6 +1284,7 @@ fn listed<D: Drm>(
         &found.modes,
         verdicts,
         edid.as_deref(),
+        nouveau,
     )
 }
 
