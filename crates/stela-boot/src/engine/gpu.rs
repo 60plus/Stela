@@ -1250,6 +1250,12 @@ fn claim(
         &*function.config(),
         port.as_ref(),
     );
+    // Before the reset, which saves the GPU's side as set here and puts it
+    // back, as Linux sets a link at enumeration before its driver resets.
+    // SAFETY: the cold owner of `address` its fabric promoted, in D0 since
+    // `enable_decode`, Bus Master sealed by its preparation; the fabric
+    // keeps every other configuration writer out.
+    unsafe { link::set_substates(address, function, port.as_ref()) };
     let config = function
         .config()
         .retain_epoch()

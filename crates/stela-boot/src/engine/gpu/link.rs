@@ -1,17 +1,23 @@
-//! The PCI Express link above a GPU, for the boot log: both ends' ASPM,
-//! Clock Power Management, LTR and L1 PM Substates as the firmware left
-//! them and after the claim's reset, and the port's view when the GPU stops
-//! answering or answers again, which tells a link that went down from a
-//! port that lost power with it. The port is read through a read-only
-//! mapping of its configuration kept for the boot; nothing is written.
+//! The PCI Express link above a GPU: its L1 PM Substates set at the claim
+//! as Linux's ASPM core leaves a link the firmware set up, and, for the
+//! boot log, both ends' ASPM, Clock Power Management, LTR and L1 PM
+//! Substates as the firmware left them and after the claim's reset, and the
+//! port's view when the GPU stops answering or answers again, which tells a
+//! link that went down from a port that lost power with it. The port is
+//! read through a read-only mapping of its configuration kept for the boot;
+//! only the substates are written, through the fabric that owns the port.
 use crate::{native_mmio, output};
 use alloc::{format, string::String};
-use stela_drivers::bus::pci::{Address, ConfigSpace, link_report, owned::ObservedConfig};
+use stela_drivers::bus::pci::{
+    Address, ConfigSpace, Function, link_report, owned::ObservedConfig, owned::OwnedConfig,
+};
 
-/// The PCI Express port directly above a GPU, kept read-only.
+/// The PCI Express port directly above a GPU, kept read-only, and the
+/// fabric that owns it.
 pub(in crate::engine) struct Port {
     address: Address,
     config: ObservedConfig,
+    source: &'static native_mmio::Source,
 }
 
 impl Port {
@@ -51,6 +57,7 @@ pub(in crate::engine) fn port_above(
         Ok(config) => Some(Port {
             address: bridge,
             config,
+            source: mmio,
         }),
         Err((error, mut mapping)) => {
             // SAFETY: the refused attachment published no view or reader.
@@ -77,6 +84,30 @@ pub(in crate::engine) fn log_link<C: ConfigSpace + ?Sized>(
     output::arguments(format_args!(
         "GPU {address} link {when}: GPU {own}; {above}\n"
     ));
+}
+
+/// `GPU <address> L1 PM Substates: <what was found and done>`: the link
+/// above the GPU `function` at `address`, in D0, set as Linux leaves it
+/// ([`stela_drivers::bus::pci::substates`]) before the claim's reset, which
+/// then saves and restores the GPU's side as set here.
+///
+/// # Safety
+/// `function` is the cold owner of `address` the port's fabric promoted,
+/// in D0, with Bus Master sealed; no other configuration writer runs.
+pub(in crate::engine) unsafe fn set_substates(
+    address: Address,
+    function: &mut Function<OwnedConfig>,
+    port: Option<&Port>,
+) {
+    let done = match port {
+        None => String::from("not set: no port above it is read"),
+        // SAFETY: forwarded; the fabric owns the port.
+        Some(port) => match unsafe { port.source.configure_link_substates(address, function) } {
+            Ok(configured) => format!("{configured}"),
+            Err(why) => format!("not set: {why}"),
+        },
+    };
+    output::arguments(format_args!("GPU {address} L1 PM Substates: {done}\n"));
 }
 
 /// `GPU <name> <event>; port <address> <its report>`: what the port above
