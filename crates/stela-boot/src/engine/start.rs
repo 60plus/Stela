@@ -261,6 +261,12 @@ fn start(handoff: u64) -> Started {
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
     output::keep_stop_reserve();
     super::large_blocks::install();
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
     // Before any AP: the boot processor's class, its caches, clock and
     // memory, with its heap's buffer (`HOST SPEED`).
     super::speed::calibrate_once();
@@ -289,12 +295,6 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
-    // Before any user of the rate: this image's copy has not been found.
-    crate::firmware::adopt_tsc(
-        handoff.tsc_hz,
-        handoff.tsc_source,
-        handoff.tsc_tolerance_ppm,
-    );
     crate::status::set_clock(handoff.tsc_hz);
     // Before any AP agrees with the BSP through a software offset: from
     // then on the drivers' times and deadlines read the BSP's counter on
