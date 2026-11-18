@@ -72,9 +72,13 @@ impl InputDevice {
                 }
                 Ok(())
             }
+            // An interface whose transfer failed is tried again; its first
+            // failure is the poll's error once, for the log.
             Self::Usb(device) => {
                 inputs.extend(device.poll());
-                Ok(())
+                device
+                    .take_first_error()
+                    .map_or(Ok(()), |error| Err(InputError::Usb(error)))
             }
             Self::Ehci(device) => {
                 inputs.extend(device.poll());

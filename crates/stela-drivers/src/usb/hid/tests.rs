@@ -11,6 +11,42 @@ pub(super) const NUMBERED_KEYBOARD: [u8; 43] = [
     0xc0,
 ];
 
+/// Linux `hid_io_error`: a failure half a second or more after the second
+/// of retries is a new error. An idle keyboard's endpoint gives no report
+/// between two rare failures, and the second one must not end it.
+#[test]
+fn a_failure_long_after_the_last_one_starts_its_own_second_of_retries() {
+    let first = Retry::first(1_000);
+    let later = first.stop_us + NEW_ERROR_US + 1;
+    assert_eq!(first.next(later), Retry::first(later));
+    // Within the second and the half second after it, it is the same error.
+    let same = first.next(first.stop_us + NEW_ERROR_US);
+    assert!(same.slow);
+}
+
+/// A second of failed retries makes them slow instead of ending the
+/// interface; a retry that fails as soon as it goes out keeps the slow
+/// pace, and one that waited half a second without failing worked, so the
+/// next failure is a new error.
+#[test]
+fn a_second_of_failures_slows_the_retries_and_never_ends_them() {
+    let first = Retry::first(0);
+    let slow = first.next(first.stop_us + 1);
+    assert_eq!(
+        (slow.slow, slow.delay_ms, slow.at_us),
+        (
+            true,
+            SLOW_RETRY_MS,
+            first.stop_us + 1 + SLOW_RETRY_MS * 1_000
+        )
+    );
+    let again = slow.next(slow.at_us + 1_000);
+    assert!(again.slow);
+    assert_eq!(again.at_us, slow.at_us + 1_000 + SLOW_RETRY_MS * 1_000);
+    let later = again.at_us + NEW_ERROR_US + 1;
+    assert_eq!(again.next(later), Retry::first(later));
+}
+
 /// Linux `hid_get_class_descriptor` asks for the report descriptor up to
 /// four times: a device that stalls the first three still starts, one that
 /// refuses all four does not.
@@ -81,6 +117,96 @@ fn numbered_keyboard() -> (
     (input, hardware, shared, dma)
 }
 
+/// Poll until the endpoint's transfer failed and its retry waits.
+fn poll_to_failure(input: &mut UsbInput) {
+    for _ in 0..16 {
+        assert!(input.poll().is_empty());
+        if input.retry.is_some() && input.queued.is_none() {
+            return;
+        }
+    }
+    panic!("the transfer did not fail");
+}
+
+/// The first press on a keyboard whose endpoint failed twice while nobody
+/// typed, seconds apart, still arrives: the interface is not stopped.
+#[test]
+fn two_failures_seconds_apart_on_an_idle_keyboard_keep_it_running() {
+    let (mut input, hardware, shared, _dma) = numbered_keyboard();
+    let clock = shared.borrow().clock;
+    assert!(input.take_first_error().is_none());
+    // More transaction errors than the controller's soft retries absorb.
+    hardware.borrow_mut().transaction_errors[3] = 5;
+    poll_to_failure(&mut input);
+    assert_eq!(
+        input.take_first_error(),
+        Some(BlockError::Device { status: 4 }),
+        "USB transaction error"
+    );
+    assert!(input.take_first_error().is_none(), "reported once");
+    crate::test_clock::advance(clock, 20_000);
+    assert!(input.poll().is_empty());
+    assert!(input.queued.is_some(), "the retry waits for a report");
+    // Nothing is typed for three seconds, then one more error.
+    crate::test_clock::advance(clock, 3_000_000);
+    hardware.borrow_mut().transaction_errors[3] = 1;
+    // The waiting transfer fails when the device answers it.
+    hardware.borrow_mut().transfer(3);
+    poll_to_failure(&mut input);
+    assert!(!input.failed());
+    assert_eq!(input.state(), State::Running);
+    assert!(!input.retrying_slowly());
+    crate::test_clock::advance(clock, 20_000);
+    assert!(input.poll().is_empty());
+    hardware
+        .borrow_mut()
+        .push_event(vec![1, 0, 0, 4, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        input.poll(),
+        [Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+/// An endpoint that fails for a whole second is tried again once a second,
+/// and reads its device again when the failures end.
+#[test]
+fn an_endpoint_that_fails_for_a_second_is_retried_slowly_and_recovers() {
+    let (mut input, hardware, shared, _dma) = numbered_keyboard();
+    let clock = shared.borrow().clock;
+    hardware.borrow_mut().transaction_errors[3] = usize::MAX;
+    poll_to_failure(&mut input);
+    for _ in 0..40 {
+        if input.retrying_slowly() {
+            break;
+        }
+        crate::test_clock::advance(clock, 110_000);
+        poll_to_failure(&mut input);
+    }
+    assert!(input.retrying_slowly());
+    assert!(!input.failed(), "the interface stays while its device does");
+    // No transfer goes out before the slow retry is due.
+    crate::test_clock::advance(clock, 500_000);
+    assert!(input.poll().is_empty());
+    assert!(input.queued.is_none());
+    hardware.borrow_mut().transaction_errors[3] = 0;
+    crate::test_clock::advance(clock, 600_000);
+    assert!(input.poll().is_empty());
+    hardware
+        .borrow_mut()
+        .push_event(vec![1, 0, 0, 5, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        input.poll(),
+        [Input::Key {
+            usage: 5,
+            pressed: true
+        }]
+    );
+    assert!(!input.retrying_slowly());
+}
+
 /// A device that pads its reports past the descriptor's length is read up
 /// to that length, as Linux `hid_report_raw_event` reads it: the transfer
 /// asks for whole packets, so the longer report is no babble error.
@@ -115,15 +241,15 @@ fn a_report_longer_than_its_descriptor_says_is_read_to_the_described_length() {
 fn transfer_errors_retry_with_linux_backoff_for_one_second() {
     let first = Retry::first(1_000);
     assert_eq!(
-        (first.delay_ms, first.at_us, first.stop_us),
-        (13, 14_000, 1_001_000)
+        (first.delay_ms, first.at_us, first.stop_us, first.slow),
+        (13, 14_000, 1_001_000, false)
     );
-    let delays: Vec<u64> = core::iter::successors(Some(first), |retry| retry.next(retry.at_us))
-        .map(|retry| retry.delay_ms)
-        .take(6)
-        .collect();
+    let delays: Vec<u64> =
+        core::iter::successors(Some(first), |retry| Some(retry.next(retry.at_us)))
+            .map(|retry| retry.delay_ms)
+            .take(6)
+            .collect();
     assert_eq!(delays, [13, 26, 52, 104, 104, 104]);
-    assert_eq!(first.next(1_001_001), None);
 }
 
 #[test]

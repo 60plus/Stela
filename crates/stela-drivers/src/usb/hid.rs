@@ -59,10 +59,17 @@ const BOOT_REPORT_BYTES: usize = 8;
 /// An interrupt endpoint's wMaxPacketSize payload bits.
 const MAX_PACKET_SIZE: u16 = 0x7ff;
 /// Linux `hid_io_error`: retry after 13 ms, doubling to at least 100 ms,
-/// and give up after a second of failures.
+/// for a second of failures; a failure half a second or more after that
+/// second is a new error with a second of its own.
 const FIRST_RETRY_MS: u64 = 13;
 const LONGEST_RETRY_MS: u64 = 100;
 const RETRY_WINDOW_US: u64 = 1_000_000;
+const NEW_ERROR_US: u64 = 500_000;
+/// How far apart an endpoint that failed for the whole second is tried
+/// again. Linux resets the device there (`usb_queue_reset_device`), which
+/// rebinds every interface of it; this driver keeps the device's other
+/// interfaces running and tries the failed endpoint again this often.
+const SLOW_RETRY_MS: u64 = 1_000;
 const MICROSECONDS_PER_MILLISECOND: u64 = 1_000;
 pub(super) const LED_PAGE: u32 = 0x08;
 /// Main item bit 1: a Variable field, one value per usage.
@@ -217,9 +224,13 @@ pub(in crate::usb) struct Negotiated {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Retry {
     delay_ms: u64,
-    /// When the next transfer may go out, and when retrying stops.
+    /// When the next transfer may go out, and when the second of fast
+    /// retries ends.
     at_us: u64,
     stop_us: u64,
+    /// The endpoint failed for the whole second: it is tried again every
+    /// [`SLOW_RETRY_MS`] until a report arrives.
+    slow: bool,
 }
 
 impl Retry {
@@ -228,24 +239,39 @@ impl Retry {
             delay_ms: FIRST_RETRY_MS,
             at_us: now_us + FIRST_RETRY_MS * MICROSECONDS_PER_MILLISECOND,
             stop_us: now_us + RETRY_WINDOW_US,
+            slow: false,
         }
     }
 
-    /// The next retry after another failure, or none once retrying has run
-    /// a second without a report.
-    fn next(self, now_us: u64) -> Option<Self> {
-        if now_us > self.stop_us {
-            return None;
+    /// The retry after another failure at `now_us`. A failure that comes
+    /// [`NEW_ERROR_US`] or more after the second of retries ended is a new
+    /// error, as an idle endpoint's rare failures are: it starts over. One
+    /// that ends a second of failures makes the retries slow. Once slow, a
+    /// failure that comes [`NEW_ERROR_US`] or more after the last retry went
+    /// out is a new error too: that transfer waited without failing, so the
+    /// endpoint worked again.
+    fn next(self, now_us: u64) -> Self {
+        let quiet_since = if self.slow { self.at_us } else { self.stop_us };
+        if now_us > quiet_since + NEW_ERROR_US {
+            return Self::first(now_us);
+        }
+        if self.slow || now_us > self.stop_us {
+            return Self {
+                delay_ms: SLOW_RETRY_MS,
+                at_us: now_us + SLOW_RETRY_MS * MICROSECONDS_PER_MILLISECOND,
+                slow: true,
+                ..self
+            };
         }
         let delay_ms = match self.delay_ms < LONGEST_RETRY_MS {
             true => self.delay_ms * 2,
             false => self.delay_ms,
         };
-        Some(Self {
+        Self {
             delay_ms,
             at_us: now_us + delay_ms * MICROSECONDS_PER_MILLISECOND,
             ..self
-        })
+        }
     }
 }
 
@@ -287,8 +313,11 @@ pub struct UsbInput {
     pending: TouchPoll,
     touch: Option<touch::Assembler>,
     receiver: Option<receiver::Link>,
-    /// The first transfer failure, reported once.
+    /// Polling stopped for good: the device left, or its endpoint could
+    /// not be made ready again.
     failed: bool,
+    /// The first transfer failure was handed to the log.
+    error_reported: bool,
     pub name: String,
 }
 
@@ -475,6 +504,7 @@ impl UsbInput {
             touch: None,
             receiver: None,
             failed: false,
+            error_reported: false,
             name: format!("{} ({})", device.name(), device.location),
         }))
     }
@@ -600,14 +630,15 @@ impl UsbInput {
                     if recovered.is_ok() {
                         self.queued = None;
                     }
-                    self.retry = match self.retry {
-                        None => Some(Retry::first(now)),
+                    self.retry = Some(match self.retry {
+                        None => Retry::first(now),
                         Some(retry) => retry.next(now),
-                    };
-                    if let Err(error) = recovered {
-                        self.fault(error);
-                    } else if self.retry.is_none() {
-                        self.fault(error);
+                    });
+                    // Only an endpoint that cannot be made ready again
+                    // stops the interface: a transfer that keeps failing
+                    // is tried again for as long as the device stays.
+                    if let Err(recovery) = recovered {
+                        self.fault(recovery);
                     }
                     break;
                 }
@@ -642,9 +673,27 @@ impl UsbInput {
         self.translator.dropped()
     }
 
-    /// Whether polling stopped on a transfer failure.
+    /// Whether polling stopped for good: the device left, or its endpoint
+    /// could not be made ready again after a failure.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// The first transfer failure, the first time it is asked for after it
+    /// happened: the log's one line for an interface that is retried.
+    pub fn take_first_error(&mut self) -> Option<BlockError> {
+        if self.error_reported {
+            return None;
+        }
+        let error = self.error.clone()?;
+        self.error_reported = true;
+        Some(error)
+    }
+
+    /// Whether the endpoint failed for a whole second of retries and is now
+    /// tried again once a second.
+    pub fn retrying_slowly(&self) -> bool {
+        self.retry.is_some_and(|retry| retry.slow)
     }
 }
 
