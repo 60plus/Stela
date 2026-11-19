@@ -251,6 +251,37 @@ pub(crate) fn page_fault(
     saved: &super::super::interrupts::SavedState<'_>,
 ) {
     let entered = rdtsc();
+    fill_or_end(frame, address, saved, entered);
+    let state = state();
+    state.faults += 1;
+    state.fault_ticks += rdtsc().wrapping_sub(entered);
+}
+
+/// [`abandon`] for a #PF, counted by its cause's class ([`ABANDONED`]).
+fn abandon_fault(
+    state: &mut State,
+    frame: &mut Frame,
+    address: u64,
+    write: bool,
+    cause: FaultCause,
+    saved: &super::super::interrupts::SavedState<'_>,
+) {
+    let class = match cause {
+        FaultCause::Guest(_) => 0,
+        FaultCause::Device { .. } => 1,
+        _ => 2,
+    };
+    state.abandoned[class] += 1;
+    abandon(state, frame, address, write, cause, saved);
+}
+
+/// [`page_fault`]'s work, from its handler's entry at TSC `entered`.
+fn fill_or_end(
+    frame: &mut Frame,
+    address: u64,
+    saved: &super::super::interrupts::SavedState<'_>,
+    entered: u64,
+) {
     let write = frame.error & 2 != 0;
     let state = state();
     if !in_code(state, frame.rip) {
@@ -279,7 +310,7 @@ pub(crate) fn page_fault(
     // (`mmu::placement`): its own check finds where it goes.
     if !state.placement.native(address) {
         state.guard_faults += u64::from(state.placement.in_guard(address));
-        return abandon(
+        return abandon_fault(
             state,
             frame,
             address,
@@ -291,10 +322,11 @@ pub(crate) fn page_fault(
     // The fault's own walk notes its leaf table; fault-around's walks of
     // the same window start there.
     let mut walk_table = None;
+    state.walks += 1;
     let (translation, host) =
         match resolve_recording(state, address, write, false, true, &mut walk_table) {
             Ok(resolved) => resolved,
-            Err(cause) => return abandon(state, frame, address, write, cause, saved),
+            Err(cause) => return abandon_fault(state, frame, address, write, cause, saved),
         };
     let rights = shadow_rights(state, &translation);
     let root = state.roots[state.root_of(state.current)];
@@ -352,6 +384,18 @@ pub(crate) fn page_fault(
         state.record_lower(root, entry);
     }
     state.extents[half].record(address, translation.size, translation.global);
+    let space = match (half, state.regime.as_ref()) {
+        (LOWER, Some(regime)) => {
+            let controls = &regime.controls;
+            controls.ttbr0 ^ (controls.tcr & LOWER_TCR).rotate_left(29)
+        }
+        _ => 0,
+    };
+    let view = state.root_of(state.current);
+    let filled = state
+        .history
+        .fill(half, space, virtual_page, view, frame.error & 1 != 0);
+    state.fill_causes[filled.cause as usize] += 1;
     // The rest of the leaf's window has the same translation and rights:
     // map its RAM pages that are not watched now, as a TLB entry covers
     // the whole leaf. Pages that were absent need no flush. A Tagged leaf
@@ -407,7 +451,22 @@ pub(crate) fn page_fault(
     if frame.error & 1 == 0 {
         let table = slot.wrapping_sub(tables::index(virtual_page, 0));
         for beside in shadow::around(address, translation.size, FILL_WINDOW) {
-            map_around(state, table, half, beside, &mut walk_table);
+            state.around += map_around(state, table, half, beside, &mut walk_table).unwrap_or(0);
+        }
+        // The first fill of a region since its half was lost maps again
+        // the granules of it the lost incarnation filled, from walks made
+        // now, as fault-around maps its window: one fault, rather than one
+        // each, after a TLBI of everything, a half out of frames or a kept
+        // half replaced. A granule that maps nothing is forgotten.
+        let mut restore = filled.restore;
+        while restore != 0 {
+            let bit = restore.trailing_zeros();
+            restore &= restore - 1;
+            let granule = shadow_fills::granule(virtual_page, bit);
+            if let Some(pages) = map_around(state, table, half, granule, &mut walk_table) {
+                state.restored += pages;
+                state.history.keep(half, space, granule);
+            }
         }
     }
     state.fills += 1;
@@ -443,20 +502,23 @@ fn shadow_rights(state: &State, translation: &mmu::Translation) -> u64 {
 /// cached either. Lower-half global leaves are left to their fault too (the
 /// shared span widens there), and pages already present are kept, so every
 /// entry written was absent and needs no flush.
+///
+/// Returns the pages it mapped, or `None` when it maps nothing of the leaf
+/// whether present or not.
 fn map_around(
     state: &mut State,
     table: *mut u64,
     half: usize,
     address: u64,
     walk_table: &mut Option<mmu::WalkTable>,
-) {
+) -> Option<u64> {
     if !state.placement.native(address) {
-        return;
+        return None;
     }
-    let Ok((translation, _)) = resolve_recording(state, address, false, false, false, walk_table)
-    else {
-        return;
-    };
+    state.walks += 1;
+    state.table_walks += u64::from(walk_table.is_some_and(|table| table.holds(address)));
+    let (translation, _) =
+        resolve_recording(state, address, false, false, false, walk_table).ok()?;
     let tag_checks = state
         .regime
         .as_ref()
@@ -464,21 +526,26 @@ fn map_around(
     if (half == LOWER && translation.global)
         || (tag_checks && translation.attributes == mmu::attributes::TAGGED)
     {
-        return;
+        return None;
     }
     let rights = shadow_rights(state, &translation);
     let (first, last) = shadow::window(address, translation.size, FILL_WINDOW);
+    // `table` maps the 2 MiB around `address` alone.
+    if (first ^ address) >> 21 != 0 || (last ^ address) >> 21 != 0 {
+        return None;
+    }
     let physical = translation
         .physical
         .wrapping_sub(address)
         .wrapping_add(first);
     let watch = &state.regime.as_ref().expect("a fault was filled").watch;
     let mut page = first;
-    let mut mapped = false;
+    let mut mapped = 0;
     loop {
-        // SAFETY: the window lies in the aligned fill window of the fault
-        // just filled, inside the one leaf table `table` names: the live
-        // table that fault's slot belongs to, which only this host manages.
+        // SAFETY: the window lies in the 2 MiB around the fault just
+        // filled (the caller's addresses and the check above), which the
+        // one leaf table `table` names maps: the live table that fault's
+        // slot belongs to, which only this host manages.
         let entry = unsafe { table.add(tables::index(page, 0)) };
         // SAFETY: as above.
         let absent = unsafe { entry.read_volatile() } & PRESENT == 0;
@@ -488,17 +555,17 @@ fn map_around(
         {
             // SAFETY: as above.
             unsafe { entry.write_volatile((host & tables::ADDRESS) | rights) };
-            state.around += 1;
-            mapped = true;
+            mapped += 1;
         }
         if page >= last & !(PAGE - 1) {
             break;
         }
         page += PAGE;
     }
-    if mapped {
+    if mapped != 0 {
         state.extents[half].record(address, translation.size, translation.global);
     }
+    Some(mapped)
 }
 
 /// #GP or #UD inside native code ends the block; elsewhere it is fatal.

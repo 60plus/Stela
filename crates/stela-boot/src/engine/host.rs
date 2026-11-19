@@ -81,6 +81,7 @@ pub(super) mod local;
 #[cfg(feature = "native-profile")]
 use stela_boot_core::native_profile as profile;
 use stela_boot_core::ram;
+use stela_boot_core::shadow_fills;
 mod translated;
 pub(crate) use local::activated_base;
 #[cfg(feature = "nvk")]
@@ -119,6 +120,8 @@ struct Pool {
     half: usize,
     /// The most bytes of shadow frames each half has held at once.
     peak: [u64; 2],
+    /// Shadow frames handed out so far.
+    taken: u64,
     /// Each half's frames given back since it was last reset, which it
     /// hands out first: the lower half's, whose storage holds every frame
     /// of the half, so a fault never allocates to give one back.
@@ -132,6 +135,7 @@ const UPPER: usize = 1;
 impl Frames for Pool {
     fn frame(&mut self) -> Option<u64> {
         if let Some(frame) = self.free[self.half].pop() {
+            self.taken += 1;
             zero(frame);
             return Some(frame);
         }
@@ -143,6 +147,7 @@ impl Frames for Pool {
         self.shadow[self.half] += PAGE;
         let used = self.shadow[self.half] - self.range(self.half).0;
         self.peak[self.half] = self.peak[self.half].max(used);
+        self.taken += 1;
         zero(frame);
         Some(frame)
     }
@@ -404,6 +409,13 @@ const FIVE_LEVEL_LOWER_END: u64 = (1 << 48) - 1;
 const FOUR_LEVEL_LOWER_END: u64 = (1 << 47) - 1;
 /// The aligned bytes of a guest leaf one fault maps.
 const FILL_WINDOW: u64 = 64 * 1024;
+/// log2 of the 2 MiB regions each core's fill history remembers: 4096,
+/// 128 KiB, more than the regions of the kept halves and the kernel.
+const HISTORY_BITS: u32 = 12;
+/// The causes of a #PF that ended its block: a guest fault, a device
+/// access, anything else (a watched page, a Tag Check, an address outside
+/// the native ranges, an unsupported translation).
+const ABANDONED: usize = 3;
 /// Pages a scoped invalidation flushes one by one; more reload CR3.
 const INVLPG_PAGES: u64 = 16;
 const FAULT_KIND: u64 = 0xffff;
@@ -606,6 +618,12 @@ pub struct State {
     pub kept_dropped: u64,
     /// TLBIs that unmapped ranges rather than whole halves.
     pub scoped: u64,
+    /// Kept lower halves whose tables went back to the pool: replaced,
+    /// dropped by a TLBI or given up for a half out of frames.
+    pub reclaimed: u64,
+    /// Pages a region's first fill since its half was lost mapped again
+    /// from the fill history (`shadow_fills`).
+    pub restored: u64,
     /// Pages mapped beside a fault's from the same leaf.
     pub prefills: u64,
     /// Pages mapped beside a fault's from the window's other leaves
@@ -614,6 +632,19 @@ pub struct State {
     pub around: u64,
     /// TSC ticks from a filled #PF's handler entry to its return.
     pub fill_ticks: u64,
+    /// Every #PF from native code, filled or ending its block (by cause:
+    /// a guest fault, a device access, anything else), and the TSC ticks
+    /// of all of them.
+    pub faults: u64,
+    pub abandoned: [u64; ABANDONED],
+    pub fault_ticks: u64,
+    /// The fills by [`shadow_fills::Cause`], from [`State::history`].
+    pub fill_causes: [u64; shadow_fills::Cause::COUNT],
+    history: shadow_fills::History,
+    /// Guest walks made for fills and fault-around, and of those the ones
+    /// that started at the table the fault's own walk read its leaf from.
+    pub walks: u64,
+    pub table_walks: u64,
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
@@ -701,6 +732,7 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
         shadow_base: config.pool_physical + PERMANENT_FRAMES * PAGE,
         half: LOWER,
         peak: [0; 2],
+        taken: 0,
         free: [Vec::new(), Vec::new()],
     };
     pool.reserve_free();
@@ -822,9 +854,18 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             lower_found: 0,
             kept_dropped: 0,
             scoped: 0,
+            reclaimed: 0,
+            restored: 0,
             prefills: 0,
             around: 0,
             fill_ticks: 0,
+            faults: 0,
+            abandoned: [0; ABANDONED],
+            fault_ticks: 0,
+            fill_causes: [0; shadow_fills::Cause::COUNT],
+            history: shadow_fills::History::new(HISTORY_BITS),
+            walks: 0,
+            table_walks: 0,
             stray: 0,
             placement: config.placement,
             tlb: Tlb::default(),
@@ -854,6 +895,22 @@ pub struct Statistics {
     /// Nanoseconds the filled faults' handlers took, entry to return
     /// (without the exception's delivery and IRETQ).
     pub fill_ns: u64,
+    /// Every #PF from native code, those that ended the block by cause
+    /// ([`ABANDONED`]) and the nanoseconds of all of them.
+    pub faults: u64,
+    pub abandoned: [u64; ABANDONED],
+    pub fault_ns: u64,
+    /// Fills by [`shadow_fills::Cause`].
+    pub fill_causes: [u64; shadow_fills::Cause::COUNT],
+    /// Guest walks for fills and fault-around, and those that started at
+    /// the fault's leaf table; the shadow frames the pool handed out.
+    pub walks: u64,
+    pub table_walks: u64,
+    pub frames: u64,
+    /// Kept lower halves whose frames went back to the pool, and pages
+    /// mapped again from the fill history.
+    pub reclaimed: u64,
+    pub restored: u64,
     /// Resets of the whole shadow, those because a half ran out of frames,
     /// of the lower half alone, and TLBIs that unmapped ranges instead.
     pub resets: u64,
@@ -903,6 +960,16 @@ pub fn statistics() -> Statistics {
         around: state.around,
         fill_ns: (u128::from(state.fill_ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1)))
             as u64,
+        faults: state.faults,
+        abandoned: state.abandoned,
+        fault_ns: (u128::from(state.fault_ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1)))
+            as u64,
+        fill_causes: state.fill_causes,
+        walks: state.walks,
+        table_walks: state.table_walks,
+        frames: state.pool.taken,
+        reclaimed: state.reclaimed,
+        restored: state.restored,
         resets: state.resets,
         exhausted: state.exhausted,
         lower_resets: state.lower_resets,
@@ -1168,6 +1235,7 @@ impl State {
         let extents = core::mem::take(&mut self.extents[LOWER]);
         let kept = self.kept.switch(from, entries, extents, to);
         self.reclaim_kept();
+        self.history.switched(from, to, kept.is_some());
         if let Some(half) = kept {
             self.lower_found += 1;
             for &(root, entry, value) in &half.entries {
@@ -1244,6 +1312,7 @@ impl State {
             });
         }
         self.pool.free[LOWER] = free;
+        self.reclaimed += 1;
         self.kept.recycle(half.entries);
     }
 
@@ -1269,6 +1338,8 @@ impl State {
                 // The kept halves may hold entries of these roots, which
                 // take other rights now.
                 self.drop_kept();
+                self.history.emptied(LOWER);
+                self.history.emptied(UPPER);
                 index
             }
         };
@@ -1289,6 +1360,7 @@ impl State {
     fn clear(&mut self, half: usize) {
         self.pool.reset_half(half);
         self.extents[half].clear();
+        self.history.emptied(half);
         for root in self.all_roots() {
             self.detach(root, half);
         }
