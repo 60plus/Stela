@@ -182,7 +182,7 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
     assert_ne!(point, at);
     let thunks = install_targets(&page, Fallback::Jump(site));
     let block = page.address() + BLOCK_AT as u64;
-    let (body, bytes) = link(at, POLLED_LINK_BYTES, 1, 1, block).unwrap();
+    let linking = link(at, POLLED_LINK_BYTES, 1, 1, block).unwrap();
     let (unlink_at, unlink) = unlinked(site, POLLED_LINK_BYTES).unwrap();
     assert_eq!(unlink_at, point);
     let seen = run_while_patching(&page, at, |step| {
@@ -194,9 +194,9 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
                 // The body is written once, while the point jumps over it;
                 // later rounds fall into the same bytes again.
                 if step == 0 {
-                    page.write(body, &bytes);
+                    page.write(linking.rest_at, &linking.rest);
                 }
-                page.patch(point, NOP5);
+                page.patch(point, linking.point);
                 1
             }
             1 => {

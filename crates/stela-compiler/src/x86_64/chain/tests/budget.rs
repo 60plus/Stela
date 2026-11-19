@@ -122,11 +122,10 @@ fn slot(mapping: &Mapping) -> Vec<u8> {
         TARGET,
         ExitKind::Direct,
     ));
-    let (body, bytes) = link(at, POLLED_LINK_BYTES, 7, 3, at).unwrap();
-    let start = (body - at) as usize;
-    code[start..start + bytes.len()].copy_from_slice(&bytes);
+    let linking = link(at, POLLED_LINK_BYTES, 7, 3, at).unwrap();
     let point = (slot_patch(at) - at) as usize;
-    code[point..point + PATCH_BYTES].copy_from_slice(&NOP5);
+    let body = linking.body();
+    code[point..point + body.len()].copy_from_slice(&body);
     code
 }
 fn exited(value: u128) -> (u64, u64) {

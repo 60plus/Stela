@@ -1185,11 +1185,10 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
         ),
     };
     let instruction = arena_bytes(arena, point, chain::PATCH_BYTES)?;
-    if exit.slot != 0 && instruction == chain::NOP5 {
+    if exit.slot != 0 && instruction == chain::LINKED_SLOT {
         let at = exit.site - u64::from(exit.slot);
-        let body = point + chain::PATCH_BYTES as u64;
-        return read_link(arena, body, near, |block, entry| {
-            chain::link(at, exit.slot.into(), retired, block, entry).map(|(_, bytes)| bytes)
+        return read_link(arena, point, near, |block, entry| {
+            chain::link(at, exit.slot.into(), retired, block, entry).map(|linking| linking.body())
         });
     }
     // Else a `jmp rel32` to a thunk.

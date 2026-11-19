@@ -765,18 +765,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;
         // A slot's body runs in the block's own code, once: its patch
-        // point falls into it once it is written ([`chain::link`]).
+        // point becomes the body's start once the rest is written
+        // ([`chain::link`]).
         if exit.slot != 0 && !record.used(position) {
             let at = site - u64::from(exit.slot);
             let point = chain::slot_patch(at);
-            let Some((body, bytes)) =
-                chain::link(at, exit.slot.into(), retired, target as u32, entry)
-                    .filter(|_| chain::patchable(point))
+            let Some(linking) = chain::link(at, exit.slot.into(), retired, target as u32, entry)
+                .filter(|_| chain::patchable(point))
             else {
                 return false;
             };
-            self.patch_native(NativeCode(body as usize), &bytes);
-            self.patch_point(NativeCode(point as usize), chain::NOP5);
+            self.patch_native(NativeCode(linking.rest_at as usize), &linking.rest);
+            self.patch_point(NativeCode(point as usize), linking.point);
             record.set_linked(position, true, true);
             self.statistics.links += 1;
             return true;

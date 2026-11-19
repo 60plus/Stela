@@ -319,13 +319,13 @@ impl Program {
                 }
                 let at = block.at + exit.offset as u64 - slot as u64;
                 let retired = block.instructions - u32::from(exit.skipped);
-                let (body, bytes) = link(at, slot, retired, target as u32, blocks[target].at)
+                let linking = link(at, slot, retired, target as u32, blocks[target].at)
                     .expect("a link in reach");
                 let offset = |address: u64| (address - arena.at(0)) as usize;
-                arena.write(offset(body), &bytes);
+                arena.write(offset(linking.rest_at), &linking.rest);
                 let point = slot_patch(at);
                 assert!(patchable(point));
-                arena.write(offset(point), &NOP5);
+                arena.write(offset(point), &linking.point);
             }
         }
         // The entry: the pinned registers loaded around a jump to the

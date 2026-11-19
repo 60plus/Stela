@@ -28,11 +28,11 @@
 //! instruction, so the host replaces it with one aligned 8-byte store, and
 //! the core runs either the old instruction or the new one, each complete:
 //! the jump to the exit's return to the engine ([`RET_ROOM`]) or a
-//! `jmp rel32` to a thunk or tail at an exit, a jump to the exit or
-//! [`NOP5`] into the slot's body at a slot. Whatever a new instruction
-//! reaches is written, and serialized by the writer, before the store: a
-//! thunk or tail in fresh arena bytes, or a slot's body, which nothing runs
-//! while its point still jumps over it. A body once linked is not written
+//! `jmp rel32` to a thunk or tail at an exit, a jump to the exit or the
+//! first bytes of the slot's body at a slot ([`link`]). Whatever a new
+//! instruction reaches is written, and serialized by the writer, before the
+//! store: a thunk or tail in fresh arena bytes, or the rest of a slot's
+//! body, which nothing runs while its point still jumps over it. A body once linked is not written
 //! again, as a core may still be in it after an unlink; a later link of its
 //! exit takes a thunk. Code is emitted unpadded and padded where it lands
 //! ([`align_direct_exit`]), as exits move with the code before them.
@@ -99,7 +99,8 @@ pub const DIRECT_EXIT_BYTES: usize = 10 + DYNAMIC_EXIT_BYTES;
 /// direct exit before the code is reachable.
 pub const JUMP_BYTES: usize = 5;
 /// Bytes of the one instruction a live patch changes ([`patchable`]): a
-/// `jmp rel32`, or the [`RET_ROOM`] or [`NOP5`] it replaces.
+/// `jmp rel32`, the [`RET_ROOM`] it replaces, or the first bytes of a link
+/// slot's body ([`link`]).
 pub const PATCH_BYTES: usize = JUMP_BYTES;
 /// The most NOP bytes before a patch point that keep its instruction in
 /// one aligned 8-byte word ([`patch_pad`]).
@@ -113,10 +114,10 @@ const REFUND_BYTES: usize = 7;
 /// `mov edx` and [`EXIT_RETURN`].
 pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + REFUND_BYTES + 5 + EXIT_RETURN_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
-/// pad, the patch point, the body and the refund, without and with the
-/// gate.
-pub const LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + LINK_BODY_BYTES + REFUND_BYTES;
-pub const POLLED_LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + POLLED_LINK_BODY_BYTES + REFUND_BYTES;
+/// pad, the body, which starts at the patch point, and the refund, without
+/// and with the gate.
+pub const LINK_BYTES: usize = MAX_PAD + LINK_BODY_BYTES + REFUND_BYTES;
+pub const POLLED_LINK_BYTES: usize = MAX_PAD + POLLED_LINK_BODY_BYTES + REFUND_BYTES;
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
 /// Bytes in an exit to a dynamic target in RAX: `mov edx, kind`, a pad,
@@ -147,7 +148,15 @@ pub const EXIT_RSP_STORE: [u8; 12] = {
 /// An unlinked exit's patch point: a `jmp rel32` to the [`EXIT_RETURN`]
 /// right after it.
 pub const RET_ROOM: [u8; PATCH_BYTES] = [0xe9, 0, 0, 0, 0];
-/// A linked slot's patch point: the 5-byte NOP that falls into its body.
+/// A linked slot's patch point ([`link`]): the first bytes of its body's
+/// first instruction, `mov rcx, [rdi + anchors + 8 * Control]`, the same
+/// in every slot.
+pub const LINKED_SLOT: [u8; PATCH_BYTES] = {
+    let anchor = core::mem::offset_of!(crate::GuestState, anchors) + Anchor::Control as usize * 8;
+    let d = (anchor as u32).to_le_bytes();
+    [0x48, 0x8b, 0x8f, d[0], d[1]]
+};
+/// The 5-byte NOP (Intel SDM vol. 2, NOP).
 pub const NOP5: [u8; PATCH_BYTES] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 /// The bits of a PC above which [`lookup_slot`] folds the next ones in:
 /// what selects an entry of the largest block table.
@@ -2495,23 +2504,26 @@ pub fn unlinked(site: u64, slot: usize) -> Option<(u64, [u8; PATCH_BYTES])> {
     }
 }
 
-/// The body of the link in the slot of `bytes` at host address `at`, and
-/// where it goes: right after the slot's patch point, which then becomes
-/// [`NOP5`] to fall into it. It chains a block of `retired` instructions
+/// The link in the slot of `bytes` at host address `at`: its body starts
+/// at the slot's patch point, whose instruction becomes the first bytes of
+/// the body's, the control's load. A link writes the
+/// body's bytes past the point first ([`SlotLink::rest`]), which nothing
+/// runs while the point jumps over them, then the point's
+/// ([`SlotLink::point`]). The body chains a block of `retired` instructions
 /// into block `block`, whose code is at `entry`, or goes to the exit after
 /// the slot when the control allows no transfer. `None` when `entry` is out
 /// of a 32-bit jump's reach, an operand exceeds its 32-bit field or `bytes`
 /// is no slot.
-pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Option<(u64, Vec<u8>)> {
+pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Option<SlotLink> {
     let polled = match bytes {
         LINK_BYTES => false,
         POLLED_LINK_BYTES => true,
         _ => return None,
     };
-    let body = slot_patch(at) + PATCH_BYTES as u64;
+    let point = slot_patch(at);
     let exit = at + bytes as u64;
     let code = link_body(
-        body,
+        point,
         polled,
         retired,
         block,
@@ -2519,8 +2531,35 @@ pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Opti
         Fall::After(exit),
         Interruption::Epoch,
     )?;
-    debug_assert!(body + code.len() as u64 <= exit);
-    Some((body, code))
+    debug_assert_eq!(point + code.len() as u64, exit);
+    let (first, rest) = code.split_at(PATCH_BYTES);
+    debug_assert_eq!(first, LINKED_SLOT);
+    Some(SlotLink {
+        point: first.try_into().ok()?,
+        rest_at: point + PATCH_BYTES as u64,
+        rest: rest.to_vec(),
+    })
+}
+
+/// A slot's [`link`]: the bytes past its patch point, written first, and
+/// the point's instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLink {
+    /// What the patch point becomes: the first bytes of the body's first
+    /// instruction, whose others start [`Self::rest`].
+    pub point: [u8; PATCH_BYTES],
+    /// The host address right after the point, where `rest` goes.
+    pub rest_at: u64,
+    pub rest: Vec<u8>,
+}
+
+impl SlotLink {
+    /// The body whole, from the patch point.
+    pub fn body(&self) -> Vec<u8> {
+        let mut body = self.point.to_vec();
+        body.extend(&self.rest);
+        body
+    }
 }
 
 /// Where a link's body goes when the control allows no transfer.
@@ -4073,15 +4112,24 @@ mod tests {
                 let (undone, jump_back) = unlinked(site, slot).unwrap();
                 assert_eq!(undone, point);
                 assert_eq!(code[offset..offset + PATCH_BYTES], jump_back);
-                let (body, bytes) = link(at, slot, 3, 7, 0x10_8000).unwrap();
-                assert_eq!(body, point + PATCH_BYTES as u64);
-                let start = (body - at) as usize;
-                assert!(start + bytes.len() <= slot);
+                let linking = link(at, slot, 3, 7, 0x10_8000).unwrap();
+                assert_eq!(linking.rest_at, point + PATCH_BYTES as u64);
+                let start = (linking.rest_at - at) as usize;
+                // The body fills the slot from its point to the exit.
+                assert_eq!(start + linking.rest.len(), slot);
+                // The point's instruction is the first of the body's, the
+                // control's load, whose bytes go on past the point.
+                let mut first = Code::new();
+                first.asm().place(Rcx, CONTROL);
+                let first = first.into_bytes();
+                assert!(first.len() > PATCH_BYTES);
+                assert_eq!(linking.body()[..first.len()], first);
+                assert_eq!(linking.point, LINKED_SLOT);
                 // The body's every way out of the slot: the target, or the
                 // exit right after it.
                 let mut linked = code.clone();
-                linked[start..start + bytes.len()].copy_from_slice(&bytes);
-                linked[offset..offset + PATCH_BYTES].copy_from_slice(&NOP5);
+                linked[start..start + linking.rest.len()].copy_from_slice(&linking.rest);
+                linked[offset..offset + PATCH_BYTES].copy_from_slice(&linking.point);
                 assert_eq!(linked[slot..], code[slot..]);
                 // An exit without a slot is patched at its RET.
                 let (exit_point, ret) = unlinked(site, 0).unwrap();
