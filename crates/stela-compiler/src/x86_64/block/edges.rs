@@ -168,6 +168,30 @@ impl Region {
         true
     }
 
+    /// The loop that starts at `at` and that a run of locals can cover
+    /// alone: the last row of its back edges to `at`, when only the
+    /// fallthrough into `at` enters it (or `at` is the entry) and no edge
+    /// leaves it for another row of the region, so that the run is entered
+    /// once before its landing and left where the loop falls out of its
+    /// last branch; its exits are side exits, which store the locals.
+    pub(in crate::x86_64) fn inner_loop(&self, at: usize) -> Option<usize> {
+        let edges = || {
+            self.internal
+                .iter()
+                .enumerate()
+                .filter_map(|(row, to)| Some((row, (*to)?)))
+                .chain(self.terminal.map(|to| (self.rows - 1, to)))
+        };
+        let last = edges()
+            .filter(|&(row, to)| to == at && row >= at)
+            .map(|(row, _)| row)
+            .max()?;
+        let inside = |row: usize| (at..=last).contains(&row);
+        edges()
+            .all(|(row, to)| inside(row) == inside(to) && (!inside(row) || to > row || to == at))
+            .then_some(last)
+    }
+
     /// The bound a back edge to `to` compares L with: it jumps while L is
     /// less ([`Self`]'s module).
     fn limit(&self, to: usize) -> i32 {

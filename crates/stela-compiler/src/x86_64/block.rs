@@ -733,8 +733,10 @@ fn emit_selected(
         None => vec![],
     };
     let mut carried = vec![];
-    // Whether one run covers a self-loop's body ([`pinned::Span::plan_loop`]).
+    // Whether one run covers a self-loop's body ([`pinned::Span::plan_loop`]),
+    // a region or, `inner_loop`, one of the region's loops.
     let mut loop_run = false;
+    let mut inner_loop = false;
     // Guest vectors stay in host registers between the instructions that
     // only compute ([`super::vector_cache`]): in system-mode blocks, whose
     // faults the fault table settles from the state block the cache keeps
@@ -874,7 +876,40 @@ fn emit_selected(
                     && let Some((active, _)) = run.take()
                 {
                     active.leave(code);
+                    if core::mem::take(&mut inner_loop) {
+                        // The loop fell out of its last branch.
+                        loop_run = false;
+                        next_pinned_span = cursor;
+                    }
                 }
+            }
+            // A loop of the region that one run can cover: its locals are
+            // loaded before its landing and stay in their hosts across its
+            // back edges ([`edges::Region::inner_loop`]).
+            if let Some(region) = &region
+                && runs
+                && run.is_none()
+                && region.landing[cursor]
+                && let Some(last) = region.inner_loop(cursor)
+                && let body = &instructions[cursor..(last + 1).min(instructions.len())]
+                && let Some(plan) = super::pinned::Span::plan_loop(body)
+            {
+                if plan.takes_slots() {
+                    bases.reset();
+                }
+                let mut active = plan.enter_all(code);
+                // Each counts as written from the start, as over a region.
+                active.emitted(code, body);
+                let end = if last < instructions.len() {
+                    last + 1
+                } else {
+                    usize::MAX
+                };
+                run = Some((active, end));
+                run_emitted = cursor;
+                next_pinned_span = usize::MAX;
+                loop_run = true;
+                inner_loop = true;
             }
             // An edge lands here: after any run ended, before one starts.
             if let Some(region) = &region

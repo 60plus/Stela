@@ -221,6 +221,31 @@ fn programs() -> Vec<Program> {
             },
         },
         Program {
+            name: "copy loop after a preheader no run takes, ending at a zero",
+            words: vec![
+                0x9e67_0061, //    fmov d1,x3
+                0xb400_00c2, //    cbz x2,2f
+                0xa8c1_2428, // 1: ldp x8,x9,[x1],#16
+                0xb400_00c9, //    cbz x9,3f
+                0xa881_2408, //    stp x8,x9,[x0],#16
+                0xf100_0442, //    subs x2,x2,#1
+                0x54ff_ff81, //    b.ne 1b
+                0x9100_054a, // 2: add x10,x10,#1
+                0xd400_0001, //    svc #0
+                0xaa09_03ec, // 3: mov x12,x9
+            ],
+            setup: |rng, base, state, data| {
+                state.x[1] = base + 16 * rng.below(PAGE / 8);
+                state.x[0] = base + 16 * rng.below(PAGE / 8);
+                state.x[2] = rng.below(PAGE / 4);
+                for word in data.as_chunks_mut::<8>().0 {
+                    if rng.below(64) == 0 {
+                        *word = [0; 8];
+                    }
+                }
+            },
+        },
+        Program {
             name: "products the engine completes",
             words: vec![
                 0xf840_8408, // 1: ldr x8,[x0],#8
