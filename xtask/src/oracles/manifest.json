@@ -4702,6 +4702,14 @@
     "reason": "host timing report of a Poll answered from the published serial against one that takes the turn and asks the mock device; a measurement, not a check; run on request"
   },
   {
+    "package": "stela-driver-gpu",
+    "test": "bench_compositor_commit_replay",
+    "source": "crates/stela-driver-gpu/src/metal/service/tests/commands.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing report of replaying a compositor-shaped Commit per command buffer and per draw over the mock backend; a measurement, not a check; run on request in release"
+  },
+  {
     "package": "stela-compiler",
     "test": "sve_merge_costs",
     "source": "crates/stela-compiler/src/x86_64/sve/integer_bits/tests/costs.rs",
