@@ -388,7 +388,11 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
             }
             return Ok(());
         }
-        self.machine.register_written(register);
+        if layout(register) {
+            self.machine.layout_written();
+        } else {
+            self.machine.register_written(register);
+        }
         if table_base(register) {
             if self.translation == Translation::Unchanged {
                 self.translation = Translation::TableBase;
@@ -396,6 +400,10 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
         } else if sctlr && (before ^ self.machine.cpu.read(register)) & mmu::SCTLR_TRANSLATION == 0
         {
             self.regime = true;
+        } else if layout(register) {
+            if self.translation == Translation::Unchanged {
+                self.translation = Translation::Layout;
+            }
         } else if translates(register) {
             self.translation = Translation::All;
         }

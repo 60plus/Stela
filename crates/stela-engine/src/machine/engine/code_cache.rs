@@ -479,6 +479,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.permissions_changed();
     }
 
+    /// TCR changed the layout of translation ([`Self::layout_written`]):
+    /// everything that translates goes, as after any control: fetch
+    /// translations, lookup contexts, the code page and device reads, and
+    /// the host's shadow follows the new controls.
+    pub(super) fn layout_changed(&mut self) {
+        self.advance_translation_generation();
+        self.statistics.translation_changes += 1;
+        self.sync_host_regime(step_timing::SyncSource::Translation);
+    }
+
     /// Translation changed, but nothing derived from System registers:
     /// an SPRR_PERM write, which XNU makes around its writes to protected
     /// data and at thread switches, thousands of times a second.

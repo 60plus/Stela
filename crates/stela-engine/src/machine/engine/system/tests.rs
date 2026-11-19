@@ -1722,6 +1722,62 @@ fn mirrored_cells_open_exactly_on_the_plain_reads() {
     );
 }
 
+/// A TCR write that changes the layout of translation keeps every open
+/// mirrored-read cell exactly as the engine's own read after it opens it
+/// again, in every context where the write completes; what translates goes.
+/// Before, the write closed every cell, and each register native code then
+/// read took an exit to open its cell again.
+#[test]
+fn layout_writes_keep_exactly_the_cells_reads_open_again() {
+    use super::super::{COUNT_MIRRORS, COUNTER_MIRRORS, MIRRORED};
+    const TCR_EL1: Encoding = Encoding::new(3, 0, 2, 0, 2);
+    const TBI0: u64 = 1 << 37;
+    let mut kept = 0;
+    let mut written = 0;
+    native_completion_contexts(|machine, pstate, case| {
+        let read_all = |machine: &mut TestMachine| {
+            for &encoding in &MIRRORED {
+                machine.cpu.pstate = pstate;
+                machine.cpu.pc = BASE;
+                let _ = machine.system_instruction(access(true, encoding, 1));
+            }
+            machine.cpu.pstate = pstate;
+            machine.cpu.pc = BASE;
+        };
+        read_all(machine);
+        let (translations, devices) = (
+            machine.translation_generation,
+            machine.device_read_generation,
+        );
+        machine.cpu.state.x[0] = machine.cpu.regime_tcr() ^ TBI0;
+        let exceptions = machine.statistics.exceptions;
+        let Ok(()) = machine.system_instruction(access(false, TCR_EL1, 0)) else {
+            return;
+        };
+        if (machine.cpu.pstate.el, machine.cpu.pc) != (pstate.el, BASE + 4)
+            || machine.statistics.exceptions != exceptions
+        {
+            return;
+        }
+        written += 1;
+        assert!(machine.translation_generation > translations, "{case}");
+        assert!(machine.device_read_generation > devices, "{case}");
+        let after = *machine.mirrors;
+        read_all(machine);
+        for index in 0..MIRRORED.len() {
+            let (cell, again) = (after[index], machine.mirrors[index]);
+            // The counts' cells hold what time moves; their plainness stays.
+            if COUNT_MIRRORS.contains(&index) || COUNTER_MIRRORS.contains(&index) {
+                assert_eq!(cell.readable, again.readable, "{case} {index}");
+            } else {
+                assert_eq!(cell, again, "{case} {index}");
+            }
+            kept += usize::from(cell.readable != 0);
+        }
+    });
+    assert!(written > 0 && kept > 0, "{written} {kept}");
+}
+
 #[test]
 fn rmr_el2_resets_into_aarch64_and_a_warm_reset_needs_a_reset_vector() {
     const RMR_EL2: Encoding = Encoding::new(3, 4, 12, 0, 2);

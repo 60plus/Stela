@@ -356,7 +356,9 @@ pub const PATH_EVERY: u32 = 64;
 /// exception, the run loop left); within the traced services, the host's
 /// regime syncs and prediction isolations; and every change of derived
 /// state that closed every mirror cell, with the open cells it closed, each
-/// of which costs an exit to open again where code reaches it.
+/// of which costs an exit to open again where code reaches it; and the TCR
+/// writes that kept them (`Machine::layout_written`), with the open cells
+/// they kept.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExitPaths {
     pub traced: u64,
@@ -368,6 +370,8 @@ pub struct ExitPaths {
     pub isolation_ticks: u64,
     pub closes: u64,
     pub cells_closed: u64,
+    pub layouts: u64,
+    pub cells_kept: u64,
 }
 
 impl ExitPaths {
@@ -384,6 +388,8 @@ impl ExitPaths {
         self.isolation_ticks += other.isolation_ticks;
         self.closes += other.closes;
         self.cells_closed += other.cells_closed;
+        self.layouts += other.layouts;
+        self.cells_kept += other.cells_kept;
     }
 }
 

@@ -55,6 +55,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.timed_closed |= self.timed_word.is_some();
     }
 
+    /// A TCR write changed the layout of translation
+    /// (`system::layout`): what derives from System registers goes, the
+    /// transition records and PAC's layout with it, but the mirror cells
+    /// stay, as no System register access traps on TCR or reads a value
+    /// derived from it. What translates goes after it
+    /// ([`Self::layout_changed`]).
+    pub(super) fn layout_written(&mut self) {
+        self.forget_derived();
+        self.device_lines = None;
+        if self.step_timing.is_some() {
+            let paths = &mut self.system_exits.paths;
+            paths.layouts += 1;
+            paths.cells_kept += self.mirrors.open_cells();
+        }
+    }
+
     /// An exception entry or return, GENTER or GEXIT moved the PE to another
     /// EL or GXF state: what derives from PSTATE goes, but the mirrored reads
     /// keep their cells per state ([`Self::cells_moved`]).

@@ -280,9 +280,10 @@ fn system_total_report(
 /// to `total`, and at the end of a [`HOT_TOTAL_BEATS`] stretch write
 /// `PES EXIT PATH`: the exits traced and abandoned, the mean ns of each
 /// segment and their total, the traced services' host regime syncs and
-/// prediction isolations (per 100 traced exits, and ns each), and the
-/// changes of derived state that closed every mirror cell with the open
-/// cells each closed; then start over.
+/// prediction isolations (per 100 traced exits, and ns each), the changes
+/// of derived state that closed every mirror cell with the open cells each
+/// closed, and the TCR writes that kept them with the open cells each kept;
+/// then start over.
 fn exit_path_report(
     total: &mut step_timing::ExitPaths,
     paths: &step_timing::ExitPaths,
@@ -308,13 +309,15 @@ fn exit_path_report(
     }
     let each = |ticks: u64, count: u64| nanos(ticks) / u128::from(count.max(1));
     line.push_str(&format!(
-        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={}",
+        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={} layouts={} kept_each={}",
         u128::from(total.syncs) * 100 / traced,
         each(total.sync_ticks, total.syncs),
         u128::from(total.isolations) * 100 / traced,
         each(total.isolation_ticks, total.isolations),
         total.closes,
         total.cells_closed / total.closes.max(1),
+        total.layouts,
+        total.cells_kept / total.layouts.max(1),
     ));
     output::arguments(format_args!("{line}\n"));
     *total = step_timing::ExitPaths::default();
