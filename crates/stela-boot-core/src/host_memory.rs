@@ -246,6 +246,40 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     Err(Shortfall { free, needed }.refusal())
 }
 
+/// [`sizes`] on a host where the translation pack left `room` of its
+/// budget ([`pack_budget`]) unused: a pack read on demand holds its index
+/// and the records a boot asks for, not every record. The room goes to
+/// the code budget (the window and its block records, a byte each) instead
+/// of the pack: a larger window keeps more of a sign-in's code, which the
+/// pack served back after each eviction. The other parts and the guest get
+/// what they got while the pack held its budget.
+pub fn sizes_with_room(free: u64, cores: usize, runners: usize, room: u64) -> Result<Sizes> {
+    match sizes(free.saturating_sub(room), cores, runners) {
+        Ok(sizes) => Ok(give_room(sizes, room)),
+        Err(_) => sizes(free, cores, runners),
+    }
+}
+
+/// `sizes`, with `room` beside them given to the window and its records.
+fn give_room(sizes: Sizes, room: u64) -> Sizes {
+    let window = sizes.code.window;
+    let grown = (room / (1 + HEAP_PER_WINDOW)).min(MAX_WINDOW.saturating_sub(window))
+        / CODE_ALIGNMENT
+        * CODE_ALIGNMENT;
+    if grown == 0 {
+        return sizes;
+    }
+    Sizes {
+        heap: sizes.heap + HEAP_PER_WINDOW * grown,
+        code: CodeReservation {
+            bytes: sizes.code.bytes + grown,
+            window: window + grown,
+            ..sizes.code
+        },
+        ..sizes
+    }
+}
+
 /// One budget for compiled code, the window's first: the window, its
 /// block records ([`HEAP_PER_WINDOW`]) and the code kept beside it in the
 /// heap (a [`CODE_SHARE`]th of the heap for blocks and stored forms, a

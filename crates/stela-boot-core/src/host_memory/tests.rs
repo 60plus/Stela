@@ -639,3 +639,52 @@ fn small_hosts_move_their_kept_code_into_the_window() {
         );
     }
 }
+
+#[test]
+fn a_pack_read_on_demand_gives_its_room_to_the_window_and_the_guest_keeps_its_floor() {
+    // The index of a whole footprint's pack: 175 thousand records.
+    const INDEX: u64 = 9 * MIB;
+    for (gib, cores) in [(8, 8), (12, 8), (16, 8), (32, 16)] {
+        let free = free(gib);
+        let budget = pack_budget(free, cores, cores);
+        // Before: the pack held its budget, measured off the free RAM.
+        let before = sizes(free - budget - PACK_MARGIN, cores, cores).unwrap();
+        let after = sizes_with_room(
+            free - INDEX - PACK_MARGIN,
+            cores,
+            cores,
+            budget.saturating_sub(INDEX),
+        )
+        .unwrap();
+        std::println!(
+            "ROOM {gib} GiB: pack {}M window {}M -> {}M guest {}M -> {}M",
+            budget / MIB,
+            before.code.window / MIB,
+            after.code.window / MIB,
+            before.guest / MIB,
+            after.guest / MIB
+        );
+        assert!(after.guest >= GUEST_FLOOR, "{gib} GiB: {after:?}");
+        assert!(after.code.window >= before.code.window, "{gib} GiB");
+        assert!(after.code.window <= MAX_WINDOW);
+        assert_eq!(after.code.window % CODE_ALIGNMENT, 0);
+        // The guest keeps what it had, within the window's alignment.
+        assert!(
+            after.guest + 2 * CODE_ALIGNMENT >= before.guest,
+            "{gib} GiB: {before:?} {after:?}"
+        );
+        // The window grows by about half the room, up to the most a window
+        // takes.
+        assert!(
+            after.code.window >= (before.code.window + budget / 3).min(MAX_WINDOW),
+            "{gib} GiB: {before:?} {after:?}"
+        );
+        assert_eq!(after.pool, before.pool);
+    }
+    // No room, no change.
+    let free = free(12);
+    assert_eq!(
+        sizes_with_room(free, 8, 8, 0).unwrap(),
+        sizes(free, 8, 8).unwrap()
+    );
+}
