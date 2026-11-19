@@ -5072,20 +5072,20 @@
     "reason": "host timing of transfers from sites of two random targets through their lookup and predicted tails; run on request"
   },
   {
-    "package": "stela-driver-gpu",
-    "test": "bench_compositor_commit_replay",
-    "source": "crates/stela-driver-gpu/src/metal/service/tests/commands.rs",
-    "kind": "manual",
-    "inputs": [],
-    "reason": "host timing of a replayed compositor commit through the service; run on request"
-  },
-  {
     "package": "stela-engine",
     "test": "sign_in_replay_on_the_real_ring",
     "source": "crates/stela-engine/src/machine/engine/board/replay.rs",
     "kind": "manual",
     "inputs": [],
     "reason": "prints the table of the sign-in replays on the real ring; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "ahead_prepared_and_used",
+    "source": "crates/stela-engine/src/machine/engine/ahead/model.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host model of what translation ahead prepares and what of it runs, over a pack named by AHEAD_PACK and a shared cache named by AHEAD_DSC; run on request"
   },
   {
     "package": "stela-engine",

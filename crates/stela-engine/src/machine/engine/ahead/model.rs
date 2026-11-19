@@ -177,7 +177,7 @@ struct Tally {
 }
 
 #[test]
-#[ignore = "a model run by hand over a pack and a shared cache"]
+#[ignore = "manual: opt-in"]
 fn ahead_prepared_and_used() {
     let pack_path = std::env::var("AHEAD_PACK").expect("AHEAD_PACK");
     let cache = Cache::open(&std::env::var("AHEAD_DSC").expect("AHEAD_DSC"));
