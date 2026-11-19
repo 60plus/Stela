@@ -1705,6 +1705,8 @@ _Static_assert(STELA_METAL_DIRTY_TILE_SHIFT == STELA_AIR_DIRTY_TILE_SHIFT &&
                STELA_METAL_DIRTY_LAYER == STELA_AIR_DIRTY_LAYER &&
                STELA_METAL_DIRTY_TILE == 1u << STELA_METAL_DIRTY_TILE_SHIFT,
                "the dirty tiles the compiler marks are the ones the load kernel reads");
+_Static_assert(STELA_METAL_KERNEL_WORKGROUP == STELA_METAL_DIRTY_TILE,
+               "a workgroup is one dirty tile's columns, which stop together when it is clean");
 
 /* Encodes the working image's texel at coord into an IOSurface's planes, at
  * address and alpha (zero for none), where its codes or alpha differ from
@@ -1755,11 +1757,13 @@ static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def 
    nir_pop_if(b, NULL);
 }
 
-/* A load given the pass's stamp: thread n converts texel n % 64 of row
- * n / 64 % 64 of tile n / 4096 of the region, when the dirty layer holds
- * the stamp at the tile: a workgroup is a row of a tile, so a clean tile's
- * threads only read that texel, and a dirty tile's convert its texels
- * side by side rather than row after row. */
+/* A load given the pass's stamp: thread n is column n % 64 of tile n / 64
+ * of the region, so a workgroup is a tile. Where the dirty layer holds the
+ * stamp at the tile, each thread converts its column's texels row after
+ * row, the workgroup a row's side by side; a clean tile's threads read the
+ * mark once and stop. An encode then runs a workgroup a tile rather than
+ * one a tile's row, which on a GPU of few cores cost as much as the dirty
+ * tiles' conversion. */
 static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *stamp)
 {
    nir_def *arguments = t->arguments;
@@ -1773,9 +1777,7 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
       origin[i] = load(b, arguments, STELA_METAL_TEXELS_ORIGIN + 4 * i, 32);
    nir_def *tiles_x = nir_ushr_imm(b, nir_iadd_imm(b, width, STELA_METAL_DIRTY_TILE - 1),
                                    STELA_METAL_DIRTY_TILE_SHIFT);
-   nir_def *tile = nir_ushr_imm(b, t->thread, 2 * STELA_METAL_DIRTY_TILE_SHIFT);
-   nir_def *row = nir_iand_imm(b, nir_ushr_imm(b, t->thread, STELA_METAL_DIRTY_TILE_SHIFT),
-                               STELA_METAL_DIRTY_TILE - 1);
+   nir_def *tile = nir_ushr_imm(b, t->thread, STELA_METAL_DIRTY_TILE_SHIFT);
    nir_def *lane = nir_iand_imm(b, t->thread, STELA_METAL_DIRTY_TILE - 1);
    nir_def *ty = nir_udiv(b, tile, tiles_x);
    nir_def *tx = nir_isub(b, tile, nir_imul(b, ty, tiles_x));
@@ -1790,21 +1792,36 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
                                                         .format = PIPE_FORMAT_NONE,
                                                         .dest_type = nir_type_uint32), 0);
    nir_def *x = nir_iadd(b, nir_ishl_imm(b, tx, STELA_METAL_DIRTY_TILE_SHIFT), lane);
-   nir_def *y = nir_iadd(b, nir_ishl_imm(b, ty, STELA_METAL_DIRTY_TILE_SHIFT), row);
-   nir_def *inside = nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height));
-   nir_push_if(b, nir_iand(b, nir_ieq(b, mark, stamp), inside));
-   for (unsigned e = STELA_METAL_TEXELS_XR10_PLANES; e <= STELA_METAL_TEXELS_XR10_PLANES_SRGB; e++) {
-      nir_push_if(b, nir_ieq_imm(b, t->encoding, e));
-      nir_def *coord = nir_vec4(b, nir_iadd(b, origin[0], x), nir_iadd(b, origin[1], y),
-                                origin[2], nir_imm_int(b, 0));
-      nir_def *address = nir_iadd(b, t->buffer,
-                                  nir_u2u64(b, nir_iadd(b, nir_imul(b, y, row_bytes),
-                                                        nir_ishl_imm(b, x, 2))));
-      nir_def *alpha_at = nir_bcsel(
-         b, nir_ieq_imm(b, alpha, 0), alpha,
-         nir_iadd(b, alpha, nir_u2u64(b, nir_iadd(b, nir_imul(b, y, alpha_row), x))));
-      encode_planes_texel(b, t, coord, address, alpha_at, e == STELA_METAL_TEXELS_XR10_PLANES_SRGB);
-      nir_pop_if(b, NULL);
+   nir_def *top = nir_ishl_imm(b, ty, STELA_METAL_DIRTY_TILE_SHIFT);
+   nir_push_if(b, nir_iand(b, nir_ieq(b, mark, stamp),
+                           nir_iand(b, nir_ult(b, x, width), nir_ult(b, top, height))));
+   {
+      nir_def *rows = nir_umin(b, nir_isub(b, height, top), nir_imm_int(b, STELA_METAL_DIRTY_TILE));
+      nir_variable *row_variable = nir_local_variable_create(b->impl, glsl_uint_type(), "row");
+      nir_store_var(b, row_variable, nir_imm_int(b, 0), 1);
+      nir_push_loop(b);
+      {
+         nir_def *row = nir_load_var(b, row_variable);
+         nir_break_if(b, nir_uge(b, row, rows));
+         nir_def *y = nir_iadd(b, top, row);
+         for (unsigned e = STELA_METAL_TEXELS_XR10_PLANES; e <= STELA_METAL_TEXELS_XR10_PLANES_SRGB;
+              e++) {
+            nir_push_if(b, nir_ieq_imm(b, t->encoding, e));
+            nir_def *coord = nir_vec4(b, nir_iadd(b, origin[0], x), nir_iadd(b, origin[1], y),
+                                      origin[2], nir_imm_int(b, 0));
+            nir_def *address = nir_iadd(b, t->buffer,
+                                        nir_u2u64(b, nir_iadd(b, nir_imul(b, y, row_bytes),
+                                                              nir_ishl_imm(b, x, 2))));
+            nir_def *alpha_at = nir_bcsel(
+               b, nir_ieq_imm(b, alpha, 0), alpha,
+               nir_iadd(b, alpha, nir_u2u64(b, nir_iadd(b, nir_imul(b, y, alpha_row), x))));
+            encode_planes_texel(b, t, coord, address, alpha_at,
+                                e == STELA_METAL_TEXELS_XR10_PLANES_SRGB);
+            nir_pop_if(b, NULL);
+         }
+         nir_store_var(b, row_variable, nir_iadd_imm(b, row, 1), 1);
+      }
+      nir_pop_loop(b, NULL);
    }
    nir_pop_if(b, NULL);
 }

@@ -2405,10 +2405,10 @@ fn marked_passes_encode_their_dirty_tiles() {
         width: 200,
         height: 70,
     };
-    // 4 x 2 tiles of 64, a thread for each of their texels.
+    // 4 x 2 tiles of 64, a thread for each of their columns.
     assert_eq!(
         record(whole, ResourceId(0x55)),
-        [(4 * 2 * 64 * 64, 7, [200, 70])]
+        [(4 * 2 * 64, 7, [200, 70])]
     );
     let part = ScissorRect {
         x: 8,
@@ -2610,6 +2610,12 @@ fn large_surface_encodes_copy_through_staging_memory() {
     assert_eq!(
         (counts.stamped, counts.stamped_tiles, counts.copied),
         (1, 64, 0)
+    );
+    // A workgroup of 64 threads a tile, each converting a column of its
+    // tile when the tile is marked: 64 tiles of 512 by 512.
+    assert!(
+        seen.iter()
+            .any(|seen| matches!(seen, Seen::Encode(threads, ..) if *threads == 64 * 64))
     );
     let aligned = crate::metal::pass::ExtendedPlanes {
         refreshes: [

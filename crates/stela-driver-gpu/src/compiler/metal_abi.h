@@ -81,8 +81,8 @@
  * the view, then for the two-plane extended-range encodings the address of
  * the alpha plane's first texel, or zero, its bytes per row, and the
  * pass's stamp (STELA_METAL_DIRTY_LAYER: nonzero, the region is the whole
- * image from its origin and thread n converts texel n % 64 of row
- * n / 64 % 64 of tile n / 4096 where the dirty layer holds the stamp), and the
+ * image from its origin and thread n converts column n % 64 of tile n / 64,
+ * row after row, where the dirty layer holds the stamp), and the
  * planes' mirror (STELA_METAL_TEXELS_MIRROR_*): the view's next layer
  * holds, per texel, the codes word and alpha byte the planes hold, which a
  * load compares to write only the texels that changed. */
