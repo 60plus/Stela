@@ -542,7 +542,17 @@ impl<'a> Writer<'a> {
         };
         let heap_eased = heap
             .is_none_or(|Heap { total, room }| room >= total / SHED_SHARE + total / RELEASE_SHARE);
-        self.pack_full = reason == Some(ShedReason::Pack);
+        // The pack stays full from reaching its share until it falls a
+        // sixteenth of the limit under it, as long as the store sheds for
+        // it: a merge of the boot's segments that takes it just under its
+        // share frees no room, and a refill (`refill_due`) must still run.
+        // Run 20261119-052839 shed with its pack at 550 of 566 MB and kept
+        // nothing new for the rest of the boot.
+        self.pack_full = match reason {
+            Some(ShedReason::Pack) => true,
+            Some(ShedReason::Heap) => false,
+            None => self.pack_full && pack >= left.saturating_sub(self.limit / 16),
+        };
         let keep = reason.is_none() && heap_eased && pack < left.saturating_sub(self.limit / 16);
         if let Some(reason) = reason
             && !self.shedding
