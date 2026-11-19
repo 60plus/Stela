@@ -462,7 +462,7 @@ impl ChainControl {
 
     /// The transfers still allowed, or `None` once one found none left.
     pub const fn remaining(&self) -> Option<u64> {
-        match (self.account as i64) >> ACCOUNT_SHIFT {
+        match (self.account.wrapping_sub(self.retired()) as i64) >> ACCOUNT_SHIFT {
             left if left < 0 => None,
             left => Some(left as u64),
         }
@@ -476,14 +476,23 @@ impl ChainControl {
         }
     }
 
-    /// The instructions of the blocks transfers left.
+    /// The instructions of the blocks transfers left, a signed count: a
+    /// self-loop's or region's settle before an exit may add less than
+    /// zero (`GuestState::loop_retired` short of the exit's rows), which
+    /// borrows a unit of the budget until the exit's rows come in. Bit 30
+    /// is the sign, as a run counts far fewer than 2^30 instructions; a
+    /// count below zero reads as its two's complement, which the rows the
+    /// engine adds for the exit complete, and the borrowed unit goes back
+    /// to [`Self::remaining`].
     pub const fn retired(&self) -> u64 {
-        self.account & ACCOUNT_RETIRED
+        const SIGN: u32 = u64::BITS - ACCOUNT_SHIFT;
+        (((self.account << SIGN) as i64) >> SIGN) as u64
     }
 
     /// Allow `budget` transfers, the instructions counted kept.
     pub fn set_budget(&mut self, budget: u64) {
-        self.account = Self::account_of(budget, self.retired());
+        debug_assert!(budget < 1 << 32);
+        self.account = (budget << ACCOUNT_SHIFT).wrapping_add(self.retired());
     }
 
     /// Count `retired` instructions, the budget kept: an exhausted one
@@ -2254,9 +2263,10 @@ fn refund(asm: &mut crate::x86_64::asm::Asm, ran: u32) {
     }
 }
 
-/// One transfer and no instructions, for a probe, whose block's
-/// instructions come in EDX and which adds them after: the jump of a
-/// transfer that found no budget left, which needs no [`refund`].
+/// One transfer for a probe, then the instructions of its block, which
+/// come in EDX above its word: `add qword [rcx], -ACCOUNT_TRANSFER`, whose
+/// sign sends the probe to [`owed_transfer`] by the jump this returns, then
+/// the instructions. Clobbers EDX on the way on.
 fn spend_transfer(
     asm: &mut crate::x86_64::asm::Asm,
     policy: Interruption,
@@ -2264,7 +2274,40 @@ fn spend_transfer(
     locked(asm, policy);
     // imm32 0x8000_0000, sign-extended: -ACCOUNT_TRANSFER.
     asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), i32::MIN);
-    asm.jcc(Cond::S)
+    let owed = asm.jcc(Cond::S);
+    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
+    locked(asm, policy);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    owed
+}
+
+/// Where a probe's [`spend_transfer`] goes when the account turned
+/// negative before its block's instructions came in, out of the hot path:
+/// a settle before the exit may have left the instructions part below zero
+/// ([`ChainControl::retired`]), which the instructions in EDX repay. They
+/// are added (EDX kept on the stack); a sum still negative found no budget
+/// left, so they come off again and the probe falls into its miss, which
+/// follows, with its word in EDX whole. Else the probe goes on at
+/// `counted`, where the transfer is counted.
+fn owed_transfer(
+    asm: &mut crate::x86_64::asm::Asm,
+    policy: Interruption,
+    owed: crate::x86_64::asm::Patch,
+    counted: usize,
+) {
+    asm.bind(owed);
+    asm.push(Rdx);
+    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
+    locked(asm, policy);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    let spent = asm.jcc8(Cond::S);
+    asm.pop(Rdx);
+    let back = asm.jmp();
+    asm.bind_back(back, counted);
+    asm.bind(spent);
+    locked(asm, policy);
+    asm.alu(Alu::Sub, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    asm.pop(Rdx);
 }
 
 fn locked(asm: &mut crate::x86_64::asm::Asm, policy: Interruption) {
@@ -2896,7 +2939,9 @@ pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Opti
     }
     misses.extend(interruption_gate(asm, Interruption::Epoch, R8));
     // Budget left: the account is past its instructions part. A return
-    // spends none, and counts the block's instructions.
+    // spends none, and counts the block's instructions. A count a settle
+    // left below zero ([`ChainControl::retired`]) reads as one unit less
+    // here, so the last unit takes the miss, whose exit counts exactly.
     asm.alu_imm32(
         Alu::Cmp,
         Qword,
@@ -3034,14 +3079,14 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.mov_load(Dword, R8, Mem::base(R10, ENTRY_BLOCK));
     asm.mov_load(Qword, R9, Mem::base(R10, ENTRY_CODE));
     misses.extend(seqlock_check(&mut asm, R10));
-    misses.push(spend_transfer(&mut asm, policy));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    let owed = spend_transfer(&mut asm, policy);
+    let counted = asm.len();
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     fill_jump_cache(&mut asm);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     found(&mut asm);
+    owed_transfer(&mut asm, policy, owed, counted);
     for miss in misses {
         asm.bind(miss);
     }
@@ -3114,15 +3159,15 @@ fn cell_probe(
     let unsampled = asm.jcc8(Cond::Ne);
     asm.mov_store(Qword, Mem::base(Rcx, SAMPLED), R10);
     asm.bind(unsampled);
-    misses.push(spend_transfer(&mut asm, policy));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    let owed = spend_transfer(&mut asm, policy);
+    let counted = asm.len();
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     if stamping {
         stamp(&mut asm);
     }
     found(&mut asm);
+    owed_transfer(&mut asm, policy, owed, counted);
     for miss in misses {
         asm.bind(miss);
     }
@@ -4527,6 +4572,27 @@ mod tests {
                 (TARGET, ExitKind::Return as u64)
             );
             assert_eq!((control.budget(), control.retired()), (u64::MAX, 12));
+            // A settle before the exit left the count 5 below zero, which
+            // borrowed the budget's unit: the probe's 9 instructions repay
+            // it, and the one transfer left is taken.
+            let hits = control.hits;
+            control.account = ChainControl::account_of(1, 0).wrapping_sub(5);
+            assert_eq!((control.budget(), control.retired()), (1, (-5i64) as u64));
+            assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
+            assert_eq!((control.budget(), control.retired()), (0, 4));
+            assert_eq!(control.hits, hits + 1);
+            control.hits = hits;
+            // With none left it exits, the count as it was.
+            control.account = ChainControl::account_of(0, 0).wrapping_sub(5);
+            assert_eq!(
+                exit(dynamic(frame, TARGET)),
+                (TARGET, ExitKind::Return as u64)
+            );
+            assert_eq!(
+                (control.budget(), control.retired()),
+                (u64::MAX, (-5i64) as u64)
+            );
+            control.set_retired(12);
             control.set_budget(5);
             // Another PC in the slot misses.
             let other = TARGET ^ (1 << (2 + LOOKUP_BITS) | 1 << 2);

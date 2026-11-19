@@ -180,11 +180,16 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, u64, Vec<u32>)>
                 core::slice::from_raw_parts(core::ptr::addr_of!(TRACE).cast::<u32>(), count);
             write(fds[1], (&raw const exit).cast(), 8);
             write(fds[1], (&raw const word).cast(), 8);
-            // ChainControl's retired count (its second word) and the loop's.
+            // The instructions ChainControl's account counts (its first
+            // word) and the loop's.
             let control = *(core::ptr::from_mut(state).cast::<u8>())
                 .add(core::mem::offset_of!(GuestState, anchors))
                 .cast::<*const u64>();
-            let retired = (*control.add(1)).wrapping_add(state.loop_retired);
+            let account = crate::x86_64::chain::ChainControl {
+                account: *control,
+                ..Default::default()
+            };
+            let retired = account.retired().wrapping_add(state.loop_retired);
             write(fds[1], (&raw const retired).cast(), 8);
             write(fds[1], (&raw const count).cast(), 8);
             let mut sent = 0;
