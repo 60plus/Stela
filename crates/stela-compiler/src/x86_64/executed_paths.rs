@@ -110,6 +110,11 @@ extern "sysv64" fn authenticated(_: *mut u8, _: u32, value: u64, _: u64) -> Pair
 }
 
 fn options() -> Options {
+    // As the engine's blocks; `REGIONS=0` compiles blocks alone.
+    options_with(std::env::var("REGIONS").map_or(true, |regions| regions != "0"))
+}
+
+fn options_with(regions: bool) -> Options {
     let checks = MemoryChecks::system(true, false, true, false)
         .with_range(RangeCheck::four_level(4).one_sided(true));
     let system = NativeSystem {
@@ -124,8 +129,7 @@ fn options() -> Options {
                 .then_some(CIPHER),
         }),
         self_loops: true,
-        // As the engine's blocks; `REGIONS=0` compiles blocks alone.
-        regions: std::env::var("REGIONS").map_or(true, |regions| regions != "0"),
+        regions,
         ..NativeSystem::NONE
     };
     Options::new(
@@ -292,6 +296,10 @@ fn executed_paths_of_real_blocks() {
     let mut out = std::fs::File::create(output).expect("the output");
     let options = options();
     let mut causes = census::Census::default();
+    // The causes in the blocks that compile as regions when regions are on,
+    // in this run's mode: the same code before and after.
+    let with_regions = options_with(true);
+    let mut region_causes = census::Census::default();
     // Weighted guest and host instructions of all blocks and of regions
     // (`CompiledBlock::region`), and the weight of each.
     let mut shares = [[0_f64; 3]; 2];
@@ -311,6 +319,11 @@ fn executed_paths_of_real_blocks() {
         let Ok(compiled) = plan.compile() else {
             continue;
         };
+        let shaped = compiled.region
+            || CompilationPlan::new(&source, GuestAddress(pc), &with_regions)
+                .ok()
+                .and_then(|plan| plan.compile().ok())
+                .is_some_and(|compiled| compiled.region);
         let body = &compiled.native.x86_64_code;
         let entry = crate::x86_64::pinned::entered(body);
         let body_offset = entry.len() - body.len();
@@ -421,13 +434,13 @@ fn executed_paths_of_real_blocks() {
         .unwrap();
         let weighted: f64 = weight.parse().unwrap_or(1.0);
         for (index, share) in shares.iter_mut().enumerate() {
-            if index == 0 || compiled.region {
+            if index == 0 || shaped {
                 share[0] += weighted * guest as f64;
                 share[1] += weighted * f64::from(inside + out_of_line);
                 share[2] += weighted;
             }
         }
-        causes.add(&census::Traced {
+        let traced = census::Traced {
             weight: weight.parse().unwrap_or(1),
             guest,
             pc,
@@ -436,12 +449,17 @@ fn executed_paths_of_real_blocks() {
             map,
             inline_end,
             runs: &runs,
-        });
+        };
+        causes.add(&traced);
+        if shaped {
+            region_causes.add(&traced);
+        }
     }
     let [all, regions] = shares;
     let table = format!(
-        "{}R regions weight={:.1}% guest={:.1}% host_per_guest={:.3} (all {:.3})\n",
+        "{}{}R regions weight={:.1}% guest={:.1}% host_per_guest={:.3} (all {:.3})\n",
         causes.table(),
+        region_causes.table().replace("T ", "RT "),
         100.0 * regions[2] / all[2].max(1.0),
         100.0 * regions[0] / all[0].max(1.0),
         regions[1] / regions[0].max(1.0),
