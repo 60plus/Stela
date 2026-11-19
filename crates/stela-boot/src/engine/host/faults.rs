@@ -257,6 +257,40 @@ pub(crate) fn page_fault(
     state.fault_ticks += rdtsc().wrapping_sub(entered);
 }
 
+/// The #PF gate's fill (`interrupts::stela_pf_gate`), before the handler
+/// saves any extended state: a fault from native code at `rip` that the
+/// shadow fills from the guest's tables returns true, filled. Every other
+/// outcome changes nothing it would not change again and returns false for
+/// the full handler ([`page_fault`]) to take the fault from the start. The
+/// target is soft-float, so this path leaves the guest's vector registers
+/// as the fault found them.
+pub(crate) fn gate_fill(error: u64, rip: u64, rflags: u64, address: u64) -> bool {
+    let entered = rdtsc();
+    if !in_code(state(), rip) {
+        return false;
+    }
+    super::pmu::fill_begin();
+    let filled = matches!(fill(error, rflags, address, entered), Filled::Done);
+    super::pmu::fill_end();
+    if filled {
+        let state = state();
+        state.faults += 1;
+        state.gate_fills += 1;
+        state.fault_ticks += rdtsc().wrapping_sub(entered);
+    }
+    filled
+}
+
+/// What [`fill`] came to.
+enum Filled {
+    /// The shadow maps the page, or nothing needed mapping.
+    Done,
+    /// The block ends with this cause.
+    End(FaultCause),
+    /// The shadow cannot map the page even after it was emptied.
+    Fatal,
+}
+
 /// [`abandon`] for a #PF, counted by its cause's class ([`ABANDONED`]).
 fn abandon_fault(
     state: &mut State,
@@ -283,8 +317,7 @@ fn fill_or_end(
     entered: u64,
 ) {
     let write = frame.error & 2 != 0;
-    let state = state();
-    if !in_code(state, frame.rip) {
+    if !in_code(state(), frame.rip) {
         // A client's mapping Linux moved: its refault may sleep, which only
         // the faulting context may do, never this handler.
         #[cfg(feature = "nvk")]
@@ -300,34 +333,46 @@ fn fill_or_end(
         super::super::gpu::client::note_stack_guard(address);
         super::super::interrupts::fatal(frame);
     }
+    match fill(frame.error, frame.rflags, address, entered) {
+        Filled::Done => {}
+        Filled::End(cause) => {
+            let state = state();
+            if matches!(cause, FaultCause::NonCanonical) {
+                state.guard_faults += u64::from(state.placement.in_guard(address));
+            }
+            abandon_fault(state, frame, address, write, cause, saved);
+        }
+        Filled::Fatal => super::super::interrupts::fatal(frame),
+    }
+}
+
+/// Fill the shadow for a #PF from native code at `address` with error
+/// code `error` and RFLAGS `rflags`, its handler entered at TSC `entered`,
+/// or say why not.
+fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
+    let write = error & 2 != 0;
+    let state = state();
     state.follow_native();
-    state.follow_pan(frame.rflags & RFLAGS_AC == 0);
+    state.follow_pan(rflags & RFLAGS_AC == 0);
     let Some(tag_checks) = state.regime.as_ref().map(|regime| regime.tag_checks) else {
-        super::super::interrupts::fatal(frame);
+        return Filled::Fatal;
     };
     // Only the native ranges are shadow; the rest is the engine's. An
     // access past a check an earlier one stood for may reach the guard
     // (`mmu::placement`): its own check finds where it goes.
     if !state.placement.native(address) {
-        state.guard_faults += u64::from(state.placement.in_guard(address));
-        return abandon_fault(
-            state,
-            frame,
-            address,
-            write,
-            FaultCause::NonCanonical,
-            saved,
-        );
+        return Filled::End(FaultCause::NonCanonical);
     }
     // The fault's own walk notes its leaf table; fault-around's walks of
     // the same window start there.
     let mut walk_table = None;
-    state.walks += 1;
     let (translation, host) =
         match resolve_recording(state, address, write, false, true, &mut walk_table) {
             Ok(resolved) => resolved,
-            Err(cause) => return abandon_fault(state, frame, address, write, cause, saved),
+            Err(cause) => return Filled::End(cause),
         };
+    let walked = rdtsc();
+    state.walks += 1;
     let rights = shadow_rights(state, &translation);
     let root = state.roots[state.root_of(state.current)];
     let virtual_page = address & !(PAGE - 1);
@@ -339,7 +384,7 @@ fn fill_or_end(
             span.widen(first, last)
         })
     {
-        return;
+        return Filled::Done;
     }
     state.pool.half = half;
     // A failed allocation can already have installed intermediate tables.
@@ -369,14 +414,14 @@ fn fill_or_end(
             state.legacy_translations_dirty = true;
             match tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights) {
                 Ok(slot) => slot,
-                Err(_) => super::super::interrupts::fatal(frame),
+                Err(_) => return Filled::Fatal,
             }
         }
     };
     // A not-present fault has no cached translation to invalidate. Every
     // shadow removal already invalidates that view or marks it stale.
     // A protection fault can replace a present mapping.
-    if frame.error & 1 != 0 {
+    if error & 1 != 0 {
         invlpg(virtual_page);
     }
     if half == LOWER {
@@ -394,7 +439,7 @@ fn fill_or_end(
     let view = state.root_of(state.current);
     let filled = state
         .history
-        .fill(half, space, virtual_page, view, frame.error & 1 != 0);
+        .fill(half, space, virtual_page, view, error & 1 != 0);
     state.fill_causes[filled.cause as usize] += 1;
     // The rest of the leaf's window has the same translation and rights:
     // map its RAM pages that are not watched now, as a TLB entry covers
@@ -403,7 +448,7 @@ fn fill_or_end(
     if tag_checks[half] && translation.attributes == mmu::attributes::TAGGED {
         state.fills += 1;
         state.fill_ticks += rdtsc().wrapping_sub(entered);
-        return;
+        return Filled::Done;
     }
     const { assert!(FILL_WINDOW.is_power_of_two() && FILL_WINDOW <= tables::LARGE) };
     let (first, last) = shadow::window(address, translation.size, FILL_WINDOW);
@@ -448,7 +493,8 @@ fn fill_or_end(
     // The window's other leaves, when the guest's are smaller than it. A
     // protection fault replaced a present page, whose neighbours its own
     // fill already mapped.
-    if frame.error & 1 == 0 {
+    let mapped_at = rdtsc();
+    if error & 1 == 0 {
         let table = slot.wrapping_sub(tables::index(virtual_page, 0));
         for beside in shadow::around(address, translation.size, FILL_WINDOW) {
             state.around += map_around(state, table, half, beside, &mut walk_table).unwrap_or(0);
@@ -469,8 +515,13 @@ fn fill_or_end(
             }
         }
     }
+    let done = rdtsc();
     state.fills += 1;
-    state.fill_ticks += rdtsc().wrapping_sub(entered);
+    state.fill_ticks += done.wrapping_sub(entered);
+    state.fill_segments[0] += walked.wrapping_sub(entered);
+    state.fill_segments[1] += mapped_at.wrapping_sub(walked);
+    state.fill_segments[2] += done.wrapping_sub(mapped_at);
+    Filled::Done
 }
 
 /// The shadow entry bits for `translation` in the current view. EL1 and

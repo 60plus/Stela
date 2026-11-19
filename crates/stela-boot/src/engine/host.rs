@@ -67,7 +67,7 @@ pub(crate) mod sampling;
 mod signals;
 pub use bare_host::BareHost;
 use faults::*;
-pub(crate) use faults::{native_exception, page_fault};
+pub(crate) use faults::{gate_fill, native_exception, page_fault};
 pub(crate) use signals::{
     clear_interrupted, completion_signal, device_signals, doorbell_counter, doorbells,
     end_stale_in_service, in_interrupt, interrupted, join_shootdown, network_interrupt,
@@ -645,6 +645,12 @@ pub struct State {
     /// that started at the table the fault's own walk read its leaf from.
     pub walks: u64,
     pub table_walks: u64,
+    /// Fills the #PF gate made without saving extended state
+    /// ([`faults::gate_fill`]).
+    pub gate_fills: u64,
+    /// The TSC ticks of all fills by segment: the fault's walk, its
+    /// mapping (with the leaf's prefill), fault-around and restores.
+    pub fill_segments: [u64; 3],
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
@@ -870,6 +876,8 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             history: shadow_fills::History::new(HISTORY_BITS),
             walks: 0,
             table_walks: 0,
+            gate_fills: 0,
+            fill_segments: [0; 3],
             stray: 0,
             placement: config.placement,
             tlb: Tlb::default(),
@@ -915,6 +923,10 @@ pub struct Statistics {
     /// mapped again from the fill history.
     pub reclaimed: u64,
     pub restored: u64,
+    /// Fills the #PF gate made, and the nanoseconds of all fills by
+    /// segment ([`State::fill_segments`]).
+    pub gate_fills: u64,
+    pub fill_segment_ns: [u64; 3],
     /// Resets of the whole shadow, those because a half ran out of frames,
     /// of the lower half alone, and TLBIs that unmapped ranges instead.
     pub resets: u64,
@@ -974,6 +986,10 @@ pub fn statistics() -> Statistics {
         frames: state.pool.taken,
         reclaimed: state.reclaimed,
         restored: state.restored,
+        gate_fills: state.gate_fills,
+        fill_segment_ns: state.fill_segments.map(|ticks| {
+            (u128::from(ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1))) as u64
+        }),
         resets: state.resets,
         exhausted: state.exhausted,
         lower_resets: state.lower_resets,

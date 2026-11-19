@@ -91,6 +91,7 @@ impl TranslatedSeen {
 #[derive(Default)]
 pub(super) struct ShadowSeen {
     pub(super) counts: [u64; 29],
+    pub(super) gate: [u64; 4],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
@@ -113,8 +114,11 @@ impl ShadowSeen {
     /// a TLBI by address, after the loss of the half, a write to a read-only
     /// mapping), the guest walks fills made and those that started at the
     /// fault's leaf table, the shadow frames taken, the kept lower halves
-    /// whose frames went back to the pool, and the pages regions mapped
-    /// again at their first fill after their half was lost.
+    /// whose frames went back to the pool, the pages regions mapped
+    /// again at their first fill after their half was lost, the fills the
+    /// #PF gate made without saving extended state, and a fill's mean time
+    /// by segment: its walk, its mapping and prefill, fault-around and
+    /// restores.
     pub(super) fn report(&mut self) {
         let host = host::statistics();
         let counts = [
@@ -148,6 +152,12 @@ impl ShadowSeen {
             host.reclaimed,
             host.restored,
         ];
+        let gate = [
+            host.gate_fills,
+            host.fill_segment_ns[0],
+            host.fill_segment_ns[1],
+            host.fill_segment_ns[2],
+        ];
         let [
             fills,
             prefills,
@@ -180,8 +190,13 @@ impl ShadowSeen {
             restored,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
+        let [gate_fills, walk_ns, map_ns, around_ns] =
+            core::array::from_fn(|index| gate[index] - self.gate[index]);
+        self.gate = gate;
         let fill_ns_each = fill_ns / fills.max(1);
         let fault_ns_each = fault_ns / faults.max(1);
+        let [walk_ns_each, map_ns_each, around_ns_each] =
+            [walk_ns, map_ns, around_ns].map(|ns| ns / fills.max(1));
         let [_, sprr, table, controls, tags, invalidated, maintained] =
             core::array::from_fn(|index| host.reset_causes[index] - self.causes[index]);
         self.causes = host.reset_causes;
@@ -211,7 +226,8 @@ impl ShadowSeen {
              device_faults={device_faults} other_faults={other_faults} first={first} \
              view={view} unmapped={unmapped} lost={lost} upgrade={upgrade} walks={walks} \
              table_walks={table_walks} frames={frames} reclaimed={reclaimed} \
-             restored={restored}\n"
+             restored={restored} gate_fills={gate_fills} walk_ns_each={walk_ns_each} \
+             map_ns_each={map_ns_each} around_ns_each={around_ns_each}\n"
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0
