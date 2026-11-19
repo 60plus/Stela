@@ -509,3 +509,61 @@ fn a_rewritten_region_runs_its_new_body() -> Result<()> {
     }
     Ok(())
 }
+
+/// Host time per guest instruction of each program through the engine,
+/// blocks against regions: one machine per mode runs 40 cases 50 times
+/// each, the first round compiling. Opt-in: `--ignored --nocapture`, in a
+/// release build on a quiet host.
+#[test]
+#[ignore = "manual: timing"]
+fn regions_time_their_programs() -> Result<()> {
+    let data = Mapping::new()?;
+    let code = Mapping::new()?;
+    for program in programs() {
+        let words = [program.words.clone(), vec![SUFFIX]].concat();
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        let cases: Vec<(GuestState, Vec<u8>)> = (0..40)
+            .map(|_| {
+                let mut initial = GuestState {
+                    x: std::array::from_fn(|_| rng.next()),
+                    ..GuestState::default()
+                };
+                let mut contents: Vec<u8> = (0..BYTES).map(|_| rng.next() as u8).collect();
+                (program.setup)(&mut rng, data.0, &mut initial, &mut contents);
+                (initial, contents)
+            })
+            .collect();
+        let mut line = format!("{:58}", program.name);
+        for regions in [false, true] {
+            let mut machine = machine(&code, &data, &words, TargetCpu::detect())?;
+            machine.set_regions(regions);
+            // A case that ends in an abort leaves EL1; each starts at EL0.
+            let pstate = machine.cpu.pstate.clone();
+            let (mut nanos, mut retired, mut blocks) = (0u128, 0u64, 0u64);
+            for round in 0..50 {
+                for (initial, contents) in &cases {
+                    ensure!(data.write(data.0, contents), "write data");
+                    machine.cpu.state = initial.clone();
+                    machine.cpu.pstate = pstate.clone();
+                    machine.cpu.pc = code.0;
+                    let (before, transfers) = (machine.cpu.retired, machine.statistics.blocks);
+                    let start = std::time::Instant::now();
+                    machine.run(machine.statistics.blocks + 1_000_000);
+                    if round > 0 {
+                        nanos += start.elapsed().as_nanos();
+                        retired += machine.cpu.retired - before;
+                        blocks += machine.statistics.blocks - transfers;
+                    }
+                }
+            }
+            line += &format!(
+                " | {}: {:.3} ns/instr {:5.1} instr/transfer",
+                if regions { "regions" } else { "blocks" },
+                nanos as f64 / retired.max(1) as f64,
+                retired as f64 / blocks.max(1) as f64
+            );
+        }
+        std::println!("{line}");
+    }
+    Ok(())
+}
