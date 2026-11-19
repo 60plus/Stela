@@ -318,6 +318,31 @@ impl Thunk {
 struct Lookup {
     misses: Vec<Patch>,
     modifier: Gpr,
+    /// The cipher's jump taken while the key is not open, its compare of
+    /// the tag word with [`DISABLED`] in the flags: equal, the key is
+    /// disabled and the instruction completes with the pointer, in RAX;
+    /// below, it is closed and misses ([`unopened`]).
+    unopened: Option<Patch>,
+}
+
+/// The start of `lookup`'s out-of-line path: a disabled key's jump to
+/// `complete`, which [`resolve`] binds once it is known, and its misses
+/// bound here, before the service call.
+#[must_use]
+fn unopened(asm: &mut Asm, lookup: Lookup) -> (Option<Patch>, Gpr) {
+    let Lookup {
+        misses,
+        modifier,
+        unopened,
+    } = lookup;
+    let disabled = unopened.map(|patch| {
+        asm.bind(patch);
+        asm.jcc(Cond::E)
+    });
+    for miss in misses {
+        asm.bind(miss);
+    }
+    (disabled, modifier)
 }
 
 /// `form`'s pointer into RAX, and the register holding its modifier: its
@@ -400,7 +425,11 @@ fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
     asm.alu_imm8(Alu::Add, Qword, Rcx, entry as i8);
     asm.bind(first_hit);
     asm.mov_load(Qword, Rax, Mem::base(Rcx, VALUE));
-    Lookup { misses, modifier }
+    Lookup {
+        misses,
+        modifier,
+        unopened: None,
+    }
 }
 
 /// How native code reaches the service routine.
@@ -484,7 +513,7 @@ pub fn thunk(
     use Size::Qword;
     let mut code = Code::pinned();
     let mut asm = code.asm();
-    let Lookup { misses, modifier } = match cipher {
+    let computed = match cipher {
         Some(cipher) => cipher::compute(&mut asm, form, tags, cipher),
         None => lookup(&mut asm, form, tags),
     };
@@ -518,14 +547,15 @@ pub fn thunk(
             super::block::exit_kind_with(&mut asm, kind);
         }
     }
-    for miss in misses {
-        asm.bind(miss);
-    }
+    let (disabled, modifier) = unopened(&mut asm, computed);
     let failed = call_service(&mut asm, form, Routine::Address(service), modifier);
     let back = asm.jmp();
     asm.bind(failed);
     super::block::direct_exit_with(&mut asm, pc, ExitKind::PointerAuthentication);
     resolve(&mut code, back, complete);
+    if let Some(disabled) = disabled {
+        resolve(&mut code, disabled, complete);
+    }
     Thunk::new(code.into_bytes(), next, dynamic)
 }
 

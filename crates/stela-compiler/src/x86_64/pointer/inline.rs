@@ -15,8 +15,8 @@
 //! keeps nothing else live but the pinned registers, which the call
 //! preserves. The branch forms (BRA*, BLRA* and RETA*) still end their
 //! block, whose thunk completes them.
-use super::{Finish, Form, Lookup, Routine, call_service, lookup};
-use crate::x86_64::asm::{Code, Gpr, Patch, Size, resolve};
+use super::{Finish, Form, Lookup, Routine, call_service, lookup, unopened};
+use crate::x86_64::asm::{Code, Patch, Size, resolve};
 use crate::{
     Anchor, GuestAddress, Place,
     aarch64::Register,
@@ -54,8 +54,8 @@ pub fn inlines(operation: Operation) -> bool {
 pub(crate) struct Slow {
     pc: GuestAddress,
     /// The service call of a memo miss, which returns to the completion,
-    /// and the modifier's register.
-    service: Option<(Form, Vec<Patch>, usize, Gpr)>,
+    /// what the computation left to it and the completion's offset.
+    service: Option<(Form, Lookup, usize)>,
     /// The jumps to the exit at the instruction.
     exits: Vec<Patch>,
 }
@@ -85,7 +85,7 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
         .filter(|form| form.completion == Finish::Register)
         .expect("a form that completes into its register");
     let tags = Place::new(Anchor::Pointer, cells.tags as usize);
-    let Lookup { misses, modifier } = match cells.cipher {
+    let computed = match cells.cipher {
         Some(cipher) => {
             let cipher = Place::new(Anchor::Pointer, cipher as usize);
             super::cipher::compute(&mut asm, form, tags, cipher)
@@ -94,10 +94,10 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
     };
     let complete = asm.len();
     let result = asm.guest(Register::X(form.result)).expect("X0..X30");
-    asm.mov_store(Size::Qword, result, Gpr::Rax);
+    asm.mov_store(Size::Qword, result, crate::x86_64::asm::Gpr::Rax);
     Slow {
         pc,
-        service: Some((form, misses, complete, modifier)),
+        service: Some((form, computed, complete)),
         exits: vec![],
     }
 }
@@ -107,10 +107,9 @@ pub(crate) fn place(code: &mut Code, slow: Slow, cells: Cells) {
     let mut asm = code.asm();
     let mut exits = slow.exits;
     let mut back = vec![];
-    if let Some((form, misses, complete, modifier)) = slow.service {
-        for miss in misses {
-            asm.bind(miss);
-        }
+    if let Some((form, computed, complete)) = slow.service {
+        let (disabled, modifier) = unopened(&mut asm, computed);
+        back.extend(disabled.map(|patch| (patch, complete)));
         let routine = Routine::Cell(cells.routine);
         exits.push(call_service(&mut asm, form, routine, modifier));
         back.push((asm.jmp(), complete));

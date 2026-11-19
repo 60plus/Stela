@@ -444,9 +444,12 @@ fn native_completes(
     let (Kind::Sign, Some(key)) = (kind, key) else {
         return true;
     };
-    let layout = service.cipher.layouts[usize::from(pointer::key_index(key))][0];
-    let extension = layout.extension[usize::from(operand & layout.select != 0)];
-    operand & extension == 0 || operand & extension == extension
+    let data = matches!(
+        key,
+        PointerAuthenticationKey::Da | PointerAuthenticationKey::Db
+    );
+    let range = service.cipher.ranges[usize::from(data)][usize::from(operand & 1 << 55 != 0)];
+    operand & range.extension == range.canonical
 }
 
 /// Blocks given the cipher complete PAC instructions in line with the
@@ -613,8 +616,19 @@ fn schedules_follow_the_keys_words() {
             pauth::keyed::schedule(words)
         );
     }
-    assert_eq!(service.cipher.classic, 0);
-    assert_eq!(service.cipher.enhanced, u64::MAX);
+    // TCRS[0]: 39-bit ranges, TBI0 alone (for instructions too, without
+    // TBID0); FEAT_PAuth2's XOR.
+    let [instruction, data] = service.cipher.ranges;
+    assert_eq!(instruction, data);
+    assert_eq!(
+        data,
+        [
+            pointer::cipher::Range::new(0x00ff_ff80_0000_0000, false, false),
+            pointer::cipher::Range::new(0xffff_ff80_0000_0000, true, false),
+        ]
+    );
+    assert_eq!(data[1].authenticated, 0xff7f_ff80_0000_0000);
+    assert_eq!((data[1].signed, data[0].authenticated), (0, 0));
 }
 
 /// What a PAC operation costs natively, run by hand in a release build: an

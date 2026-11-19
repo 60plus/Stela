@@ -36,8 +36,9 @@ const RIP: usize = 16;
 const EFLAGS: usize = 17;
 const STEPS: usize = 1 << 20;
 const OUTSIDE: u32 = u32::MAX;
-/// Where the pointer anchor's area holds the cipher's schedules and layouts
-/// (zero: every pointer is canonical and every authentication succeeds).
+/// Where the pointer anchor's area holds the cipher's schedules and ranges
+/// (empty PAC fields: every pointer is canonical, every authentication
+/// succeeds and every result is its pointer).
 const CIPHER: u32 = 0x400;
 
 #[repr(C)]
@@ -266,8 +267,14 @@ fn prepare(state: &mut GuestState) {
                 .add(3 << 16)
                 .add(0x40 + 8 * key)
                 .cast::<u64>()
-                .write(1);
+                .write(pointer::tag(1, key as u8, 0));
         }
+        let ranges = [[false, true].map(|upper| pointer::cipher::Range::new(0, upper, false)); 2];
+        anchors
+            .add(3 << 16)
+            .add(CIPHER as usize + core::mem::offset_of!(pointer::cipher::Cipher, ranges))
+            .cast::<[[pointer::cipher::Range; 2]; 2]>()
+            .write(ranges);
         anchors.add(3 << 16).add(0x1c0).cast::<u64>().write(
             (authenticated as extern "sysv64" fn(*mut u8, u32, u64, u64) -> Pair) as usize as u64,
         );

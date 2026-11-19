@@ -362,18 +362,13 @@ impl PointerService {
             *schedule = context.native_schedule(index).unwrap_or_default();
         }
         let classic = inputs.version == pauth::Version::Classic;
-        self.cipher.classic = if classic { u64::MAX } else { 0 };
-        self.cipher.enhanced = !self.cipher.classic;
-        let domains = [false, true].map(|data| {
-            [true, false].map(|signing| {
-                let (select, extension) = layouts.native(data, signing);
-                pointer::cipher::Layout::new(select, extension)
+        // Instructions, then data, each by bit 55.
+        self.cipher.ranges = [false, true].map(|data| {
+            let extension = layouts.native(data);
+            [false, true].map(|upper| {
+                pointer::cipher::Range::new(extension[usize::from(upper)], upper, classic)
             })
         });
-        for (index, key) in self.cipher.layouts.iter_mut().enumerate() {
-            // IA and IB lay out instructions, DA and DB data.
-            *key = domains[index / 2];
-        }
         self.context = Some(context);
     }
 
