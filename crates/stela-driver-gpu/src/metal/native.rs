@@ -3184,6 +3184,36 @@ impl Backend for NativeBackend {
         }
     }
 
+    fn write_memory_rows(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+    ) -> Result<()> {
+        let mapped = self.mapping(memory, offset, length)?;
+        let mut at = 0;
+        for row in rows {
+            ensure(at + row.len() as u64 <= length, "the rows fill the range")?;
+            // SAFETY: `mapped` covers `length` bytes, of which the row's
+            // lie within, and the slice is disjoint from device memory.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    row.as_ptr(),
+                    mapped.pointer.as_ptr().add(at as usize),
+                    row.len(),
+                );
+            }
+            at += row.len() as u64;
+        }
+        ensure(at == length, "the rows fill the range")?;
+        if mapped.coherent {
+            Ok(())
+        } else {
+            self.flush_range(mapped.memory, mapped.offset, length)
+        }
+    }
+
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()> {
         let mapped = self.mapping(memory, offset, bytes.len() as u64)?;
         if !mapped.coherent {

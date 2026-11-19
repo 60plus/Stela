@@ -497,8 +497,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         &mut self,
         id: TextureId,
         region: &BufferImageCopy,
-        bytes: &[u8],
+        source: &super::SourceRows<'_>,
     ) -> Result<bool> {
+        let bytes = source.packed();
         let Some((memory, rows)) = self.aligned_rows(id, region, bytes.len())? else {
             return Ok(false);
         };

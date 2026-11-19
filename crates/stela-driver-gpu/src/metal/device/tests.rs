@@ -2667,6 +2667,20 @@ fn texture_transfers_keep_strided_padding_and_coalesce_contiguous_rows() {
         panic!("contiguous texture data should reach the backend in one write");
     };
     assert_eq!(written, &pixels);
+    // The padded rows reach the copy from where the caller laid them,
+    // with no packed copy of their own.
+    assert_eq!(device.backend().row_writes, 1);
+    // Rows the copy keeps apart are packed and written row by row.
+    let column = Region {
+        size: [1, 2, 2],
+        ..region
+    };
+    let previous = device.backend().writes.len();
+    device
+        .replace_region(texture, &column, &upload, strides)
+        .unwrap();
+    assert_eq!(device.backend().row_writes, 1);
+    assert_eq!(device.backend().writes.len() - previous, 4);
 
     let mut read = [0xee; 49];
     device

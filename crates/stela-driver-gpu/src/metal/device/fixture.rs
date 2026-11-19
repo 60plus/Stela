@@ -205,6 +205,8 @@ pub(crate) struct MockBackend {
     pub(crate) adopted: usize,
     pub(crate) submissions: Vec<Vec<Segment>>,
     pub(crate) writes: Vec<(Memory, u64, Vec<u8>)>,
+    /// Writes of a caller's rows without packing them first.
+    pub(crate) row_writes: usize,
     pub(crate) write_error: Option<Error>,
     pub(crate) invalidated: Vec<(Memory, u64, u64)>,
     /// Host memory each imported memory is, by memory.
@@ -602,6 +604,18 @@ impl Backend for MockBackend {
         }
         self.writes.push((memory, offset, bytes.to_vec()));
         Ok(())
+    }
+    fn write_memory_rows(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+        rows: &mut dyn Iterator<Item = &[u8]>,
+    ) -> Result<()> {
+        self.row_writes += 1;
+        let packed: Vec<u8> = rows.flat_map(|row| row.iter().copied()).collect();
+        assert_eq!(packed.len() as u64, length, "the rows fill the range");
+        self.write_memory(memory, offset, &packed)
     }
     /// Reads back the latest write to each byte.
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()> {
