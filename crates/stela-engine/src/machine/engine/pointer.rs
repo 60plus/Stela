@@ -691,6 +691,9 @@ fn complete_with(
 ))]
 mod native_tests;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod cost;
+
 #[cfg(test)]
 mod replay;
 
