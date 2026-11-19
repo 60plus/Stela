@@ -500,10 +500,12 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
             state.around += map_around(state, table, half, beside, &mut walk_table).unwrap_or(0);
         }
         // The first fill of a region since its half was lost maps again
-        // the granules of it the lost incarnation filled, from walks made
-        // now, as fault-around maps its window: one fault, rather than one
-        // each, after a TLBI of everything, a half out of frames or a kept
-        // half replaced. A granule that maps nothing is forgotten.
+        // the granules of it the lost incarnation's faults filled, from walks
+        // made now, as fault-around maps its window: one fault, rather than
+        // one each, after a TLBI of everything, a half out of frames or a
+        // kept half replaced. What it maps is not a fault's, so the next
+        // loss names it only if a fault takes it again: the list follows
+        // what the guest touches rather than growing with each restore.
         let mut restore = filled.restore;
         while restore != 0 {
             let bit = restore.trailing_zeros();
@@ -511,7 +513,6 @@ fn fill(error: u64, rflags: u64, address: u64, entered: u64) -> Filled {
             let granule = shadow_fills::granule(virtual_page, bit);
             if let Some(pages) = map_around(state, table, half, granule, &mut walk_table) {
                 state.restored += pages;
-                state.history.keep(half, space, granule);
             }
         }
     }

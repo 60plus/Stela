@@ -156,15 +156,6 @@ impl History {
         Fill { cause, restore }
     }
 
-    /// A granule [`Fill::restore`] named was mapped again at `page`.
-    pub fn keep(&mut self, half: usize, space: u64, page: u64) {
-        let (index, tag) = self.slot(half, space, page);
-        let slot = &mut self.slots[index];
-        if slot.head >> TAG_SHIFT == tag && slot.head as u32 == self.incarnation[half] {
-            slot.granules |= 1 << ((page >> GRANULE_BITS) & 127);
-        }
-    }
-
     /// `half` was emptied: every page it mapped is lost, and for the lower
     /// half every kept half with it.
     pub fn emptied(&mut self, half: usize) {
@@ -273,8 +264,9 @@ mod tests {
     }
 
     /// The first fill of a region after its half was lost names the other
-    /// granules the earlier incarnation took, once; those mapped again stay
-    /// known, the others are forgotten.
+    /// granules the earlier incarnation's faults took, once; a granule
+    /// mapped again from that list is not one a fault took, so it is not
+    /// named after the next loss unless a fault takes it again.
     #[test]
     fn a_lost_region_names_its_granules_once() {
         let mut history = History::new(12);
@@ -289,16 +281,12 @@ mod tests {
         assert_eq!(fill.cause, Cause::Lost);
         assert_eq!(fill.restore, 1 | 1 << 3 | 1 << 127);
         assert_eq!(granule(fault, 127), region + (127 << GRANULE_BITS));
-        // Granule 3 maps again; 0 and 127 no longer translate.
-        history.keep(UPPER, 0, granule(fault, 3));
         assert_eq!(history.fill(UPPER, 0, fault, 1, false).restore, 0);
+        // Only granule 5 was a fault's in that incarnation.
         history.emptied(UPPER);
         let fill = history.fill(UPPER, 0, region, 1, false);
-        assert_eq!((fill.cause, fill.restore), (Cause::First, 1 << 3 | 1 << 5));
-        // Granules 3 and 5 were not mapped again after that loss, so they
-        // are forgotten; a keep in an older incarnation does nothing.
+        assert_eq!((fill.cause, fill.restore), (Cause::First, 1 << 5));
         history.emptied(UPPER);
-        history.keep(UPPER, 0, region + (9 << GRANULE_BITS));
         let fill = history.fill(UPPER, 0, region, 1, false);
         assert_eq!((fill.cause, fill.restore), (Cause::Lost, 0));
     }
