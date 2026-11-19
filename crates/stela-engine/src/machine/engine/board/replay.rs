@@ -344,7 +344,13 @@ fn sign_in_replay_on_the_real_ring() {
                 new: 900,
                 turnover,
             };
-            for (window, blocks) in [(512, 10_500), (640, 13_100), (816, 16_700)] {
+            for (window, blocks) in [
+                (512, 10_500),
+                (640, 13_100),
+                (816, 16_700),
+                (1200, 24_600),
+                (1616, 33_100),
+            ] {
                 let bound = least_recent(guest, blocks);
                 for policy in [Policy::Ring, Policy::TenureHot, Policy::Survivors] {
                     let outcome = replay(guest, blocks, super::ring::NURSERY_SHARE, policy);

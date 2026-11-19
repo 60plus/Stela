@@ -9,6 +9,8 @@
 //! and the pack `stela.efi` keeps
 //! ([`pack`]).
 pub mod pack;
+#[cfg(test)]
+mod replay;
 mod stored;
 pub mod writer;
 
