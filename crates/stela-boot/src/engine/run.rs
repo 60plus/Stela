@@ -223,9 +223,10 @@ const SYSTEM_TOTAL_SHOWN: usize = 48;
 
 /// Add the beat's System exits (`exits`) to `total`, by key; at `due`, the
 /// end of a [`HOT_TOTAL_BEATS`] stretch, write `PES SYSTEM TOTAL
-/// count/ns_each/ms`: the [`SYSTEM_TOTAL_SHOWN`] keys that took the most
-/// exit time over the stretch, each with its class
-/// (`step_timing::SystemClass`), then the rest summed, and start over. The
+/// count/ns_each/ms/closes`: the [`SYSTEM_TOTAL_SHOWN`] keys that took the
+/// most exit time over the stretch, each with its class
+/// (`step_timing::SystemClass`) and the exits of it that closed every mirror
+/// cell, then the rest summed, and start over. The
 /// beat's line names only its sixteen costliest keys, and a kernel spreads
 /// many exits over keys that each stay under that cut in every beat.
 fn system_total_report(
@@ -249,24 +250,26 @@ fn system_total_report(
     let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let mut keys: Vec<step_timing::SystemExit> = total.values().copied().collect();
     keys.sort_unstable_by_key(|exit| core::cmp::Reverse(exit.ticks));
-    let mut line = format!("PES SYSTEM TOTAL beats={HOT_TOTAL_BEATS} count/ns_each/ms");
+    let mut line = format!("PES SYSTEM TOTAL beats={HOT_TOTAL_BEATS} count/ns_each/ms/closes");
     for exit in keys.iter().take(SYSTEM_TOTAL_SHOWN) {
         let class =
             step_timing::SystemClass::NAMES[step_timing::SystemClass::of(exit.key) as usize];
         line.push_str(&format!(
-            " {}[{class}]={}/{}/{}",
+            " {}[{class}]={}/{}/{}/{}",
             step_timing::system_key_name(exit.key),
             exit.count,
             nanos(exit.ticks) / u128::from(exit.count.max(1)),
-            nanos(exit.ticks) / 1_000_000
+            nanos(exit.ticks) / 1_000_000,
+            exit.closes
         ));
     }
     if let Some(rest) = rest(&keys, SYSTEM_TOTAL_SHOWN) {
         line.push_str(&format!(
-            " rest={}/{}/{}",
+            " rest={}/{}/{}/{}",
             rest.count,
             nanos(rest.ticks) / u128::from(rest.count.max(1)),
-            nanos(rest.ticks) / 1_000_000
+            nanos(rest.ticks) / 1_000_000,
+            rest.closes
         ));
     }
     output::arguments(format_args!("{line}\n"));
