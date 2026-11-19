@@ -370,7 +370,22 @@ enum Ring {
     Stamped,
     /// A cell tail, through the cell probe.
     Cell,
+    /// An indirect exit to the target in RAX, one per site, through its
+    /// lookup tail and this PE's jump cache, or the table probe.
+    Lookup,
+    /// An indirect exit through a predicted tail of its one target, whose
+    /// direct exit is linked through a stamped tail.
+    Predicted,
 }
+
+/// Bytes of each block's tails: a predicted tail and a stamped tail. Not
+/// a power of two, so the tails' branches do not share predictor sets.
+const RING_TAIL: usize = 240;
+/// Where a predicted tail's stamped tail lies in the block's tails.
+const RING_STAMPED: usize = 64;
+const _: () = assert!(PREDICTED_TAIL_BYTES <= RING_STAMPED);
+const _: () = assert!(RING_STAMPED + STAMPED_TAIL_BYTES <= RING_TAIL);
+const _: () = assert!(LOOKUP_TAIL_BYTES <= RING_TAIL);
 
 /// Bytes of each block of a ring: its exit and nothing else.
 const RING_BLOCK: usize = 64;
@@ -387,12 +402,12 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
     const TRANSFERS: u64 = 1 << 22;
     const RUN: u64 = 1 << 12;
     let tails = RING_BLOCKS + blocks * RING_BLOCK;
-    let bytes = (tails + blocks * STAMPED_TAIL_BYTES).next_multiple_of(4096);
+    let bytes = (tails + blocks * RING_TAIL).next_multiple_of(4096);
     let region = mapped_bytes(bytes);
     put(&region, 0, &vec![0xcc; bytes]);
     let base = region.0 as u64;
     let block_at = |block: usize| base + (RING_BLOCKS + block * RING_BLOCK) as u64;
-    let tail_at = |block: usize| base + (tails + block * STAMPED_TAIL_BYTES) as u64;
+    let tail_at = |block: usize| base + (tails + block * RING_TAIL) as u64;
     // The return the exhausted budget takes.
     let mut out = vec![0xb8, 1, 0, 0, 0, 0xba, 2, 0, 0, 0];
     out.extend(EXIT_RETURN);
@@ -467,11 +482,48 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                 let code = cell_tail(tail, cell, pc, word, RAN, probe).unwrap();
                 (jump(at, tail).unwrap().to_vec(), Some(code.to_vec()))
             }
+            Ring::Lookup => {
+                let probe = base + (PROBES + PROBE_ENTRY) as u64;
+                let code = lookup_tail(tail, ExitKind::Indirect, RAN, probe, 0).unwrap();
+                (indirect_jump(at, pc, tail), Some(code.to_vec()))
+            }
+            Ring::Predicted => {
+                let probe = base + (PROBES + PROBE_ENTRY) as u64;
+                let mut code =
+                    predicted_tail(tail, GuestAddress(pc), ExitKind::Indirect, RAN, probe)
+                        .unwrap()
+                        .to_vec();
+                world.table.link_hot_cell(site, pc, Some(held)).unwrap();
+                let number = world.table.site_cell_number(site).unwrap();
+                world.table.note_stamped(number);
+                let cell = LookupTable::cell_slot(&world.table.cells, number) as *const Slot as u64;
+                let stamping = base + (PROBES + STAMPING_PROBE_ENTRY) as u64;
+                let stamped_at = tail + RING_STAMPED as u64;
+                let stamped = stamped_tail(
+                    stamped_at,
+                    cell,
+                    number,
+                    pc,
+                    ExitKind::Indirect,
+                    RAN,
+                    held.block,
+                    entry,
+                    stamping,
+                )
+                .unwrap();
+                let point = direct_patch(tail + PREDICTED_EXIT as u64);
+                let offset = (point - tail) as usize;
+                code[offset..offset + PATCH_BYTES]
+                    .copy_from_slice(&jump(point, stamped_at).unwrap());
+                code.resize(RING_STAMPED, 0xcc);
+                code.extend(stamped);
+                (indirect_jump(at, pc, tail), Some(code))
+            }
         };
         assert!(code.len() <= RING_BLOCK);
         put(&region, RING_BLOCKS + block * RING_BLOCK, &code);
         if let Some(tail_code) = tail_code {
-            put(&region, tails + block * STAMPED_TAIL_BYTES, &tail_code);
+            put(&region, tails + block * RING_TAIL, &tail_code);
         }
     }
     let mut guest = Box::new(GuestState::default());
@@ -508,6 +560,15 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
     (best as f64 / TRANSFERS as f64, per)
 }
 
+/// `movabs rax, pc; jmp tail` at `at`: a block whose indirect branch's
+/// target is `pc`, its exit's point linked to `tail`.
+fn indirect_jump(at: u64, pc: u64, tail: u64) -> Vec<u8> {
+    let mut code = vec![0x48, 0xb8];
+    code.extend(pc.to_le_bytes());
+    code.extend(jump(at + 10, tail).unwrap());
+    code
+}
+
 #[test]
 #[ignore = "manual: opt-in"]
 fn spread_transfer_costs() {
@@ -518,6 +579,8 @@ fn spread_transfer_costs() {
             Ring::Thunk,
             Ring::Stamped,
             Ring::Cell,
+            Ring::Lookup,
+            Ring::Predicted,
         ] {
             let (ticks, counts) = spread_cost(ring, blocks);
             std::println!(
