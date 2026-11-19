@@ -1569,6 +1569,38 @@ impl LookupTable {
         }
     }
 
+    /// Whether stamped cell `cell` still holds the entry its exit's stamped
+    /// tail jumps to: [`put_cell`] clears its `live` word when the entry
+    /// changes, and then every stamped transfer of it misses to the cell
+    /// probe, which stamps it no more.
+    pub fn stamped_live(&self, cell: u32) -> bool {
+        (cell as usize) < STAMPED_CELLS
+            && !self.cells.is_empty()
+            && self.cells[0]
+                .word(CELL_LIVE + 4 * cell as usize)
+                .load(Ordering::Acquire)
+                != 0
+    }
+
+    /// Set the `live` word of stamped cell `cell` again, for an exit whose
+    /// patch point now jumps to a stamped tail of `entry`, the entry the
+    /// cell holds: false, with the cell as it was, when it holds another,
+    /// holds none or is no exit's stamped cell. Every PE's stamps of the
+    /// cell are zero while the word is clear ([`stamp`]), so a stale tail
+    /// that a core is still in misses as before.
+    pub fn revive_stamped(&mut self, cell: u32, entry: LookupEntry) -> bool {
+        if entry.key == 0
+            || !self.stamped.contains(&cell)
+            || Self::cell_slot(&self.cells, cell).load() != entry
+        {
+            return false;
+        }
+        self.cells[0]
+            .word(CELL_LIVE + 4 * cell as usize)
+            .store(1, Ordering::Release);
+        true
+    }
+
     /// How many exits have a stamped tail ([`Self::note_stamped`]).
     pub fn stamped_tails(&self) -> usize {
         self.stamped.len()

@@ -3320,6 +3320,92 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     assert_eq!(machine.host.patches.len(), patches + 2);
 }
 
+/// A stamped exit whose target block goes and is made again: its cell
+/// takes the new block's entry and stops being live, so the old stamped
+/// tail's transfers would all miss to the cell probe. Its samples give it
+/// a stamped tail of the new entry in the same cell, the site's jump to
+/// it, and the cell live again.
+#[test]
+fn a_stamped_exit_whose_block_was_made_again_gets_a_tail_of_the_new_one() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let far = base + 0x1000;
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
+    machine.step().unwrap();
+    machine.step().unwrap();
+    let first = &machine.code.blocks[0];
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
+    let sample = |machine: &mut Machine<FakeHost, NoDevices>| {
+        let address = {
+            let cache = machine.code.cache();
+            let number = cache.targets.site_cell_number(site).expect("a cell");
+            cache.targets.cell_address(number)
+        };
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
+        }
+        machine.promote_hot_exits();
+    };
+    sample(&mut machine);
+    let number = {
+        let cache = machine.code.cache();
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!((number as usize) < chain::STAMPED_CELLS, "{number}");
+        assert!(cache.targets.stamped_live(number));
+        number
+    };
+    // The block of `far` goes and is made again elsewhere.
+    let old = machine.code.blocks[1].code.0;
+    machine.evict_code(old..old + 1);
+    let Ok(Fetched::Block(again)) = machine.fetch_block(far, false) else {
+        panic!("a block of far");
+    };
+    let entry = machine.code.blocks[again].code.0 as u64;
+    assert_ne!(entry, old as u64);
+    {
+        let cache = machine.code.cache();
+        assert_eq!(cache.targets.site_cell_number(site), Some(number));
+        let held = cache.targets.site_cell(site).expect("a cell");
+        assert_eq!((held.pc, held.entry), (far, entry));
+        assert!(!cache.targets.stamped_live(number));
+    }
+    let patches = machine.host.patches.len();
+    sample(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches + 2);
+    let (tail, bytes) = machine.host.patches[patches].clone();
+    assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+    let direct = (0..bytes.len() - 5).any(|at| {
+        bytes[at] == 0xe9 && {
+            let relative = i32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap());
+            (tail as u64 + at as u64 + 5).wrapping_add(relative as i64 as u64) == entry
+        }
+    });
+    assert!(direct, "no direct jump to the new block");
+    let jump = chain::jump(site, tail as u64).unwrap();
+    assert_eq!(
+        machine.host.patches[patches + 1],
+        (site as usize, jump.to_vec())
+    );
+    let cache = machine.code.cache();
+    assert_eq!(cache.targets.site_cell_number(site), Some(number));
+    assert!(cache.targets.stamped_live(number));
+    drop(cache);
+    // Live again: its samples relink it no more.
+    sample(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches + 2);
+}
+
 /// An exit to a block another address space compiled, in a page this one
 /// does not translate yet, waits for the fetch of its target, which
 /// translates the page and finds the block's entry without adding one,

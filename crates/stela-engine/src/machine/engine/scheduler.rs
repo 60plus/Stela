@@ -1300,6 +1300,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// no entry yet waits for later samples; an exit whose block takes no
     /// transfer of its BTYPE keeps its cell tail, as does every hot exit
     /// while every stamped cell is held.
+    ///
+    /// A stamped cell whose entry changed since its tail was made (its
+    /// block went, and the cell took the entry of the block made again)
+    /// sends every transfer from the stamped tail on to the cell probe,
+    /// which no longer stamps it. Its samples give the exit a stamped tail
+    /// of the entry it holds now ([`Self::relink_stamped`]).
     pub(super) fn promote_hot_exits(&mut self) {
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(board::LockSite::Link);
@@ -1309,7 +1315,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let Some((cell, link)) = cache.targets.sampled_link(address) else {
                 continue;
             };
-            if (cell as usize) < chain::STAMPED_CELLS {
+            let stamped = (cell as usize) < chain::STAMPED_CELLS;
+            if stamped && cache.targets.stamped_live(cell) {
                 continue;
             }
             let count = self.sampled_exits.entry(link.site).or_insert(0);
@@ -1327,6 +1334,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             if link.btype != 0 && held.targets & 1 << link.btype == 0 {
+                continue;
+            }
+            if stamped {
+                self.relink_stamped(&mut cache, cell, link, held);
                 continue;
             }
             if !cache.targets.has_free_stamped() {
@@ -1352,6 +1363,56 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.statistics.cells_live = cache.targets.cells() as u64;
         self.statistics.cells_past = cache.targets.cells_past_stamped() as u64;
         self.statistics.cells_empty = cache.targets.cells_empty() as u64;
+    }
+
+    /// Give the hot exit of `link`, whose stamped cell `cell` holds `held`,
+    /// an entry other than the one its stamped tail jumps to, a stamped
+    /// tail of `held` in the same cell, its patch point's jump to it, and
+    /// then the cell's `live` word again
+    /// ([`chain::LookupTable::revive_stamped`]). The cell keeps its number,
+    /// so no other exit's tail names it; its stamps stay zero until the
+    /// word is set, after the jump, so a core still in the old tail misses
+    /// to the cell probe as it did. A tail that cannot be made leaves the
+    /// exit as it was.
+    fn relink_stamped(
+        &mut self,
+        cache: &mut board::Cache,
+        cell: u32,
+        link: chain::CellLink,
+        held: chain::LookupEntry,
+    ) {
+        if cache.targets.site_cell_number(link.site) != Some(cell) || !chain::patchable(link.site) {
+            return;
+        }
+        let Some((probe, tail)) =
+            self.probe_and_tail(cache, link.site, link.btype, chain::STAMPED_TAIL_BYTES)
+        else {
+            return;
+        };
+        let at = tail.0 as u64;
+        let (Some(code), Some(jump)) = (
+            chain::stamped_branch_tail(
+                at,
+                cache.targets.cell_address(cell),
+                cell,
+                link.pc,
+                link.word,
+                link.retired,
+                held.block,
+                held.entry,
+                probe + chain::STAMPING_PROBE_ENTRY as u64,
+                link.btype,
+            ),
+            chain::jump(link.site, at),
+        ) else {
+            return;
+        };
+        self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Stamped);
+        self.patch_point(NativeCode(link.site as usize), jump);
+        if cache.targets.revive_stamped(cell, held) {
+            self.statistics.stamped_tails += 1;
+        }
     }
 
     /// The probes of `btype` and room for a tail of `bytes` that calls
