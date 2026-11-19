@@ -640,46 +640,50 @@ fn small_hosts_move_their_kept_code_into_the_window() {
     }
 }
 
+/// A pack read on demand holds its indexes and an arena of
+/// [`DEMAND_ARENA_SHARE`] of its budget; the room it leaves goes to the
+/// window up to the knee, then half to the window up to
+/// [`SHARED_PER_RUNNER`] and half to the guest, then all to the guest.
 #[test]
-fn a_pack_read_on_demand_gives_its_room_to_the_window_and_the_guest_keeps_its_floor() {
-    // The index of a whole footprint's pack: 175 thousand records.
+fn a_pack_read_on_demand_splits_its_room_between_the_window_and_the_guest() {
+    // The indexes of a whole footprint's pack: 175 thousand records.
     const INDEX: u64 = 9 * MIB;
-    for (gib, cores) in [(8, 8), (12, 8), (16, 8), (32, 16)] {
+    for gib in [8, 12, 16, 32] {
         let free = free(gib);
-        let budget = pack_budget(free, cores, cores);
-        // Before: the pack held its budget, measured off the free RAM.
-        let before = sizes(free - budget - PACK_MARGIN, cores, cores).unwrap();
-        let after = sizes_with_room(
-            free - INDEX - PACK_MARGIN,
-            cores,
-            cores,
-            budget.saturating_sub(INDEX),
-        )
-        .unwrap();
+        let budget = pack_budget(free, 8, 8);
+        let before = sizes(free - budget - PACK_MARGIN, 8, 8).unwrap();
+        let held = (budget / DEMAND_ARENA_SHARE).max(INDEX);
+        let room = budget - held;
+        let after = sizes_with_room(free - held - PACK_MARGIN, 8, 8, room).unwrap();
         std::println!(
-            "ROOM {gib} GiB: pack {}M window {}M -> {}M guest {}M -> {}M",
-            budget / MIB,
+            "ROOM {gib} GiB: room {}M window {}M -> {}M guest {}M -> {}M",
+            room / MIB,
             before.code.window / MIB,
             after.code.window / MIB,
             before.guest / MIB,
             after.guest / MIB
         );
-        assert!(after.guest >= GUEST_FLOOR, "{gib} GiB: {after:?}");
-        assert!(after.code.window >= before.code.window, "{gib} GiB");
-        assert!(after.code.window <= MAX_WINDOW);
-        assert_eq!(after.code.window % CODE_ALIGNMENT, 0);
-        // The guest keeps what it had, within the window's alignment.
+        let knee = 8 * KNEE_PER_RUNNER;
+        let top = 8 * SHARED_PER_RUNNER;
+        let grown = after.code.window - before.code.window;
+        assert_eq!(grown % CODE_ALIGNMENT, 0);
+        assert!(after.code.window <= before.code.window.max(top));
+        // Up to the knee the window takes the room; past it, half.
+        let to_knee = knee.saturating_sub(before.code.window);
+        let most = match room / 2 {
+            half if half <= to_knee => half,
+            half => to_knee + (half - to_knee) / 2,
+        };
+        assert!(grown <= most, "{gib} GiB");
         assert!(
-            after.guest + 2 * CODE_ALIGNMENT >= before.guest,
-            "{gib} GiB: {before:?} {after:?}"
+            grown + CODE_ALIGNMENT > most.min(top.saturating_sub(before.code.window)),
+            "{gib} GiB"
         );
-        // The window grows by about half the room, up to the most a window
-        // takes.
-        assert!(
-            after.code.window >= (before.code.window + budget / 3).min(MAX_WINDOW),
-            "{gib} GiB: {before:?} {after:?}"
-        );
-        assert_eq!(after.pool, before.pool);
+        // The guest gets the rest, never less than it had.
+        assert_eq!(after.guest, before.guest + room - 2 * grown);
+        assert!(after.guest >= before.guest);
+        assert_eq!(after.heap, before.heap + grown);
+        assert_eq!((after.pool, after.kept), (before.pool, before.kept));
     }
     // No room, no change.
     let free = free(12);
