@@ -798,6 +798,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.statistics.shared += 1;
                     self.count_store_source(StoreSource::Shared);
                     self.statistics.shared_ticks += self.host.counter().wrapping_sub(looking);
+                    // Prepared ahead by a waiting PE: the first install
+                    // offers it, so the pack keeps blocks that ran.
+                    if compiled.ahead() {
+                        let level = usize::from(self.cpu.pstate.el != 0);
+                        self.statistics.ahead_installs[level] += 1;
+                        let quiet = self.cpu.pstate.el == 0;
+                        if let Some(translations) = self.host.translations() {
+                            translations.offer(compiled.offer(quiet));
+                        }
+                    }
                     return self
                         .install(
                             pc,
@@ -948,6 +958,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 emission: emission.clone(),
                 successors,
                 quiet: self.cpu.pstate.el == 0,
+                frame: physical & !(FETCH_PAGE - 1),
+                depth: 0,
             };
             translations.offer(offer);
             self.statistics.offered += 1;

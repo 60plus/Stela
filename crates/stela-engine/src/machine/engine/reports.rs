@@ -637,6 +637,9 @@ pub struct Statistics {
     /// instruction, a device-site page, a host breakpoint, no store),
     /// taken from the pack, taken from another PE.
     pub store_sources: [[u64; StoreSource::COUNT]; 2],
+    /// Of the `Shared` installs at EL0 and above, those of blocks a waiting
+    /// PE prepared ahead of any fetch ([`super::ahead`]).
+    pub ahead_installs: [u64; 2],
     /// Counter ticks spent, for blocks not yet installed, reading, hashing
     /// and looking up their fetch pages; finding `shared` blocks; and
     /// installing every block.
@@ -864,6 +867,7 @@ impl core::ops::AddAssign for Statistics {
             sync_ticks,
             mail_waits,
             store_sources,
+            ahead_installs,
         } = other;
         for (index, (total, count)) in self.mail_waits.iter_mut().zip(mail_waits).enumerate() {
             if index < MailWait::Longest as usize {
@@ -961,6 +965,9 @@ impl core::ops::AddAssign for Statistics {
             .iter_mut()
             .zip(store_sources.as_flattened())
         {
+            *total += count;
+        }
+        for (total, count) in self.ahead_installs.iter_mut().zip(ahead_installs) {
             *total += count;
         }
         for (total, count) in [

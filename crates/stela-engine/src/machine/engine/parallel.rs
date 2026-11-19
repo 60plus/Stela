@@ -527,6 +527,9 @@ pub struct Counts {
     /// Its installs at EL0 and above by where the block came from
     /// ([`super::Statistics::store_sources`]).
     pub store_sources: [[u64; 5]; 2],
+    /// Of its shared installs, blocks prepared ahead of any fetch
+    /// ([`super::Statistics::ahead_installs`]).
+    pub ahead_installs: [u64; 2],
     /// Blocks it holds, the slots its block table has, the pages its
     /// index finds blocks in, and the parts of its code arena it released
     /// for heap pressure.
@@ -2661,6 +2664,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 [statistics.self_loops, entries, iterated]
             },
             store_sources: statistics.store_sources,
+            ahead_installs: statistics.ahead_installs,
             live_blocks: self.code.blocks.live() as u64,
             block_slots: self.code.blocks.len() as u64,
             indexed_pages: self.code.indexed_pages() as u64,

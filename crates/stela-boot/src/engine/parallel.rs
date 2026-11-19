@@ -286,6 +286,12 @@ impl Pe {
                         }
                         // The translation pack's writes, a bounded step.
                         super::translations::step();
+                        // Blocks the other PEs will fetch, prepared ahead
+                        // while this PE's guest has no work.
+                        super::translations::prepare_ahead(
+                            &mut |frame, bytes| machine.host.read_ram(frame, bytes),
+                            &|| watch.pending(host::fresh_counter()).is_some(),
+                        );
                         // A GPU compilation a guest call deferred.
                         #[cfg(feature = "nvk")]
                         super::gpu::gate::run_job(super::gpu::gate::Taker::Waiting);

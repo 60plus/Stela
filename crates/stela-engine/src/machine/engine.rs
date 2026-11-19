@@ -78,6 +78,7 @@ pub use device_read::{CanonicalDeviceMemory, ConsumedScalar, DeviceReadRequest, 
 pub use device_write::{
     CanonicalDeviceWrite, CanonicalWriteMemory, ConsumedWrite, DeviceWriteRequest, DeviceWriteShape,
 };
+pub mod ahead;
 mod block_index;
 mod board;
 mod page_sets;

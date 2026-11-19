@@ -2018,6 +2018,12 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Whether the shared blocks hold one at `pc` of the page `key` in
+    /// `context`, without counting a lookup.
+    pub fn holds_shared(&self, key: &Digest, pc: u64, context: &Digest) -> bool {
+        self.shared.contains_key(&shared_key(key, pc, context))
+    }
+
     /// Keep no offer while `shed`, the heap being short, or keep them again:
     /// the writer sheds the store's work before anything else's.
     pub fn shed(&mut self, shed: bool) {
@@ -2275,6 +2281,22 @@ mod tests {
             .collect();
         preparation.admit(&mut input);
         Offer::compile(key, page, pc, preparation.context(page), input, preparation).unwrap()
+    }
+
+    #[test]
+    fn a_shared_block_is_held_without_a_lookup_counted() {
+        let key = Digest([7; 32]);
+        let mut store = Store::new(translator_id(), None).0;
+        store.share(1 << 20);
+        let offer = offer(0x1000, key);
+        let context = offer.context();
+        assert!(!store.holds_shared(&key, 0x1000, &context));
+        store.offer(offer);
+        assert!(store.holds_shared(&key, 0x1000, &context));
+        assert!(!store.holds_shared(&key, 0x1004, &context));
+        assert_eq!(store.counters.shared_hits, 0);
+        assert!(store.prepared(&key, 0x1000, &context).is_some());
+        assert_eq!(store.counters.shared_hits, 1);
     }
 
     #[test]

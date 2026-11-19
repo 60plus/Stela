@@ -38,6 +38,7 @@ use stela_drivers::block::BlockDevice;
 use stela_engine::machine::Offer;
 use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
+use stela_engine::machine::engine::ahead;
 use stela_engine::translations;
 use stela_engine::translations::Digest;
 use stela_engine::translations::pack;
@@ -812,7 +813,20 @@ impl Translations for Shared {
 
     fn offer(&mut self, offer: Offer) {
         let capabilities = AVAILABLE.capabilities.load(Ordering::Acquire);
-        if capabilities & WRITE_PACK != 0 {
+        // Its successors in its page, for a waiting PE to prepare.
+        if capabilities & SHARE_BLOCKS != 0 {
+            AHEAD.with(|queue| {
+                let queue = queue.get_or_insert_with(ahead::Queue::new);
+                offer.ahead_jobs().for_each(|job| queue.push(job));
+            });
+        }
+        // A block prepared ahead is only shared: the PE that installs it
+        // first offers it again for the pack.
+        if offer.ahead() {
+            if capabilities & SHARE_BLOCKS != 0 {
+                Self::publish_shared(offer);
+            }
+        } else if capabilities & WRITE_PACK != 0 {
             Self::publish_writable(offer);
         } else if capabilities & SHARE_BLOCKS != 0 {
             Self::publish_shared(offer);
@@ -850,6 +864,76 @@ impl Translations for Shared {
     /// code pages a desktop boot reads.
     fn known_pages(&mut self) -> Option<usize> {
         Some(crate::ALLOCATOR.usage().total / 128 / 56)
+    }
+}
+
+/// The blocks waiting to be prepared ahead of any fetch
+/// ([`stela_engine::machine::engine::ahead`]).
+static AHEAD: Lock<Option<ahead::Queue>> = Lock::new(None);
+
+/// How long one [`prepare_ahead`] call may take, in microseconds.
+const AHEAD_MICROS: u64 = 500;
+
+/// Prepare blocks ahead of any fetch, newest job first, for at most
+/// [`AHEAD_MICROS`] or until `stop` says this PE's guest has work: a PE
+/// whose guest waits calls it. `read` reads a guest-physical frame. A job
+/// whose block the store holds (in a pack record or among its shared
+/// blocks) or whose frame no longer holds its page's bytes is skipped; the
+/// others' blocks join the shared blocks, and their successors the queue.
+pub fn prepare_ahead(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, stop: &dyn Fn() -> bool) {
+    if !available(SHARE_BLOCKS) {
+        return;
+    }
+    let started = super::host::fresh_counter();
+    let deadline = started + super::host::COUNTER_HZ * AHEAD_MICROS / 1_000_000;
+    let mut page = [0u8; translations::PAGE_BYTES];
+    // The frame read last and the key its bytes hashed to.
+    let mut verified: Option<(u64, Digest)> = None;
+    while super::host::fresh_counter() < deadline && !stop() {
+        let Some(job) = AHEAD.with(|queue| queue.as_mut()?.pop()) else {
+            break;
+        };
+        let outcome = ahead_job(&job, read, &mut page, &mut verified);
+        AHEAD.with(|queue| {
+            if let Some(queue) = queue {
+                queue.note(outcome);
+            }
+        });
+    }
+}
+
+fn ahead_job(
+    job: &ahead::Job,
+    read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    page: &mut [u8; translations::PAGE_BYTES],
+    verified: &mut Option<(u64, Digest)>,
+) -> ahead::Outcome {
+    let key = *job.key();
+    let held = part(&key).with(|store| {
+        store
+            .as_ref()
+            .is_some_and(|store| store.holds_shared(&key, job.pc(), job.context()))
+    });
+    if held
+        || Shared
+            .record(&key)
+            .is_some_and(|record| record.contains(job.offset(), job.context()))
+    {
+        return ahead::Outcome::Present;
+    }
+    if *verified != Some((job.frame(), key)) {
+        *verified = None;
+        if !read(job.frame(), page) || !ahead::page_matches(job, page) {
+            return ahead::Outcome::Stale;
+        }
+        *verified = Some((job.frame(), key));
+    }
+    match ahead::prepare(job, page) {
+        Ok(offer) => {
+            Shared.offer(offer);
+            ahead::Outcome::Prepared
+        }
+        Err(outcome) => outcome,
     }
 }
 
@@ -1085,6 +1169,19 @@ fn millis(ticks: u64) -> u64 {
 /// Report what the store did and cost this boot: lookups and their causes,
 /// shared misses by reason, stored forms kept and checked, and lock waits.
 fn report(counters: &pack::Counters) {
+    let ahead = AHEAD.with(|queue| queue.as_ref().map(ahead::Queue::counts));
+    let ahead = ahead.unwrap_or_default();
+    output::arguments(format_args!(
+        "TRANSLATIONS ahead queued={} repeated={} dropped={} prepared={} present={} stale={} \
+         refused={}\n",
+        ahead.queued,
+        ahead.repeated,
+        ahead.dropped,
+        ahead.prepared,
+        ahead.present,
+        ahead.stale,
+        ahead.refused,
+    ));
     let costs = &COSTS;
     let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     output::arguments(format_args!(

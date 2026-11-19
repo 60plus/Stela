@@ -133,6 +133,11 @@ pub struct SharedTranslation {
     page: u64,
     pc: u64,
     context: Digest,
+    /// The guest-physical frame of its fetch page.
+    frame: u64,
+    /// Prepared ahead of any fetch (`ahead.rs`), not offered for the
+    /// pack yet: the PE that first installs it offers it.
+    ahead: bool,
 }
 impl SharedTranslation {
     pub fn input(&self) -> &[u8] {
@@ -143,6 +148,25 @@ impl SharedTranslation {
     }
     pub fn preparation(&self) -> &Arc<Preparation> {
         &self.emission.preparation
+    }
+    /// Whether it was prepared ahead of any fetch and not offered since.
+    pub fn ahead(&self) -> bool {
+        self.ahead
+    }
+    /// The offer of a block prepared ahead, made by the PE that installs it
+    /// first: the store keeps it for the pack as any block compiled anew.
+    pub(super) fn offer(&self, quiet: bool) -> Offer {
+        Offer {
+            key: self.key,
+            page: self.page,
+            pc: self.pc,
+            context: self.context,
+            emission: self.emission.clone(),
+            successors: Vec::new(),
+            quiet,
+            frame: self.frame,
+            depth: 0,
+        }
     }
     pub(super) fn matches(&self, key: &Digest, pc: u64, context: &Digest, source: &[u8]) -> bool {
         self.key == *key
@@ -261,6 +285,12 @@ pub struct Offer {
     /// Compiled for EL0, where the PE holds no lock of the guest's kernel:
     /// a store may take time there for work of its own.
     pub(super) quiet: bool,
+    /// The guest-physical frame of its fetch page, which a PE preparing its
+    /// successors ahead reads (`ahead.rs`).
+    pub(super) frame: u64,
+    /// 0 for a block a fetch compiled; for one prepared ahead, how many
+    /// static successor steps it lies from one (`ahead.rs` DEPTH).
+    pub(super) depth: u8,
 }
 
 impl Offer {
@@ -290,6 +320,8 @@ impl Offer {
             emission: Arc::new(Emission::new(input, block, preparation)),
             successors: Vec::new(),
             quiet: false,
+            frame: 0,
+            depth: 0,
         })
     }
     pub fn key(&self) -> Digest {
@@ -336,7 +368,14 @@ impl Offer {
             page: self.page,
             pc: self.pc,
             context: self.context,
+            frame: self.frame,
+            ahead: self.depth > 0,
         })
+    }
+
+    /// Whether it was prepared ahead of any fetch (`ahead.rs`).
+    pub fn ahead(&self) -> bool {
+        self.depth > 0
     }
 
     /// Its block's stored form ([`stored_entry`]).

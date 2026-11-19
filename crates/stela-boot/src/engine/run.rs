@@ -2113,10 +2113,12 @@ impl Heartbeat {
             // to it), compiled where it keys none (one instruction, a
             // device-site page), taken from the pack, taken from another
             // PE, rebased from an entry proven at another address during
-            // the boot.
+            // the boot; then, of the shared ones, blocks a waiting PE
+            // prepared ahead of any fetch.
             let mut store = String::from(concat!(
                 "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
                 "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
+                "/user_ahead/kernel_ahead",
             ));
             // Per PE: stamped tail hits and misses by cause, stamps written,
             // changed cells, table probe transfers (jump cache misses), stamped
@@ -2383,6 +2385,9 @@ impl Heartbeat {
                     now.store_sources.as_flattened(),
                     before.store_sources.as_flattened(),
                 );
+                for (now, before) in now.ahead_installs.iter().zip(&before.ahead_installs) {
+                    store.push_str(&format!("/{}", now.saturating_sub(*before)));
+                }
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
                     " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
