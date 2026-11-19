@@ -274,6 +274,7 @@ fn load_holding(disk: &[u8], limit: u64, demand: bool) -> File<'static> {
     File {
         translator,
         limit,
+        records: u64::MAX,
         file_bytes: size,
         committed,
         segments,
@@ -1202,6 +1203,68 @@ fn a_first_boot_leaves_at_most_its_share_of_the_limit_and_sheds_the_rest() {
         })
         .count();
     assert_eq!(pack_sheds, 1, "{:?}", run.events);
+}
+
+/// A pack read on demand grows to its file, not to the RAM: its limit is
+/// the file's data area less the share a full merge writes beside it.
+#[test]
+fn a_pack_read_on_demand_is_bounded_by_its_file_and_a_merges_room() {
+    let file = 2u64 << 30;
+    let data = file - DATA_START;
+    let limit = demand_limit(file);
+    assert_eq!(limit, data - data / 8 * MERGED_SHARE);
+    // A boot leaves at most 6/8 of it and a full merge keeps 4/8: within
+    // the half of the file past which a full merge runs, and the share
+    // its segment may take.
+    assert!(limit / 8 * LEFT_EIGHTHS <= data / 2);
+    assert!(limit / 8 * KEPT_EIGHTHS <= data / 8 * MERGED_SHARE);
+    assert_eq!(demand_limit(0), 0);
+    // An 8 GiB host's budget holds the indexes of millions of records.
+    assert_eq!(
+        resident_records(496 << 20),
+        (496 << 20) / crate::translations::pack::RESIDENT_RECORD_BYTES
+    );
+}
+
+/// The records whose indexes the RAM holds bound a pack read on demand as
+/// its bytes do: the store sheds once the pack reaches them.
+#[test]
+fn a_pack_sheds_at_the_records_its_ram_holds_the_indexes_of() {
+    const ENTRY: usize = 4 << 10;
+    let record_bytes = {
+        let mut record = Record::new(translator_id(), page_key(0));
+        record.insert(entry(0, 0, ENTRY));
+        record.encode().len() as u64 + 56
+    };
+    let limit = 1000 * record_bytes;
+    let mut disk = Disk::new(DATA_START + 8 * limit.div_ceil(journal::ALIGN) * journal::ALIGN);
+    disk.track = false;
+    let mut file: File<'_> = load(&disk.bytes.clone(), limit);
+    file.records = 300;
+    let mut run = Run::new(file, 1);
+    run.boot.entry_bytes = ENTRY;
+    run.boot.bound = 200;
+    for _ in 0..24 {
+        run.boot.add(50);
+        run.run(&mut disk, 2).unwrap();
+    }
+    run.run(&mut disk, 2 * FIRST_DELTA_SECONDS).unwrap();
+    run.stop(&mut disk).unwrap();
+    let left = load(&disk.bytes.clone(), limit);
+    let records: usize = left.segments.iter().map(Segment::records).sum();
+    // Within the bound and what one look's batch adds past it.
+    assert!(records <= 300 + 50, "{records}");
+    assert!(records >= 300 - 300 / 16, "{records}");
+    let left: u64 = left.segments.iter().map(Segment::bytes).sum();
+    assert!(left < limit / 2, "{left} of {limit}");
+    assert!(run.boot.shed > 0);
+    assert!(run.events.iter().any(|event| matches!(
+        event,
+        Event::Shed {
+            reason: ShedReason::Pack,
+            ..
+        }
+    )));
 }
 
 /// A second boot of 300 of the 600 pages the first left, each given

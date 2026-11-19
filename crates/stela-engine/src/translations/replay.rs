@@ -443,3 +443,45 @@ fn demand_read_layout_replay() {
         }
     }
 }
+
+/// The pack's limit: the share of the boot's pages a pack holds when the
+/// RAM bounds it (before: the budget of an 8 GiB host, read whole or on
+/// demand) and when the file does (now: a 2 GiB file less a merge's room),
+/// after a boot (the [`super::writer::LEFT_EIGHTHS`] of the limit it leaves)
+/// and after a full merge (the [`super::writer::KEPT_EIGHTHS`] it keeps),
+/// with the memory its indexes take on that host. The pack holds pages
+/// chosen at random, not by use: a lower bound on its hits.
+#[test]
+#[ignore = "manual: the table"]
+fn demand_read_limit_replay() {
+    use super::writer::{KEPT_EIGHTHS, LEFT_EIGHTHS, demand_limit, resident_records};
+    let footprint = PAGES as u64 * RECORD_BYTES;
+    // `pack_budget` of an 8 GiB host at 8 PEs.
+    let budget: u64 = 496 << 20;
+    let reader = Reader {
+        ahead: true,
+        launch: 16,
+        wait_us: 0,
+        first_use: true,
+    };
+    for (name, limit) in [("ram", budget), ("file", demand_limit(2 << 30))] {
+        for (state, eighths) in [("left", LEFT_EIGHTHS), ("kept", KEPT_EIGHTHS)] {
+            let bytes = limit / 8 * eighths;
+            let pages = (bytes / RECORD_BYTES).min(resident_records(budget)) as usize;
+            let held = pages as f64 / PAGES as f64;
+            let outcome = replay(held, DISKS[0], reader, 32_768);
+            std::println!(
+                "LIMIT {name}={}MB {state}={}MB of {}MB held%={:.1} index={}MB of {}MB \
+                 hit%={:.1} of_all%={:.1}",
+                limit >> 20,
+                bytes >> 20,
+                footprint >> 20,
+                100.0 * held,
+                (pages as u64 * super::pack::RESIDENT_RECORD_BYTES) >> 20,
+                budget >> 20,
+                100.0 * outcome.hits as f64 / outcome.lookups.max(1) as f64,
+                100.0 * outcome.hits as f64 / outcome.all.max(1) as f64,
+            );
+        }
+    }
+}

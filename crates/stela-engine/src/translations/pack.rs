@@ -56,6 +56,11 @@ const DIGEST_BYTES: usize = 32;
 /// pack, the most uses a boot made of it ([`Merge::by_use`], saturating),
 /// the rest its length.
 const INDEX_ENTRY_BYTES: usize = DIGEST_BYTES + 8 + 8;
+/// What a record whose bytes stay in the file costs a boot's memory: its
+/// index entry, its place in the layout order ([`LayoutOrder`]) and its
+/// key filter bits ([`KeyFilters`]).
+pub const RESIDENT_RECORD_BYTES: u64 =
+    (INDEX_ENTRY_BYTES + size_of::<u32>() + FILTER_BITS_PER_KEY / 8) as u64;
 const AGE_SHIFT: u32 = 56;
 const USES_SHIFT: u32 = 48;
 pub const LENGTH_MASK: u64 = (1 << USES_SHIFT) - 1;

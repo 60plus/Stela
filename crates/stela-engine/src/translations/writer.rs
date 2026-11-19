@@ -67,7 +67,7 @@
 //! file, and no merge runs, as one would leave them out.
 use super::pack::{
     Delta, FileReads, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge,
-    Merged, SEGMENT_BLOB, Segment, Streamed, USED_BLOB, Use, UsedKeys,
+    Merged, RESIDENT_RECORD_BYTES, SEGMENT_BLOB, Segment, Streamed, USED_BLOB, Use, UsedKeys,
 };
 use super::{Digest, Record};
 use alloc::{
@@ -121,6 +121,21 @@ pub const RESIDENT_SHARE: u64 = 16;
 pub const SHED_SHARE: u64 = 16;
 /// Under this share of room, the writer lets its laid-out segments go.
 pub const RELEASE_SHARE: u64 = 32;
+
+/// The limit of a pack read on demand in a file of `file_bytes`: its data
+/// area less the [`MERGED_SHARE`] a full merge writes beside the content.
+/// Memory holds such a pack's indexes alone, so its size is the file's,
+/// not the RAM's; the RAM bounds its records ([`File::records`]).
+pub fn demand_limit(file_bytes: u64) -> u64 {
+    let data = (file_bytes / journal::ALIGN * journal::ALIGN).saturating_sub(DATA_START);
+    data - data / 8 * MERGED_SHARE
+}
+
+/// The most records a pack may hold whose indexes `bytes` of memory hold
+/// while their records stay in the file ([`RESIDENT_RECORD_BYTES`]).
+pub fn resident_records(bytes: u64) -> u64 {
+    bytes / RESIDENT_RECORD_BYTES
+}
 
 /// The heap the writer's segments and the store's entries share with the
 /// rest of the boot.
@@ -302,6 +317,9 @@ pub struct Writer<'a> {
     translator: Digest,
     /// The bound a merged segment stays within: what this PC can read.
     limit: u64,
+    /// The most records the pack holds: those whose indexes this PC's
+    /// memory holds.
+    records: u64,
     file_bytes: u64,
     committed: Option<Commit>,
     /// The file's segments as memory holds them, oldest first, and the
@@ -349,8 +367,11 @@ pub struct Writer<'a> {
     refilling: Option<u64>,
     /// The bytes of the segments read: records of earlier boots.
     read_bytes: u64,
-    /// The bytes of the entries a segment being laid out took.
+    /// The bytes and records of the entries a segment being laid out took,
+    /// and the entries taken from the store so far.
     delta_bytes: u64,
+    delta_records: u64,
+    taken: u64,
     /// The reads of a streamed write's next piece.
     reads: FileReads,
     fetch: Option<Fetch>,
@@ -366,8 +387,11 @@ pub struct Writer<'a> {
 /// A boot's view of its pack file as the loader read it.
 pub struct File<'a> {
     pub translator: Digest,
-    /// The bound a merged segment stays within.
+    /// The bound a merged segment stays within: the RAM's for a pack read
+    /// whole, the file's for one read on demand ([`demand_limit`]).
     pub limit: u64,
+    /// The most records the pack holds ([`resident_records`]).
+    pub records: u64,
     pub file_bytes: u64,
     /// The file's newest commit, any translator's.
     pub committed: Option<Commit>,
@@ -401,6 +425,7 @@ impl<'a> Writer<'a> {
         let mut writer = Self {
             translator: file.translator,
             limit: file.limit,
+            records: file.records,
             file_bytes: file.file_bytes,
             committed: file.committed,
             segments: Vec::new(),
@@ -428,6 +453,8 @@ impl<'a> Writer<'a> {
             refilling: None,
             read_bytes: segments.iter().map(Segment::bytes).sum(),
             delta_bytes: 0,
+            delta_records: 0,
+            taken: 0,
             reads: FileReads::default(),
             fetch: None,
             avoid,
@@ -487,12 +514,13 @@ impl<'a> Writer<'a> {
         }
         let left = self.left_bytes();
         let pack = self.pack_bytes(entries);
+        let records = self.pack_records(entries);
         let heap_short = heap.is_some_and(|Heap { total, room }| {
             room < total / SHED_SHARE || resident >= total / RESIDENT_SHARE
         });
         let reason = if heap_short {
             Some(ShedReason::Heap)
-        } else if pack >= left {
+        } else if pack >= left || records >= self.records {
             Some(ShedReason::Pack)
         } else {
             None
@@ -504,13 +532,15 @@ impl<'a> Writer<'a> {
         // it: a merge of the boot's segments that takes it just under its
         // share frees no room, and a refill (`refill_due`) must still run.
         // Run 20261119-052839 shed with its pack at 550 of 566 MB and kept
-        // nothing new for the rest of the boot.
+        // nothing new for the rest of the boot. Its records likewise.
+        let eased = pack < left.saturating_sub(self.limit / 16)
+            && records < self.records.saturating_sub(self.records / 16);
         self.pack_full = match reason {
             Some(ShedReason::Pack) => true,
             Some(ShedReason::Heap) => false,
-            None => self.pack_full && pack >= left.saturating_sub(self.limit / 16),
+            None => self.pack_full && !eased,
         };
-        let keep = reason.is_none() && heap_eased && pack < left.saturating_sub(self.limit / 16);
+        let keep = reason.is_none() && heap_eased && eased;
         if let Some(reason) = reason
             && !self.shedding
         {
@@ -554,6 +584,23 @@ impl<'a> Writer<'a> {
             _ => 0,
         };
         self.segment_bytes() + waiting + task + self.held_bytes + entries.added_bytes()
+    }
+
+    /// The records the pack holds and will hold, counted as
+    /// [`Self::pack_bytes`] counts their bytes (a key in two counts twice).
+    fn pack_records(&self, entries: &mut dyn Entries) -> u64 {
+        let segments: usize = self.segments.iter().map(Segment::records).sum();
+        let waiting: usize = self.waiting.iter().map(|layout| layout.records()).sum();
+        let task = match &self.task {
+            Task::Delta(..) => self.delta_records,
+            Task::Write {
+                done: Done::Segment(layout, _),
+                ..
+            } => layout.records() as u64,
+            _ => 0,
+        };
+        let added = entries.added().saturating_sub(self.taken);
+        (segments + waiting + self.held.len()) as u64 + task + added
     }
 
     /// Let every segment laid out go, with a merge in progress, the entries
@@ -621,6 +668,7 @@ impl<'a> Writer<'a> {
 
     /// Note the keys of entries taken for a segment.
     fn note_added(&mut self, added: &BTreeMap<Digest, Record>) {
+        self.taken += added.len() as u64;
         if self.added_keys.len() <= MAX_USED_KEYS {
             self.added_keys.extend(added.keys().copied());
         }
@@ -838,6 +886,7 @@ impl<'a> Writer<'a> {
             self.delta_interval = (self.delta_interval * 2).min(self.hz * LAST_DELTA_SECONDS);
         }
         self.stats.delta_records += added.len() as u64;
+        self.delta_records = added.len() as u64;
         self.delta_bytes = added
             .values()
             .map(|record| record.retained_bytes() as u64)

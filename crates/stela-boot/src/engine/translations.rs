@@ -228,9 +228,13 @@ pub struct Opened {
 /// The store on the first volume with `store.cfg`, as the handoff file's
 /// pages: run before boot services end, with no volume opened exclusively.
 /// `budget` is the most of the pack this PC's RAM holds
-/// (`host_memory::pack_budget`); the pack is read within it and the engine
-/// merges it within it, so that it does not grow past what the next boot on
-/// this PC can read. `None` when no volume has a store.
+/// (`host_memory::pack_budget`). A pack read whole is read within it and
+/// the engine merges it within it, so that it does not grow past what the
+/// next boot on this PC can read. A pack read on demand holds its indexes
+/// within it, and the engine merges it within the file
+/// ([`writer::demand_limit`]), its records bounded by the indexes the
+/// budget holds ([`writer::resident_records`]). `None` when no volume has a
+/// store.
 pub fn read(budget: u64) -> Option<Opened> {
     let translator = translations::translator_id();
     for handle in boot::find_handles::<SimpleFileSystem>().ok()? {
@@ -244,7 +248,8 @@ pub fn read(budget: u64) -> Option<Opened> {
         let Some(bound) = bound(&mut root) else {
             continue;
         };
-        let limit = bound.min(budget);
+        // What this PC's RAM reads of the pack.
+        let ram = bound.min(budget);
         let path = pack_path(&translator, "\\");
         if open(&mut root, &path, FileMode::Read).is_none() {
             claim_spare(&mut root, &translator);
@@ -264,13 +269,14 @@ pub fn read(budget: u64) -> Option<Opened> {
                 .map_or(0, |info| info.file_size());
             !previous::committed(file, &translator, size)
         });
-        let previous = match first && limit >= PACK_FLOOR {
-            true => previous::read(&mut root, &translator, limit / previous::PREVIOUS_SHARE),
+        let previous = match first && ram >= PACK_FLOOR {
+            true => previous::read(&mut root, &translator, ram / previous::PREVIOUS_SHARE),
             false => None,
         };
         let previous_bytes = previous.as_ref().map_or(0, |(_, bytes)| *bytes);
+        let held_ram = ram.saturating_sub(previous_bytes);
         let reading = output::now();
-        let (loaded, size, allocated) = match opened {
+        let (loaded, size, allocated, demand) = match opened {
             Some((mut file, writable)) => {
                 let size = file
                     .get_boxed_info::<FileInfo>()
@@ -278,17 +284,20 @@ pub fn read(budget: u64) -> Option<Opened> {
                 let allocated = writable && size >= bound;
                 // The engine reads records from the partition it writes:
                 // a pack it may write is read on demand, its merges too.
-                let demand = allocated && partition.is_some() && limit >= PACK_FLOOR;
-                let loaded = read_journal(
-                    &mut file,
-                    &translator,
-                    size,
-                    limit.saturating_sub(previous_bytes),
-                    demand,
-                )?;
-                (loaded, size, allocated)
+                let demand = allocated && partition.is_some() && ram >= PACK_FLOOR;
+                let loaded = read_journal(&mut file, &translator, size, held_ram, demand)?;
+                (loaded, size, allocated, demand)
             }
-            None => (blank()?, 0, false),
+            None => (blank()?, 0, false, false),
+        };
+        // Read on demand, the pack's records stay in the file: it grows to
+        // the file's limit, its records to the indexes the RAM holds.
+        let (limit, records) = match demand {
+            true => (
+                writer::demand_limit(bound),
+                writer::resident_records(held_ram),
+            ),
+            false => (ram, u64::MAX),
         };
         let (read, held) = match loaded.pack {
             PackRead::None | PackRead::Skipped => (0, 0),
@@ -300,9 +309,9 @@ pub fn read(budget: u64) -> Option<Opened> {
             }
         };
         output::arguments(format_args!(
-            "TRANSLATIONS {path} bound={bound} budget={budget} file={size} segments={} of {} \
-             lists={} pack={read} held={held} skipped={} allocated={allocated} partition={} \
-             read_ms={}\n",
+            "TRANSLATIONS {path} bound={bound} budget={budget} limit={limit} records={records} \
+             file={size} segments={} of {} lists={} pack={read} held={held} skipped={} \
+             allocated={allocated} partition={} read_ms={}\n",
             loaded.segments.0,
             loaded.segments.1,
             loaded.lists,
@@ -314,7 +323,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         // keeps its translations in memory.
         let writable = allocated
             && partition.is_some()
-            && limit >= PACK_FLOOR
+            && ram >= PACK_FLOOR
             && loaded.pack != PackRead::Skipped;
         let flags = if writable { WRITABLE } else { 0 } | if loaded.partial { PARTIAL } else { 0 };
         // SAFETY: the exclusive loader allocation starts with the placement
@@ -327,6 +336,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         placement[16..32].copy_from_slice(&partition.unwrap_or_default());
         placement[32..36].copy_from_slice(&flags.to_le_bytes());
         placement[40..48].copy_from_slice(&size.to_le_bytes());
+        placement[48..56].copy_from_slice(&records.to_le_bytes());
         return Some(Opened {
             region: loaded.region,
             writable,
@@ -1135,7 +1145,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
     let contents: &'static [u8] = &region[..blobs];
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let word = |at: usize| u32::from_le_bytes(contents[at..at + 4].try_into().expect("a word"));
-    let (limit, flags, size) = (field(8), word(32), field(40));
+    let (limit, flags, size, records) = (field(8), word(32), field(40), field(48));
     let translator = translations::translator_id();
     let slot = &contents[PLACEMENT_BYTES..head];
     let committed = (0..2).find_map(|index| Commit::decode(slot, index, DOMAIN, size));
@@ -1191,6 +1201,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
     let file = writer::File {
         translator,
         limit,
+        records,
         file_bytes: size,
         committed,
         segments: segments
