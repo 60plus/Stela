@@ -780,6 +780,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// System exits by key since they were last taken, under step timing
     /// ([`Self::take_system_exits`]).
     system_exits: Box<step_timing::SystemExits>,
+    /// The System exit whose round trip is being traced, under step timing
+    /// ([`step_timing::ExitTrace`]).
+    exit_trace: step_timing::ExitTrace,
     /// Hot-block samples not yet taken, under step timing
     /// ([`step_timing::HotBlocks`], [`Self::take_hot_samples`]), the runs
     /// until the next sampled one and the generator of sampled budgets.
@@ -1359,6 +1362,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             timed_word: None,
             timed_closed: false,
             system_exits: Box::default(),
+            exit_trace: step_timing::ExitTrace::default(),
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,

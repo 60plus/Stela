@@ -85,11 +85,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 hub.pass(self.current);
             }
             let started = self.timing_start();
+            self.trace_point(step_timing::PATH_SCHEDULE, started);
             let scheduled = match deadline {
                 Some(deadline) => self.schedule_with_deadline(Some(deadline)),
                 None => self.schedule(),
             };
-            self.timing_charge(step_timing::Phase::Schedule, started);
+            let scheduled_at = self.timing_charge(step_timing::Phase::Schedule, started);
+            self.trace_point(step_timing::PATH_SCHEDULED, scheduled_at);
             if let Err(stop) = scheduled
                 .and_then(|()| self.step())
                 .or_else(|stop| self.undefined_instead(stop))
@@ -106,6 +108,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // What this PE kept of shared counts, for the reports and the ring.
         self.flush_exits();
         self.flush_entered();
+        self.exit_trace.abandon(&mut self.system_exits.paths);
         // Out of the wait, a PE in WFE has guest work the host's work keeps
         // from it (`clock`); one waiting for an interrupt or off has none.
         if !self.waits_for_interrupt() && !self.processor_paused(self.current) {
@@ -154,7 +157,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let started = self.timing_start();
         self.poll_due_devices()?;
         let delivered = self.deliver_interrupts();
-        self.timing_charge(step_timing::Phase::Devices, started);
+        let devices_at = self.timing_charge(step_timing::Phase::Devices, started);
+        self.trace_point(step_timing::PATH_DEVICES, devices_at);
         if let Some(reason) = self.devices.take_reset() {
             return Err(Stop::Reset(reason));
         }
@@ -195,7 +199,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let single = mode.breakpoints || mode.step || pacm;
         let fetching = self.timing_start();
         let fetched = self.fetch_block(pc, single);
-        self.timing_charge(step_timing::Phase::Fetch, fetching);
+        let fetched_at = self.timing_charge(step_timing::Phase::Fetch, fetching);
+        self.trace_point(step_timing::PATH_FETCHED, fetched_at);
         let fetched = fetched?;
         // Between blocks a broadcast does not wait for this PE
         // (`Hub::applied`): mail that came meanwhile is read first, and the
@@ -324,6 +329,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
         // chained blocks and thunks too.
         let exit = unsafe { self.host.execute(entry, &mut self.cpu.state) };
+        self.finish_trace();
         self.set_doing(step_timing::BLOCKER_RETURNED);
         if self.mail_returned == 0
             && let Some(hub) = &self.parallel
@@ -471,7 +477,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
                 let mut slot = kind as usize;
                 if kind == ExitKind::System as u64 && self.step_timing.is_some() {
-                    let word = self.timed_system_word(last, next_pc);
+                    let word = self.traced_system_word(last, next_pc, returned);
                     if word == step_timing::DEVICE_SITE_KEY {
                         slot = step_timing::DEVICE_SITE_SLOT;
                     }
@@ -487,6 +493,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 let spent = remaining > budget;
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
+                self.trace_point_now(step_timing::PATH_SERVED);
                 if exited.is_ok()
                     && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
                 {
@@ -509,6 +516,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
                 }
                 self.timing_exit(slot, returned);
+                self.trace_point_now(step_timing::PATH_CLOSED);
                 self.set_doing(0);
                 exited
             }

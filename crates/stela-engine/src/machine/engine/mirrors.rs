@@ -578,6 +578,17 @@ impl Mirrors {
         self.entered = 1 << self.state;
     }
 
+    /// The open cells [`Self::close_all`] would close.
+    pub(super) fn open_cells(&self) -> u64 {
+        self.banks
+            .iter()
+            .enumerate()
+            .filter(|&(state, _)| self.entered >> state & 1 != 0)
+            .flat_map(|(_, cells)| cells)
+            .filter(|cell| cell.readable != 0)
+            .count() as u64
+    }
+
     /// Whether every cell is closed.
     #[cfg(test)]
     pub(super) fn closed(&self) -> bool {

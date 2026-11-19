@@ -276,6 +276,50 @@ fn system_total_report(
     total.clear();
 }
 
+/// Add the beat's traced System exit round trips (`step_timing::ExitPaths`)
+/// to `total`, and at the end of a [`HOT_TOTAL_BEATS`] stretch write
+/// `PES EXIT PATH`: the exits traced and abandoned, the mean ns of each
+/// segment and their total, the traced services' host regime syncs and
+/// prediction isolations (per 100 traced exits, and ns each), and the
+/// changes of derived state that closed every mirror cell with the open
+/// cells each closed; then start over.
+fn exit_path_report(
+    total: &mut step_timing::ExitPaths,
+    paths: &step_timing::ExitPaths,
+    due: bool,
+    tsc_hz: u64,
+) {
+    total.merge(paths);
+    if !due || *total == step_timing::ExitPaths::default() {
+        return;
+    }
+    let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let traced = u128::from(total.traced.max(1));
+    let mut line = format!(
+        "PES EXIT PATH beats={HOT_TOTAL_BEATS} traced={} abandoned={} ns",
+        total.traced, total.abandoned
+    );
+    let mut sum = 0;
+    for (index, (name, &ticks)) in step_timing::PATH_NAMES.iter().zip(&total.ticks).enumerate() {
+        let each = nanos(ticks) / traced;
+        sum += each;
+        let separator = if index == 0 { ' ' } else { ',' };
+        line.push_str(&format!("{separator}{name}={each}"));
+    }
+    let each = |ticks: u64, count: u64| nanos(ticks) / u128::from(count.max(1));
+    line.push_str(&format!(
+        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={}",
+        u128::from(total.syncs) * 100 / traced,
+        each(total.sync_ticks, total.syncs),
+        u128::from(total.isolations) * 100 / traced,
+        each(total.isolation_ticks, total.isolations),
+        total.closes,
+        total.cells_closed / total.closes.max(1),
+    ));
+    output::arguments(format_args!("{line}\n"));
+    *total = step_timing::ExitPaths::default();
+}
+
 /// The exits of `exits` past the first `shown`, summed, if any.
 fn rest(exits: &[step_timing::SystemExit], shown: usize) -> Option<step_timing::SystemExit> {
     let rest = exits.get(shown..).filter(|rest| !rest.is_empty())?;
@@ -1542,6 +1586,10 @@ pub(super) struct Heartbeat {
     /// Every System exit key's exits since the last `PES SYSTEM TOTAL`
     /// line (`system_total_report`).
     pub(super) system_total: BTreeMap<u32, step_timing::SystemExit>,
+    /// The traced System exit round trips of the current
+    /// [`HOT_TOTAL_BEATS`] stretch, for its `PES EXIT PATH` line
+    /// (`exit_path_report`).
+    pub(super) exit_paths: step_timing::ExitPaths,
 }
 
 /// The heartbeat's reports after its first part ([`Heartbeat::beat`]), in
@@ -1613,6 +1661,7 @@ impl Heartbeat {
             dynamic: Default::default(),
             hot_total: Default::default(),
             system_total: BTreeMap::new(),
+            exit_paths: step_timing::ExitPaths::default(),
         }
     }
 
@@ -1937,6 +1986,12 @@ impl Heartbeat {
                 system_total_report(
                     &mut self.system_total,
                     &exits,
+                    self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    tsc_hz,
+                );
+                exit_path_report(
+                    &mut self.exit_paths,
+                    &exits.paths,
                     self.beats.is_multiple_of(HOT_TOTAL_BEATS),
                     tsc_hz,
                 );

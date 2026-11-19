@@ -45,6 +45,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.forget_derived();
         self.mirrors.transitions.forget();
         self.device_lines = None;
+        if self.step_timing.is_some() {
+            let paths = &mut self.system_exits.paths;
+            paths.closes += 1;
+            paths.cells_closed += self.mirrors.open_cells();
+        }
         self.mirrors.close_all();
         // Under step timing, the System exit being handled is charged with it.
         self.timed_closed |= self.timed_word.is_some();
@@ -292,6 +297,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let isolating = self.timing_start();
             self.host.isolate_predictions();
             isolated = Some(self.timing_since(isolating));
+        }
+        if self.exit_trace.in_service() {
+            self.exit_trace.sync(synced, isolated);
         }
         if self.step_timing.is_some() {
             let regimes = &mut self.system_exits.regimes;

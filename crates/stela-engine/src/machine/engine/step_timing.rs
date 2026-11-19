@@ -316,6 +316,188 @@ pub struct SystemExits {
     pub regimes: RegimeSyncs,
     /// WKDMC, then WKDMD ([`Compression`]).
     pub compression: [Compression; 2],
+    /// Where sampled System exits' round trips went ([`ExitPaths`]).
+    pub paths: ExitPaths,
+}
+
+/// The points a traced System exit's round trip passes ([`ExitTrace`]), in
+/// order: native code's return in the host, the engine's adoption of what
+/// it did, the start and end of the profile's look at the exit's word, the
+/// end of the service, of its links and charge, the start and end of the
+/// next schedule, the end of the devices' and the fetch's phases, and the
+/// host's next entry into native code.
+pub const PATH_RETURNED: usize = 0;
+pub const PATH_ADOPTED: usize = 1;
+pub const PATH_WORD: usize = 2;
+pub const PATH_SERVICE: usize = 3;
+pub const PATH_SERVED: usize = 4;
+pub const PATH_CLOSED: usize = 5;
+pub const PATH_SCHEDULE: usize = 6;
+pub const PATH_SCHEDULED: usize = 7;
+pub const PATH_DEVICES: usize = 8;
+pub const PATH_FETCHED: usize = 9;
+pub const PATH_ENTERED: usize = 10;
+const PATH_POINTS: usize = PATH_ENTERED + 1;
+
+/// The segments between the [`ExitTrace`] points, as `PES EXIT PATH` names
+/// them.
+pub const PATH_SEGMENTS: usize = PATH_POINTS - 1;
+pub const PATH_NAMES: [&str; PATH_SEGMENTS] = [
+    "back", "prelude", "word", "service", "close", "loop", "schedule", "devices", "fetch", "enter",
+];
+
+/// One System exit in this many is traced: a few hundred cycles of stamps
+/// on one in 64 keep the trace's cost far below the step timing's own.
+pub const PATH_EVERY: u32 = 64;
+
+/// Sampled System exits' round trips under step timing, from native code's
+/// return to its next entry, by segment ([`PATH_NAMES`]): the exits traced
+/// and those whose trace another path ended first (an interrupt taken, an
+/// exception, the run loop left); within the traced services, the host's
+/// regime syncs and prediction isolations; and every change of derived
+/// state that closed every mirror cell, with the open cells it closed, each
+/// of which costs an exit to open again where code reaches it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitPaths {
+    pub traced: u64,
+    pub abandoned: u64,
+    pub ticks: [u64; PATH_SEGMENTS],
+    pub syncs: u64,
+    pub sync_ticks: u64,
+    pub isolations: u64,
+    pub isolation_ticks: u64,
+    pub closes: u64,
+    pub cells_closed: u64,
+}
+
+impl ExitPaths {
+    /// Add everything `other` counts.
+    pub fn merge(&mut self, other: &Self) {
+        self.traced += other.traced;
+        self.abandoned += other.abandoned;
+        for (ticks, more) in self.ticks.iter_mut().zip(other.ticks) {
+            *ticks += more;
+        }
+        self.syncs += other.syncs;
+        self.sync_ticks += other.sync_ticks;
+        self.isolations += other.isolations;
+        self.isolation_ticks += other.isolation_ticks;
+        self.closes += other.closes;
+        self.cells_closed += other.cells_closed;
+    }
+}
+
+/// The System exit being traced on a PE, if any: the profile ticks at each
+/// point it passed ([`PATH_RETURNED`] and on), the next point it expects,
+/// and the syncs its service made. A point out of order abandons it, as
+/// does leaving the run loop; the next native entry folds it into
+/// [`ExitPaths`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitTrace {
+    countdown: u32,
+    next: usize,
+    stamps: [u64; PATH_POINTS],
+    syncs: [u64; 4],
+}
+
+impl ExitTrace {
+    /// Whether the next System exit is one to trace.
+    #[inline]
+    pub fn due(&mut self) -> bool {
+        if self.countdown != 0 {
+            self.countdown -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Trace the System exit native code returned for at `returned` (the
+    /// host's ticks, 0 where it keeps none), which the engine adopted by
+    /// `adopted`, its word looked at from `now`.
+    pub fn begin(&mut self, returned: u64, adopted: u64, now: u64) {
+        self.countdown = PATH_EVERY - 1;
+        let returned = if returned == 0 || returned > adopted {
+            adopted
+        } else {
+            returned
+        };
+        self.stamps[PATH_RETURNED] = returned;
+        self.stamps[PATH_ADOPTED] = adopted;
+        self.stamps[PATH_WORD] = now;
+        self.syncs = [0; 4];
+        self.next = PATH_SERVICE;
+    }
+
+    /// Drop the exit begun, which is not one to trace (a wait, a device
+    /// site): the next System exit is traced instead.
+    pub fn cancel(&mut self) {
+        self.next = 0;
+        self.countdown = 0;
+    }
+
+    #[inline]
+    pub fn open(&self) -> bool {
+        self.next != 0
+    }
+
+    /// Whether the traced exit's service runs.
+    #[inline]
+    pub fn in_service(&self) -> bool {
+        self.next == PATH_SERVED
+    }
+
+    /// The trace reached `point` at `now`; out of order, it is abandoned.
+    pub fn stamp(&mut self, point: usize, now: u64, paths: &mut ExitPaths) {
+        if self.next == 0 {
+            return;
+        }
+        if self.next != point {
+            return self.abandon(paths);
+        }
+        self.stamps[point] = now;
+        self.next = point + 1;
+    }
+
+    /// End the trace without a sample.
+    pub fn abandon(&mut self, paths: &mut ExitPaths) {
+        if self.next != 0 {
+            self.next = 0;
+            paths.abandoned += 1;
+        }
+    }
+
+    /// The service synchronized the host's regime in `ticks`, and isolated
+    /// its predictions in `isolated`'s.
+    pub fn sync(&mut self, ticks: u64, isolated: Option<u64>) {
+        self.syncs[0] += 1;
+        self.syncs[1] += ticks;
+        if let Some(isolated) = isolated {
+            self.syncs[2] += 1;
+            self.syncs[3] += isolated;
+        }
+    }
+
+    /// Native code was entered again at `entered` (the host's ticks, 0
+    /// where it keeps none): the trace ends and its segments count.
+    pub fn finish(&mut self, entered: u64, paths: &mut ExitPaths) {
+        if self.next == 0 {
+            return;
+        }
+        if self.next != PATH_ENTERED {
+            return self.abandon(paths);
+        }
+        let fetched = self.stamps[PATH_FETCHED];
+        self.stamps[PATH_ENTERED] = if entered < fetched { fetched } else { entered };
+        for (segment, ticks) in paths.ticks.iter_mut().enumerate() {
+            *ticks += self.stamps[segment + 1].saturating_sub(self.stamps[segment]);
+        }
+        paths.traced += 1;
+        paths.syncs += self.syncs[0];
+        paths.sync_ticks += self.syncs[1];
+        paths.isolations += self.syncs[2];
+        paths.isolation_ticks += self.syncs[3];
+        self.next = 0;
+    }
 }
 
 /// The host's regime changes ([`super::Host::set_regime`]) and prediction
@@ -993,6 +1175,7 @@ impl Default for SystemExits {
             barriers: BarrierWaits::default(),
             regimes: RegimeSyncs::default(),
             compression: [Compression::default(); 2],
+            paths: ExitPaths::default(),
         }
     }
 }
@@ -1031,6 +1214,7 @@ impl SystemExits {
         for (compression, other) in self.compression.iter_mut().zip(&exits.compression) {
             compression.merge(other);
         }
+        self.paths.merge(&exits.paths);
     }
 
     /// The keys with exits.
@@ -1046,6 +1230,7 @@ impl SystemExits {
             && self.floating_words.is_empty()
             && self.barriers.waits == 0
             && self.regimes == RegimeSyncs::default()
+            && self.paths == ExitPaths::default()
             && self
                 .compression
                 .iter()

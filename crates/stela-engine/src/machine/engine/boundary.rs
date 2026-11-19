@@ -505,6 +505,13 @@ pub trait Host {
     /// time goes counts that time as idle rather than as the scheduler's
     /// ([`step_timing::Phase::Schedule`]), which holds it.
     fn profile_idle(&mut self, _idle: bool) {}
+    /// The profile ticks ([`Self::profile_ticks`]) at which the last native
+    /// run was entered and returned, as close to native code as the host
+    /// keeps them; 0 where it keeps none. Under `--profile` they bound a
+    /// traced System exit's round trip ([`step_timing::ExitTrace`]).
+    fn native_stamps(&self) -> [u64; 2] {
+        [0; 2]
+    }
     /// Under `--profile`, the `bytes` of code just installed at `code` are
     /// `regions`: `(offset, region)` pairs in ascending offsets, each
     /// running to the next one's offset and the last to `bytes`

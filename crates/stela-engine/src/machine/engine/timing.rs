@@ -141,6 +141,62 @@ impl<H: Host, D: Devices> Machine<H, D> {
         now
     }
 
+    /// The traced System exit ([`step_timing::ExitTrace`]) reached `point`
+    /// at profile ticks `now`.
+    #[inline]
+    pub(super) fn trace_point(&mut self, point: usize, now: u64) {
+        if self.exit_trace.open() {
+            self.exit_trace
+                .stamp(point, now, &mut self.system_exits.paths);
+        }
+    }
+
+    /// [`Self::trace_point`] at the profile clock's ticks now, read only
+    /// while a trace is open.
+    #[inline]
+    pub(super) fn trace_point_now(&mut self, point: usize) {
+        if self.exit_trace.open() {
+            let now = self.host.profile_ticks();
+            self.exit_trace
+                .stamp(point, now, &mut self.system_exits.paths);
+        }
+    }
+
+    /// Under step timing, perhaps trace the System exit of block `index` at
+    /// `next_pc` that native code returned for, which the engine adopted by
+    /// profile ticks `adopted`: one in [`step_timing::PATH_EVERY`], other
+    /// than waits and device sites. The profile's look at the exit's word
+    /// is the trace's `word` segment; its key is returned.
+    pub(super) fn traced_system_word(&mut self, index: usize, next_pc: u64, adopted: u64) -> u32 {
+        if !self.exit_trace.due() {
+            return self.timed_system_word(index, next_pc);
+        }
+        let now = self.host.profile_ticks();
+        let [_, returned] = self.host.native_stamps();
+        self.exit_trace.begin(returned, adopted, now);
+        let word = self.timed_system_word(index, next_pc);
+        let traced = word != step_timing::DEVICE_SITE_KEY
+            && step_timing::SystemClass::of(step_timing::system_key(word))
+                != step_timing::SystemClass::Wait;
+        if traced {
+            self.trace_point_now(step_timing::PATH_SERVICE);
+        } else {
+            self.exit_trace.cancel();
+        }
+        word
+    }
+
+    /// Native code was entered again: a traced exit's round trip ends at
+    /// the host's entry.
+    #[inline]
+    pub(super) fn finish_trace(&mut self) {
+        if self.exit_trace.open() {
+            let [entered, _] = self.host.native_stamps();
+            self.exit_trace
+                .finish(entered, &mut self.system_exits.paths);
+        }
+    }
+
     /// Charge the ticks since `since` to handling an exit in `slot`, a native
     /// device fault's or device site's to the register it reached, and a
     /// System exit's to its key ([`Self::take_system_exits`]).

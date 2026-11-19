@@ -648,6 +648,9 @@ pub struct State {
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
+    /// The TSC at the last native run's entry and return
+    /// (`Host::native_stamps`).
+    pub native_stamps: [u64; 2],
     /// The runs of compiled code and the time from their returns to the
     /// next entries, by the kind of exit that ended them (`PES EXIT TIME`).
     outside: stela_boot_core::exit_times::ExitTimes,
@@ -833,6 +836,7 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             ring,
             fills: 0,
             native_ticks: 0,
+            native_stamps: [0; 2],
             outside: stela_boot_core::exit_times::ExitTimes::new(),
             clock: stela_boot_core::host_clock::Clock::new(
                 stela_boot_core::host_clock::Features::read(),
@@ -1546,6 +1550,7 @@ fn native_return(code: NativeCode, exit: BlockExit, entered: u64) -> NativeExit 
     state.native = false;
     let returned = rdtsc();
     state.native_ticks += returned - entered;
+    state.native_stamps = [entered, returned];
     // The exit before this run took until `entered`; this one's time runs
     // from here to the next entry.
     let kind = if exit.kind == FAULT_KIND {

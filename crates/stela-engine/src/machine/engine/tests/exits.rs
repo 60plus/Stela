@@ -457,3 +457,63 @@ fn contended(locked: bool) -> u64 {
             .unwrap()
     })
 }
+
+/// `MSR TPIDR_EL1, X0`, then `b .-4`: a System exit and a direct exit back.
+fn thread_switches() -> Machine<FakeHost, NoDevices> {
+    const MSR_TPIDR_EL1_X0: u32 = 0xd518_d080;
+    const BACK: u32 = 0x17ff_ffff;
+    let mut machine = machine(&[MSR_TPIDR_EL1_X0, BACK]);
+    machine.cpu.set_pstate(Pstate::reset(1));
+    machine.host.counter_step = 1;
+    machine.set_step_timing(true);
+    machine
+}
+
+/// The scripted exits of `rounds` of [`thread_switches`]: the System exit
+/// at the MSR, then the branch's.
+fn switch_exits(machine: &mut Machine<FakeHost, NoDevices>, rounds: usize) {
+    for _ in 0..rounds {
+        for kind in [ExitKind::System, ExitKind::Direct] {
+            machine.host.exits.push(NativeExit::Exit {
+                next_pc: BASE,
+                kind: kind as u64,
+            });
+        }
+    }
+}
+
+/// Under step timing one System exit in `PATH_EVERY` is traced through the
+/// run loop, point by point, to the next native entry: each segment counts
+/// once and their sum is the round trip. A trace still open when the run
+/// loop is left counts as abandoned, and nothing is traced without step
+/// timing.
+#[test]
+fn system_exit_round_trips_are_traced_through_the_run_loop() {
+    let mut machine = thread_switches();
+    let rounds = step_timing::PATH_EVERY as usize + 1;
+    switch_exits(&mut machine, rounds);
+    let stop = machine.run_blocks(2 * rounds as u64);
+    assert!(matches!(stop, Stop::Budget), "{stop:?}");
+    assert!(machine.host.exits.is_empty());
+    let paths = machine.take_system_exits().paths;
+    assert_eq!((paths.traced, paths.abandoned), (2, 0), "{paths:?}");
+    // The fake clock moves at every read, so every segment is short and the
+    // service, which reads it, is not empty.
+    assert!(paths.ticks.iter().all(|&ticks| ticks < 1000), "{paths:?}");
+    assert!(paths.ticks[step_timing::PATH_SERVICE] > 0, "{paths:?}");
+    // Left right after the exit, the trace is abandoned.
+    let mut machine = thread_switches();
+    switch_exits(&mut machine, 1);
+    machine.run_blocks(1);
+    let paths = machine.take_system_exits().paths;
+    assert_eq!((paths.traced, paths.abandoned), (0, 1), "{paths:?}");
+    // Without step timing nothing is stamped.
+    let mut machine = thread_switches();
+    machine.set_step_timing(false);
+    switch_exits(&mut machine, 1);
+    machine.run_blocks(2);
+    assert_eq!(
+        machine.take_system_exits().paths,
+        step_timing::ExitPaths::default()
+    );
+}

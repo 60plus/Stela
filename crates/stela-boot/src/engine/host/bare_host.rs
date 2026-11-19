@@ -699,6 +699,10 @@ impl Host for BareHost<'_> {
         super::sampling::idle(idle);
     }
 
+    fn native_stamps(&self) -> [u64; 2] {
+        state().native_stamps
+    }
+
     fn profile_exit(&mut self, slot: usize, now: u64) {
         let phase = stela_engine::machine::engine::step_timing::Phase::Exit;
         super::sampling::charge(phase, Some(slot));
