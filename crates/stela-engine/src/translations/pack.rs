@@ -1050,6 +1050,11 @@ pub struct Merge<'a> {
     /// those the running boot did not use when it names those it did
     /// ([`Merge::protect`]), so they are kept first.
     by_age: [(u64, usize); RANKS],
+    /// The running boot's uses of each key ([`Merge::by_use`]), and the
+    /// records of the rank that does not fit whole that are kept: those
+    /// used most, until the bound is full.
+    uses: BTreeMap<Digest, u32>,
+    chosen: Vec<bool>,
     phase: Phase<'a>,
     evicted: u64,
     expired: u64,
@@ -1128,6 +1133,8 @@ impl<'a> Merge<'a> {
             scratch: DecodeScratch::default(),
             records: Vec::new(),
             by_age: [(0, 0); RANKS],
+            uses: BTreeMap::new(),
+            chosen: Vec::new(),
             phase: Phase::Taking,
             evicted: 0,
             expired: 0,
@@ -1145,6 +1152,41 @@ impl<'a> Merge<'a> {
     pub fn protect(mut self, keys: UsedKeys) -> Self {
         self.protect = Some(keys);
         self
+    }
+
+    /// Of the rank that does not fit whole, keep the records the running
+    /// boot used most (`uses`, by page key), not the first in key order:
+    /// a merge that ran while a boot had used part of its pack left out
+    /// pages by their hash, those a session runs among them.
+    pub fn by_use(mut self, uses: BTreeMap<Digest, u32>) -> Self {
+        self.uses = uses;
+        self
+    }
+
+    /// Which records of rank `oldest` fit after `count` records of `bytes`
+    /// kept whole: the most used first, ties in key order.
+    fn choose(&self, oldest: Option<usize>, mut count: usize, mut bytes: u64) -> Vec<bool> {
+        let Some(oldest) = oldest else {
+            return Vec::new();
+        };
+        let mut order: Vec<(u32, usize)> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, rank))| usize::from(*rank) == oldest)
+            .map(|(at, (key, _, _))| (self.uses.get(key).copied().unwrap_or(0), at))
+            .collect();
+        order.sort_by_key(|&(uses, at)| (core::cmp::Reverse(uses), at));
+        let mut chosen = alloc::vec![false; self.records.len()];
+        for (_, at) in order {
+            let more = self.records[at].1.bytes().len() as u64;
+            if count < MAX_RECORDS && layout_bytes(count + 1, bytes + more) <= self.bound {
+                chosen[at] = true;
+                count += 1;
+                bytes += more;
+            }
+        }
+        chosen
     }
 
     /// Add a record of age 0 after those taken, its key past theirs.
@@ -1272,6 +1314,7 @@ impl<'a> Merge<'a> {
                 Phase::Taking => {
                     if !self.take() {
                         let (oldest, count, bytes) = self.whole_ages();
+                        self.chosen = self.choose(oldest, count, bytes);
                         self.phase = Phase::Choosing {
                             oldest,
                             at: 0,
@@ -1303,14 +1346,14 @@ impl<'a> Merge<'a> {
                         };
                         continue;
                     };
+                    let index = *at;
                     *at += 1;
                     let keep = match *oldest {
                         None => true,
                         Some(oldest) if usize::from(*age) < oldest => true,
                         Some(oldest) if usize::from(*age) == oldest => {
                             let more = piece.bytes().len() as u64;
-                            let fits = *count < MAX_RECORDS
-                                && layout_bytes(*count + 1, *bytes + more) <= self.bound;
+                            let fits = self.chosen[index];
                             if fits {
                                 *bytes += more;
                                 *count += 1;
@@ -1803,6 +1846,10 @@ pub struct Store<'a> {
     /// each. The records themselves are the engine's to keep: decoded, they
     /// take several times the pack's bytes.
     loaded: BTreeMap<Digest, bool>,
+    /// This boot's uses of each page key: its records handed out (decoded
+    /// or from the cache) and its blocks offered. A full merge that must
+    /// leave records out keeps those used most ([`Merge::by_use`]).
+    uses: BTreeMap<Digest, u32>,
     decoded: DecodedCache,
     decode_scratch: DecodeScratch,
     /// Entries added during the run, by page key, and their retained bytes.
@@ -1892,6 +1939,7 @@ impl<'a> Store<'a> {
             segments,
             filters,
             loaded: BTreeMap::new(),
+            uses: BTreeMap::new(),
             decoded: DecodedCache::new(bounds.decoded),
             decode_scratch: DecodeScratch::default(),
             added: BTreeMap::new(),
@@ -1922,6 +1970,10 @@ impl<'a> Store<'a> {
     pub fn absorb(&mut self, other: Self) {
         for (key, valid) in other.loaded {
             self.loaded.entry(key).or_insert(valid);
+        }
+        for (key, uses) in other.uses {
+            let held = self.uses.entry(key).or_default();
+            *held = held.saturating_add(uses);
         }
         for (key, record) in other.added {
             match self.added.entry(key) {
@@ -2048,6 +2100,7 @@ impl<'a> Store<'a> {
     /// bound has room.
     pub fn keep(&mut self, offer: &Offer, entry: Option<Entry>) {
         let key = offer.key();
+        self.used(&key);
         self.misses
             .offered(shared_key(&key, offer.pc(), &offer.context()));
         if self.shedding {
@@ -2095,7 +2148,19 @@ impl<'a> Store<'a> {
         let record = self.decoded.get(key)?;
         self.counters.cached += 1;
         self.counters.repeated += 1;
+        self.used(key);
         Some(record)
+    }
+
+    /// Count a use of `key` this boot.
+    fn used(&mut self, key: &Digest) {
+        let uses = self.uses.entry(*key).or_default();
+        *uses = uses.saturating_add(1);
+    }
+
+    /// This boot's uses of each page key so far ([`Merge::by_use`]).
+    pub fn uses(&self) -> &BTreeMap<Digest, u32> {
+        &self.uses
     }
 
     /// The pack's slot for `key`, unless an earlier lookup found it invalid.
@@ -2157,6 +2222,7 @@ impl<'a> Store<'a> {
             {
                 self.counters.decoded += 1;
                 self.looked_up(key, true, true);
+                self.used(key);
                 self.decoded.insert(&decoded.record, decoded.retained_bytes)
             }
             Err(DecodeError::Invalid) => {
@@ -2766,6 +2832,50 @@ mod tests {
         assert_eq!(error, Some(PackError::Truncated));
         assert_eq!(empty.record(&first), None);
         assert_eq!(empty.counters.absent, 1);
+    }
+
+    /// A merge that cannot keep every record of a rank keeps those the
+    /// boot used most, not the first in key order.
+    #[test]
+    fn a_merge_short_of_room_keeps_the_records_used_most() {
+        let translator = translator_id();
+        let pages: Vec<Digest> = (0u8..6).map(|page| Digest::of(&[page])).collect();
+        let mut store = Store::new(translator, None).0;
+        for (at, &key) in pages.iter().enumerate() {
+            store.offer(offer(0x1_0000_4008 + 0x4000 * at as u64, key));
+        }
+        let bytes = Delta::new(translator, store.take_added())
+            .finish()
+            .unwrap()
+            .to_vec();
+        let mut keys = pages.clone();
+        keys.sort();
+        let mut next = Store::new(translator, Some(&bytes)).0;
+        // The two last in key order are used most, the first once.
+        for (key, uses) in [(keys[5], 3), (keys[4], 2), (keys[0], 1)] {
+            for _ in 0..uses {
+                assert!(next.record(&key).is_some());
+            }
+        }
+        assert_eq!(next.uses().get(&keys[5]), Some(&3));
+        let record = next.segments()[0].get(&keys[0]).unwrap().len() as u64;
+        let bound = layout_bytes(2, 2 * record);
+        let merged = |by_use: bool| {
+            let segments = next.segments().iter().cloned().map(Segment::from).collect();
+            let merge = Merge::new(translator, segments, Vec::new(), bound);
+            let merge = if by_use {
+                merge.by_use(next.uses().clone())
+            } else {
+                merge
+            };
+            let bytes = merge.finish().layout.to_vec();
+            let pack = Pack::parse(&bytes, &translator).unwrap();
+            keys.iter()
+                .map(|key| pack.get(key).is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(merged(false), [true, true, false, false, false, false]);
+        assert_eq!(merged(true), [false, false, false, false, true, true]);
     }
 
     /// A key several segments hold reads as their records merged, and a
