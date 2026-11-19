@@ -523,28 +523,62 @@ fn one_transfer_past_the_gate(gate: LinkGate) {
 /// A notifier's [`interrupt`] racing its owner's [`acknowledge`] of a
 /// snapshot: whatever the interleaving, a notification the snapshot missed
 /// leaves the control's quiet word 0, so the next polled transfer stops.
+/// A round in three makes the notification first, one the acknowledge
+/// first, each by waiting for the other thread, so both orders happen on
+/// any host, one CPU too; the third runs free.
 #[test]
 fn a_notification_the_snapshot_missed_stays_pending() {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Order {
+        NotifierFirst,
+        OwnerFirst,
+        Free,
+    }
+    /// Wait, yielding the CPU, until `flag` is set.
+    fn wait(flag: &AtomicU64) {
+        while flag.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+    }
     let mut raced = [0u32; 2];
     for round in 0..20_000u64 {
+        let order = [Order::NotifierFirst, Order::OwnerFirst, Order::Free][round as usize % 3];
         let control = Box::into_raw(Box::new(ChainControl {
             interrupt_epoch: round,
             observed_interrupt_epoch: round,
             ..ChainControl::default()
         }));
         let address = control as usize;
+        // Set by the owner to start the notifier (free) or once it has
+        // acknowledged (owner first); by the notifier once it interrupted.
         let start = Arc::new(AtomicU64::new(0));
+        let acknowledged = Arc::new(AtomicU64::new(0));
+        let interrupted = Arc::new(AtomicU64::new(0));
         let notifier = {
-            let start = Arc::clone(&start);
+            let (start, acknowledged, interrupted) = (
+                Arc::clone(&start),
+                Arc::clone(&acknowledged),
+                Arc::clone(&interrupted),
+            );
             std::thread::spawn(move || {
-                while start.load(Ordering::Acquire) == 0 {
-                    core::hint::spin_loop();
+                match order {
+                    Order::OwnerFirst => wait(&acknowledged),
+                    Order::NotifierFirst => {}
+                    Order::Free => {
+                        while start.load(Ordering::Acquire) == 0 {
+                            core::hint::spin_loop();
+                        }
+                    }
                 }
                 // SAFETY: the control lives until both threads are done.
                 unsafe { interrupt(address as *mut ChainControl) };
+                interrupted.store(1, Ordering::Release);
             })
         };
         start.store(1, Ordering::Release);
+        if order == Order::NotifierFirst {
+            wait(&interrupted);
+        }
         // SAFETY: as above; only this thread writes the observed epoch.
         let snapshot = unsafe {
             AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch))
@@ -552,12 +586,28 @@ fn a_notification_the_snapshot_missed_stays_pending() {
         };
         // SAFETY: as above.
         unsafe { acknowledge(control, snapshot) };
+        acknowledged.store(1, Ordering::Release);
         notifier.join().unwrap();
         // SAFETY: both threads are done; this takes the control back.
         let control = unsafe { Box::from_raw(control) };
         assert_eq!(control.interrupt_epoch, round + 1);
         if control.observed_interrupt_epoch != control.interrupt_epoch {
             assert_eq!(control.quiet, Quiet(0), "round {round}");
+        }
+        // A forced order ends as it must: the notification seen and
+        // acknowledged, or missed and pending.
+        match order {
+            Order::NotifierFirst => assert_eq!(
+                (snapshot, control.observed_interrupt_epoch, control.quiet),
+                (round + 1, round + 1, Quiet(QUIET)),
+                "round {round}"
+            ),
+            Order::OwnerFirst => assert_eq!(
+                (snapshot, control.observed_interrupt_epoch, control.quiet),
+                (round, round, Quiet(0)),
+                "round {round}"
+            ),
+            Order::Free => {}
         }
         raced[usize::from(snapshot == round + 1)] += 1;
     }
