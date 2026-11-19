@@ -7221,12 +7221,12 @@ fn a_wait_counts_its_host_halt_apart_from_its_poll() {
     assert!((300..400).contains(&spun), "{statistics:?}");
 }
 
-/// A RETAB's PAC thunk ends its completion with the exit to the target
-/// in RAX, which the first return through it redirects into a lookup.
-/// Neither the check failures after a block's last exit nor a side exit
-/// that leaves only the PAC terminal unrun hides that exit from its thunk.
+/// A RETAB authenticated in line ends its block's code with RET's exit to
+/// the target in RAX, its dynamic site, and no PAC thunk. Neither the
+/// check failures after a block's last exit nor a side exit before the
+/// RETAB hides that exit.
 #[test]
-fn what_follows_a_pac_exit_keeps_its_thunk() {
+fn what_follows_a_pac_return_keeps_its_dynamic_site() {
     const LOAD: u32 = 0xf940_0020; // ldr x0,[x1]
     const BRANCH: u32 = 0xb400_0080; // cbz x0,.+16
     const RETAB: u32 = 0xd65f_0fff;
@@ -7246,7 +7246,17 @@ fn what_follows_a_pac_exit_keeps_its_thunk() {
             SERVICE as usize as u64,
             pointer::native_cipher(machine.target),
         );
-        assert!(machine.host.installed.contains(&thunk.code), "{words:x?}");
+        assert!(!machine.host.installed.contains(&thunk.code), "{words:x?}");
+        let block = &machine.code.blocks[0];
+        let code = &machine.host.installed[block.code.0 / NATIVE_CODE_STRIDE - 1];
+        let site = block.dynamic_site.expect("the RET exit's site").get() as usize;
+        assert!(
+            chain::is_dynamic_exit(
+                &code[site - block.code.0..][..chain::DYNAMIC_EXIT_BYTES],
+                ExitKind::Return
+            ),
+            "{words:x?}"
+        );
     }
 }
 
@@ -7260,22 +7270,9 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         kind: ExitKind::Return as u64,
     }];
     machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::ReturnIbSp).unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-        pointer::native_cipher(machine.target),
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
+    // The block authenticates in line and ends with RET's exit.
+    let site = machine.code.blocks[0].dynamic_site.expect("a dynamic site");
+    let site = chain::dynamic_patch(site.get());
     // The probes, then the RET's own tail, which takes its call's paired
     // frame with the authenticated target or calls the table probe.
     let installed = machine.host.installed.len();
@@ -7304,9 +7301,9 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
 
-/// The first branch through a BRAA X16, X17's PAC thunk to a target this
-/// PE translates gives its exit a tail of its own that predicts the
-/// authenticated target: its direct exit to it is linked through a cell,
+/// The first branch through a BRAA X16, X17 authenticated in line to a
+/// target this PE translates gives its exit a tail of its own that
+/// predicts the authenticated target: its direct exit to it is linked through a cell,
 /// which starts with the target's entry, with the probes of the branch's
 /// BTYPE, before the exit jumps to the tail; any other target takes the
 /// table probe, as a lookup tail sends it. A branch before the target's
@@ -7335,28 +7332,9 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     assert_eq!(machine.statistics.predicted_tails, 0);
     machine.step().unwrap();
     machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::Branch {
-            key: block::PointerAuthenticationKey::Ia,
-            target: 16,
-            modifier: block::PointerAuthenticationModifier::Register(17),
-            link: false,
-        })
-        .unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-        pointer::native_cipher(machine.target),
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
+    // The block authenticates in line and ends with BR's exit.
+    let site = machine.code.blocks[0].dynamic_site.expect("a dynamic site");
+    let site = chain::dynamic_patch(site.get());
     // The probes of BTYPE 0b01, the predicted tail, then its exit's cell
     // tail.
     let installed = machine.host.installed.len();

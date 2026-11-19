@@ -1733,15 +1733,15 @@ fn a_part_another_part_jumps_into_waits_for_it() {
 
 /// A tenured part that stayed open while young code turned the ring past
 /// the age cap is old when a block takes its last bytes. The block's own
-/// PAC thunk then finds the part full and opens the next, and that advance
+/// CLREX thunk then finds the part full and opens the next, and that advance
 /// chooses a part to go: never the one the block's install still writes,
 /// which a choice by age counted from the part's opening took (finding 1
 /// of the engine audit: the block was then published into a part already
 /// taken away, and later ran another block's bytes).
 #[test]
 fn a_block_whose_thunk_fills_its_part_is_published_in_a_part_that_stays() {
-    const RETAA: u32 = 0xd65f_0bff;
-    let words = [RETAA, RET].repeat(2 * FETCH_PAGE as usize / 8);
+    const CLREX: u32 = 0xd503_3f5f;
+    let words = [CLREX, RET].repeat(2 * FETCH_PAGE as usize / 8);
     // The block's code as a machine alone compiles it, and its frame.
     let (block_bytes, physical) = {
         let mut memory = vec![0u8; 8 * 4096];

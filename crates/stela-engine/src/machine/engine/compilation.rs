@@ -1215,7 +1215,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             })
         }));
         // RET, BR and BLR end the code with their exit to the target in
-        // RAX; the PAC thunk of a RETA*, BRA* or BLRA* has one too. Only
+        // RAX, and so do RETA*, BRA* and BLRA* authenticated in line; the
+        // PAC thunk of one that ends with its PAC exit has one too. Only
         // side exits follow a terminal's, and of the direct exits only a
         // terminal that has one precedes them: what a thunk completes has
         // none, whatever a side exit just before it leaves unrun.
@@ -1226,7 +1227,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .unwrap_or(chain::without_failures(code_bytes).len());
         let code_bytes = &code_bytes[..terminal_end];
         let mut dynamic_site = (!single
-            && terminal & 0xff9f_fc1f == 0xd61f_0000
             && dynamic_branch(terminal).is_some_and(|(kind, _)| {
                 let exit = code_bytes.len().saturating_sub(chain::DYNAMIC_EXIT_BYTES);
                 chain::is_dynamic_exit(&code_bytes[exit..], kind)

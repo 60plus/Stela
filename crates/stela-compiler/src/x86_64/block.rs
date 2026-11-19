@@ -2337,14 +2337,19 @@ fn terminal_exits(
 ) -> Vec<super::chain::DirectExit> {
     use super::chain::{DIRECT_EXIT_BYTES, DirectExit, is_direct_exit, link_slot};
     let paired = linked.is_some()
-        && matches!(
-            terminal.map(|(_, terminal)| terminal),
+        && match terminal.map(|(_, terminal)| terminal) {
             Some(Terminator::DirectCall(_))
-                | Some(Terminator::Register {
-                    kind: ExitKind::Call,
-                    ..
-                })
-        );
+            | Some(Terminator::Register {
+                kind: ExitKind::Call,
+                ..
+            }) => true,
+            // BLRA* in line; else its PAC exit ends the code, which the
+            // continuation check below finds is not one.
+            Some(Terminator::PointerAuthentication(request)) => {
+                super::pointer::inline::transfer(request.operation) == Some(ExitKind::Call)
+            }
+            _ => false,
+        };
     if !paired {
         return terminal_exits_before(code, terminal, fallthrough, linked);
     }
@@ -2484,13 +2489,29 @@ fn emit_terminal(
                 direct_exit(code, request.instruction_pc, ExitKind::Amx);
             }
             Terminator::PointerAuthentication(request) => {
-                // Return to the checked runtime helper with unchanged guest
-                // state at this instruction. Never embed keys/helper pointers.
-                direct_exit(
-                    code,
-                    request.instruction_pc,
-                    ExitKind::PointerAuthentication,
-                );
+                let transfer = native
+                    .pointer
+                    .zip(super::pointer::inline::transfer(request.operation));
+                if let Some((cells, kind)) = transfer {
+                    // RETA*, BRA* and BLRA* authenticate in line, then
+                    // branch as RET, BR and BLR do.
+                    super::pointer::inline::authenticate_transfer(
+                        code,
+                        request.operation,
+                        *pc,
+                        cells,
+                    );
+                    register_transfer(code, kind, fallthrough, source_map.len());
+                } else {
+                    // Return to the checked runtime helper with unchanged
+                    // guest state at this instruction. Never embed
+                    // keys/helper pointers.
+                    direct_exit(
+                        code,
+                        request.instruction_pc,
+                        ExitKind::PointerAuthentication,
+                    );
+                }
             }
             Terminator::System(request) => {
                 let zero = native.zero_block.zip(super::zero_block::operand(request));
@@ -2525,21 +2546,7 @@ fn emit_terminal(
             }
             Terminator::Register { source, kind } => {
                 load_unless_held(code, *source, rax);
-                if *kind == ExitKind::Call {
-                    // Capture BLR X30's target before LR is overwritten.
-                    code.asm().mov(Size::Qword, Gpr::Rcx, Gpr::Rax);
-                    super::guest_immediate(code, fallthrough);
-                    super::store(code, Register::X(30));
-                    code.asm().mov(Size::Qword, Gpr::Rax, Gpr::Rcx);
-                    let ran = source_map.len();
-                    paired_exit(code, fallthrough, ran, |asm| {
-                        exit_kind_with(asm, ExitKind::Call)
-                    });
-                } else {
-                    // A return's frame check is its lookup tail's
-                    // (`chain::paired_tail`).
-                    exit_kind(code, *kind);
-                }
+                register_transfer(code, *kind, fallthrough, source_map.len());
             }
             Terminator::Branch(operation) => match *operation {
                 Operation::Branch { target } => direct_exit(code, target, ExitKind::Direct),
@@ -2555,6 +2562,26 @@ fn emit_terminal(
         }
     } else {
         direct_exit(code, fallthrough, ExitKind::Fallthrough);
+    }
+}
+
+/// The exit of BR, BLR or RET (`kind`) to the target in RAX, from a block
+/// of `ran` instructions that falls through to `fallthrough`: a call links
+/// X30 first and pairs its frame ([`paired_exit`]).
+fn register_transfer(code: &mut Code, kind: ExitKind, fallthrough: GuestAddress, ran: usize) {
+    if kind == ExitKind::Call {
+        // Capture BLR X30's target before LR is overwritten.
+        code.asm().mov(Size::Qword, Gpr::Rcx, Gpr::Rax);
+        super::guest_immediate(code, fallthrough);
+        super::store(code, Register::X(30));
+        code.asm().mov(Size::Qword, Gpr::Rax, Gpr::Rcx);
+        paired_exit(code, fallthrough, ran, |asm| {
+            exit_kind_with(asm, ExitKind::Call)
+        });
+    } else {
+        // A return's frame check is its lookup tail's
+        // (`chain::paired_tail`).
+        exit_kind(code, kind);
     }
 }
 

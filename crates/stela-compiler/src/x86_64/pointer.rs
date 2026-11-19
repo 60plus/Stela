@@ -34,6 +34,10 @@
 //! Where the host has AES-NI, thunks and blocks given a [`cipher::Cipher`]
 //! compute signings, successful authentications and PACGA in native code
 //! instead of looking them up; the rest still goes to the service.
+//!
+//! Blocks given the service's cells ([`inline::Cells`]) complete these
+//! instructions themselves, the branch forms included ([`inline`]), so
+//! thunks serve only blocks compiled without them.
 use crate::x86_64::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size, resolve};
 use crate::{
     Anchor, GuestAddress, Place,
