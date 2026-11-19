@@ -34,7 +34,7 @@ fn system_inputs() -> (
     (checks, system)
 }
 
-fn system_preparation() -> Preparation {
+pub(super) fn system_preparation() -> Preparation {
     let chip = crate::machine::test_chip();
     let (checks, system) = system_inputs();
     Preparation::new(

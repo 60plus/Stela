@@ -245,4 +245,6 @@ pub fn prepare(job: &Job, page: &[u8; PAGE_BYTES]) -> Result<Offer, Outcome> {
 }
 
 #[cfg(test)]
+mod model;
+#[cfg(test)]
 mod tests;
