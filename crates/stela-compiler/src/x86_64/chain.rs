@@ -2882,9 +2882,13 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
 /// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
 pub const TAIL_BYTES: usize = 5 + 5;
-/// Bytes in a [`cell_tail`]: the target's and the cell's MOVABS and a
-/// [`lookup_tail`]'s plain tail.
-pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
+/// Bytes in a [`cell_tail`]: the target's and the cell's MOVABS, `mov edx,
+/// word`, the call of the cell probe and the jump into the block it found.
+pub const CELL_TAIL_BYTES: usize = 10 + 10 + 5 + 5 + 3;
+/// `lea rsp, [rsp + 8]`: a called cell probe that goes on to the table
+/// probe drops its return address first, and the table probe jumps into
+/// the block itself.
+const DROP_RETURN: [u8; 5] = [0x48, 0x8d, 0x64, 0x24, 0x08];
 
 /// The probes the per-site tails of the exits of branches that set `btype`
 /// jump to ([`lookup_tail`]): the target in RAX, the tail's word in EDX.
@@ -2898,8 +2902,14 @@ pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
 /// in R9, and the table when the cell does not hold the target with that
 /// key. Each enters the block it found, the transfer counted and `block`
 /// named, or returns to the engine with RAX and RDX as the exit left them.
-/// Neither touches the stack: R10 and R11, free between blocks, hold what
-/// a probe keeps.
+/// R10 and R11, free between blocks, hold what a probe keeps.
+/// A cell tail calls the cell probe, which returns to it with the block's
+/// code in R9 for the tail's own `jmp r9`: the host predicts that jump per
+/// exit, as each exit's cell holds one target, where one shared indirect
+/// jump in the probe mispredicted across many hot exits. The return pops
+/// the call's return stack entry, so the stack stays as the tail found it;
+/// a cell probe that goes on to the table probe drops its return address
+/// first ([`DROP_RETURN`]), and an exit to the engine reloads RSP.
 /// Other cores write the table and cells meanwhile: a probe takes an entry
 /// only when its last word, read before its fields, was not busy and is
 /// unchanged after them ([`Slot`]); a cell read torn starts the table
@@ -3056,7 +3066,8 @@ fn cell_probe(
     if stamping {
         stamp(&mut asm);
     }
-    found(&mut asm);
+    // Back to the tail, whose own jump enters the block at R9.
+    asm.ret();
     for miss in misses {
         asm.bind(miss);
     }
@@ -3066,11 +3077,13 @@ fn cell_probe(
     for miss in torn {
         asm.bind(miss);
     }
+    asm.fixed(&DROP_RETURN);
     let to_probe = asm.jmp();
     // Another PC or key leaves the target to the table, with the key still
     // in R8 and the control in RCX.
     asm.bind(stale);
     asm.bind(other);
+    asm.fixed(&DROP_RETURN);
     let to_table = asm.jmp();
     (to_table, to_probe)
 }
@@ -3135,7 +3148,7 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(kept);
 }
 
-/// Bytes in a [`stamped_tail`]: 170 at most, with a 32-bit displacement
+/// Bytes in a [`stamped_tail`]: 173 at most, with a 32-bit displacement
 /// for the stamp of a cell numbered 8 or above.
 pub const STAMPED_TAIL_BYTES: usize = 176;
 
@@ -3640,9 +3653,10 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
 
 /// The tail at host address `at` of a direct exit to `target` out of its
 /// page, whose target the cell at `cell` holds ([`LookupTable::link_cell`]):
-/// the target in RAX, which the exit's patch point did not load, then the
-/// cell probe at `probe` ([`CELL_PROBE_ENTRY`]), and the jump or the exit as
-/// in a [`lookup_tail`]. `None` as for a [`lookup_tail`].
+/// the target in RAX, which the exit's patch point did not load, the word
+/// in EDX as in a [`lookup_tail`], then a call of the cell probe at `probe`
+/// ([`CELL_PROBE_ENTRY`]), which returns only when it found the block, and
+/// the tail's own jump into it. `None` as for a [`lookup_tail`].
 pub fn cell_tail(
     at: u64,
     cell: u64,
@@ -3654,7 +3668,7 @@ pub fn cell_tail(
     let mut code = Code::new();
     code.asm().mov_imm64(Rax, target);
     code.asm().mov_imm64(R9, cell);
-    tail(&mut code, at, word.into(), ran, probe)?;
+    called_tail(&mut code, at, word.into(), ran, probe)?;
     code.try_into().ok()
 }
 
@@ -3670,7 +3684,7 @@ fn rax_cell_tail(
 ) -> Option<Vec<u8>> {
     let mut code = Code::new();
     code.asm().mov_imm64(R9, cell);
-    tail(&mut code, at, word.into(), ran, probe)?;
+    called_tail(&mut code, at, word.into(), ran, probe)?;
     Some(code.into_bytes())
 }
 
@@ -3710,6 +3724,21 @@ pub fn predicted_tail(
     asm.bind(other);
     tail(&mut code, at, word, ran, probe)?;
     code.try_into().ok()
+}
+
+/// A cell tail's end at host address `at`, after its MOVABS: `mov edx`
+/// with `word` and `ran`, `call probe`, `jmp r9`.
+fn called_tail(code: &mut Code, at: u64, word: ExitWord, ran: u32, probe: u64) -> Option<()> {
+    if ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
+        return None;
+    }
+    let mut asm = code.asm();
+    asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
+    let call = asm.call();
+    let relative = relative(at + call.end() as u64, probe)?;
+    code.patch(call.offset(), relative.to_le_bytes());
+    code.asm().jmp_rm(R9);
+    Some(())
 }
 
 fn tail(code: &mut Code, at: u64, word: ExitWord, ran: u32, probe: u64) -> Option<()> {
@@ -3763,12 +3792,16 @@ fn lookup_with_policy(
     if let Some(cell) = cell {
         asm.mov_imm64(R9, cell);
     }
-    let call = asm.jmp();
-    let probes = code.len();
-    let entry = match (cell, target) {
-        (Some(_), Some(_)) => CELL_PROBE_ENTRY,
-        _ => PROBE_ENTRY,
+    let (call, entry) = match (cell, target) {
+        // The cell probe is called, as a cell tail calls it.
+        (Some(_), Some(_)) => {
+            let call = asm.call();
+            asm.jmp_rm(R9);
+            (call, CELL_PROBE_ENTRY)
+        }
+        _ => (asm.jmp(), PROBE_ENTRY),
     };
+    let probes = code.len();
     crate::x86_64::asm::resolve(&mut code, call, probes + entry);
     let mut bytes = code.into_bytes();
     bytes.extend(dispatcher_with_policy(btype, policy)?);
@@ -4745,8 +4778,9 @@ mod tests {
         assert_eq!(table.sampled_link(cells[0].1), None);
     }
 
-    /// Each tail calls its probe and jumps through R9 itself: the site's own
-    /// indirect jump. A probe set's pieces keep their places in every policy.
+    /// A lookup tail jumps to its probe; a cell tail calls its probe and
+    /// jumps through R9 itself, the site's own indirect jump. A probe set's
+    /// pieces keep their places in every policy.
     #[test]
     fn tails_jump_to_the_probes() {
         let mut plain = Code::new();
@@ -4781,7 +4815,9 @@ mod tests {
         assert_eq!(&cell[10..12], &[0x49, 0xb9]);
         assert_eq!(&cell[12..20], &0xdead_beef_0000u64.to_le_bytes());
         assert_eq!(&cell[20..25], &expected[..5]);
-        assert_eq!(&cell[25..30], &[0xe9, 0xe2, 0x0f, 0, 0]);
+        // call probe; jmp r9.
+        assert_eq!(&cell[25..30], &[0xe8, 0xe2, 0x0f, 0, 0]);
+        assert_eq!(&cell[30..], &[0x41, 0xff, 0xe1]);
         assert!(lookup_tail(0, ExitKind::Return, 0, 1 << 40, 0).is_none());
         assert!(lookup_tail(0, ExitKind::Return, 1 << 12, 0, 0).is_none());
         for btype in 0..4 {
