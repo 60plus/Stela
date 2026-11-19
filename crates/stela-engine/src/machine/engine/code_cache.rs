@@ -557,7 +557,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 // (`itlb_drops`' mail_all tells them apart).
                 let source = match self.applying_mail {
                     true => ItlbSource::AllReceived,
-                    false => ItlbSource::AllLocal,
+                    false => {
+                        self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
+                        ItlbSource::AllLocal
+                    }
                 };
                 self.statistics.itlb_sources[source as usize] += 1;
                 self.forget_spaces(0..=1, 1);

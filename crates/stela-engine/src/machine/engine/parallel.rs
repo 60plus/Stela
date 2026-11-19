@@ -603,6 +603,9 @@ pub struct Counts {
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
     pub itlb_sources: [u64; super::ItlbSource::COUNT],
+    /// The guest PCs of its own TLBIs of everything
+    /// ([`super::Statistics::whole_tlbi_sites`]).
+    pub whole_tlbi_sites: super::WholeTlbiSites,
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
@@ -2700,6 +2703,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb_drops: statistics.itlb_drops,
             lookup_forgets: statistics.lookup_forgets,
             itlb_sources: statistics.itlb_sources,
+            whole_tlbi_sites: statistics.whole_tlbi_sites,
             transitions: [
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],

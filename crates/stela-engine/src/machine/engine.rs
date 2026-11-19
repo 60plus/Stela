@@ -17,7 +17,7 @@ use reports::*;
 pub use reports::{
     DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
     Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit,
+    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit, WholeTlbiSites,
 };
 mod amx;
 mod apple_maintenance;

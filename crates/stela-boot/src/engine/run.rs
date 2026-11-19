@@ -2647,6 +2647,19 @@ impl Heartbeat {
             output::arguments(format_args!("{paths}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
+            // Where TLBIs of everything came from, over the whole run: the
+            // guest PCs that issued the most, merged over the PEs.
+            let mut sites = stela_engine::machine::engine::WholeTlbiSites::default();
+            for counts in per_pe.iter() {
+                for [pc, count] in counts.whole_tlbi_sites.0 {
+                    sites.add(pc, count);
+                }
+            }
+            let mut line = String::from("PES WHOLE TLBI pc=count");
+            for [pc, count] in sites.0.into_iter().filter(|site| site[1] != 0) {
+                line.push_str(&format!(" {pc:#x}={count}"));
+            }
+            output::arguments(format_args!("{line}\n"));
             output::arguments(format_args!("{transitions}\n"));
             let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
                 transition_misses[kind * 9..kind * 9 + 9]

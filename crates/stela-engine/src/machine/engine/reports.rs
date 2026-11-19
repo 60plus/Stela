@@ -618,6 +618,10 @@ pub struct Statistics {
     /// The ITLB's fills, drops and forgotten contexts by where they came
     /// from, in `ItlbSource`'s order.
     pub itlb_sources: [u64; ItlbSource::COUNT],
+    /// The guest PCs of this PE's own TLBIs of everything (not those mail
+    /// brought) and how many each issued, the most frequent kept
+    /// ([`WholeTlbiSites`]).
+    pub whole_tlbi_sites: WholeTlbiSites,
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
@@ -778,6 +782,29 @@ pub enum MailWait {
     LongestNative,
 }
 
+/// The guest PCs that issued the most TLBIs of everything, with their
+/// counts, most first where they were merged: a PC not held takes the
+/// place of the least frequent when it has issued more. `[0, 0]` is free.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WholeTlbiSites(pub [[u64; 2]; 4]);
+
+impl WholeTlbiSites {
+    /// Count `count` TLBIs of everything at `pc`.
+    pub fn add(&mut self, pc: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(site) = self.0.iter_mut().find(|site| site[0] == pc && site[1] != 0) {
+            site[1] += count;
+        } else if let Some(least) = self.0.iter_mut().min_by_key(|site| site[1])
+            && least[1] < count
+        {
+            *least = [pc, count];
+        }
+        self.0.sort_unstable_by(|a, b| b[1].cmp(&a[1]));
+    }
+}
+
 /// [`MailWait`]'s parts.
 pub const MAIL_WAITS: usize = MailWait::LongestNative as usize + 1;
 
@@ -810,6 +837,7 @@ impl core::ops::AddAssign for Statistics {
             itlb_misses,
             itlb_drops,
             itlb_sources,
+            whole_tlbi_sites,
             compiled,
             self_loops,
             compile_ticks,
@@ -951,6 +979,9 @@ impl core::ops::AddAssign for Statistics {
         }
         for (total, count) in self.itlb_sources.iter_mut().zip(itlb_sources) {
             *total += count;
+        }
+        for [pc, count] in whole_tlbi_sites.0 {
+            self.whole_tlbi_sites.add(pc, count);
         }
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
