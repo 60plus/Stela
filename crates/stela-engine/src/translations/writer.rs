@@ -723,6 +723,12 @@ impl<'a> Writer<'a> {
     /// translation does not press, enough segments or lists.
     fn full_merge_due(&self) -> bool {
         let segments = self.count(SEGMENT_BLOB);
+        // A merge reads its segments from memory: one whose records stay in
+        // the file waits for a boot that reads them whole, which the boot
+        // chooses once the file holds [`MERGE_AT`] segments.
+        if !self.segments.iter().all(Segment::in_memory) {
+            return false;
+        }
         self.refill_due()
             || segments >= MERGE_FULL
             || self.segment_bytes() > self.data_bytes() / 2
@@ -776,6 +782,12 @@ impl<'a> Writer<'a> {
         let [.., older, newer] = segments[..] else {
             return None;
         };
+        if !self.segments[self.segments.len() - 2..]
+            .iter()
+            .all(Segment::in_memory)
+        {
+            return None;
+        }
         let both = older.length + newer.length;
         (newer.length * 2 >= older.length && both <= self.limit && both <= self.free())
             .then_some([older.offset, newer.offset])

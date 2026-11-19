@@ -568,6 +568,15 @@ impl<'a> Segment<'a> {
         }
     }
 
+    /// Whether its records are in memory, for a merge to read: a pack
+    /// read on demand leaves them in the file ([`Pack::index_only`]).
+    pub fn in_memory(&self) -> bool {
+        match self {
+            Self::Packed(pack) => pack.resident,
+            Self::Laid(_) => true,
+        }
+    }
+
     fn format(&self) -> PackFormat {
         PackFormat::read(self.index()).unwrap_or(PackFormat::Raw)
     }
@@ -2036,6 +2045,10 @@ impl Wanted {
 /// compile without asking.
 pub const MAX_WANTED: usize = 4096;
 
+/// The most read-ahead entries one [`Store::take_ahead`] looks at, so a
+/// call stays bounded while it skips the records other parts own.
+pub const AHEAD_SCAN: usize = 256;
+
 /// What a store keeps beyond its pack, in bytes ([`Store::set_bounds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
@@ -2187,13 +2200,16 @@ impl<'a> Store<'a> {
         })
     }
 
-    /// The next record to read ahead of any lookup, the most used first,
-    /// skipping those looked up or asked for already.
-    pub fn take_ahead(&mut self) -> Option<Wanted> {
-        while let Some(&(segment, index)) = self.ahead.get(self.ahead_at) {
+    /// The next record `owns` (a part of the store owns a share of the
+    /// keys) to read ahead of any lookup, the most used first, skipping
+    /// those looked up or asked for already. A call looks at no more than
+    /// [`AHEAD_SCAN`] entries.
+    pub fn take_ahead(&mut self, owns: impl Fn(&Digest) -> bool) -> Option<Wanted> {
+        for _ in 0..AHEAD_SCAN {
+            let &(segment, index) = self.ahead.get(self.ahead_at)?;
             self.ahead_at += 1;
             let key = entry(self.segments[usize::from(segment)].bytes, index as usize).0;
-            if self.loaded.contains_key(&key) || !self.asked.insert(key) {
+            if !owns(&key) || self.loaded.contains_key(&key) || !self.asked.insert(key) {
                 continue;
             }
             self.counters.read_ahead += 1;
@@ -2203,6 +2219,13 @@ impl<'a> Store<'a> {
             });
         }
         None
+    }
+
+    /// Whether the decoded cache has room for records read ahead of a
+    /// lookup: what it holds is under half its bound, which the heap's
+    /// governor sets.
+    pub fn ahead_room(&self) -> bool {
+        self.decoded.bytes * 2 < self.decoded.bound
     }
 
     /// The bytes kept in memory for the records left in the file: the
@@ -3867,7 +3890,7 @@ mod tests {
         let mut store = Store::over(translator, alloc::vec![disk]);
         assert!(store.ahead_bytes() >= 16 * size_of::<(u8, u32)>());
         assert!(store.record(&keys[15]).is_none());
-        let order: Vec<Digest> = core::iter::from_fn(|| store.take_ahead())
+        let order: Vec<Digest> = core::iter::from_fn(|| store.take_ahead(|_| true))
             .map(|wanted| wanted.key)
             .collect();
         let expected: Vec<Digest> = keys[..15].iter().rev().copied().collect();

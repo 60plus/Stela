@@ -208,6 +208,13 @@ fn entry(offset: u16, fill: u8, bytes: usize) -> crate::translations::Entry {
 /// The pack file as a boot's loader reads it: the newest commit, whose
 /// blobs must read back whole, and its segments and lists.
 fn load(disk: &[u8], limit: u64) -> File<'static> {
+    load_holding(disk, limit, false)
+}
+
+/// [`load`], each segment's header and index alone when `demand` and the
+/// file holds fewer than [`MERGE_AT`] segments, as a boot that reads its
+/// pack on demand holds them.
+fn load_holding(disk: &[u8], limit: u64, demand: bool) -> File<'static> {
     let translator = translator_id();
     let size = disk.len() as u64;
     let committed = journal::candidates(&disk[..DATA_START as usize], JOURNAL_DOMAIN, size)
@@ -222,9 +229,19 @@ fn load(disk: &[u8], limit: u64) -> File<'static> {
             Some(())
         })
         .expect("the newest commit's blobs read back whole");
+        let demand = demand
+            && blobs
+                .iter()
+                .filter(|(kind, _)| *kind == SEGMENT_BLOB)
+                .count()
+                < MERGE_AT;
         for (kind, bytes) in blobs {
             let bytes: &'static [u8] = Vec::leak(bytes);
             match kind {
+                SEGMENT_BLOB if demand => {
+                    let prefix = crate::translations::pack::prefix_bytes(bytes, &translator);
+                    segments.push(Pack::index_only(&bytes[..prefix.unwrap()], &translator).unwrap())
+                }
                 SEGMENT_BLOB => segments.push(Pack::parse(bytes, &translator).unwrap()),
                 USED_BLOB => used.push(UsedKeys::parse(bytes, &translator).unwrap()),
                 _ => panic!("an unknown blob"),
@@ -269,7 +286,7 @@ impl<'a> Run<'a> {
         let found = file
             .segments
             .iter()
-            .flat_map(|pack| pack.iter().map(|(key, _)| key).collect::<Vec<_>>())
+            .flat_map(|pack| pack.uses().map(|(key, _)| key).collect::<Vec<_>>())
             .collect();
         Self {
             writer: Writer::new(file, HZ),
@@ -353,6 +370,37 @@ fn boot_of(
     }
     let stopped = run.stop(disk)?;
     Ok((added, stopped))
+}
+
+#[test]
+fn boots_that_hold_only_indexes_leave_merges_to_a_boot_that_reads_the_file_whole() {
+    let mut disk = Disk::new(FILE_BYTES);
+    let mut all = BTreeSet::new();
+    let mut on_demand = 0;
+    for boot in 0..8 {
+        let mut arena = vec![0u8; BOOT_ARENA_BYTES];
+        let mut file = load_holding(&disk.bytes.clone(), u64::MAX, true);
+        let demand = file.segments.iter().any(|pack| !pack.resident());
+        on_demand += u32::from(demand);
+        file.arena = Arena::new(&mut arena);
+        let mut run = Run::new(file, boot + 1);
+        for (seconds, count) in [(30, 200), (100, 50), (200, 10)] {
+            all.extend(run.boot.add(count));
+            run.run(&mut disk, seconds).unwrap();
+        }
+        let stopped = run.stop(&mut disk).unwrap();
+        // A boot holding only indexes merges nothing: its segments' records
+        // are not in memory.
+        if demand {
+            assert_eq!(run.writer.stats().merges, 0, "boot {boot}");
+        }
+        assert!(stopped.segments < MAX_SEGMENTS, "boot {boot}");
+        assert_eq!(keys(&disk.bytes), all, "boot {boot}");
+    }
+    // Boots alternate: those under MERGE_AT segments hold indexes, the one
+    // at it reads whole and merges, so the file never runs out of slots.
+    assert!((3..8).contains(&on_demand), "{on_demand}");
+    assert!(load(&disk.bytes, u64::MAX).segments.len() < MAX_SEGMENTS);
 }
 
 #[test]
