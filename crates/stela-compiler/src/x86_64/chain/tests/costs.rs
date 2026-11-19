@@ -376,6 +376,11 @@ enum Ring {
     /// An indirect exit through a predicted tail of its one target, whose
     /// direct exit is linked through a stamped tail.
     Predicted,
+    /// [`Ring::Lookup`] of sites that each take one of two targets at
+    /// random: the next block or the one after it.
+    PolyLookup,
+    /// [`Ring::Predicted`] of such sites, predicting the next block.
+    PolyPredicted,
 }
 
 /// Bytes of each block's tails: a predicted tail and a stamped tail. Not
@@ -388,7 +393,7 @@ const _: () = assert!(RING_STAMPED + STAMPED_TAIL_BYTES <= RING_TAIL);
 const _: () = assert!(LOOKUP_TAIL_BYTES <= RING_TAIL);
 
 /// Bytes of each block of a ring: its exit and nothing else.
-const RING_BLOCK: usize = 64;
+const RING_BLOCK: usize = 80;
 /// The ring's blocks start here, after the return at 0 and the probes.
 const RING_BLOCKS: usize = 1 << 16;
 
@@ -482,12 +487,16 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                 let code = cell_tail(tail, cell, pc, word, RAN, probe).unwrap();
                 (jump(at, tail).unwrap().to_vec(), Some(code.to_vec()))
             }
-            Ring::Lookup => {
+            Ring::Lookup | Ring::PolyLookup => {
                 let probe = base + (PROBES + PROBE_ENTRY) as u64;
                 let code = lookup_tail(tail, ExitKind::Indirect, RAN, probe, 0).unwrap();
-                (indirect_jump(at, pc, tail), Some(code.to_vec()))
+                let jump = match ring {
+                    Ring::Lookup => indirect_jump(at, pc, tail),
+                    _ => either_jump(at, pc, target_pc(next[to]), tail),
+                };
+                (jump, Some(code.to_vec()))
             }
-            Ring::Predicted => {
+            Ring::Predicted | Ring::PolyPredicted => {
                 let probe = base + (PROBES + PROBE_ENTRY) as u64;
                 let mut code =
                     predicted_tail(tail, GuestAddress(pc), ExitKind::Indirect, RAN, probe)
@@ -517,7 +526,11 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                     .copy_from_slice(&jump(point, stamped_at).unwrap());
                 code.resize(RING_STAMPED, 0xcc);
                 code.extend(stamped);
-                (indirect_jump(at, pc, tail), Some(code))
+                let jump = match ring {
+                    Ring::Predicted => indirect_jump(at, pc, tail),
+                    _ => either_jump(at, pc, target_pc(next[to]), tail),
+                };
+                (jump, Some(code))
             }
         };
         assert!(code.len() <= RING_BLOCK);
@@ -569,6 +582,26 @@ fn indirect_jump(at: u64, pc: u64, tail: u64) -> Vec<u8> {
     code
 }
 
+/// A block at `at` whose indirect branch takes `first` or `second` at
+/// random, by a xorshift of RSI, its exit's point linked to `tail`.
+fn either_jump(at: u64, first: u64, second: u64, tail: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    for (shift, op) in [(13u8, 4u8), (7, 5), (17, 4)] {
+        // mov rax, rsi; shl/shr rax, shift; xor rsi, rax
+        code.extend([0x48, 0x89, 0xf0, 0x48, 0xc1, 0xe0 | op << 3 & 0x38, shift]);
+        code.extend([0x48, 0x31, 0xc6]);
+    }
+    // bt esi, 20; movabs rax, first; movabs r8, second; cmovc rax, r8
+    code.extend([0x0f, 0xba, 0xe6, 20, 0x48, 0xb8]);
+    code.extend(first.to_le_bytes());
+    code.extend([0x49, 0xb8]);
+    code.extend(second.to_le_bytes());
+    code.extend([0x49, 0x0f, 0x42, 0xc0]);
+    let end = at + code.len() as u64;
+    code.extend(jump(end, tail).unwrap());
+    code
+}
+
 #[test]
 #[ignore = "manual: opt-in"]
 fn spread_transfer_costs() {
@@ -581,6 +614,8 @@ fn spread_transfer_costs() {
             Ring::Cell,
             Ring::Lookup,
             Ring::Predicted,
+            Ring::PolyLookup,
+            Ring::PolyPredicted,
         ] {
             let (ticks, counts) = spread_cost(ring, blocks);
             std::println!(
