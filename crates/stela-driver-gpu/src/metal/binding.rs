@@ -609,6 +609,14 @@ pub struct TexelArguments {
     /// `STELA_METAL_TEXELS_MIRROR_*`: whether the view's next layer
     /// mirrors the planes, and whether an encode compares with it.
     pub mirror: u32,
+    /// For the two-plane extended-range encodings, the planes' device copy
+    /// a load writes with the planes, the same texels: the address of the
+    /// region's first codes word, or zero for none, and its bytes per row,
+    /// and those of its alpha plane.
+    pub copy: u64,
+    pub copy_bytes_per_row: u32,
+    pub copy_alpha_bytes_per_row: u32,
+    pub copy_alpha: u64,
 }
 
 impl TexelArguments {
@@ -625,10 +633,16 @@ impl TexelArguments {
     pub const ALPHA_OFFSET: u32 = 56;
     pub const ALPHA_ROW_OFFSET: u32 = 64;
     pub const MIRROR_OFFSET: u32 = 68;
-    pub const BYTES: u32 = 72;
-    /// `STELA_METAL_TEXELS_MIRROR_WRITE` and `_COMPARE`.
+    pub const COPY_OFFSET: u32 = 72;
+    pub const COPY_ROW_OFFSET: u32 = 80;
+    pub const COPY_ALPHA_ROW_OFFSET: u32 = 84;
+    pub const COPY_ALPHA_OFFSET: u32 = 88;
+    pub const BYTES: u32 = 96;
+    /// `STELA_METAL_TEXELS_MIRROR_WRITE` and `_COMPARE`, and `_COPY`: the
+    /// planes' device copy holds what they do in the mirror's place.
     pub const MIRROR_WRITE: u32 = 1;
     pub const MIRROR_COMPARE: u32 = 2;
+    pub const MIRROR_COPY: u32 = 3;
     /// The side of the dirty tiles, and the working image's layer that
     /// holds them (`STELA_METAL_DIRTY_TILE`, `_LAYER`).
     pub const DIRTY_TILE: u32 = 64;
@@ -658,6 +672,10 @@ impl TexelArguments {
         writer.u64(self.alpha);
         writer.u32(self.alpha_bytes_per_row);
         writer.u32(self.mirror);
+        writer.u64(self.copy);
+        writer.u32(self.copy_bytes_per_row);
+        writer.u32(self.copy_alpha_bytes_per_row);
+        writer.u64(self.copy_alpha);
         bytes
     }
 }
@@ -1629,6 +1647,19 @@ mod tests {
                 TexelArguments::ALPHA_ROW_OFFSET,
             ),
             ("STELA_METAL_TEXELS_MIRROR", TexelArguments::MIRROR_OFFSET),
+            ("STELA_METAL_TEXELS_COPY", TexelArguments::COPY_OFFSET),
+            (
+                "STELA_METAL_TEXELS_COPY_ROW",
+                TexelArguments::COPY_ROW_OFFSET,
+            ),
+            (
+                "STELA_METAL_TEXELS_COPY_ALPHA_ROW",
+                TexelArguments::COPY_ALPHA_ROW_OFFSET,
+            ),
+            (
+                "STELA_METAL_TEXELS_COPY_ALPHA",
+                TexelArguments::COPY_ALPHA_OFFSET,
+            ),
             (
                 "STELA_METAL_TEXELS_MIRROR_WRITE",
                 TexelArguments::MIRROR_WRITE,
@@ -1636,6 +1667,10 @@ mod tests {
             (
                 "STELA_METAL_TEXELS_MIRROR_COMPARE",
                 TexelArguments::MIRROR_COMPARE,
+            ),
+            (
+                "STELA_METAL_TEXELS_MIRROR_COPY",
+                TexelArguments::MIRROR_COPY,
             ),
             ("STELA_METAL_TEXELS_BYTES", TexelArguments::BYTES),
             (

@@ -346,9 +346,10 @@ pub struct PlaneCounts {
     /// Encodes whose kernel wrote the planes in guest RAM, and their texels.
     pub direct: u64,
     pub direct_texels: u64,
-    /// Encodes into staging memory that copies moved into the planes
-    /// ([`PlaneStaging`](crate::metal::pass::PlaneStaging)), and their
-    /// texels.
+    /// Encodes into the planes' device copy alone that copies moved into
+    /// the planes ([`ExtendedPlanes::STAGED_TEXELS`]), and their texels.
+    ///
+    /// [`ExtendedPlanes::STAGED_TEXELS`]: crate::metal::pass::ExtendedPlanes::STAGED_TEXELS
     pub copied: u64,
     pub copied_texels: u64,
     /// Encodes of a pass's dirty tiles, and the tiles they looked at.

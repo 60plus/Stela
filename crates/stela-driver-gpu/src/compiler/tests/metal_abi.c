@@ -402,8 +402,9 @@ static unsigned varying_alu_count(nir_shader *shader, nir_op op)
  * it once and writes the buffer once per encoding. The two-plane
  * extended-range encodings' store kernel reads the texel's alpha where no
  * plane holds it and writes the planes' mirror; their load kernel reads the
- * mirror and writes the color word, the alpha byte and the mirror, or the
- * texel back without a buffer. */
+ * mirror or the planes' device copy and writes the color word and the alpha
+ * byte, in the planes and the copy, and the mirror, or the texel back
+ * without a buffer. */
 static void texel_kernels_convert_each_encoding(void)
 {
    unsigned encodings = STELA_METAL_TEXELS_PADDED8X2 - STELA_METAL_TEXELS_XR10 + 1;
@@ -422,12 +423,13 @@ static void texel_kernels_convert_each_encoding(void)
    nir_shader *load = stela_metal_load_texels_kernel(NULL);
    check_kernel(load);
    /* Linear: the texel and each planes encoding's mirror; the mirror or
-    * the quantized texel stored; the word and alpha written. Tiled: the
-    * dirty mark, then each planes encoding's texel and mirror; the mirror
-    * stored; the word and alpha written. */
+    * the quantized texel stored; the word and alpha written, in the planes
+    * and their device copy. Tiled: the dirty mark, then each planes
+    * encoding's texel and mirror; the mirror stored; the word and alpha
+    * written, in the planes and their device copy. */
    assert(intrinsic_count(load, nir_intrinsic_image_deref_load) == 1 + planes + 1 + 2 * planes);
    assert(intrinsic_count(load, nir_intrinsic_image_deref_store) == 2 * planes + planes);
-   assert(intrinsic_count(load, nir_intrinsic_store_global) == encodings + 2 * planes + 2 * planes);
+   assert(intrinsic_count(load, nir_intrinsic_store_global) == encodings + 4 * planes + 4 * planes);
    /* A linear thread converts one texel; a dirty tile's thread its
     * column's, in one loop. */
    assert(count(load).loops == 1);

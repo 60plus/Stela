@@ -126,17 +126,19 @@ fn buffer(device: &mut TestDevice, length: u64) -> BufferId {
     device.new_buffer(length, shared()).unwrap()
 }
 
-/// WindowServer's '&b38' screen surfaces of a 3440 or 1680 wide screen:
-/// the alpha plane's row is the width in bytes, which NVIDIA's linear
-/// images cannot take. The texture is made, its alpha plane an aligned
-/// copy every commit refreshes from the rows and a pass's encode of the
-/// planes refreshes again; the color plane's rows fit and stay in place.
+/// WindowServer's '&b38' screen surfaces of a 3440 or 1680 wide screen,
+/// over unified memory: the alpha plane's row is the width in bytes, which
+/// an integrated GPU's 256-byte linear rows cannot take. The texture is
+/// made, its alpha plane an aligned copy every commit refreshes from the
+/// rows and a pass's encode of the planes refreshes again; the color
+/// plane's rows fit and stay in place.
 #[test]
 fn screen_surfaces_of_odd_widths_sample_their_alpha_through_an_aligned_copy() {
     for (width, height, alpha_offset) in
         [(3440u32, 1440u32, 20_076_544u64), (1680, 1050, 7_227_392)]
     {
         let mut device = device();
+        device.capabilities.has_unified_memory = true;
         let length = alpha_offset + u64::from(width) * u64::from(height);
         let buffer = buffer(&mut device, length);
         let planes = [
@@ -502,16 +504,17 @@ fn a_sampled_surface_of_unaligned_rows_is_copied_only_where_used_and_changed() {
     device.destroy_texture(texture).unwrap();
 }
 
-/// A screen surface's alpha plane of an odd width, an aligned copy: until a
-/// command buffer reports the texture, every one refreshes it; once
-/// reported, only one that uses it after the surface changed. Its own pass
-/// encodes the rows and refreshes the copy after, so the next use copies
-/// nothing; another texture's write to the surface, a buffer over it or
-/// the CPU (a new seed) make the next use copy again.
+/// A screen surface's alpha plane of an odd width over unified memory, an
+/// aligned copy: until a command buffer reports the texture, every one
+/// refreshes it; once reported, only one that uses it after the surface
+/// changed. Its own pass encodes the rows and refreshes the copy after, so
+/// the next use copies nothing; another texture's write to the surface, a
+/// buffer over it or the CPU (a new seed) make the next use copy again.
 #[test]
 fn a_reported_screen_surface_is_refreshed_only_where_used_and_changed() {
     let (width, height, alpha_offset) = (1680u32, 1050u32, 7_227_392u64);
     let mut device = device();
+    device.capabilities.has_unified_memory = true;
     let length = alpha_offset + u64::from(width) * u64::from(height);
     let buffer = buffer(&mut device, length);
     let planes = [
@@ -640,4 +643,80 @@ fn a_reported_texture_its_command_buffer_wrote_keeps_its_copy() {
     assert_eq!(read(&mut device), [into]);
     device.destroy_texture(other).unwrap();
     device.destroy_texture(texture).unwrap();
+}
+
+/// A rendered screen surface on a GPU of its own memory keeps a device
+/// copy of both planes, whatever their rows: no command buffer refreshes
+/// it before one uses it. One that writes it unreported fills it first,
+/// while nothing filled it yet; a reported use fills it when the seed
+/// changed; its own pass's encode writes it with the rows, so nothing is
+/// copied after, nor back. Another texture's write to the surface or the
+/// CPU make the next use copy again.
+#[test]
+fn a_rendered_screen_surface_keeps_a_device_copy_of_both_planes() {
+    let (width, height, alpha_offset) = (1680u32, 1050u32, 7_227_392u64);
+    let mut device = device();
+    let length = alpha_offset + u64::from(width) * u64::from(height);
+    let buffer = buffer(&mut device, length);
+    let planes = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: u64::from(width) * 4,
+        },
+        PlaneLayout {
+            offset: alpha_offset,
+            bytes_per_row: u64::from(width),
+        },
+    ];
+    let surface = descriptor(
+        PixelFormat::Rgb10A8_2pXr10,
+        width.into(),
+        height.into(),
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    );
+    let screen = device
+        .new_extended_plane_texture(buffer, &surface, planes)
+        .unwrap();
+    let both = [
+        (true, 0, width, [width, height, 1]),
+        (true, alpha_offset, width, [width, height, 1]),
+    ];
+    let note = |texture, seed| SurfaceNote {
+        texture,
+        surface: 9,
+        seed,
+    };
+    let commit = |device: &mut TestDevice, notes: &[SurfaceNote], written: &[TextureId]| {
+        let mut commands = device.new_command_buffer();
+        commands.surfaces.extend_from_slice(notes);
+        commands.written.extend_from_slice(written);
+        device.commit(commands).unwrap();
+        row_copies(device)
+    };
+    assert_eq!(commit(&mut device, &[], &[]), []);
+    // Written unreported, never filled: filled first, every time.
+    assert_eq!(commit(&mut device, &[], &[screen]), both);
+    assert_eq!(commit(&mut device, &[], &[screen]), both);
+    // Reported: once, then not while the seed holds.
+    assert_eq!(commit(&mut device, &[note(Some(screen), 1)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 1)], &[]), []);
+    // Its own pass, of the surface reported: nothing copied before, after
+    // or back.
+    let mut request = pass(screen, LoadAction::Load);
+    if let Some(color) = &mut request.color_attachments[0] {
+        color.surface = Some((9, 1));
+    }
+    let mut commands = device.new_command_buffer();
+    device.begin_render(&mut commands, &request).unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    commands.surfaces.push(note(Some(screen), 1));
+    device.commit(commands).unwrap();
+    assert_eq!(row_copies(&mut device), []);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 1)], &[]), []);
+    // The CPU wrote the surface.
+    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), both);
+    // A buffer over the surface, which any shader may write.
+    assert_eq!(commit(&mut device, &[note(None, 2)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), both);
+    device.destroy_texture(screen).unwrap();
 }

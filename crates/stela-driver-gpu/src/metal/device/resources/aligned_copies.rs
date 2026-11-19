@@ -28,7 +28,11 @@
 //!   back into its rows;
 //! - a pass that encodes a two-plane extended-range texture's planes, which
 //!   it writes in the rows themselves, copies the rows into the aligned
-//!   copies after it, for the command buffer's later reads;
+//!   copies after it, for the command buffer's later reads; a rendered one
+//!   on a GPU of its own memory keeps a device copy of its planes instead
+//!   ([`PlaneCopy`](crate::metal::pass::PlaneCopy)), whose encodes write it
+//!   with the rows, and which a command buffer that writes it unreported
+//!   fills first while nothing filled it yet;
 //! - the CPU's copies of such a texture convert row by row in the rows.
 //!
 //! A texture whose rows fit keeps its linear image placed in the rows: no
@@ -83,6 +87,12 @@ pub(in crate::metal::device) struct AlignedCopy {
     place: u64,
     bytes_per_row: u64,
     texel_bytes: u64,
+    /// A plane of an extended-range IOSurface texture's device copy
+    /// ([`PlaneCopy`]), whose memory the texture keeps and whose encodes
+    /// write it with the rows: nothing refreshes it after them.
+    ///
+    /// [`PlaneCopy`]: crate::metal::pass::PlaneCopy
+    device: bool,
 }
 
 /// When an aligned copy is refreshed from its rows.
@@ -244,8 +254,63 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 place,
                 bytes_per_row: layout.bytes_per_row,
                 texel_bytes,
+                device: false,
             }),
         ))
+    }
+
+    /// The aligned copy of a plane of an extended-range IOSurface texture's
+    /// device copy: `image`, placed in device memory the texture keeps,
+    /// refreshed from the plane's `rows` where used and changed
+    /// ([`Refresh::Changed`]) and written with them by encodes.
+    pub(in crate::metal::device) fn device_plane_copy(
+        &self,
+        image: Image,
+        rows: Rows,
+        extent: [u32; 2],
+    ) -> Result<AlignedCopy> {
+        let Rows {
+            buffer,
+            memory,
+            memory_offset,
+            layout,
+            texel_bytes,
+        } = rows;
+        let place = memory_offset
+            .checked_add(layout.offset)
+            .ok_or(Error::Invalid("the rows lie past the memory"))?;
+        let row_length = u32::try_from(layout.bytes_per_row / texel_bytes.max(1))
+            .map_err(|_| Error::Invalid("bytesPerRow exceeds the row pitch range"))?;
+        Ok(AlignedCopy {
+            memory,
+            bytes: 0,
+            rows: RowCopy {
+                buffer,
+                image,
+                region: BufferImageCopy {
+                    buffer_offset: layout.offset,
+                    buffer_row_length: row_length,
+                    buffer_image_height: 0,
+                    subresource: Subresource {
+                        aspects: ImageAspects::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    offset: [0; 3],
+                    extent: [extent[0], extent[1], 1],
+                },
+            },
+            refresh: Refresh::Changed {
+                surface: None,
+                filled: None,
+            },
+            rows_memory: memory,
+            place,
+            bytes_per_row: layout.bytes_per_row,
+            texel_bytes,
+            device: true,
+        })
     }
 
     /// Releases the memory of aligned copies whose images are destroyed.
@@ -253,7 +318,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         &mut self,
         copies: impl IntoIterator<Item = AlignedCopy>,
     ) {
-        for copy in copies {
+        // A device copy's memory is its texture's.
+        for copy in copies.into_iter().filter(|copy| !copy.device) {
             self.release_memory(copy.memory, copy.bytes);
         }
     }
@@ -387,6 +453,25 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .filter(|copy| copy.refresh == Refresh::Always)
             .map(|copy| copy.rows.refresh())
             .collect();
+        // A device copy no command buffer filled yet, of a texture this one
+        // writes without reporting it, is filled first: encodes compare
+        // with it.
+        for id in writes {
+            if used.iter().any(|(root, _)| root == id) {
+                continue;
+            }
+            lead.extend(
+                self.resources
+                    .aligned_copies
+                    .get(&id.0)
+                    .into_iter()
+                    .flatten()
+                    .filter(|copy| {
+                        copy.device && matches!(copy.refresh, Refresh::Changed { filled: None, .. })
+                    })
+                    .map(|copy| copy.rows.refresh()),
+            );
+        }
         for (root, note) in &used {
             let Some(copies) = self.resources.aligned_copies.get_mut(&root.0) else {
                 continue;
@@ -480,12 +565,31 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let Ok(texture) = self.resources.textures.get(id.0) else {
             return refreshes;
         };
-        for copy in copies {
+        for copy in copies.iter().filter(|copy| !copy.device) {
             if Some(copy.rows.image) == texture.image {
                 refreshes[0] = Some(copy.rows);
             } else if Some(copy.rows.image) == texture.second_plane {
                 refreshes[1] = Some(copy.rows);
             }
+        }
+        refreshes
+    }
+
+    /// The copies between an extended-range IOSurface texture's device
+    /// copy and its planes' rows: the first plane's and the second's.
+    pub(in crate::metal::device) fn device_copy_rows(&self, id: TextureId) -> [Option<RowCopy>; 2] {
+        let mut refreshes = [None; 2];
+        for (slot, copy) in self
+            .resources
+            .aligned_copies
+            .get(&id.0)
+            .into_iter()
+            .flatten()
+            .filter(|copy| copy.device)
+            .enumerate()
+            .take(2)
+        {
+            refreshes[slot] = Some(copy.rows);
         }
         refreshes
     }

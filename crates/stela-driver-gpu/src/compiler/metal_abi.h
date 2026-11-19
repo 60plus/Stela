@@ -85,7 +85,11 @@
  * row after row, where the dirty layer holds the stamp), and the
  * planes' mirror (STELA_METAL_TEXELS_MIRROR_*): the view's next layer
  * holds, per texel, the codes word and alpha byte the planes hold, which a
- * load compares to write only the texels that changed. */
+ * load compares to write only the texels that changed. Last, the planes'
+ * device copy, which a load writes with the planes, the same texels: the
+ * address of the region's first codes word, or zero for none, its bytes
+ * per row, its alpha plane's bytes per row and the address of the region's
+ * first alpha byte, or zero. */
 #define STELA_METAL_TEXELS_BUFFER 0u
 #define STELA_METAL_TEXELS_COUNT 8u
 #define STELA_METAL_TEXELS_ENCODING 12u
@@ -99,15 +103,23 @@
 #define STELA_METAL_TEXELS_ALPHA 56u
 #define STELA_METAL_TEXELS_ALPHA_ROW 64u
 #define STELA_METAL_TEXELS_MIRROR 68u
-#define STELA_METAL_TEXELS_BYTES 72u
+#define STELA_METAL_TEXELS_COPY 72u
+#define STELA_METAL_TEXELS_COPY_ROW 80u
+#define STELA_METAL_TEXELS_COPY_ALPHA_ROW 84u
+#define STELA_METAL_TEXELS_COPY_ALPHA 88u
+#define STELA_METAL_TEXELS_BYTES 96u
 
 /* What the two-plane encodings do with the planes' mirror
  * (STELA_METAL_TEXELS_MIRROR): nothing; every conversion writes it; or as
  * WRITE, and a load writes the planes only where the codes or alpha differ
- * from the mirror's, which holds what the planes do. */
+ * from the mirror's, which holds what the planes do. With COPY, the planes'
+ * device copy (STELA_METAL_TEXELS_COPY) holds what they do in its place:
+ * a load writes the planes and the copy only where the codes or alpha
+ * differ from the copy's, and nothing writes the mirror. */
 #define STELA_METAL_TEXELS_MIRROR_NONE 0u
 #define STELA_METAL_TEXELS_MIRROR_WRITE 1u
 #define STELA_METAL_TEXELS_MIRROR_COMPARE 2u
+#define STELA_METAL_TEXELS_MIRROR_COPY 3u
 
 /* The layouts a texture's image stores in place of its Metal format's
  * bytes (pixel_format.rs Encoding): the extended-range codes of BGR10_XR

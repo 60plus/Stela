@@ -1532,10 +1532,23 @@ struct texels {
    nir_def *alpha;
    /* STELA_METAL_TEXELS_MIRROR_*, and the mirror's coordinate. */
    nir_def *mirror, *mirror_coord;
+   /* The planes' device copy's codes word and alpha byte of the texel, or
+    * zero for none. */
+   nir_def *copy, *copy_alpha;
    /* The thread's index. */
    nir_def *thread;
    nir_deref_instr *image;
 };
+
+/* The address of texel (x, y) of a plane of texels of size bytes, row bytes
+ * a row, from base, the address of its texel (0, 0); zero for a base of
+ * zero, a plane there is none of. */
+static nir_def *plane_texel(nir_builder *b, nir_def *base, nir_def *row, nir_def *x, nir_def *y,
+                            unsigned size)
+{
+   nir_def *offset = nir_iadd(b, nir_imul(b, y, row), nir_imul_imm(b, x, size));
+   return nir_bcsel(b, nir_ieq_imm(b, base, 0), base, nir_iadd(b, base, nir_u2u64(b, offset)));
+}
 
 static nir_builder texels(const nir_shader_compiler_options *options, const char *name,
                           struct texels *t)
@@ -1574,6 +1587,11 @@ static nir_builder texels(const nir_shader_compiler_options *options, const char
       &b, nir_imul(&b, y, load(&b, arguments, STELA_METAL_TEXELS_ALPHA_ROW, 32)), x);
    t->alpha = nir_bcsel(&b, nir_ieq_imm(&b, alpha, 0), alpha,
                         nir_iadd(&b, alpha, nir_u2u64(&b, alpha_offset)));
+   t->copy = plane_texel(&b, load(&b, arguments, STELA_METAL_TEXELS_COPY, 64),
+                         load(&b, arguments, STELA_METAL_TEXELS_COPY_ROW, 32), x, y, 4);
+   t->copy_alpha = plane_texel(&b, load(&b, arguments, STELA_METAL_TEXELS_COPY_ALPHA, 64),
+                               load(&b, arguments, STELA_METAL_TEXELS_COPY_ALPHA_ROW, 32), x, y,
+                               1);
    t->mirror = load(&b, arguments, STELA_METAL_TEXELS_MIRROR, 32);
    t->mirror_coord = nir_vector_insert_imm(&b, t->coord,
                                            nir_iadd_imm(&b, nir_channel(&b, t->coord, 2), 1), 2);
@@ -1618,6 +1636,28 @@ static nir_def *store_xr(nir_builder *b, nir_def *lo, nir_def *hi, bool alpha, b
    return halves(b, xr_value(b, red, srgb), xr_value(b, green, srgb), xr_value(b, blue, srgb), a);
 }
 
+/* Whether the view's next layer mirrors the planes: neither none nor the
+ * device copy in its place. */
+static nir_def *mirrors(nir_builder *b, const struct texels *t)
+{
+   return nir_iand(b, nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_NONE),
+                   nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+}
+
+/* Whether the planes' device copy holds a two-plane texel's codes word and
+ * alpha byte at copy and copy_alpha, where alpha is compared only when its
+ * plane is copied. */
+static nir_def *copy_holds(nir_builder *b, nir_def *copy, nir_def *copy_alpha, nir_def *word,
+                           nir_def *alpha)
+{
+   nir_def *held = nir_load_global(b, 1, 32, copy, .align_mul = 4);
+   nir_push_if(b, nir_ine_imm(b, copy_alpha, 0));
+   nir_def *byte = nir_u2u32(b, nir_load_global(b, 1, 8, copy_alpha, .align_mul = 1));
+   nir_pop_if(b, NULL);
+   byte = nir_if_phi(b, byte, alpha);
+   return nir_iand(b, nir_ieq(b, held, word), nir_ieq(b, byte, alpha));
+}
+
 /* Writes a two-plane texel's codes word and alpha byte to its mirror. */
 static void store_mirror(nir_builder *b, const struct texels *t, nir_def *word, nir_def *alpha)
 {
@@ -1625,6 +1665,19 @@ static void store_mirror(nir_builder *b, const struct texels *t, nir_def *word, 
                          nir_vec4(b, word, alpha, nir_imm_int(b, 0), nir_imm_int(b, 0)),
                          nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = true,
                          .format = PIPE_FORMAT_NONE, .src_type = nir_type_uint32);
+}
+
+/* Writes a two-plane texel's codes word and alpha byte to the planes'
+ * device copy at copy and copy_alpha, where each is not zero. */
+static void store_copy(nir_builder *b, nir_def *copy, nir_def *copy_alpha, nir_def *word,
+                       nir_def *alpha)
+{
+   nir_push_if(b, nir_ine_imm(b, copy, 0));
+   nir_store_global(b, word, copy, .align_mul = 4);
+   nir_pop_if(b, NULL);
+   nir_push_if(b, nir_ine_imm(b, copy_alpha, 0));
+   nir_store_global(b, nir_u2u8(b, alpha), copy_alpha, .align_mul = 1);
+   nir_pop_if(b, NULL);
 }
 
 nir_shader *stela_metal_store_texels_kernel(const nir_shader_compiler_options *options)
@@ -1679,7 +1732,7 @@ nir_shader *stela_metal_store_texels_kernel(const nir_shader_compiler_options *o
                                .image_array = true, .format = PIPE_FORMAT_NONE,
                                .src_type = nir_type_uint32);
          /* The mirror holds what the planes do. */
-         nir_push_if(&b, nir_ine_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+         nir_push_if(&b, mirrors(&b, &t));
          store_mirror(&b, &t, lo, byte);
          nir_pop_if(&b, NULL);
       }
@@ -1709,10 +1762,13 @@ _Static_assert(STELA_METAL_KERNEL_WORKGROUP == STELA_METAL_DIRTY_TILE,
                "a workgroup is one dirty tile's columns, which stop together when it is clean");
 
 /* Encodes the working image's texel at coord into an IOSurface's planes, at
- * address and alpha (zero for none), where its codes or alpha differ from
- * the mirror's when the mirror is compared, and writes the mirror with it. */
+ * address and alpha (zero for none), and into their device copy at copy and
+ * copy_alpha (zero for none), where its codes or alpha differ from the
+ * mirror's or the copy's when either is compared, and writes the mirror
+ * with it. */
 static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def *coord,
-                                nir_def *address, nir_def *alpha, bool srgb)
+                                nir_def *address, nir_def *alpha, nir_def *copy,
+                                nir_def *copy_alpha, bool srgb)
 {
    nir_def *stored = nir_image_deref_load(b, 4, 32, &t->image->def, coord, nir_undef(b, 1, 32),
                                           nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
@@ -1740,13 +1796,18 @@ static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def 
                               nir_ine(b, nir_channel(b, mirrored, 1), alpha_byte));
    nir_pop_if(b, NULL);
    differs = nir_if_phi(b, differs, changed);
+   nir_push_if(b, nir_ieq_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+   nir_def *copied = nir_inot(b, copy_holds(b, copy, copy_alpha, word, steps));
+   nir_pop_if(b, NULL);
+   differs = nir_if_phi(b, copied, differs);
    nir_push_if(b, differs);
    {
       nir_store_global(b, word, address, .align_mul = 4);
       nir_push_if(b, nir_ine_imm(b, alpha, 0));
       nir_store_global(b, nir_u2u8(b, steps), alpha, .align_mul = 1);
       nir_pop_if(b, NULL);
-      nir_push_if(b, nir_ine_imm(b, t->mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+      store_copy(b, copy, copy_alpha, word, steps);
+      nir_push_if(b, mirrors(b, t));
       nir_image_deref_store(b, &t->image->def, mirror_coord, nir_undef(b, 1, 32),
                             nir_vec4(b, word, alpha_byte, nir_imm_int(b, 0), nir_imm_int(b, 0)),
                             nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
@@ -1772,6 +1833,10 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
    nir_def *row_bytes = load(b, arguments, STELA_METAL_TEXELS_ROW, 32);
    nir_def *alpha_row = load(b, arguments, STELA_METAL_TEXELS_ALPHA_ROW, 32);
    nir_def *alpha = load(b, arguments, STELA_METAL_TEXELS_ALPHA, 64);
+   nir_def *copy = load(b, arguments, STELA_METAL_TEXELS_COPY, 64);
+   nir_def *copy_row = load(b, arguments, STELA_METAL_TEXELS_COPY_ROW, 32);
+   nir_def *copy_alpha = load(b, arguments, STELA_METAL_TEXELS_COPY_ALPHA, 64);
+   nir_def *copy_alpha_row = load(b, arguments, STELA_METAL_TEXELS_COPY_ALPHA_ROW, 32);
    nir_def *origin[3];
    for (unsigned i = 0; i < 3; i++)
       origin[i] = load(b, arguments, STELA_METAL_TEXELS_ORIGIN + 4 * i, 32);
@@ -1812,10 +1877,10 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
             nir_def *address = nir_iadd(b, t->buffer,
                                         nir_u2u64(b, nir_iadd(b, nir_imul(b, y, row_bytes),
                                                               nir_ishl_imm(b, x, 2))));
-            nir_def *alpha_at = nir_bcsel(
-               b, nir_ieq_imm(b, alpha, 0), alpha,
-               nir_iadd(b, alpha, nir_u2u64(b, nir_iadd(b, nir_imul(b, y, alpha_row), x))));
+            nir_def *alpha_at = plane_texel(b, alpha, alpha_row, x, y, 1);
             encode_planes_texel(b, t, coord, address, alpha_at,
+                                plane_texel(b, copy, copy_row, x, y, 4),
+                                plane_texel(b, copy_alpha, copy_alpha_row, x, y, 1),
                                 e == STELA_METAL_TEXELS_XR10_PLANES_SRGB);
             nir_pop_if(b, NULL);
          }
@@ -1889,7 +1954,7 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
                               nir_ishl_imm(&b, codes[2], 20));
       nir_def *alpha_byte = nir_f2u32(&b, steps);
       /* A texel whose codes and alpha the planes hold already, as the
-       * mirror says, is not written again. */
+       * mirror or their device copy says, is not written again. */
       nir_def *compares = nir_ieq_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_COMPARE);
       nir_def *changed = nir_imm_false(&b);
       nir_push_if(&b, compares);
@@ -1901,11 +1966,16 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
                                nir_ieq(&b, nir_channel(&b, mirrored, 1), alpha_byte));
       nir_pop_if(&b, NULL);
       held = nir_if_phi(&b, held, changed);
+      nir_push_if(&b, nir_ieq_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_COPY));
+      nir_def *copied = copy_holds(&b, t.copy, t.copy_alpha, word, alpha_byte);
+      nir_pop_if(&b, NULL);
+      held = nir_if_phi(&b, copied, held);
       nir_push_if(&b, nir_inot(&b, held));
       nir_push_if(&b, nir_ine_imm(&b, t.buffer, 0));
       {
          nir_store_global(&b, word, address, .align_mul = 4);
-         nir_push_if(&b, nir_ine_imm(&b, t.mirror, STELA_METAL_TEXELS_MIRROR_NONE));
+         store_copy(&b, t.copy, t.copy_alpha, word, alpha_byte);
+         nir_push_if(&b, mirrors(&b, &t));
          store_mirror(&b, &t, word, nir_bcsel(&b, nir_ine_imm(&b, t.alpha, 0), alpha_byte,
                                               nir_imm_int(&b, 0)));
          nir_pop_if(&b, NULL);
