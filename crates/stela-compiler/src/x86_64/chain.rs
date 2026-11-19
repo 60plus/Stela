@@ -3686,9 +3686,15 @@ fn rax_cell_tail(
 /// Where a [`predicted_tail`]'s direct exit to its predicted target begins:
 /// its patch point is [`direct_patch`] of the tail's address plus this.
 pub const PREDICTED_EXIT: usize = 15;
-/// Bytes in a [`predicted_tail`]: the compare, the direct exit and a
-/// [`lookup_tail`].
-pub const PREDICTED_TAIL_BYTES: usize = PREDICTED_EXIT + DIRECT_EXIT_BYTES + TAIL_BYTES;
+/// Where a [`predicted_tail`]'s miss begins, after its direct exit: an
+/// [`open_predicted_tail`]'s is a dynamic exit, whose patch point is
+/// [`dynamic_patch`] of the tail's address plus this.
+pub const PREDICTED_MISS: usize = PREDICTED_EXIT + DIRECT_EXIT_BYTES;
+/// Bytes in a [`predicted_tail`] or an [`open_predicted_tail`]: the
+/// compare, the direct exit and the miss, a lookup's call of the table
+/// probe or a dynamic exit, padded.
+pub const PREDICTED_TAIL_BYTES: usize = PREDICTED_MISS + DYNAMIC_EXIT_BYTES;
+const _: () = assert!(TAIL_BYTES <= DYNAMIC_EXIT_BYTES);
 
 /// The tail at host address `at` of an exit to the target in RAX that the
 /// engine predicts is `target`: a one-target inline cache. When RAX is
@@ -3718,6 +3724,34 @@ pub fn predicted_tail(
     asm.fixed(&direct_exit_at(exit, target, word));
     asm.bind(other);
     tail(&mut code, at, word, ran, probe)?;
+    while code.len() < PREDICTED_TAIL_BYTES {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// A [`predicted_tail`] whose miss is the exit's dynamic exit of `word`
+/// ([`PREDICTED_MISS`]), returning to the engine with RAX and EDX as the
+/// redirected exit did: the engine learns a site's second target from it
+/// and sends its patch point to a [`predicted_tail`] of that target, or to
+/// a lookup. `None` when `target`'s direct exit cannot be made.
+pub fn open_predicted_tail(
+    at: u64,
+    target: GuestAddress,
+    word: impl Into<ExitWord>,
+) -> Option<[u8; PREDICTED_TAIL_BYTES]> {
+    let word = word.into();
+    let mut code = Code::new();
+    let mut asm = code.asm();
+    asm.mov_imm64(R8, target.0);
+    asm.alu(Alu::Cmp, Qword, Rax, R8);
+    let other = asm.jcc8(Cond::Ne);
+    debug_assert_eq!(asm.len(), PREDICTED_EXIT);
+    asm.fixed(&direct_exit_at(at + PREDICTED_EXIT as u64, target, word));
+    asm.bind(other);
+    debug_assert_eq!(asm.len(), PREDICTED_MISS);
+    let miss = at + PREDICTED_MISS as u64;
+    asm.fixed(&exit_word_bytes(word.encoded(), patch_pad(miss)));
     code.try_into().ok()
 }
 

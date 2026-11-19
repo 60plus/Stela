@@ -826,12 +826,18 @@ fn predicted_tails_hold_a_direct_exit_and_a_lookup_tail() {
         assert!(is_direct_exit(exit, target, word));
         assert!(exit_ready(&tail, PREDICTED_EXIT, at, 0));
         assert!(patchable(direct_patch(at + PREDICTED_EXIT as u64)));
-        let lookup = at + (PREDICTED_EXIT + DIRECT_EXIT_BYTES) as u64;
-        assert_eq!(tail[PREDICTED_EXIT + DIRECT_EXIT_BYTES..], {
+        let lookup = at + PREDICTED_MISS as u64;
+        let plain = {
             let mut plain = Code::new();
             super::super::tail(&mut plain, lookup, word, 3, probe).unwrap();
             plain.into_bytes()
-        });
+        };
+        assert_eq!(tail[PREDICTED_MISS..][..plain.len()], plain);
+        assert!(
+            tail[PREDICTED_MISS + plain.len()..]
+                .iter()
+                .all(|&byte| byte == 0xcc)
+        );
         // movabs r8, target; cmp rax, r8; jne over the direct exit.
         assert_eq!(tail[..2], [0x49, 0xb8]);
         assert_eq!(tail[2..10], target.0.to_le_bytes());
@@ -841,4 +847,22 @@ fn predicted_tails_hold_a_direct_exit_and_a_lookup_tail() {
         );
     }
     assert!(predicted_tail(0, GuestAddress(0), ExitKind::Return, 1 << 12, 0).is_none());
+}
+
+/// An open predicted tail misses through a dynamic exit of its word, its
+/// patch point patchable where it lands, which the engine later sends to
+/// the site's second predicted tail; its compare and direct exit are a
+/// predicted tail's.
+#[test]
+fn open_predicted_tails_miss_through_a_dynamic_exit() {
+    for at in (0x1000..0x1010).map(|at| 0x7f00_0000_0000 + at) {
+        let target = GuestAddress(0xffff_fe00_1234_0010);
+        let word = ExitWord::from(ExitKind::Call);
+        let open = open_predicted_tail(at, target, word).unwrap();
+        let closed = predicted_tail(at, target, word, 3, 0x7f00_0010_0000).unwrap();
+        assert_eq!(open[..PREDICTED_MISS], closed[..PREDICTED_MISS]);
+        assert!(is_dynamic_exit(&open[PREDICTED_MISS..], ExitKind::Call));
+        assert!(dynamic_ready(&open, PREDICTED_MISS, at));
+        assert!(patchable(dynamic_patch(at + PREDICTED_MISS as u64)));
+    }
 }

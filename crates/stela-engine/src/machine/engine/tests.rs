@@ -4556,6 +4556,64 @@ fn sctlr_fields_outside_translation_keep_every_translation() {
     assert_ne!(machine.translation_generation, generation);
 }
 
+/// A BR's predicted tail misses to the engine until it meets another
+/// target, which becomes the site's second: the miss's patch point then
+/// jumps to a predicted tail of that target, whose own miss calls the
+/// table probe, and further targets stay in native code.
+#[test]
+fn indirect_branches_learn_a_second_target_at_their_first_miss() {
+    const BR_X0: u32 = 0xd61f_0000;
+    let mut words = vec![0; 0x801];
+    words[0] = BR_X0;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let (first, second) = (base + 0x1000, base + 0x2000);
+    for target in [first, second] {
+        let Ok(Fetched::Block(_)) = machine.fetch_block(target, false) else {
+            panic!("the target's block");
+        };
+    }
+    let exit = |next_pc| NativeExit::Exit {
+        next_pc,
+        kind: ExitKind::Indirect as u64,
+    };
+    machine.host.exits = vec![exit(first)];
+    machine.cpu.pc = base;
+    machine.step().unwrap();
+    let index = machine.code.blocks.len() - 1;
+    assert_eq!(machine.code.blocks[index].pc, base);
+    let record = machine.code.blocks.record(index);
+    assert!(!record.dynamic_open());
+    let (miss, predicted) = record.second().expect("an open miss");
+    assert_eq!(predicted, first);
+    assert_eq!(machine.statistics.predicted_tails, 1);
+    // The first target again leaves the miss open; another takes it.
+    machine.host.exits = vec![exit(first), exit(second)];
+    for _ in 0..2 {
+        machine.cpu.pc = base;
+        machine.step().unwrap();
+    }
+    assert_eq!(machine.code.blocks.record(index).second(), None);
+    assert_eq!(machine.statistics.predicted_tails, 2);
+    let tail = machine
+        .host
+        .patches
+        .iter()
+        .rev()
+        .find(|(_, bytes)| bytes.len() == chain::PREDICTED_TAIL_BYTES)
+        .expect("the second predicted tail")
+        .0 as u64;
+    assert!(
+        machine
+            .host
+            .patches
+            .contains(&(miss as usize, chain::jump(miss, tail).unwrap().to_vec()))
+    );
+    let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
+    let cell = machine.code.cache().targets.site_cell(exit).expect("its cell");
+    assert_eq!(cell.pc, second);
+}
+
 /// BLR and BR exits are redirected, once their target is translated,
 /// through tails that predict it and call the probes of their BTYPE: a BR
 /// through other than X16 or X17 sets 0b11 from a guarded page, whose
@@ -7312,9 +7370,9 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
 /// target this PE translates gives its exit a tail of its own that
 /// predicts the authenticated target: its direct exit to it is linked through a cell,
 /// which starts with the target's entry, with the probes of the branch's
-/// BTYPE, before the exit jumps to the tail; any other target takes the
-/// table probe, as a lookup tail sends it. A branch before the target's
-/// first fetch leaves the exit open.
+/// BTYPE, before the exit jumps to the tail; any other target returns to
+/// the engine, which makes it the site's second. A branch before the
+/// target's first fetch leaves the exit open.
 #[test]
 fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
@@ -7349,17 +7407,10 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         machine.host.installed[installed - 3],
         chain::lookup_dispatcher(0b01).unwrap()
     );
-    let probes = ((installed - 2) * NATIVE_CODE_STRIDE) as u64;
     let tail = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let cell_tail = (installed * NATIVE_CODE_STRIDE) as u64;
-    let predicted = chain::predicted_tail(
-        tail,
-        GuestAddress(target),
-        ExitKind::Indirect,
-        1,
-        probes + chain::PROBE_ENTRY as u64,
-    )
-    .unwrap();
+    let predicted =
+        chain::open_predicted_tail(tail, GuestAddress(target), ExitKind::Indirect).unwrap();
     let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
     let cell = machine
         .code

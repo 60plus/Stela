@@ -833,6 +833,12 @@ pub(super) struct Record {
     used: AtomicU64,
     /// Its dynamic exit is served by a lookup dispatcher.
     dynamic: AtomicBool,
+    /// The patch point of the miss of its dynamic exit's predicted tail
+    /// while that miss still returns to the engine
+    /// (`chain::open_predicted_tail`), and the target the tail predicts:
+    /// the miss's next target becomes the site's second.
+    second: AtomicU64,
+    second_target: AtomicU64,
     /// Its install lost to another PE's of the same block: never reachable.
     lost: AtomicBool,
     /// Jump cache hits that found no block table entry of it and went for
@@ -856,6 +862,8 @@ impl Default for Record {
             settled: AtomicU64::new(0),
             used: AtomicU64::new(0),
             dynamic: AtomicBool::new(false),
+            second: AtomicU64::new(0),
+            second_target: AtomicU64::new(0),
             lost: AtomicBool::new(false),
             remembers: AtomicU32::new(0),
             recovery: Mutex::new(None),
@@ -999,6 +1007,28 @@ impl Record {
 
     pub(super) fn close_dynamic(&self) {
         self.dynamic.store(true, Ordering::Release);
+    }
+
+    /// The patch point of its predicted tail's open miss and the target the
+    /// tail predicts, while the miss returns to the engine.
+    pub(super) fn second(&self) -> Option<(u64, u64)> {
+        let miss = self.second.load(Ordering::Acquire);
+        (miss != 0).then(|| (miss, self.second_target.load(Ordering::Relaxed)))
+    }
+
+    /// Its predicted tail of `target` misses through the dynamic exit whose
+    /// patch point is `miss`: under the board's lock.
+    pub(super) fn open_second(&self, miss: u64, target: u64) {
+        self.second_target.store(target, Ordering::Relaxed);
+        self.second.store(miss, Ordering::Release);
+    }
+
+    /// [`Self::second`], which no other caller then takes: under the
+    /// board's lock.
+    pub(super) fn take_second(&self) -> Option<(u64, u64)> {
+        let held = self.second()?;
+        self.second.store(0, Ordering::Release);
+        Some(held)
     }
 
     /// Whether its install lost to another PE's ([`Self::mark_lost`]).
@@ -1154,6 +1184,7 @@ impl Blocks {
         record.settled.store(0, Ordering::Relaxed);
         record.used.store(0, Ordering::Relaxed);
         record.dynamic.store(false, Ordering::Relaxed);
+        record.second.store(0, Ordering::Relaxed);
         record.lost.store(false, Ordering::Relaxed);
         record.remembers.store(0, Ordering::Relaxed);
         record.incarnation.fetch_add(1, Ordering::Release);

@@ -855,13 +855,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// form's thunk still authenticates every transfer: only which block an
     /// authenticated target enters is cached, and validated as every cell
     /// is. Returns keep their paired tails.
+    ///
+    /// A predicted tail's miss first returns to the engine
+    /// ([`chain::open_predicted_tail`]): the first other target it meets
+    /// becomes the site's second, whose own predicted tail the miss then
+    /// jumps to, its miss the lookup ([`Self::link_second`]).
     pub(super) fn link_dynamic(&mut self, index: usize, btype: u8, target: u64) {
         // Decided on the board borrowed: nearly every such exit has its
         // dispatcher already, and a clone of the board's `Arc` would write
         // a count every PE's exits write.
+        let record = self.code.blocks.record(index);
+        if !record.dynamic_open() {
+            if record.second().is_some_and(|(_, first)| first != target) {
+                self.link_second(index, btype, target);
+            }
+            return;
+        }
         let (point, kind, retired, predicted) = {
             let block = &self.code.blocks[index];
-            let record = self.code.blocks.record(index);
             let Some(site) = block.dynamic_site.filter(|_| {
                 !self.variants[block.variant.0 as usize].single && record.dynamic_open()
             }) else {
@@ -898,11 +909,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if predicted && self.translated_entry(&cache, target).is_none() {
             return;
         }
-        if (predicted
-            && self.redirect_through_prediction(&mut cache, point, retired, word, btype, target))
-            || self.redirect_through_lookup(&mut cache, point, retired, word, btype)
+        if predicted
+            && let Some(miss) = self
+                .redirect_through_prediction(&mut cache, point, retired, word, btype, target, true)
         {
+            record.open_second(miss, target);
             record.close_dynamic();
+        } else if self.redirect_through_lookup(&mut cache, point, retired, word, btype) {
+            record.close_dynamic();
+        }
+    }
+
+    /// Send the open miss of block `index`'s predicted tail to a predicted
+    /// tail of `target`, which just took it, as the site's second target,
+    /// whose own miss takes the lookup ([`Self::redirect_through_lookup`]);
+    /// to the lookup alone when that tail cannot be made. A target no
+    /// translation of this PE names yet leaves the miss open for the next.
+    fn link_second(&mut self, index: usize, btype: u8, target: u64) {
+        let Some((kind, _)) = dynamic_branch(self.code.blocks[index].terminal)
+            .or_else(|| transitions::transition_branch(self.code.blocks[index].terminal))
+        else {
+            return;
+        };
+        let retired = u32::from(self.code.blocks[index].instructions);
+        let code = Arc::clone(&self.code);
+        let record = code.blocks.record(index);
+        let mut cache = code.cache_at(board::LockSite::Dynamic);
+        if !record.live() || self.translated_entry(&cache, target).is_none() {
+            return;
+        }
+        let Some((miss, first)) = record.take_second() else {
+            return;
+        };
+        let word = kind.into();
+        let linked = self
+            .redirect_through_prediction(&mut cache, miss, retired, word, btype, target, false)
+            .is_some()
+            || self.redirect_through_lookup(&mut cache, miss, retired, word, btype);
+        if !linked {
+            record.open_second(miss, first);
         }
     }
 
@@ -911,8 +956,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `btype`, to a [`chain::predicted_tail`] of its own for `target`: its
     /// direct exit to `target` is linked through a cell before the point
     /// jumps to the tail, and any other target takes the tail's lookup, as
-    /// [`Self::redirect_through_lookup`] would send it. False, with the
-    /// exit as it was, when the tail or the cell link cannot be made.
+    /// [`Self::redirect_through_lookup`] would send it, or for an `open`
+    /// tail its miss's dynamic exit ([`chain::open_predicted_tail`]). The
+    /// tail's miss's patch point; `None`, with the exit as it was, when the
+    /// tail or the cell link cannot be made.
+    #[allow(clippy::too_many_arguments)]
     fn redirect_through_prediction(
         &mut self,
         cache: &mut board::Cache,
@@ -921,27 +969,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
         word: ExitWord,
         btype: u8,
         target: u64,
-    ) -> bool {
+        open: bool,
+    ) -> Option<u64> {
         if !chain::patchable(site) {
-            return false;
+            return None;
         }
-        let Some((probe, tail)) =
-            self.probe_and_tail(cache, site, btype, chain::PREDICTED_TAIL_BYTES)
-        else {
-            return false;
-        };
+        let (probe, tail) = self.probe_and_tail(cache, site, btype, chain::PREDICTED_TAIL_BYTES)?;
         let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::predicted_tail(
+        let code = match open {
+            true => chain::open_predicted_tail(at, GuestAddress(target), word),
+            false => chain::predicted_tail(
                 at,
                 GuestAddress(target),
                 word,
                 retired,
                 probe + chain::PROBE_ENTRY as u64,
             ),
-            chain::jump(site, at),
-        ) else {
-            return false;
+        };
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
+            return None;
         };
         // Nothing reaches the tail before the point's jump: its direct exit
         // is linked first, so no predicted transfer returns to the engine.
@@ -949,12 +995,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
         if !self.link_through_cell(cache, exit, target, retired, word, btype, false) {
-            return false;
+            return None;
         }
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.lookups += 1;
         self.statistics.predicted_tails += 1;
-        true
+        Some(chain::dynamic_patch(at + chain::PREDICTED_MISS as u64))
     }
 
     /// Send the exit of `word` whose patch point is at host address `site`
