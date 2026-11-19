@@ -345,6 +345,92 @@ fn fetch_phase_costs() {
     );
 }
 
+/// What DEFLATE does to the pack records of real code: every block of the
+/// first `FETCH_IMAGE` file (from `FETCH_OFFSET`, 8 MiB) compiled and
+/// stored, one record per 4 KiB page, each encoded and compressed at levels
+/// 1 and 6: bytes before and after, and microseconds per record each way.
+#[test]
+#[ignore = "manual: opt-in"]
+fn pack_record_compression() {
+    use crate::translations::{Digest, Record, translator_id};
+    let path = std::env::var("FETCH_IMAGE").expect("FETCH_IMAGE");
+    let path = path.split(',').next().unwrap_or_default();
+    let offset = std::env::var("FETCH_OFFSET")
+        .ok()
+        .and_then(|value| usize::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    let file = std::fs::read(path).expect("the code image");
+    let image = &file[offset.min(file.len())..(offset + (8 << 20)).min(file.len())];
+    let preparation = Arc::new(system_preparation());
+    let options = system_options();
+    let translator = translator_id();
+    let base = 0x1_8040_0000u64;
+    let mut records: alloc::collections::BTreeMap<u64, Record> = Default::default();
+    let mut staging = [0u8; super::MAX_BLOCK_BYTES as usize];
+    let mut at = 0usize;
+    while at + 4 <= image.len() {
+        let pc = base + at as u64;
+        let page = pc & !(FETCH_PAGE - 1);
+        let page_end = (at as u64 | (FETCH_PAGE - 1)) + 1;
+        let end = (page_end as usize).min(image.len()).min(at + window(pc));
+        let length = end - at;
+        staging[..length].copy_from_slice(&image[at..end]);
+        preparation.admit(&mut staging[..length]);
+        let Ok((analysis, Ok(plan))) =
+            block::analyze_and_plan(&staging[..length], GuestAddress(pc), &options)
+        else {
+            at += 4;
+            continue;
+        };
+        let Ok(compiled) = plan.compile() else {
+            at += 4;
+            continue;
+        };
+        let input = analysis.source_bytes;
+        let step = compiled.source_bytes.max(4);
+        let emission = Emission::new(staging[..input].to_vec(), compiled, preparation.clone());
+        let context = preparation.context(page);
+        if let Some(entry) = Entry::stored(&emission.block, &emission.input, page, pc, context) {
+            records
+                .entry(page)
+                .or_insert_with(|| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&page.to_le_bytes());
+                    Record::new(translator, Digest(key))
+                })
+                .insert(entry);
+        }
+        at += step;
+    }
+    let encoded: Vec<Vec<u8>> = records.values().map(Record::encode).collect();
+    let raw: usize = encoded.iter().map(Vec::len).sum();
+    for level in [1u8, 6] {
+        let started = Instant::now();
+        let packed: Vec<Vec<u8>> = encoded
+            .iter()
+            .map(|bytes| miniz_oxide::deflate::compress_to_vec(bytes, level))
+            .collect();
+        let deflate = started.elapsed();
+        let started = Instant::now();
+        for (bytes, raw) in packed.iter().zip(&encoded) {
+            let out = miniz_oxide::inflate::decompress_to_vec(bytes).expect("inflates");
+            assert_eq!(out.len(), raw.len());
+        }
+        let inflate = started.elapsed();
+        let compressed: usize = packed.iter().map(Vec::len).sum();
+        let per = |time: Duration| time.as_secs_f64() * 1e6 / encoded.len().max(1) as f64;
+        std::println!(
+            "records={} raw={raw} bytes_per_record={} level={level} compressed={compressed} \
+             ratio={:.2} deflate_us_per_record={:.1} inflate_us_per_record={:.1}",
+            encoded.len(),
+            raw / encoded.len().max(1),
+            raw as f64 / compressed.max(1) as f64,
+            per(deflate),
+            per(inflate),
+        );
+    }
+}
+
 /// The first window's bytes: the engine's, or `FETCH_FIRST` instructions'.
 fn first_window() -> usize {
     std::env::var("FETCH_FIRST")
