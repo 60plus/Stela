@@ -101,7 +101,8 @@ pub use ram::RamRange;
 
 /// Page-table frames from the handoff pool: a permanent part for roots and a
 /// shadow part, split between the guest's two halves, each of which resets
-/// wholesale.
+/// wholesale. Between resets a half hands out the frames given back to it
+/// (the tables of kept lower halves the shadow let go) before new ones.
 struct Pool {
     base: u64,
     bytes: u64,
@@ -118,6 +119,10 @@ struct Pool {
     half: usize,
     /// The most bytes of shadow frames each half has held at once.
     peak: [u64; 2],
+    /// Each half's frames given back since it was last reset, which it
+    /// hands out first: the lower half's, whose storage holds every frame
+    /// of the half, so a fault never allocates to give one back.
+    free: [Vec<u64>; 2],
 }
 
 /// The guest halves: VAs with bit 63 clear and set.
@@ -126,6 +131,10 @@ const UPPER: usize = 1;
 
 impl Frames for Pool {
     fn frame(&mut self) -> Option<u64> {
+        if let Some(frame) = self.free[self.half].pop() {
+            zero(frame);
+            return Some(frame);
+        }
         let (_, end) = self.range(self.half);
         if self.shadow[self.half] + PAGE > end {
             return None;
@@ -170,6 +179,13 @@ impl Pool {
     }
     fn reset_half(&mut self, half: usize) {
         self.shadow[half] = self.range(half).0;
+        self.free[half].clear();
+    }
+    /// Make room for every frame of the lower half among the frames given
+    /// back: only kept lower halves give frames back.
+    fn reserve_free(&mut self) {
+        let (start, end) = self.range(LOWER);
+        self.free[LOWER] = Vec::with_capacity(((end - start) / PAGE) as usize);
     }
 }
 
@@ -684,7 +700,9 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
         shadow_base: config.pool_physical + PERMANENT_FRAMES * PAGE,
         half: LOWER,
         peak: [0; 2],
+        free: [Vec::new(), Vec::new()],
     };
+    pool.reserve_free();
     for half in [LOWER, UPPER] {
         pool.reset_half(half);
     }
@@ -1147,7 +1165,9 @@ impl State {
         }
         self.lower_used = [0; ROOT_ENTRIES / 64];
         let extents = core::mem::take(&mut self.extents[LOWER]);
-        if let Some(half) = self.kept.switch(from, entries, extents, to) {
+        let kept = self.kept.switch(from, entries, extents, to);
+        self.reclaim_kept();
+        if let Some(half) = kept {
             self.lower_found += 1;
             for &(root, entry, value) in &half.entries {
                 // SAFETY: as above; the half's tables are still the pool's.
@@ -1197,6 +1217,33 @@ impl State {
     /// Drop the kept lower halves; their frames return with the half's.
     fn drop_kept(&mut self) {
         self.kept_dropped += self.kept.clear() as u64;
+    }
+
+    /// Give the lower half back the tables of the kept halves the switches
+    /// replaced or TLBIs dropped. Their root entries were detached, and
+    /// those views flushed, when the switch away from each kept it, so no
+    /// root and no TLB reaches them.
+    fn reclaim_kept(&mut self) {
+        while let Some(half) = self.kept.take_dropped() {
+            self.free_kept(half);
+        }
+    }
+
+    /// Give the lower half back the tables of `half`, a kept half no root
+    /// or kept list holds any more.
+    fn free_kept(&mut self, half: mmu::shadow::KeptHalf) {
+        let mut free = core::mem::take(&mut self.pool.free[LOWER]);
+        for &(_, _, value) in &half.entries {
+            tables::tables_under(&self.pool, value, &mut |frame| {
+                // Room for every frame of the half was reserved; a frame
+                // beyond it would be one given back twice.
+                if free.len() < free.capacity() {
+                    free.push(frame);
+                }
+            });
+        }
+        self.pool.free[LOWER] = free;
+        self.kept.recycle(half.entries);
     }
 
     /// Take the roots of rights `to` from their bank, leaving those of

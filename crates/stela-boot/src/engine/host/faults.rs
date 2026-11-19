@@ -290,11 +290,21 @@ pub(crate) fn page_fault(
     state.pool.half = half;
     // A failed allocation can already have installed intermediate tables.
     state.legacy_translations_dirty = true;
-    let slot = match tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights) {
+    let mut mapped = tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights);
+    // The lower half's frames are exhausted: give up kept halves for
+    // theirs, the least recently kept first, before emptying the half.
+    while mapped.is_err()
+        && half == LOWER
+        && let Some(oldest) = state.kept.evict_oldest()
+    {
+        state.free_kept(oldest);
+        state.pool.half = half;
+        mapped = tables::map_page_slot(&mut state.pool, root, virtual_page, host, rights);
+    }
+    let slot = match mapped {
         Ok(slot) => slot,
         Err(_) => {
             // The half's frames are exhausted: start it over and map again.
-            // The lower half's kept halves hold frames until it is emptied.
             state.exhausted += 1;
             if half == LOWER {
                 state.reset_lower();

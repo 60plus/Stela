@@ -605,6 +605,7 @@ impl Host for BareHost<'_> {
                 ),
             };
             state.kept_dropped += dropped as u64;
+            state.reclaim_kept();
         }
         if reach == Reach::All {
             return match everywhere {
