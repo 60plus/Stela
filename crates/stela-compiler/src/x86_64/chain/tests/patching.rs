@@ -157,7 +157,7 @@ fn run_while_patching(
 }
 
 /// The marker block, and thunks into it naming blocks 2 and 3.
-fn install_targets(page: &Page, fallback: Fallback) -> [u64; 2] {
+fn install_targets(page: &Page, fallback: u64) -> [u64; 2] {
     let block = page.address() + BLOCK_AT as u64;
     page.write(block, &[0xb8, 0x51, 0x51, 0, 0, 0xba, 99, 0, 0, 0, 0xc3]);
     [2, 3].map(|named| {
@@ -180,7 +180,7 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
     page.write(at, &code);
     let point = slot_patch(at);
     assert_ne!(point, at);
-    let thunks = install_targets(&page, Fallback::Jump(site));
+    let thunks = install_targets(&page, site);
     let block = page.address() + BLOCK_AT as u64;
     let linking = link(at, POLLED_LINK_BYTES, 1, 1, block).unwrap();
     let (unlink_at, unlink) = unlinked(site, POLLED_LINK_BYTES).unwrap();
@@ -224,8 +224,8 @@ fn an_exit_links_relinks_and_unlinks_while_it_runs() {
     for start in [0, 3, 6] {
         let site = page.address() + start;
         page.write(site, &direct_exit_at(site, TARGET, ExitKind::Direct));
-        let thunks = install_targets(&page, Fallback::Return(ExitKind::Direct.into()));
         let (point, unlink) = unlinked(site, 0).unwrap();
+        let thunks = install_targets(&page, unlinked_return(point));
         let seen = run_while_patching(&page, site, |step| {
             if step == 3 * ROUNDS {
                 return None;

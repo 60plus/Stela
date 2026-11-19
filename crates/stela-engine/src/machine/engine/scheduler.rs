@@ -782,14 +782,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return true;
         }
         // Otherwise a thunk: from the slot's point, back to the exit when
-        // no transfer is allowed; or from the exit's own point, which has
-        // loaded the target, returning.
+        // no transfer is allowed; or from the exit's own point, back to its
+        // unlinked path, which loads the target and returns.
         let (point, fallback) = match exit.slot {
-            0 => (chain::direct_patch(site), chain::Fallback::Return(word)),
-            slot => (
-                chain::slot_patch(site - u64::from(slot)),
-                chain::Fallback::Jump(site),
-            ),
+            0 => {
+                let point = chain::direct_patch(site);
+                (point, chain::unlinked_return(point))
+            }
+            slot => (chain::slot_patch(site - u64::from(slot)), site),
         };
         if !chain::patchable(point) {
             return false;
@@ -1102,7 +1102,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let stamped_cell = stamped.map(|(_, number)| number);
         let code = match stamped {
             Some((code, _)) => Some(code.to_vec()),
-            None => chain::cell_tail(at, cell, word, retired, entry).map(|code| code.to_vec()),
+            None => {
+                chain::cell_tail(at, cell, next_pc, word, retired, entry).map(|code| code.to_vec())
+            }
         };
         let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             cache.targets.release_cells(site..=site);

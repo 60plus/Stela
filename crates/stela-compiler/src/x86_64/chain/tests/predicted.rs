@@ -291,6 +291,7 @@ impl Run {
             None => cell_tail(
                 at,
                 cell,
+                predicted_of(table, site),
                 word,
                 RAN,
                 self.region.at(PROBES + CELL_PROBE_ENTRY),
@@ -780,7 +781,7 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             let at = region.at(code.len());
             let word = ExitWord::from(ExitKind::Indirect);
             code.extend(
-                cell_tail(at, cell, word, 2, region.at(PROBES + CELL_PROBE_ENTRY)).unwrap(),
+                cell_tail(at, cell, pc, word, 2, region.at(PROBES + CELL_PROBE_ENTRY)).unwrap(),
             );
             put(&region, 0, &code);
             let mut control = ChainControl {

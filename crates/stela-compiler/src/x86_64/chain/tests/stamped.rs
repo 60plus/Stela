@@ -142,7 +142,7 @@ fn tail(
         )
         .unwrap()
         .to_vec(),
-        None => cell_tail(at, cell, kind, ran, probe).unwrap().to_vec(),
+        None => cell_tail(at, cell, pc, kind, ran, probe).unwrap().to_vec(),
     };
     put(region, TAIL, &code);
 }

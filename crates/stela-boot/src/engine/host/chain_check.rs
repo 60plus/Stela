@@ -26,7 +26,7 @@ use super::local;
 use crate::{apic::rdtsc, output};
 use alloc::vec::Vec;
 use stela_compiler::{
-    Anchor, GuestState,
+    Anchor, GuestAddress, GuestState,
     block::ExitKind,
     x86_64::{
         chain::{self, ChainControl, ExitWord, LookupEntry, LookupTable},
@@ -178,10 +178,12 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
         let next = (block + 1) % BLOCKS;
         let at = block_at(block);
         let tail = tail_at(block);
-        // The block: `movabs rax, next pc; jmp tail`, as a direct exit.
-        let mut exit = alloc::vec![0x48, 0xb8];
-        exit.extend(pc(next).to_le_bytes());
-        exit.extend(chain::jump(at + exit.len() as u64, tail)?);
+        // The block: a direct exit to the next PC whose patch point jumps
+        // to its tail, as a linked one does.
+        let mut exit = chain::direct_exit_at(at, GuestAddress(pc(next)), word);
+        let point = chain::direct_patch(at);
+        let offset = (point - at) as usize;
+        exit[offset..offset + chain::PATCH_BYTES].copy_from_slice(&chain::jump(point, tail)?);
         put(BLOCKS_AT + block * STRIDE, &exit);
         let tail_code = match ring {
             Ring::Near => chain::thunk(
@@ -189,13 +191,13 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
                 1,
                 next as u32,
                 block_at(next),
-                chain::Fallback::Return(word),
+                chain::unlinked_return(point),
             )?,
             Ring::Cell => {
                 let current = table.find(table.slot(pc(next), key), pc(next), key);
                 let cell = table.link_cell(tail, pc(next), Some(current));
                 let probe = base + (DISPATCHER + chain::CELL_PROBE_ENTRY) as u64;
-                chain::cell_tail(tail, cell, word, 1, probe)?.to_vec()
+                chain::cell_tail(tail, cell, pc(next), word, 1, probe)?.to_vec()
             }
             Ring::Table => {
                 let probe = base + (DISPATCHER + chain::PROBE_ENTRY) as u64;

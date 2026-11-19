@@ -20,22 +20,21 @@ pub(super) fn exit_kind(code: &mut Code, kind: ExitKind) {
     exit_kind_with(&mut code.asm(), kind);
 }
 
-/// `mov edx,word`, the patch point's `jmp` to the return after it, and the
-/// return to the engine: the exit to the target in RAX, unpadded
-/// (`chain::dynamic_exit`).
+/// The patch point, which falls into the rest while unlinked, `mov
+/// edx,word` and the return to the engine: the exit to the target in RAX,
+/// unpadded (`chain::dynamic_exit`).
 pub(super) fn exit_kind_with(asm: &mut Asm, word: impl Into<ExitWord>) {
-    use super::chain::{DYNAMIC_EXIT_BYTES, EXIT_RETURN_BYTES, PATCH_BYTES, RET_ROOM};
+    exit_point(asm);
+    // MOV EDX zero-extends to the ABI's u64.
+    asm.fixed(&super::chain::word_return(word.into().encoded()));
+}
+
+/// The start of every exit: its patch point with the NOP after it that the
+/// pad before it takes where the code lands (`chain::exit_point`).
+fn exit_point(asm: &mut Asm) {
     // An exit hands the engine the state block, which must be current.
     asm.refuse_dirty_homes("a block exit");
-    // MOV EDX zero-extends to the ABI's u64.
-    asm.mov_imm32(Gpr::Rdx, word.into().encoded());
-    asm.fixed(&RET_ROOM);
-    super::chain::exit_return(asm);
-    // The pad that makes the patch point patchable where the code lands
-    // (`chain::dynamic_patch`).
-    for _ in 5 + PATCH_BYTES + EXIT_RETURN_BYTES..DYNAMIC_EXIT_BYTES {
-        asm.int3();
-    }
+    asm.fixed(&super::chain::exit_point(0));
 }
 
 /// Pad the exits of `code`, a block's whose direct exits are `exits`, for
@@ -68,14 +67,16 @@ pub(crate) fn direct_exit(code: &mut Code, target: GuestAddress, kind: ExitKind)
     direct_exit_with(&mut code.asm(), target, kind);
 }
 
-/// `movabs rax,target` and the exit of `word`, after its empty link slot in
-/// code whose exits keep one.
+/// The exit of `word` to `target`, after its empty link slot in code whose
+/// exits keep one: the patch point, then what only the unlinked path runs,
+/// `movabs rax,target`, `mov edx,word` and the return.
 pub(super) fn direct_exit_with(asm: &mut Asm, target: GuestAddress, word: impl Into<ExitWord>) {
     let word = word.into();
     let slot = super::chain::link_slot(asm.linked_block(), target, word.kind);
     super::chain::empty_link(asm, slot);
+    exit_point(asm);
     asm.guest_imm64(Gpr::Rax, target);
-    exit_kind_with(asm, word);
+    asm.fixed(&super::chain::word_return(word.encoded()));
 }
 
 fn conditional_exit(

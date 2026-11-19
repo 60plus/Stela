@@ -1406,9 +1406,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             spans.push((exit.offset as u32, end as u32, Exit));
             terminal_end = terminal_end.min(start);
         }
-        // RET, BR and BLR end their terminal with an exit to RAX.
+        // RET, BR and BLR end their terminal with an exit to RAX; a block
+        // whose exits are not linked ends with its direct exit.
         if let Some(start) = terminal_end.checked_sub(chain::DYNAMIC_EXIT_BYTES)
             && chain::is_dynamic_exit_of_any_kind(&bytes[start..terminal_end])
+        {
+            spans.push((start as u32, terminal_end as u32, Exit));
+        } else if let Some(start) = terminal_end.checked_sub(chain::DIRECT_EXIT_BYTES)
+            && chain::is_direct_exit_of_any_kind(&bytes[start..terminal_end])
         {
             spans.push((start as u32, terminal_end as u32, Exit));
         }

@@ -85,7 +85,7 @@ fn frame(control: u64) -> Box<GuestState> {
 }
 /// The direct exit to [`TARGET`] at host address `at`, its patch point
 /// linked to a thunk right after it into `entry`, and the thunk, which
-/// returns through the exit's RAX and EDX.
+/// returns through the exit's unlinked path.
 fn exit_into_thunk(at: u64, entry: u64, policy: Interruption) -> Vec<u8> {
     let mut code = direct_exit_at(at, TARGET, ExitKind::Direct).to_vec();
     let thunk_at = at + code.len() as u64;
@@ -98,7 +98,7 @@ fn exit_into_thunk(at: u64, entry: u64, policy: Interruption) -> Vec<u8> {
             retired: 7,
             block: 3,
             entry,
-            fallback: Fallback::Return(ExitKind::Direct.into()),
+            exit: unlinked_return(point),
         },
         policy,
     )
@@ -453,7 +453,7 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     let enter_tail = prefix.asm().jmp();
     let exit = native.address() + prefix.len() as u64;
     let at = exit + DIRECT_EXIT_BYTES as u64;
-    let body = thunk(at, 7, 3, at, Fallback::Jump(exit)).unwrap();
+    let body = thunk(at, 7, 3, at, exit).unwrap();
     // Golden legacy encodings identify the exact post-guard native window.
     // The first entry has already admitted a transfer with the old epoch;
     // its backedge re-enters the full, unchanged production thunk.
@@ -578,6 +578,7 @@ fn native_interruption_gate_costs() {
                         cell_tail(
                             tail,
                             cell,
+                            TARGET.0,
                             ExitKind::Direct,
                             7,
                             probes + CELL_PROBE_ENTRY as u64,

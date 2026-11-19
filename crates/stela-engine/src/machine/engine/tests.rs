@@ -3556,13 +3556,16 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
         let (tail, code) = &machine.host.patches[2 * index];
         let at = *tail as u64;
         let expected = if index == 0 {
-            let cell_at = u64::from_le_bytes(code[2..10].try_into().unwrap());
+            // MOVABS RAX with the target, then MOVABS R9 with the cell.
+            let target = u64::from_le_bytes(code[2..10].try_into().unwrap());
+            assert_eq!(target, cell.pc);
+            let cell_at = u64::from_le_bytes(code[12..20].try_into().unwrap());
             // SAFETY: the table keeps the cell at its address while its exit holds it.
             let raw = unsafe { *(cell_at as *const chain::LookupEntry) };
             let targets = raw.targets & chain::META_TARGETS;
             assert_eq!(chain::LookupEntry { targets, ..raw }, cell);
             let entry = probes + chain::CELL_PROBE_ENTRY as u64;
-            chain::cell_tail(at, cell_at, kind, ran, entry)
+            chain::cell_tail(at, cell_at, target, kind, ran, entry)
                 .unwrap()
                 .to_vec()
         } else {

@@ -1175,14 +1175,11 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
     let retired = u32::from(block.instructions) - u32::from(word.skipped);
     let near = block.code.0 as u64;
     let (point, fallback) = match exit.slot {
-        0 => (
-            chain::direct_patch(exit.site),
-            chain::Fallback::Return(word),
-        ),
-        bytes => (
-            chain::slot_patch(exit.site - u64::from(bytes)),
-            chain::Fallback::Jump(exit.site),
-        ),
+        0 => {
+            let point = chain::direct_patch(exit.site);
+            (point, chain::unlinked_return(point))
+        }
+        bytes => (chain::slot_patch(exit.site - u64::from(bytes)), exit.site),
     };
     let instruction = arena_bytes(arena, point, chain::PATCH_BYTES)?;
     if exit.slot != 0 && instruction == chain::LINKED_SLOT {

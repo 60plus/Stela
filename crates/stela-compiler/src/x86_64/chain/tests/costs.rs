@@ -271,7 +271,7 @@ fn cost(path: Path) -> (f64, f64, f64) {
                 }
                 _ => {
                     let probe = base + (PROBES + CELL_PROBE_ENTRY) as u64;
-                    cell_tail(at, cell, word, RAN, probe).unwrap().to_vec()
+                    cell_tail(at, cell, pc, word, RAN, probe).unwrap().to_vec()
                 }
             }
         }
@@ -280,7 +280,7 @@ fn cost(path: Path) -> (f64, f64, f64) {
             let number = world.table.site_cell_number(site).unwrap();
             let cell = LookupTable::cell_slot(&world.table.cells, number) as *const Slot as u64;
             let probe = base + (PROBES + CELL_PROBE_ENTRY) as u64;
-            cell_tail(at, cell, word, RAN, probe).unwrap().to_vec()
+            cell_tail(at, cell, pc, word, RAN, probe).unwrap().to_vec()
         }
         Path::Lookup(_) | Path::LookupRuns(..) => {
             let probe = base + (PROBES + PROBE_ENTRY) as u64;

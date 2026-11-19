@@ -407,15 +407,14 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         let ran = word >> ExitWord::RAN_SHIFT;
         let kind = ExitWord::from(ExitKind::Direct);
         let fresh = match through_cell {
-            true => cell_tail(
+            true => rax_cell_tail(
                 new.0 as u64 + 3,
                 cell,
                 kind,
                 ran,
                 new.0 as u64 + probe as u64,
             )
-            .unwrap()
-            .to_vec(),
+            .unwrap(),
             false => lookup_tail(
                 new.0 as u64 + 3,
                 kind,

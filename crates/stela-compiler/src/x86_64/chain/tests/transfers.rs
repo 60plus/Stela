@@ -664,11 +664,11 @@ fn the_cost_decoder_classes_transfer_instructions() {
 fn transfers_cost_what_their_path_runs() {
     let costs = transfer_costs();
     let expected = [
-        ("b forward", Cost::new(6, 1, 1, 1)),
-        ("b back", Cost::new(9, 3, 1, 1)),
-        ("cbz back, fallthrough", Cost::new(8, 1, 1, 1)),
-        ("cbz back, taken", Cost::new(12, 3, 1, 1)),
-        ("cbz forward, side exit", Cost::new(8, 1, 1, 1)),
+        ("b forward", Cost::new(5, 1, 1, 1)),
+        ("b back", Cost::new(8, 3, 1, 1)),
+        ("cbz back, fallthrough", Cost::new(7, 1, 1, 1)),
+        ("cbz back, taken", Cost::new(10, 3, 1, 1)),
+        ("cbz forward, side exit", Cost::new(7, 1, 1, 1)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.

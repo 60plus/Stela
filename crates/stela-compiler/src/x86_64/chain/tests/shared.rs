@@ -97,7 +97,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
         }
         bytes[offset..offset + piece.len()].copy_from_slice(piece);
     };
-    let cell_tail = cell_tail(at(3), cell, ExitKind::Call, 3, probes).unwrap();
+    let cell_tail = rax_cell_tail(at(3), cell, ExitKind::Call, 3, probes).unwrap();
     put(0, &[0x48, 0x89, 0xf0]); // mov rax,rsi
     put(3, &cell_tail);
     put(64, &[0x48, 0x89, 0xf0]);

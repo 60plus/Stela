@@ -92,8 +92,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
-/// Bytes in a direct exit: `movabs rax, target` and a [`DYNAMIC_EXIT_BYTES`]
-/// exit.
+/// Bytes in a direct exit: its patch point with the pads around it
+/// ([`EXIT_POINT_BYTES`]), `movabs rax, target`, `mov edx, word` and the
+/// [`EXIT_RETURN`]. Only the unlinked path runs past the point.
 pub const DIRECT_EXIT_BYTES: usize = 10 + DYNAMIC_EXIT_BYTES;
 /// Bytes of a `jmp rel32`: what an install writes over the start of a
 /// direct exit before the code is reachable.
@@ -110,9 +111,9 @@ pub const LINK_BODY_BYTES: usize = 29;
 pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 10;
 /// Bytes of the largest [`refund`] of a link that found no budget left.
 const REFUND_BYTES: usize = 7;
-/// Bytes in the largest [`thunk`]: the body, the refund and a return's
-/// `mov edx` and [`EXIT_RETURN`].
-pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + REFUND_BYTES + 5 + EXIT_RETURN_BYTES;
+/// Bytes in the largest [`thunk`]: the body, the refund and the jump to
+/// the exit.
+pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + REFUND_BYTES + JUMP_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
 /// pad, the body, which starts at the patch point, and the refund, without
 /// and with the gate.
@@ -120,10 +121,16 @@ pub const LINK_BYTES: usize = MAX_PAD + LINK_BODY_BYTES + REFUND_BYTES;
 pub const POLLED_LINK_BYTES: usize = MAX_PAD + POLLED_LINK_BODY_BYTES + REFUND_BYTES;
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
-/// Bytes in an exit to a dynamic target in RAX: `mov edx, kind`, a pad,
-/// then the patch point, a `jmp rel32` ([`dynamic_patch`]), and the
-/// [`EXIT_RETURN`] it falls into while unlinked.
-pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES + EXIT_RETURN_BYTES;
+/// Bytes in an exit to a dynamic target in RAX: its patch point with the
+/// pads around it ([`EXIT_POINT_BYTES`], [`dynamic_patch`]), then
+/// `mov edx, kind` and the [`EXIT_RETURN`], which only the unlinked path
+/// runs: a linked point jumps to a tail that sets EDX where it needs it.
+pub const DYNAMIC_EXIT_BYTES: usize = EXIT_POINT_BYTES + 5 + EXIT_RETURN_BYTES;
+/// Bytes every exit starts with: a NOP of the pad that makes its patch
+/// point patchable where it lies ([`patch_pad`]), the point, and a NOP of
+/// the rest of [`MAX_PAD`], so what follows lies at one offset of the exit
+/// however it is padded (a target's guest address field among it).
+pub const EXIT_POINT_BYTES: usize = MAX_PAD + PATCH_BYTES;
 /// [`crate::GuestState::exit_rsp`], from RDI.
 pub const EXIT_RSP_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, exit_rsp) as i32;
 /// Bytes of [`EXIT_RETURN`].
@@ -145,9 +152,9 @@ pub const EXIT_RSP_STORE: [u8; 12] = {
         0x4c, 0x8d, 0x5c, 0x24, 0xf8, 0x4c, 0x89, 0x9f, d[0], d[1], d[2], d[3],
     ]
 };
-/// An unlinked exit's patch point: a `jmp rel32` to the [`EXIT_RETURN`]
-/// right after it.
-pub const RET_ROOM: [u8; PATCH_BYTES] = [0xe9, 0, 0, 0, 0];
+/// An unlinked exit's patch point: a 5-byte NOP into the return to the
+/// engine after it ([`unlinked_return`]).
+pub const RET_ROOM: [u8; PATCH_BYTES] = NOP5;
 /// A linked slot's patch point ([`link`]): the first bytes of its body's
 /// first instruction, `mov rcx, [rdi + anchors + 8 * Control]`, the same
 /// in every slot.
@@ -2229,7 +2236,7 @@ struct ThunkPlan {
     retired: u32,
     block: u32,
     entry: u64,
-    fallback: Fallback,
+    exit: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<LookupEntry>() == 32);
@@ -2239,10 +2246,11 @@ const ENTRY_CODE: i32 = core::mem::offset_of!(LookupEntry, entry) as i32;
 const ENTRY_BLOCK: i32 = core::mem::offset_of!(LookupEntry, block) as i32;
 const ENTRY_TARGETS: i32 = core::mem::offset_of!(LookupEntry, targets) as i32;
 
-/// A direct exit to `target` with `kind` as a block emits it: MOVABS RAX
-/// with the target, then the dynamic exit, unpadded. Code that ends up at
-/// an address its patch point does not suit is aligned before it runs
-/// ([`align_direct_exit`]); [`is_direct_exit`] accepts every padding.
+/// A direct exit to `target` with `kind` as a block emits it, unpadded:
+/// the patch point, MOVABS RAX with the target, MOV EDX with the word and
+/// the return. Code that ends up at an address its patch point does not
+/// suit is aligned before it runs ([`align_direct_exit`]);
+/// [`is_direct_exit`] accepts every padding.
 pub fn direct_exit(target: GuestAddress, kind: impl Into<ExitWord>) -> [u8; DIRECT_EXIT_BYTES] {
     direct_exit_padded(target, kind.into().encoded(), 0)
 }
@@ -2254,38 +2262,75 @@ pub fn direct_exit_at(
     target: GuestAddress,
     kind: impl Into<ExitWord>,
 ) -> [u8; DIRECT_EXIT_BYTES] {
-    direct_exit_padded(target, kind.into().encoded(), patch_pad(at + 15))
+    direct_exit_padded(target, kind.into().encoded(), patch_pad(at))
 }
+
+/// Where a direct exit's MOVABS RAX starts, however it is padded.
+const DIRECT_TARGET: usize = EXIT_POINT_BYTES;
+const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
 
 fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIRECT_EXIT_BYTES] {
-    const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
     let mut bytes = [0; DIRECT_EXIT_BYTES];
-    bytes[..2].copy_from_slice(&MOVABS_RAX);
-    bytes[2..10].copy_from_slice(&target.0.to_le_bytes());
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    bytes[..EXIT_POINT_BYTES].copy_from_slice(&exit_point(pad));
+    bytes[DIRECT_TARGET..DIRECT_TARGET + 2].copy_from_slice(&MOVABS_RAX);
+    bytes[DIRECT_TARGET + 2..DIRECT_TARGET + 10].copy_from_slice(&target.0.to_le_bytes());
+    bytes[DIRECT_TARGET + 10..].copy_from_slice(&word_return(word));
     bytes
 }
 
-/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point, which
-/// jumps to the [`EXIT_RETURN`] right after it, and INT3s to the exit's end
-/// ([`super::block::exit_kind_with`]).
-fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
+/// A NOP of `pad` bytes, the unlinked patch point ([`RET_ROOM`]) and a NOP
+/// of the rest of [`MAX_PAD`]: the start of every exit.
+pub(crate) const fn exit_point(pad: usize) -> [u8; EXIT_POINT_BYTES] {
+    let mut bytes = [0; EXIT_POINT_BYTES];
+    let mut at = 0;
+    while at < pad {
+        bytes[at] = NOPS[pad][at];
+        at += 1;
+    }
+    while at < pad + PATCH_BYTES {
+        bytes[at] = RET_ROOM[at - pad];
+        at += 1;
+    }
+    let rest = MAX_PAD - pad;
+    while at < EXIT_POINT_BYTES {
+        bytes[at] = NOPS[rest][at - pad - PATCH_BYTES];
+        at += 1;
+    }
+    bytes
+}
+
+/// MOV EDX with `word` and the [`EXIT_RETURN`]: how every exit ends.
+pub(crate) const fn word_return(word: u32) -> [u8; 5 + EXIT_RETURN_BYTES] {
     const MOV_EDX: u8 = 0xba;
-    let mut bytes = [0xcc; DYNAMIC_EXIT_BYTES];
+    let mut bytes = [0; 5 + EXIT_RETURN_BYTES];
     bytes[0] = MOV_EDX;
-    bytes[1..5].copy_from_slice(&word.to_le_bytes());
-    bytes[5..5 + pad].copy_from_slice(NOPS[pad]);
-    let point = 5 + pad;
-    bytes[point..point + PATCH_BYTES].copy_from_slice(&RET_ROOM);
-    let back = point + PATCH_BYTES;
-    bytes[back..back + EXIT_RETURN_BYTES].copy_from_slice(&EXIT_RETURN);
+    let word = word.to_le_bytes();
+    let mut at = 0;
+    while at < 4 {
+        bytes[1 + at] = word[at];
+        at += 1;
+    }
+    while at < 4 + EXIT_RETURN_BYTES {
+        bytes[1 + at] = EXIT_RETURN[at - 4];
+        at += 1;
+    }
     bytes
 }
 
-/// The unpadded dynamic exit of the encoded `word` ([`ExitWord::encoded`]).
+/// The patch point padded by `pad`, MOV EDX with `word` and the return:
+/// the dynamic exit ([`super::block::exit_kind_with`]).
+fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
+    let mut bytes = [0; DYNAMIC_EXIT_BYTES];
+    bytes[..EXIT_POINT_BYTES].copy_from_slice(&exit_point(pad));
+    bytes[EXIT_POINT_BYTES..].copy_from_slice(&word_return(word));
+    bytes
+}
+
+/// The unpadded direct exit to `pc` of the encoded `word`
+/// ([`ExitWord::encoded`]).
 #[cfg(test)]
-pub(crate) fn exit_word(word: u32) -> [u8; DYNAMIC_EXIT_BYTES] {
-    exit_word_bytes(word, 0)
+pub(crate) fn direct_exit_word(pc: GuestAddress, word: u32) -> [u8; DIRECT_EXIT_BYTES] {
+    direct_exit_padded(pc, word, 0)
 }
 
 /// The return to the engine ([`EXIT_RETURN`]).
@@ -2329,14 +2374,23 @@ pub fn patch_word(word: u64, point: u64, instruction: [u8; PATCH_BYTES]) -> u64 
 }
 
 /// The patch point of the dynamic exit at host address `at`, aligned for
-/// it: its `ret`, which a lookup's jump replaces.
+/// it: what a lookup's jump replaces, the exit's first instruction but its
+/// pad.
 pub const fn dynamic_patch(at: u64) -> u64 {
-    at + 5 + patch_pad(at + 5) as u64
+    at + patch_pad(at) as u64
 }
 
 /// The patch point of the direct exit at host address `at`, aligned for it.
 pub const fn direct_patch(at: u64) -> u64 {
-    dynamic_patch(at + 10)
+    dynamic_patch(at)
+}
+
+/// Where the exit whose patch point is `point` returns to the engine
+/// from while unlinked: right after the point, the target loaded (a direct
+/// exit's), the word and the return. A thunk at the point that allows no
+/// transfer goes on there.
+pub const fn unlinked_return(point: u64) -> u64 {
+    point + PATCH_BYTES as u64
 }
 
 /// The link slot of `bytes` at host address `at`'s patch point: the jump
@@ -2347,7 +2401,7 @@ pub const fn slot_patch(at: u64) -> u64 {
 
 /// Whether the direct exit at `offset` of `code`, which runs from host
 /// address `at`, has its patch point where a link patches it: its slot's
-/// point jumping to it when `slot` is nonzero, else its own `ret`.
+/// point jumping to it when `slot` is nonzero, else its own.
 pub fn exit_ready(code: &[u8], offset: usize, at: u64, slot: usize) -> bool {
     let site = at + offset as u64;
     match slot {
@@ -2360,7 +2414,7 @@ pub fn exit_ready(code: &[u8], offset: usize, at: u64, slot: usize) -> bool {
 }
 
 /// Whether the dynamic exit at `offset` of `code`, which runs from host
-/// address `at`, has its patch point's `ret` where a lookup patches it.
+/// address `at`, has its unlinked patch point where a lookup patches it.
 pub fn dynamic_ready(code: &[u8], offset: usize, at: u64) -> bool {
     point_holds(code, at, dynamic_patch(at + offset as u64), RET_ROOM)
 }
@@ -2377,7 +2431,8 @@ fn point_holds(code: &[u8], at: u64, point: u64, instruction: [u8; PATCH_BYTES])
 
 /// The encoded word of the dynamic exit `bytes` is, of any padding.
 fn exit_word_of(bytes: &[u8]) -> Option<u32> {
-    let word = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?);
+    let field = EXIT_POINT_BYTES + 1;
+    let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
     (0..=MAX_PAD)
         .any(|pad| bytes == exit_word_bytes(word, pad))
         .then_some(word)
@@ -2400,20 +2455,38 @@ pub fn is_dynamic_exit_of_any_kind(bytes: &[u8]) -> bool {
     exit_word_of(bytes).is_some()
 }
 
+/// The target and encoded word of the direct exit `bytes` are, of any
+/// padding.
+fn direct_exit_of(bytes: &[u8]) -> Option<(GuestAddress, u32)> {
+    let target = bytes.get(DIRECT_TARGET + 2..DIRECT_TARGET + 10)?;
+    let target = GuestAddress(u64::from_le_bytes(target.try_into().ok()?));
+    let field = DIRECT_TARGET + 10 + 1;
+    let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
+    (0..=MAX_PAD)
+        .any(|pad| bytes == direct_exit_padded(target, word, pad))
+        .then_some((target, word))
+}
+
+/// Whether `bytes` are a direct exit of any target, kind and padding: what
+/// ends a block whose exits are not linked.
+pub fn is_direct_exit_of_any_kind(bytes: &[u8]) -> bool {
+    direct_exit_of(bytes).is_some()
+}
+
 /// Pad the direct exit at `offset` of `code`, which runs at host address
 /// `at + offset`, for its patch point there. Whether it is one.
 pub fn align_direct_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
     let Some(bytes) = code.get_mut(offset..offset + DIRECT_EXIT_BYTES) else {
         return false;
     };
-    let Some(word) = exit_word_of(&bytes[10..]) else {
+    let Some((target, word)) = direct_exit_of(bytes) else {
         return false;
     };
-    if bytes[..2] != [0x48, 0xb8] {
-        return false;
-    }
-    let pad = patch_pad(at + offset as u64 + 15);
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    bytes.copy_from_slice(&direct_exit_padded(
+        target,
+        word,
+        patch_pad(at + offset as u64),
+    ));
     true
 }
 
@@ -2426,7 +2499,7 @@ pub fn align_dynamic_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
     let Some(word) = exit_word_of(bytes) else {
         return false;
     };
-    bytes.copy_from_slice(&exit_word_bytes(word, patch_pad(at + offset as u64 + 5)));
+    bytes.copy_from_slice(&exit_word_bytes(word, patch_pad(at + offset as u64)));
     true
 }
 
@@ -2562,31 +2635,22 @@ impl SlotLink {
     }
 }
 
-/// Where a link's body goes when the control allows no transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fallback {
-    /// Return to the engine with this word in EDX, which the gate may have
-    /// clobbered: the exit has loaded RAX already, as for a thunk its patch
-    /// point jumps to.
-    Return(ExitWord),
-    /// Jump to the exit at this host address, as for a link slot.
-    Jump(u64),
-}
-
 /// A thunk at host address `at` that chains a block of `retired`
-/// instructions into block `block`, whose code is at `entry`, or takes
-/// `fallback` when the control allows no transfer: what an exit's patch
-/// point jumps to when its slot's body is used or it has none. It always
-/// looks for an interruption. `None` when `entry` or the fallback is out of
-/// a 32-bit jump's reach or an operand exceeds its 32-bit field.
-pub fn thunk(at: u64, retired: u32, block: u32, entry: u64, fallback: Fallback) -> Option<Vec<u8>> {
+/// instructions into block `block`, whose code is at `entry`, or jumps to
+/// `exit` when the control allows no transfer: what an exit's patch point
+/// jumps to when its slot's body is used or it has none. `exit` is the
+/// exit's own unlinked path ([`unlinked_return`]), or for a slot's point
+/// the exit after the slot. It always looks for an interruption. `None`
+/// when `entry` or `exit` is out of a 32-bit jump's reach or an operand
+/// exceeds its 32-bit field.
+pub fn thunk(at: u64, retired: u32, block: u32, entry: u64, exit: u64) -> Option<Vec<u8>> {
     thunk_with_policy(
         ThunkPlan {
             at,
             retired,
             block,
             entry,
-            fallback,
+            exit,
         },
         Interruption::Epoch,
     )
@@ -2597,24 +2661,16 @@ fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
         retired,
         block,
         entry,
-        fallback,
+        exit,
     } = plan;
-    link_body(
-        at,
-        true,
-        retired,
-        block,
-        entry,
-        Fall::Thunk(fallback),
-        policy,
-    )
+    link_body(at, true, retired, block, entry, Fall::Thunk(exit), policy)
 }
 
 /// Where a link's body goes when the control allows no transfer.
 #[derive(Debug, Clone, Copy)]
 enum Fall {
-    /// A thunk's [`Fallback`], after its body.
-    Thunk(Fallback),
+    /// A thunk's: a jump to the exit at this host address, after its body.
+    Thunk(u64),
     /// A slot's: the exit at this host address, a few bytes after the body.
     After(u64),
 }
@@ -2651,22 +2707,13 @@ fn link_body(
     let refunded = refunded.into_bytes();
     // A spent budget's refund, then where an interruption goes.
     let (spent, fallen) = match fall {
-        Fall::Thunk(fallback) => {
+        Fall::Thunk(exit) => {
             let spent = code.len();
             code.asm().fixed(&refunded);
             let fallen = code.len();
-            match fallback {
-                Fallback::Return(word) => {
-                    let mut asm = code.asm();
-                    asm.mov_imm32(Rdx, word.encoded());
-                    exit_return(&mut asm);
-                }
-                Fallback::Jump(exit) => {
-                    let back = code.asm().jmp();
-                    let back_distance = relative(at + back.end() as u64, exit)?;
-                    code.patch(back.offset(), back_distance.to_le_bytes());
-                }
-            }
+            let back = code.asm().jmp();
+            let back_distance = relative(at + back.end() as u64, exit)?;
+            code.patch(back.offset(), back_distance.to_le_bytes());
             (spent, fallen)
         }
         // The refund ends the slot and falls into the exit after it; the
@@ -2835,8 +2882,9 @@ pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 640;
 /// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
 pub const TAIL_BYTES: usize = 5 + 5;
-/// Bytes in a [`cell_tail`].
-pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
+/// Bytes in a [`cell_tail`]: the target's and the cell's MOVABS and a
+/// [`lookup_tail`]'s plain tail.
+pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
 
 /// The probes the per-site tails of the exits of branches that set `btype`
 /// jump to ([`lookup_tail`]): the target in RAX, the tail's word in EDX.
@@ -3087,9 +3135,9 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(kept);
 }
 
-/// Bytes in a [`stamped_tail`]: 130 at most, with a 32-bit displacement
+/// Bytes in a [`stamped_tail`]: 170 at most, with a 32-bit displacement
 /// for the stamp of a cell numbered 8 or above.
-pub const STAMPED_TAIL_BYTES: usize = 144;
+pub const STAMPED_TAIL_BYTES: usize = 176;
 
 /// The tail at host address `at` of a hot direct exit to `target` out of
 /// its page, whose stamped cell `number` at `cell` held `block`, entered at
@@ -3225,6 +3273,7 @@ fn stamped_with_policy(
     let mut asm = code.asm();
     asm.bind(exhausted);
     refund(&mut asm, ran);
+    asm.mov_imm64(Rax, target);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
     exit_return(&mut asm);
     // A miss counts its cause and takes the cell tail.
@@ -3245,7 +3294,7 @@ fn stamped_with_policy(
     for patch in to_tail {
         crate::x86_64::asm::resolve(&mut code, patch, tail_at);
     }
-    let cell_code = cell_tail(at + tail_at as u64, cell, word, ran, probe)?;
+    let cell_code = cell_tail(at + tail_at as u64, cell, target, word, ran, probe)?;
     code.asm().fixed(&cell_code);
     let padding = STAMPED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
@@ -3589,21 +3638,40 @@ fn fill_jump_cache(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(none);
 }
 
-/// The tail at host address `at` of a direct exit out of its page, whose
-/// target the cell at `cell` holds ([`LookupTable::link_cell`]): the cell
-/// probe at `probe` ([`CELL_PROBE_ENTRY`]), then the jump or the exit as in
-/// a [`lookup_tail`]. `None` as for a [`lookup_tail`].
+/// The tail at host address `at` of a direct exit to `target` out of its
+/// page, whose target the cell at `cell` holds ([`LookupTable::link_cell`]):
+/// the target in RAX, which the exit's patch point did not load, then the
+/// cell probe at `probe` ([`CELL_PROBE_ENTRY`]), and the jump or the exit as
+/// in a [`lookup_tail`]. `None` as for a [`lookup_tail`].
 pub fn cell_tail(
     at: u64,
     cell: u64,
+    target: u64,
     word: impl Into<ExitWord>,
     ran: u32,
     probe: u64,
 ) -> Option<[u8; CELL_TAIL_BYTES]> {
     let mut code = Code::new();
+    code.asm().mov_imm64(Rax, target);
     code.asm().mov_imm64(R9, cell);
     tail(&mut code, at, word.into(), ran, probe)?;
     code.try_into().ok()
+}
+
+/// A [`cell_tail`] that takes the target in RAX as it is: for tests that
+/// send other targets through a cell.
+#[cfg(test)]
+fn rax_cell_tail(
+    at: u64,
+    cell: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<Vec<u8>> {
+    let mut code = Code::new();
+    code.asm().mov_imm64(R9, cell);
+    tail(&mut code, at, word.into(), ran, probe)?;
+    Some(code.into_bytes())
 }
 
 /// Where a [`predicted_tail`]'s direct exit to its predicted target begins:
@@ -3716,7 +3784,7 @@ pub fn dynamic_exit(kind: ExitKind) -> [u8; DYNAMIC_EXIT_BYTES] {
 /// [`dynamic_exit`] for host address `at`, its patch point
 /// ([`dynamic_patch`]) patchable there.
 pub fn dynamic_exit_at(at: u64, kind: ExitKind) -> [u8; DYNAMIC_EXIT_BYTES] {
-    exit_word_bytes(ExitWord::from(kind).encoded(), patch_pad(at + 5))
+    exit_word_bytes(ExitWord::from(kind).encoded(), patch_pad(at))
 }
 
 /// `code` without the check failures that end a block, after its exits.
@@ -4131,7 +4199,7 @@ mod tests {
                 linked[start..start + linking.rest.len()].copy_from_slice(&linking.rest);
                 linked[offset..offset + PATCH_BYTES].copy_from_slice(&linking.point);
                 assert_eq!(linked[slot..], code[slot..]);
-                // An exit without a slot is patched at its RET.
+                // An exit without a slot is patched at its point.
                 let (exit_point, ret) = unlinked(site, 0).unwrap();
                 assert_eq!(exit_point, direct_patch(site));
                 let exit = (exit_point - at) as usize;
@@ -4140,16 +4208,17 @@ mod tests {
         }
         assert!(link(0, LINK_BYTES + 1, 3, 7, 0).is_none());
         let word = 0x1122_3344_5566_7788;
-        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_0000_e966_7788);
+        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_441f_0f66_7788);
     }
 
     #[test]
     fn thunks_count_name_and_jump_or_fall_back() {
         let word = ExitWord::from(ExitKind::Fallthrough);
-        let code = thunk(0x1000, 7, 3, 0x2000, Fallback::Return(word)).unwrap();
+        let _ = word;
+        let code = thunk(0x1000, 7, 3, 0x2000, 0x800).unwrap();
         let mut expected = vec![0x48, 0x8b, 0x8f];
         expected.extend(824u32.to_le_bytes());
-        // The gate, to the return past the refund.
+        // The gate, to the jump back past the refund.
         expected.extend([0x48, 0x8b, 0x51, 0x40, 0x48, 0x3b, 0x51, 0x48, 0x75, 26]);
         // One transfer and 7 instructions, or the refund.
         expected.extend([0x48, 0x81, 0x01, 7, 0, 0, 0x80, 0x78, 13]);
@@ -4157,25 +4226,20 @@ mod tests {
         // The jump ends 0x27 bytes into the thunk.
         expected.extend([0xe9]);
         expected.extend((0x2000i32 - 0x1027).to_le_bytes());
-        // sub qword [rcx], 7, then the return.
-        let refunded = POLLED_LINK_BODY_BYTES + 4;
-        expected.extend([0x48, 0x83, 0x29, 7]);
-        expected.push(0xba);
-        expected.extend(word.encoded().to_le_bytes());
-        expected.extend(EXIT_RETURN);
-        assert_eq!(code, expected);
-        let back = thunk(0x1000, 7, 3, 0x2000, Fallback::Jump(0x800)).unwrap();
-        assert_eq!(back[..refunded], expected[..refunded]);
-        assert_eq!(back.len(), refunded + JUMP_BYTES);
-        assert_eq!(back[refunded], 0xe9);
+        assert_eq!(code.len(), POLLED_LINK_BODY_BYTES + 4 + JUMP_BYTES);
+        assert_eq!(code[..POLLED_LINK_BODY_BYTES], expected);
+        // sub qword [rcx], 7, then the jump back.
+        assert_eq!(code[POLLED_LINK_BODY_BYTES..][..4], [0x48, 0x83, 0x29, 7]);
+        assert_eq!(code[POLLED_LINK_BODY_BYTES + 4], 0xe9);
         assert_eq!(
-            back[refunded + 1..],
-            (0x800i32 - 0x1000 - back.len() as i32).to_le_bytes()
+            code[POLLED_LINK_BODY_BYTES + 5..],
+            (0x800i32 - 0x1000 - code.len() as i32).to_le_bytes()
         );
+        assert!(code.len() <= THUNK_BYTES);
         // A block of more instructions than an 8-bit refund holds.
-        let long = thunk(0x1000, 200, 3, 0x2000, Fallback::Return(word)).unwrap();
+        let long = thunk(0x1000, 200, 3, 0x2000, 0x800).unwrap();
         assert_eq!(long.len(), THUNK_BYTES);
-        assert!(thunk(0, 0, 0, 1 << 40, Fallback::Return(word)).is_none());
+        assert!(thunk(0, 0, 0, 1 << 40, 0x800).is_none());
     }
 
     #[test]
@@ -4703,11 +4767,21 @@ mod tests {
             assert!(lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, btype).is_some());
         }
         assert!(lookup_tail(0x1000, ExitKind::Return, 3, 0x2000, 4).is_none());
-        let cell = cell_tail(0x1000, 0xdead_beef_0000, ExitKind::Return, 3, 0x2000).unwrap();
-        assert_eq!(&cell[..2], &[0x49, 0xb9]);
-        assert_eq!(&cell[2..10], &0xdead_beef_0000u64.to_le_bytes());
-        assert_eq!(&cell[10..15], &expected[..5]);
-        assert_eq!(&cell[15..20], &[0xe9, 0xec, 0x0f, 0, 0]);
+        let cell = cell_tail(
+            0x1000,
+            0xdead_beef_0000,
+            0x4000,
+            ExitKind::Return,
+            3,
+            0x2000,
+        )
+        .unwrap();
+        assert_eq!(&cell[..2], &[0x48, 0xb8]);
+        assert_eq!(&cell[2..10], &0x4000u64.to_le_bytes());
+        assert_eq!(&cell[10..12], &[0x49, 0xb9]);
+        assert_eq!(&cell[12..20], &0xdead_beef_0000u64.to_le_bytes());
+        assert_eq!(&cell[20..25], &expected[..5]);
+        assert_eq!(&cell[25..30], &[0xe9, 0xe2, 0x0f, 0, 0]);
         assert!(lookup_tail(0, ExitKind::Return, 0, 1 << 40, 0).is_none());
         assert!(lookup_tail(0, ExitKind::Return, 1 << 12, 0, 0).is_none());
         for btype in 0..4 {
