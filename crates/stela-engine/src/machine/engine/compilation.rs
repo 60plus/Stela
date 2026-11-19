@@ -16,18 +16,20 @@ fn shared_part(code: &board::Code, at: NativeCode) -> u8 {
 /// more than a few mean the ring is broken.
 const REDONE_INSTALLS: u32 = 64;
 
-/// Put `target`, block `index`'s entry for a fetch at `pc`, in slot `slot`
-/// of the block table, under the board's lock (`cache`), if the block is
-/// still the indexed one: a retirement or an IC IVAU takes a block out of
-/// the index and its entries out of the table in one hold, so an entry put
-/// in after would outlive its block. Whether the table took it.
+/// Put `target`, block `index`'s entry for a fetch at `pc`, in the block
+/// table, under the board's lock (`cache`), if the block is still the
+/// indexed one: a retirement or an IC IVAU takes a block out of the index
+/// and its entries out of the table in one hold, so an entry put in after
+/// would outlive its block. Its slot is the table's now, which a growth
+/// may have changed since the caller read it. Whether the table took it.
+/// `grace` is the caller's ([`Machine::grace`]), for [`grow_table`].
 fn insert_target(
     code: &board::Code,
     cache: &mut board::Cache,
     pc: u64,
     index: usize,
-    slot: usize,
     target: chain::LookupEntry,
+    grace: (&board::Grace, Option<usize>),
 ) -> bool {
     let block = &code.blocks[index];
     if cache
@@ -38,9 +40,35 @@ fn insert_target(
         cache.targets_raced += 1;
         return false;
     }
+    let slot = cache.targets.slot(pc, target.key);
     cache.targets.insert(slot, target);
     cache.targets_inserted += 1;
+    grow_table(cache, grace, code.blocks.live());
     true
+}
+
+/// A step of the block table's growth as the board's `live` blocks fill
+/// it (`chain::LookupTable::grow`), under the board's lock, or the release of
+/// the table a growth replaced once the grace since its publication
+/// passed: by then every PE inside its section passed its loop's top, and
+/// each PE refreshes its `ChainControl` from the published table before
+/// it runs native code ([`Machine::refresh_table`]), so no PE probes the
+/// old table and no engine read holds it. `grace` is the caller's: one
+/// that skips the caller refreshes at its next native run.
+pub(super) fn grow_table(
+    cache: &mut board::Cache,
+    (grace, skip): (&board::Grace, Option<usize>),
+    live: usize,
+) {
+    if let Some(snapshot) = &cache.table_retired {
+        if grace.passed(snapshot, skip) {
+            // SAFETY: the grace above.
+            unsafe { cache.targets.release_retired() };
+            cache.table_retired = None;
+        }
+    } else if cache.targets.grow(live) {
+        cache.table_retired = Some(grace.snapshot());
+    }
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
@@ -477,7 +505,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// entry: one it holds already, in either place of its set, stays where
     /// it is, and keeps its neighbour.
     pub(super) fn remember_target(&mut self, pc: u64, index: usize) -> bool {
-        let Some((slot, target)) = self.target_entry(pc, index) else {
+        let Some((_, target)) = self.target_entry(pc, index) else {
             return false;
         };
         let block = &self.code.blocks[index];
@@ -502,7 +530,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         }
         let mut cache = code.cache_at(board::LockSite::Target);
-        insert_target(code, &mut cache, pc, index, slot, target)
+        insert_target(code, &mut cache, pc, index, target, self.grace())
     }
 
     /// The block table slot and entry a fetch at `pc` of block `index`
@@ -1396,10 +1424,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             } else if !self
                 .direct_exit
                 .is_some_and(|(_, _, target, _)| target == pc)
-                && let Some((at, target)) = self.target_entry(pc, slot)
+                && let Some((_, target)) = self.target_entry(pc, slot)
                 && shared.blocks.record(slot).remember()
             {
-                insert_target(&shared, &mut cache, pc, slot, at, target);
+                insert_target(&shared, &mut cache, pc, slot, target, self.grace());
             }
         }
         drop(cache);

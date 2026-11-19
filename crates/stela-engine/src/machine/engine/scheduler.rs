@@ -394,6 +394,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         anchors
     }
 
+    /// Probe the block table the board published last from this PE's next
+    /// native run: a growth's successor (`compilation::grow_table`), whose
+    /// predecessor goes once every PE passed its loop's top.
+    pub(super) fn refresh_table(&mut self) {
+        let (table, mask) = self.code.table.current();
+        if self.chain.table() != table {
+            self.chain.set_block_table(table, mask);
+        }
+    }
+
     /// Run compiled block `index` and the blocks it chains into, up to
     /// `budget` of them, and complete the last one's exit or fault.
     pub(super) fn execute(&mut self, index: usize, budget: u64) -> Step {
@@ -402,6 +412,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let stepped: Stepped = (self.cpu.pstate, self.device_lines, self.timers);
         let (budget, sampled) = self.sampled_budget(budget);
         let entry = self.code.blocks[index].code;
+        self.refresh_table();
         self.finish_transition(budget);
         self.refresh_transition_contexts(budget);
         // Whether a transition may continue in this run, logged where

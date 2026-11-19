@@ -93,7 +93,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
 
 /// Bytes in a direct exit: its patch point with the pads around it
 /// ([`EXIT_POINT_BYTES`]), `movabs rax, target`, `mov edx, word` and the
@@ -205,9 +205,10 @@ fn sized(value: usize, low: usize, high: usize) -> usize {
     }
 }
 
-/// The block table entries for an arena of `code_bytes`, which the host
-/// sizes from its memory ([`LookupTable::with_entries`]): the power of two
-/// at least one entry per [`CODE_BYTES_PER_ENTRY`]. Rounded down, a 976 MiB
+/// The block table entries an arena of `code_bytes` full of blocks takes,
+/// which the host sizes from its memory: the power of two at least one
+/// entry per [`CODE_BYTES_PER_ENTRY`]. A board's table starts at
+/// [`first_lookup_entries`] and grows to it as its blocks fill it. Rounded down, a 976 MiB
 /// window took 2 M entries for its 2.9 M blocks, and half of the entries
 /// fetches would add were put off as other inserts kept displacing them
 /// (run 20261111-025825: `targets=` deferred 513 K of 1.09 M a beat).
@@ -217,6 +218,32 @@ pub fn lookup_entries(code_bytes: usize) -> usize {
         .next_power_of_two()
         .clamp(MIN_LOOKUP_ENTRIES, MAX_LOOKUP_ENTRIES)
 }
+
+/// Arena bytes per entry of a board's first block table, which doubles
+/// as its blocks fill it ([`LookupTable::grow`]): half of
+/// [`CODE_BYTES_PER_ENTRY`], so a window whose blocks stay few keeps half
+/// the table. Run 20261120 M4n held 1.22 M blocks in a 640 MiB window,
+/// whose 4 M entries (128 MiB) were 29% full.
+const FIRST_CODE_BYTES_PER_ENTRY: usize = 2 * CODE_BYTES_PER_ENTRY;
+
+/// The block table entries a board starts with for an arena of
+/// `code_bytes`: the power of two at least one entry per
+/// [`FIRST_CODE_BYTES_PER_ENTRY`].
+pub fn first_lookup_entries(code_bytes: usize) -> usize {
+    (code_bytes / FIRST_CODE_BYTES_PER_ENTRY)
+        .max(1)
+        .next_power_of_two()
+        .clamp(MIN_LOOKUP_ENTRIES, MAX_LOOKUP_ENTRIES)
+}
+
+/// A block table doubles once its live blocks reach this many tenths of
+/// its entries ([`LookupTable::grow`]).
+const GROW_LOAD_TENTHS: usize = 7;
+
+/// The sets of the old table one growth step copies, under the board's
+/// lock: 0.4 ms on the host (a 2 M-entry table's growth took 64 steps,
+/// the longest 0.55 ms), far below the 0.5 s an exit may take.
+const GROW_STEP_SETS: usize = 1 << 14;
 
 /// The ITLB entries for a PE whose arena holds `code_bytes`
 /// ([`LookupTable::itlb_with`]).
@@ -701,6 +728,41 @@ impl Slots {
         Self { base, len }
     }
 
+    /// `len` slots of which only the header is written: for a table whose
+    /// every slot [`Self::write`] fills before anything reads it
+    /// ([`LookupTable::grow`]), so its bytes are not written twice.
+    fn unwritten(len: usize) -> Self {
+        let layout = Self::layout(len + HEADER_SLOTS);
+        // SAFETY: a nonzero size.
+        let start = unsafe { alloc::alloc::alloc(layout) } as *mut Slot;
+        let Some(start) = core::ptr::NonNull::new(start) else {
+            alloc::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: the header slots are the allocation's first; zero bytes
+        // are valid slots.
+        unsafe { core::ptr::write_bytes(start.as_ptr(), 0, HEADER_SLOTS) };
+        // SAFETY: as in `zeroed`.
+        let base = unsafe { start.add(HEADER_SLOTS) };
+        Self { base, len }
+    }
+
+    /// Write `entry` in slot `index` of a table no other core reads yet,
+    /// whether or not the slot was written before ([`Self::unwritten`]).
+    fn write(&self, index: usize, entry: LookupEntry) {
+        assert!(index < self.len, "a slot of the table");
+        let slot = Slot {
+            pc: AtomicU64::new(entry.pc),
+            key: AtomicU64::new(entry.key),
+            entry: AtomicU64::new(entry.entry),
+            block: AtomicU32::new(entry.block),
+            meta: AtomicU32::new(entry.targets & META_TARGETS),
+        };
+        // SAFETY: in bounds of the live allocation; no reference to the
+        // slot is held, as no reader has the table yet and its writer
+        // takes none across this.
+        unsafe { self.base.as_ptr().add(index).write(slot) };
+    }
+
     /// The first four words of the header ([`ITLB_DROPS`]).
     fn header(&self) -> &[AtomicU64; 4] {
         // SAFETY: the header is in the live allocation, aligned bytes of
@@ -748,35 +810,103 @@ impl Drop for Slots {
     }
 }
 
-/// A handle that reads a table's entries from any core without its writer's
-/// lock ([`LookupTable::reader`]).
-#[derive(Clone)]
-pub struct TableReader {
+/// A table's slots and slot mask as its writer published them
+/// ([`TableView`]).
+struct Generation {
     slots: Arc<Slots>,
     mask: u32,
 }
 
+/// The table a [`LookupTable`]'s readers read: the one its writer published
+/// last, and the one before while a growth's readers may still hold it
+/// ([`LookupTable::grow`], [`LookupTable::release_retired`]). Each is a
+/// leaked box this view frees.
+struct TableView {
+    current: AtomicPtr<Generation>,
+    retired: AtomicPtr<Generation>,
+}
+
+impl TableView {
+    fn new(slots: Arc<Slots>, mask: u32) -> Self {
+        let current = Box::into_raw(Box::new(Generation { slots, mask }));
+        Self {
+            current: AtomicPtr::new(current),
+            retired: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+}
+
+impl Drop for TableView {
+    fn drop(&mut self) {
+        for held in [self.current.get_mut(), self.retired.get_mut()] {
+            if !held.is_null() {
+                // SAFETY: made by `Box::into_raw`, and no reader is left.
+                drop(unsafe { Box::from_raw(*held) });
+            }
+        }
+    }
+}
+
+/// A handle that reads a table's entries from any core without its writer's
+/// lock ([`LookupTable::reader`]): the table its writer published last,
+/// which a growth replaces with one of twice the entries.
+#[derive(Clone)]
+pub struct TableReader {
+    view: Arc<TableView>,
+}
+
 impl TableReader {
-    /// What [`LookupTable::find`] finds.
+    /// The table published last.
+    #[inline]
+    fn generation(&self) -> &Generation {
+        // SAFETY: published whole (a release store after its last write);
+        // a replaced one is freed only once no reader holds it
+        // ([`LookupTable::release_retired`]).
+        unsafe { &*self.view.current.load(Ordering::Acquire) }
+    }
+
+    /// What [`LookupTable::find`] finds. A `slot` of a table published
+    /// before finds what the probe of a stale table would: at most a miss,
+    /// as a later table is larger.
     #[inline]
     pub fn find(&self, slot: usize, pc: u64, key: u64) -> LookupEntry {
-        find_in(&self.slots, slot, pc, key)
+        find_in(&self.generation().slots, slot, pc, key)
     }
 
     /// The slot of `pc` with `key` ([`lookup_slot`]).
     #[inline]
     pub fn slot(&self, pc: u64, key: u64) -> usize {
-        lookup_slot(pc, key, self.mask)
+        lookup_slot(pc, key, self.generation().mask)
+    }
+
+    /// The entry of `pc` with `key` as a probe would find it
+    /// ([`Self::find`] at [`Self::slot`]), in one table.
+    #[inline]
+    pub fn lookup(&self, pc: u64, key: u64) -> LookupEntry {
+        let generation = self.generation();
+        find_in(
+            &generation.slots,
+            lookup_slot(pc, key, generation.mask),
+            pc,
+            key,
+        )
     }
 
     /// The table's host address, for `ChainControl::table`.
     pub fn address(&self) -> u64 {
-        self.slots.address()
+        self.generation().slots.address()
     }
 
     /// The slot mask, for `ChainControl::masks`.
     pub fn mask(&self) -> u32 {
-        self.mask
+        self.generation().mask
+    }
+
+    /// The host address and slot mask of one table, for a PE's
+    /// `ChainControl` at its next native run.
+    pub fn current(&self) -> (u64, u32) {
+        let generation = self.generation();
+        (generation.slots.address(), generation.mask)
     }
 }
 
@@ -885,6 +1015,101 @@ const GRANULE_SHIFT: u32 = 14;
 struct Granule {
     sets: Vec<u32>,
     limit: usize,
+    /// The table's sets when `sets` were numbered: a growth doubles them,
+    /// and set `s` of its entries is `s` or `s + at` after ([`renumber`]).
+    at: u32,
+}
+
+/// Number `listed`'s sets for a table of `sets` sets, after the growths
+/// since they were numbered: each set's entries are in it or in the set
+/// as many sets on. Sets that hold none of the group's entries go at its
+/// next compaction or sweep.
+fn renumber(listed: &mut Granule, sets: u32) {
+    if listed.sets.is_empty() {
+        listed.at = sets;
+        return;
+    }
+    while listed.at < sets {
+        let at = listed.at;
+        for index in 0..listed.sets.len() {
+            let set = listed.sets[index];
+            listed.sets.push(set + at);
+        }
+        listed.limit *= 2;
+        listed.at = 2 * at;
+    }
+}
+
+/// The new table of a growth under way ([`LookupTable::grow`]): the old
+/// sets below `next` are copied, and each write to one copies it again.
+struct Growth {
+    sets: Arc<Slots>,
+    mask: u32,
+    next: usize,
+}
+
+/// Copy set `set` of `old` to the two sets of `growth`'s table its entries
+/// go to, `set` and `set` plus the old table's sets, each entry in the
+/// slot its PC and key pick there or beside it: of an old set's two
+/// entries, each new set takes at most both.
+fn copy_set(old: &Slots, set: usize, growth: &Growth) {
+    let sets = old.len / 2;
+    for at in [2 * set, 2 * set + 1, 2 * (set + sets), 2 * (set + sets) + 1] {
+        growth.sets.write(at, LookupEntry::default());
+    }
+    let mut taken = [usize::MAX; 2];
+    for (position, at) in [2 * set, 2 * set + 1].into_iter().enumerate() {
+        let entry = old.get(at).load();
+        if entry.key == 0 {
+            continue;
+        }
+        let home = lookup_slot(entry.pc, entry.key, growth.mask);
+        let slot = if taken[0] == home {
+            neighbour(home)
+        } else {
+            home
+        };
+        taken[position] = slot;
+        growth.sets.write(slot, entry);
+    }
+}
+
+/// Keep what a write to set `set` of `sets` (slot mask `mask`) leaves in
+/// the tables beside it: a growth's copy of the set, and an old table
+/// that PEs may still probe, which holds only entries the current one
+/// holds alike (an entry forgotten or replaced goes from both).
+fn mirror(
+    sets: &Slots,
+    mask: u32,
+    set: usize,
+    growth: Option<&Growth>,
+    old: Option<&(Arc<Slots>, u32)>,
+) {
+    if let Some(growth) = growth
+        && set < growth.next
+    {
+        copy_set(sets, set, growth);
+    }
+    if let Some((old, _)) = old {
+        let old_set = set & (old.len / 2 - 1);
+        for at in [2 * old_set, 2 * old_set + 1] {
+            let held = old.get(at);
+            if held.key() == 0 {
+                continue;
+            }
+            let entry = held.load();
+            if entry.key != 0
+                && find_in(
+                    sets,
+                    lookup_slot(entry.pc, entry.key, mask),
+                    entry.pc,
+                    entry.key,
+                ) != entry
+            {
+                held.store(LookupEntry::default());
+            }
+        }
+    }
 }
 
 /// The groups [`LookupTable`]'s front holds, a power of two.
@@ -1121,6 +1346,16 @@ pub struct LookupTable {
     sets: Arc<Slots>,
     /// The slot mask of a block table, the set mask of an ITLB.
     mask: u32,
+    /// What its readers read ([`Self::reader`]).
+    view: Arc<TableView>,
+    /// The doubled table a growth fills ([`Self::grow`]).
+    growth: Option<Growth>,
+    /// The table before the last growth and its slot mask, which PEs may
+    /// probe until [`Self::release_retired`]: it holds only entries this
+    /// one holds alike ([`mirror`]).
+    old: Option<(Arc<Slots>, u32)>,
+    /// Growths so far.
+    grown: u32,
     grouping: Grouping,
     /// Each indexed group's list in `lists`.
     granules: BTreeMap<u64, u32>,
@@ -1221,8 +1456,12 @@ impl LookupTable {
             drops.store(1, Ordering::Relaxed);
         }
         Self {
+            view: Arc::new(TableView::new(Arc::clone(&sets), mask)),
             sets,
             mask,
+            growth: None,
+            old: None,
+            grown: 0,
             grouping,
             granules: BTreeMap::new(),
             front: vec![(NO_GROUP, 0); FRONT_GROUPS].into_boxed_slice(),
@@ -1289,8 +1528,7 @@ impl LookupTable {
     /// A reader of its entries for other cores.
     pub fn reader(&self) -> TableReader {
         TableReader {
-            slots: self.sets.clone(),
-            mask: self.mask,
+            view: Arc::clone(&self.view),
         }
     }
 
@@ -1318,7 +1556,9 @@ impl LookupTable {
 
     /// The bytes of its entries.
     pub fn table_bytes(&self) -> usize {
-        self.sets.len * size_of::<LookupEntry>()
+        let growth = self.growth.as_ref().map_or(0, |growth| growth.sets.len);
+        let old = self.old.as_ref().map_or(0, |(old, _)| old.len);
+        (self.sets.len + growth + old) * size_of::<LookupEntry>()
     }
 
     /// The table's host address, for `ChainControl::table` or `itlb`.
@@ -1326,13 +1566,112 @@ impl LookupTable {
         self.sets.address()
     }
 
+    /// Take a step of doubling a block table that `live` blocks have
+    /// filled to [`GROW_LOAD_TENTHS`], up to [`MAX_LOOKUP_ENTRIES`]:
+    /// whether this step published the doubled table to its readers
+    /// ([`Self::reader`]). One step copies [`GROW_STEP_SETS`] sets, so the
+    /// writer's hold stays short; meanwhile the table works as before,
+    /// and a write to a copied set copies it again, so the new table is
+    /// whole when it is published. None begins while the old one is held
+    /// ([`Self::release_retired`]).
+    pub fn grow(&mut self, live: usize) -> bool {
+        if self.grouping != Grouping::Frame {
+            return false;
+        }
+        let entries = self.sets.len;
+        if self.growth.is_none() {
+            if self.old.is_some()
+                || entries >= MAX_LOOKUP_ENTRIES
+                || live * 10 < entries * GROW_LOAD_TENTHS
+            {
+                return false;
+            }
+            let sets = Slots::unwritten(2 * entries);
+            for (word, held) in sets.header().iter().zip(self.sets.header()) {
+                word.store(held.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            self.growth = Some(Growth {
+                sets: Arc::new(sets),
+                mask: (2 * entries - 1) as u32,
+                next: 0,
+            });
+        }
+        let growth = self.growth.as_mut().expect("a growth under way");
+        let end = (growth.next + GROW_STEP_SETS).min(entries / 2);
+        for set in growth.next..end {
+            copy_set(&self.sets, set, growth);
+        }
+        growth.next = end;
+        if end < entries / 2 {
+            return false;
+        }
+        let growth = self.growth.take().expect("a growth under way");
+        let old = core::mem::replace(&mut self.sets, growth.sets);
+        let old_mask = core::mem::replace(&mut self.mask, growth.mask);
+        let published = Box::into_raw(Box::new(Generation {
+            slots: Arc::clone(&self.sets),
+            mask: self.mask,
+        }));
+        let replaced = self.view.current.swap(published, Ordering::AcqRel);
+        let held = self.view.retired.swap(replaced, Ordering::AcqRel);
+        debug_assert!(held.is_null(), "one retired table at a time");
+        self.old = Some((old, old_mask));
+        self.grown += 1;
+        true
+    }
+
+    /// Whether a growth is under way.
+    pub fn growing(&self) -> bool {
+        self.growth.is_some()
+    }
+
+    /// Whether the table before the last growth is still held
+    /// ([`Self::release_retired`]).
+    pub fn holds_retired(&self) -> bool {
+        self.old.is_some()
+    }
+
+    /// The growths so far.
+    pub fn growths(&self) -> u32 {
+        self.grown
+    }
+
+    /// Free the table the last growth replaced.
+    ///
+    /// # Safety
+    ///
+    /// No reader holds it: every reader that may have read the table
+    /// before the growth published its successor has since read again
+    /// ([`TableReader`] calls end before it) and no core's code probes it
+    /// (each PE's `ChainControl` names the new one): a grace period of the
+    /// board's PEs that began after the publication.
+    pub unsafe fn release_retired(&mut self) {
+        self.old = None;
+        let retired = self
+            .view
+            .retired
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            // SAFETY: made by `Box::into_raw` in `grow`; the caller's
+            // contract: no reader holds it.
+            drop(unsafe { Box::from_raw(retired) });
+        }
+    }
+
     /// Forget every entry, the cells' too; exits keep their cells.
     pub fn clear(&mut self) {
-        for slot in self.sets.iter() {
+        let old = self.old.as_ref().map(|(old, _)| old.as_ref());
+        for slot in self
+            .sets
+            .iter()
+            .chain(old.into_iter().flat_map(Slots::iter))
+        {
             if slot.key() != 0 {
                 slot.store(LookupEntry::default());
             }
         }
+        // Begun again, from the empty table, by the next insert.
+        self.growth = None;
         if !self.stamp_tables.is_empty() {
             forget_all_jumps(&self.stamp_tables);
         }
@@ -1779,6 +2118,13 @@ impl LookupTable {
         let held = self.sets.get(slot);
         let old = (!self.stamp_tables.is_empty()).then(|| held.load());
         held.store(entry);
+        mirror(
+            &self.sets,
+            self.mask,
+            slot / 2,
+            self.growth.as_ref(),
+            self.old.as_ref(),
+        );
         if let Some(old) = old
             && old.key != 0
             && old != entry
@@ -1844,6 +2190,7 @@ impl LookupTable {
         };
         let (sets, grouping) = (&self.sets, self.grouping);
         let listed = &mut self.lists[place as usize];
+        renumber(listed, (sets.len / 2) as u32);
         if listed.sets.last() == Some(&set) {
             return;
         }
@@ -1886,6 +2233,7 @@ impl LookupTable {
                 break;
             }
             let listed = &mut self.lists[place as usize];
+            renumber(listed, (sets.len / 2) as u32);
             visited += listed.sets.len().max(1);
             listed.sets.sort_unstable();
             listed.sets.dedup();
@@ -2023,6 +2371,13 @@ impl LookupTable {
             let held = self.sets.get(at);
             if held.key() == key && named(&held.load()) {
                 held.store(LookupEntry::default());
+                mirror(
+                    &self.sets,
+                    self.mask,
+                    at / 2,
+                    self.growth.as_ref(),
+                    self.old.as_ref(),
+                );
                 forget_jumps(&self.stamp_tables, pc);
             }
         }
@@ -2073,10 +2428,12 @@ impl LookupTable {
             }
         }
         let sets = &self.sets;
+        let (mask, growth, old) = (self.mask, self.growth.as_ref(), self.old.as_ref());
         let stamps = &self.stamp_tables;
         for (&group, &place) in self.granules.range(groups) {
             found = true;
             let listed = &mut self.lists[place as usize];
+            renumber(listed, (sets.len / 2) as u32);
             listed.sets.retain(|&set| {
                 for slot in [2 * set as usize, 2 * set as usize + 1] {
                     let held = sets.get(slot);
@@ -2086,6 +2443,7 @@ impl LookupTable {
                     let entry = held.load();
                     if entry.key != 0 && grouping.of(&entry) == group && forget(&entry) {
                         held.store(LookupEntry::default());
+                        mirror(sets, mask, set as usize, growth, old);
                         forget_jumps(stamps, entry.pc);
                     }
                 }
@@ -4094,6 +4452,12 @@ mod tests {
         assert_eq!(itlb_entries(720 * MIB), MAX_ITLB_ENTRIES);
         assert_eq!(lookup_entries(0), MIN_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(0), MIN_ITLB_ENTRIES);
+        // A board's first table: half, which grows as blocks fill it.
+        assert_eq!(first_lookup_entries(512 * MIB), 1 << 20);
+        assert_eq!(first_lookup_entries(640 * MIB), 1 << 21);
+        assert_eq!(first_lookup_entries(976 * MIB), 1 << 21);
+        assert_eq!(first_lookup_entries(16 * MIB), MIN_LOOKUP_ENTRIES);
+        assert_eq!(first_lookup_entries(64 * 1024 * MIB), MAX_LOOKUP_ENTRIES);
     }
 
     /// An arena full of blocks of the size a launch measured (280 bytes a
@@ -4136,6 +4500,274 @@ mod tests {
         let rounded_down = kept(1 << (ARENA / CODE_BYTES_PER_ENTRY).ilog2());
         assert!(sized >= 0.95, "{sized:.3} kept");
         assert!(rounded_down < 0.75, "{rounded_down:.3} kept rounded down");
+    }
+
+    /// The same arena's table, begun at half the size and grown as its
+    /// blocks fill it ([`LookupTable::grow`]), ends at the size the arena
+    /// gives ([`lookup_entries`]) and keeps as many of their entries, once
+    /// the fetches of the entries a full set put off add them again.
+    #[test]
+    fn a_table_grown_with_a_full_arena_keeps_most_of_its_blocks_entries() {
+        const MIB: usize = 1 << 20;
+        const ARENA: usize = 96 * MIB;
+        const BLOCK_BYTES: usize = 280;
+        let blocks = (ARENA / BLOCK_BYTES) as u64;
+        let entry = |block: u64| {
+            let pc = 0x1_0000_0000 + 12 * block;
+            let key = block_key(0x40_0000_0000 + 12 * block, 1);
+            LookupEntry {
+                pc,
+                key,
+                entry: 1,
+                block: block as u32,
+                targets: 1,
+            }
+        };
+        let mut table = LookupTable::with_entries(first_lookup_entries(ARENA));
+        assert_eq!(table.entries(), lookup_entries(ARENA) / 2);
+        let mut most_steps = 0;
+        let mut steps = 0;
+        let held = |table: &LookupTable, block: u64| {
+            let held = entry(block);
+            table.find(table.slot(held.pc, held.key), held.pc, held.key) == held
+        };
+        for pass in 0..2 {
+            for block in 0..blocks {
+                if pass == 1 && held(&table, block) {
+                    continue;
+                }
+                let held = entry(block);
+                table.insert(table.slot(held.pc, held.key), held);
+                let growing = table.growing();
+                table.grow(block as usize + 1);
+                if table.growing() || growing {
+                    steps += 1;
+                } else {
+                    most_steps = most_steps.max(steps);
+                    steps = 0;
+                }
+                if table.holds_retired() {
+                    // SAFETY: no reader.
+                    unsafe { table.release_retired() };
+                }
+            }
+        }
+        assert_eq!(table.entries(), lookup_entries(ARENA));
+        assert_eq!(table.growths(), 1);
+        let sets = lookup_entries(ARENA) / 4;
+        assert_eq!(most_steps, sets.div_ceil(GROW_STEP_SETS));
+        let kept = (0..blocks).filter(|&block| held(&table, block)).count();
+        let kept = kept as f64 / blocks as f64;
+        assert!(kept >= 0.95, "{kept:.3} kept");
+    }
+
+    /// The entry of `pc` with `key` as native code finds it: through the
+    /// host address and slot mask a PE's `ChainControl` holds.
+    fn probe(table: u64, mask: u32, pc: u64, key: u64) -> LookupEntry {
+        let slot = |index: usize| {
+            // SAFETY: a table of `mask + 1` slots the caller keeps alive.
+            unsafe { &*(table as *const Slot).add(index) }.load()
+        };
+        let home = super::lookup_slot(pc, key, mask);
+        let first = slot(home);
+        if first.pc == pc && first.key == key {
+            return first;
+        }
+        let second = slot(neighbour(home));
+        if second.pc == pc { second } else { first }
+    }
+
+    /// An entry of block `block` whose fields check each other, so a
+    /// reader tells it from bytes no writer wrote whole.
+    fn checked(pc: u64, block: u32) -> LookupEntry {
+        LookupEntry {
+            pc,
+            key: block_key(pc ^ 0x55_0000_0000, 1),
+            entry: pc.rotate_left(17) ^ 0x5eed,
+            block,
+            targets: 1,
+        }
+    }
+
+    fn is_checked(entry: &LookupEntry) -> bool {
+        entry.key == 0 || *entry == checked(entry.pc, entry.block)
+    }
+
+    /// While a block table doubles twice under inserts, PEs probing it
+    /// natively through the address and mask they took at their last
+    /// refresh, and lookups without the lock, find every entry no insert
+    /// put out, whole: neither reads a table before its last slot was
+    /// written. The old table goes after both passed a refresh since its
+    /// successor was published (a grace).
+    #[test]
+    fn readers_find_every_entry_while_the_table_grows() {
+        use std::sync::atomic::AtomicBool;
+        let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+        let old_set = |entry: &LookupEntry| {
+            super::lookup_slot(entry.pc, entry.key, MIN_LOOKUP_ENTRIES as u32 - 1) / 2
+        };
+        // Kept entries alone in their sets of the first table, so no
+        // insert puts them out of it or of its successors.
+        let all: Vec<LookupEntry> = (0..200_000u32)
+            .map(|block| checked(0x2_0000_0000 + 28 * u64::from(block), block))
+            .collect();
+        let mut taken = alloc::collections::BTreeSet::new();
+        let kept: Vec<LookupEntry> = all
+            .iter()
+            .step_by(64)
+            .filter(|entry| taken.len() < 512 && taken.insert(old_set(entry)))
+            .copied()
+            .collect();
+        let filler: Vec<LookupEntry> = all
+            .iter()
+            .filter(|entry| !taken.contains(&old_set(entry)))
+            .copied()
+            .collect();
+        for entry in &kept {
+            table.insert(table.slot(entry.pc, entry.key), *entry);
+        }
+        let reader = table.reader();
+        let done = AtomicBool::new(false);
+        let passes = [AtomicU64::new(0), AtomicU64::new(0)];
+        std::thread::scope(|scope| {
+            // A PE's native probes, refreshed at each pass as at each run.
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let (address, mask) = reader.current();
+                    for entry in &kept {
+                        let found = probe(address, mask, entry.pc, entry.key);
+                        assert_eq!(found, *entry, "a kept entry, natively");
+                    }
+                    for entry in filler.iter().step_by(97) {
+                        let found = probe(address, mask, entry.pc, entry.key);
+                        assert!(is_checked(&found), "{found:?} read whole");
+                    }
+                    passes[0].fetch_add(1, Ordering::Release);
+                }
+            });
+            // The engine's lookups without the lock.
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    for entry in &kept {
+                        assert_eq!(reader.lookup(entry.pc, entry.key), *entry);
+                    }
+                    for entry in filler.iter().step_by(89) {
+                        assert!(is_checked(&reader.lookup(entry.pc, entry.key)));
+                    }
+                    passes[1].fetch_add(1, Ordering::Release);
+                }
+            });
+            let mut grace = None;
+            let mut live = kept.len();
+            for entry in &filler {
+                table.insert(table.slot(entry.pc, entry.key), *entry);
+                live += 1;
+                if let Some(then) = &grace {
+                    let now = passes.each_ref().map(|pass| pass.load(Ordering::Acquire));
+                    // A pass begun before the snapshot may hold the old
+                    // table: two passes since.
+                    if now.iter().zip(then).all(|(now, then)| now >= &(then + 2)) {
+                        // SAFETY: each reader read the table again since.
+                        unsafe { table.release_retired() };
+                        grace = None;
+                    }
+                } else if table.grow(live) {
+                    grace = Some(passes.each_ref().map(|pass| pass.load(Ordering::Acquire)));
+                }
+                if table.growths() == 2 && grace.is_none() {
+                    break;
+                }
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert_eq!(table.growths(), 2);
+        assert_eq!(table.entries(), 4 * MIN_LOOKUP_ENTRIES);
+        for entry in &kept {
+            assert_eq!(
+                table.find(table.slot(entry.pc, entry.key), entry.pc, entry.key),
+                *entry
+            );
+        }
+    }
+
+    /// Entries forgotten or put out while a table grows leave its copy,
+    /// and once it is published, the old table that PEs may still probe:
+    /// the old table holds only entries the new one holds alike.
+    #[test]
+    fn a_growing_table_forgets_in_its_copy_and_its_old_table() {
+        let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+        let entries: Vec<LookupEntry> = (0..40_000u32)
+            .map(|block| checked(0x3_0000_0000 + 4 * u64::from(block) * 5, block))
+            .collect();
+        for entry in &entries {
+            table.insert(table.slot(entry.pc, entry.key), *entry);
+        }
+        let in_table = |table: &LookupTable, entry: &LookupEntry| {
+            table.find(table.slot(entry.pc, entry.key), entry.pc, entry.key) == *entry
+        };
+        // Half the copy made: forget entries in sets on either side of it.
+        assert!(!table.grow(entries.len() * 2));
+        assert!(table.growing());
+        let (old, old_mask) = table.reader().current();
+        let forgotten: Vec<LookupEntry> = entries
+            .iter()
+            .step_by(7)
+            .filter(|entry| in_table(&table, entry))
+            .copied()
+            .collect();
+        for entry in &forgotten {
+            table.forget_block(entry.pc, entry.key, entry.block);
+        }
+        while !table.grow(entries.len() * 2) {}
+        let (new, new_mask) = table.reader().current();
+        assert_eq!(new_mask, 2 * old_mask + 1);
+        let absent = |table: u64, mask: u32, entry: &LookupEntry| {
+            let found = probe(table, mask, entry.pc, entry.key);
+            (found.pc, found.key) != (entry.pc, entry.key)
+        };
+        for entry in &forgotten {
+            assert!(
+                absent(new, new_mask, entry),
+                "{entry:?} forgotten in the copy"
+            );
+        }
+        // Every entry of the old table is the new one's too, and stays so
+        // through frames forgotten and entries put out after.
+        let frames: Vec<u64> = entries
+            .iter()
+            .step_by(1000)
+            .map(|entry| key_frame(entry.key))
+            .collect();
+        for &frame in &frames {
+            table.forget_frames(frame..=frame, |_| true);
+        }
+        for block in 0..20_000u32 {
+            let entry = checked(0x7_0000_0000 + 4 * u64::from(block) * 3, block);
+            table.insert(table.slot(entry.pc, entry.key), entry);
+        }
+        let mut held = 0;
+        for index in 0..=old_mask as usize {
+            // SAFETY: the old table is held until `release_retired`.
+            let entry = unsafe { &*(old as *const Slot).add(index) }.load();
+            if entry.key != 0 {
+                held += 1;
+                assert!(in_table(&table, &entry), "{entry:?} in the new table");
+            }
+        }
+        assert!(held > 10_000, "{held} entries left in the old table");
+        for entry in &forgotten {
+            assert!(
+                absent(old, old_mask, entry),
+                "{entry:?} forgotten in the old"
+            );
+        }
+        // SAFETY: no reader.
+        unsafe { table.release_retired() };
+        assert!(!table.holds_retired());
+        assert_eq!(
+            table.table_bytes(),
+            2 * MIN_LOOKUP_ENTRIES * size_of::<LookupEntry>()
+        );
     }
 
     /// A span's ITLB entries go in every context its salts reach, wherever

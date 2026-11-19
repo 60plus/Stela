@@ -1335,9 +1335,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             host.code_partitions()
                 .map(|parts| parts.bytes_per_part * parts.parts)
         });
-        let (table_entries, itlb_entries) = code_bytes
-            .map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
-                (chain::lookup_entries(bytes), chain::itlb_entries(bytes))
+        let (table_entries, itlb_entries) =
+            code_bytes.map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
+                (
+                    chain::first_lookup_entries(bytes),
+                    chain::itlb_entries(bytes),
+                )
             });
         // The hub's code when this host gives its window, else a board of
         // one PE until the machine joins a hub's.

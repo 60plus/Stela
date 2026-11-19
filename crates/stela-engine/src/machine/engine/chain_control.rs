@@ -158,6 +158,22 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).salts).write(salts(contexts, masks));
         }
     }
+    /// The block table [`Self::set_table`] gave, or [`Self::set_block_table`].
+    pub(super) fn table(&self) -> u64 {
+        let control = self.storage.control.get();
+        // SAFETY: the sole owner reads this non-budget field outside native execution.
+        unsafe { core::ptr::addr_of!((*control).table).read() }
+    }
+    /// Probe the block table at `table` with slot mask `mask` from now on,
+    /// keeping the ITLB's.
+    pub(super) fn set_block_table(&mut self, table: u64, mask: u32) {
+        // SAFETY: the sole owner writes these non-budget fields outside native execution.
+        unsafe {
+            let control = self.storage.control.get();
+            core::ptr::addr_of_mut!((*control).table).write(table);
+            core::ptr::addr_of_mut!((*control).masks[0]).write(mask);
+        }
+    }
     /// This PE's stamps and the board's stamped cells, which stamped tails
     /// and the cell probe use ([`stela_compiler::x86_64::chain::stamped_tail`]).
     pub(super) fn set_stamps(&mut self, stamps: u64, cells: u64) {
@@ -188,7 +204,7 @@ impl Owner {
         // this PE, which live as long as the board.
         unsafe { chain::stamp_counts(stamps) }
     }
-    fn masks(&self) -> [u32; 2] {
+    pub(super) fn masks(&self) -> [u32; 2] {
         // SAFETY: only this Owner writes the masks, outside native execution.
         unsafe { core::ptr::addr_of!((*self.storage.control.get()).masks).read() }
     }

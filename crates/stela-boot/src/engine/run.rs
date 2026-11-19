@@ -2843,14 +2843,17 @@ fn board_code(
         ));
     }
     // Block table entries jump cache hits would add: taken, refused under
-    // the lock, refused without it, put off.
+    // the lock, refused without it, put off; then the table's entries now
+    // and its growths so far.
     let (targets, was_targets) = (now.targets, was.targets);
     let targets = format!(
-        " targets=inserted/raced/unindexed/deferred:{}/{}/{}/{}",
+        " targets=inserted/raced/unindexed/deferred/entries/growths:{}/{}/{}/{}/{}/{}",
         targets.inserted.saturating_sub(was_targets.inserted),
         targets.raced.saturating_sub(was_targets.raced),
         targets.unindexed.saturating_sub(was_targets.unindexed),
         targets.deferred.saturating_sub(was_targets.deferred),
+        targets.entries,
+        targets.growths,
     );
     // Installs: never on the board before; again after their block went
     // with its ring part, an IC IVAU, a part taken for want of a slot or

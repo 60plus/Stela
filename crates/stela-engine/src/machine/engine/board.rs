@@ -379,6 +379,10 @@ pub(super) struct Cache {
     /// Why blocks the board held before are installed again
     /// ([`super::churn`]).
     pub(super) churn: super::ChurnCounts,
+    /// When the block table's last growth published its successor, while
+    /// the table it replaced is held: it goes once that grace passed
+    /// ([`super::compilation::grow_table`]).
+    pub(super) table_retired: Option<Snapshot>,
 }
 
 /// How a board's code lock was taken, counted under it: no atomic beyond
@@ -544,6 +548,10 @@ pub struct TargetCounts {
     pub raced: u64,
     pub unindexed: u64,
     pub deferred: u64,
+    /// The block table's entries now and its growths so far
+    /// (`chain::LookupTable::grow`).
+    pub entries: u64,
+    pub growths: u64,
 }
 
 /// Board events counted outside the lock: rare, so a shared atomic each,
@@ -640,13 +648,15 @@ impl Cache {
             targets_raced: 0,
             census: None,
             churn: super::ChurnCounts::default(),
+            table_retired: None,
         }
     }
 }
 
 impl Code {
-    /// Room for `slots` blocks and a block table of `entries`
-    /// (`chain::lookup_entries`).
+    /// Room for `slots` blocks and a block table of `entries` at first
+    /// (`chain::first_lookup_entries`), which doubles as blocks fill it
+    /// (`chain::LookupTable::grow`).
     pub(super) fn new(slots: u32, entries: usize, window: Option<CodeWindow>) -> Self {
         let targets = LookupTable::with_entries(entries);
         let finder = Arc::new(Finder::new(slots));
@@ -734,16 +744,20 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (lock, inserted, raced, churn, table) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
             let counts = (cache.targets_inserted, cache.targets_raced);
+            let table = (
+                cache.targets.entries() as u64,
+                u64::from(cache.targets.growths()),
+            );
             let churn = cache.churn;
             cache.lock.longest = 0;
             for site in &mut cache.lock.sites {
                 site.longest_held = 0;
             }
-            (lock, counts.0, counts.1, churn)
+            (lock, counts.0, counts.1, churn, table)
         };
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
@@ -770,6 +784,8 @@ impl Code {
                 raced,
                 unindexed: count(&self.events.targets_unindexed),
                 deferred: count(&self.events.targets_deferred),
+                entries: table.0,
+                growths: table.1,
             },
             lock,
             churn,

@@ -1877,3 +1877,65 @@ fn a_block_whose_part_is_chosen_before_it_publishes_is_installed_again() {
     );
     assert_eq!(live_codes(&machine), [block.code.0]);
 }
+
+/// A board's block table doubles as its blocks fill it: every PE's lookups
+/// find the entries in the new table at once, each PE probes it from its
+/// next native run, and the old table goes only once the PEs inside their
+/// sections then passed their loops' tops.
+#[test]
+fn a_grown_block_table_reaches_every_pe_and_the_old_goes_after_a_grace() {
+    const BLOCKS: u64 = 64;
+    let mut memory = vec![0u8; 4 << 18];
+    let (mut first, mut second, hub) = shared_pair_of(&linked_groups(1), &mut memory);
+    let base = first.cpu.pc;
+    for group in 0..BLOCKS {
+        assert!(matches!(
+            first.fetch_block(base + 16 * group, false),
+            Ok(Fetched::Block(_))
+        ));
+    }
+    for machine in [&mut first, &mut second] {
+        machine.refresh_table();
+    }
+    let (old, old_mask) = first.code.table.current();
+    assert_eq!(first.chain.table(), old);
+    // The second PE is inside its section, holding the old table.
+    hub.board.grace.enter(1);
+    let code = Arc::clone(&first.code);
+    let live = 2 * chain::MIN_LOOKUP_ENTRIES;
+    let mut steps = 0;
+    while code.cache().targets.growths() == 0 {
+        compilation::grow_table(&mut code.cache(), first.grace(), live);
+        steps += 1;
+    }
+    assert!(steps > 1, "a growth in bounded steps");
+    let (new, new_mask) = first.code.table.current();
+    assert_eq!(new_mask, 2 * old_mask + 1);
+    assert_ne!(new, old);
+    // Lookups read the new table now; native code probes the old until
+    // the PE's next run.
+    for group in 0..BLOCKS {
+        let pc = base + 16 * group;
+        let key = target_key(&first, pc);
+        let entry = first.code.table.lookup(pc, key);
+        assert_eq!((entry.pc, entry.key), (pc, key));
+    }
+    assert_eq!((first.chain.table(), second.chain.table()), (old, old));
+    // The old table stays while the second PE has not passed its top.
+    compilation::grow_table(&mut code.cache(), first.grace(), live);
+    assert!(code.cache().targets.holds_retired());
+    hub.board.grace.pass(1);
+    compilation::grow_table(&mut code.cache(), first.grace(), live);
+    assert!(!code.cache().targets.holds_retired());
+    for machine in [&mut first, &mut second] {
+        machine.refresh_table();
+        assert_eq!(machine.chain.table(), new);
+        assert_eq!(machine.chain.masks()[0], new_mask);
+    }
+    let targets = code.report().targets;
+    assert_eq!(
+        (targets.entries, targets.growths),
+        (2 * chain::MIN_LOOKUP_ENTRIES as u64, 1)
+    );
+    hub.board.grace.leave(1);
+}
