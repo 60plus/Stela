@@ -1461,13 +1461,57 @@ pub(crate) mod tests {
         assert_eq!(found[0].1.stream, log.stream);
     }
 
+    /// A stick put back to a released Stela after `stela` made its log
+    /// 32 MiB, and booted by it: that loader starts its own 4 MiB log at
+    /// the file's start. `stela log` lists the boots from before it, which
+    /// the header's copy still names, then its boots, numbered on.
+    #[test]
+    fn stela_log_lists_the_boots_from_before_an_older_loader_s_log() {
+        let newer = written(&boot_lines(1, 5, 2_000));
+        let long = boot_log::relayout(&newer, boot_log::FILE_BYTES).unwrap();
+        let before = boot_log::read(&long).unwrap();
+        let older = released_region(&boot_lines(100, 2, 500));
+        let mut file = long.clone();
+        // The released loader's header block and the ring it reached.
+        let reached = boot_log::read(&older).unwrap().head.next_multiple_of(512) as usize;
+        let ring = boot_log::HEADER_BYTES as usize;
+        file[..512].copy_from_slice(&older[..512]);
+        file[ring..ring + reached].copy_from_slice(&older[ring..ring + reached]);
+        let text = stick_log_text(&file);
+        assert!(
+            text.starts_with("=== Stela boot log: 7 boots"),
+            "{}",
+            &text[..200]
+        );
+        for boot in 1..=7 {
+            let marker = format!("=== STELA BOOT {boot} ===\n");
+            assert!(text.contains(&marker), "{marker}");
+        }
+        // The boots from before keep their first lines; the older loader's
+        // lines follow them.
+        for start in &before.starts {
+            assert!(text.contains(std::str::from_utf8(&start.first).unwrap()));
+        }
+        let six = text
+            .find("=== STELA BOOT 6 ===\n[    0.000] boot 100 line 000000\n")
+            .unwrap();
+        assert!(text.find("boot 5 line 001999\n").unwrap() < six);
+        assert!(text.ends_with("boot 101 line 000499\n"));
+    }
+
     #[test]
     fn a_stick_log_that_cannot_be_read_whole_is_said_and_kept() {
         let dir = tempfile::tempdir().unwrap();
-        // A header that no longer decodes: the lines are read as they lie.
+        // A header that no longer decodes is read from its copy.
         let mut torn = region(&["CHOICE 1 (macOS)\n"]);
         torn[16] ^= 0xff;
         let raw = dir.path().join("torn.img");
+        std::fs::write(&raw, fat_volume(Some(&torn))).unwrap();
+        let (found, notes) = find(&raw).unwrap();
+        assert_eq!(found[0].0, "the file, EFI/stela/boot.log");
+        assert!(notes.is_empty(), "{notes:?}");
+        // Without its copy, the lines are read as they lie.
+        torn[boot_log::COPY_AT as usize + 16] ^= 0xff;
         std::fs::write(&raw, fat_volume(Some(&torn))).unwrap();
         let (found, notes) = find(&raw).unwrap();
         assert_eq!(found.len(), 1);
