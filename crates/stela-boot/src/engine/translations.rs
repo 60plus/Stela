@@ -795,7 +795,11 @@ impl Translations for Shared {
                     store.take_decode_scratch(stored),
                 ))),
                 None => {
-                    store.looked_up(key, false, false);
+                    // A record left in the file is asked for: the block
+                    // compiles meanwhile.
+                    if !store.want(key) {
+                        store.looked_up(key, false, false);
+                    }
                     None
                 }
             }
