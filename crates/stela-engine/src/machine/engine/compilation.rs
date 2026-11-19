@@ -537,7 +537,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Remember that the ITLB took `page` in `context` ([`Self::fill_log`]).
-    fn log_fill(&mut self, page: u64, context: u64) {
+    pub(super) fn log_fill(&mut self, page: u64, context: u64) {
         if self.fill_log.len() < FILL_LOG {
             self.fill_log.push((page, context));
         } else {
@@ -554,23 +554,52 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.pending_refills.retain(|&(held, _), _| held != half);
         let spaces = &self.spaces[half];
         let other = &self.spaces[1 - half];
-        let pending = &mut self.pending_refills;
+        // Runs of the log share a context: each context is looked up once,
+        // its pages gathered by key (one live context has a key) and the
+        // lists merged after.
+        let mut seen: Vec<(u64, Fate)> = Vec::new();
+        let mut lists: Vec<(contexts::Key, Vec<u64>)> = Vec::new();
+        let mut last = None;
         // A context's fills are of its half's pages, and for the upper half
         // also of the lower half's global ones (`itlb_context`).
         self.fill_log.retain(|&(page, context)| {
-            if let Some(space) = spaces.live(context) {
-                let pages = pending.entry((half, space.key)).or_default();
-                if pages.len() < REFILLS_PER_CONTEXT {
-                    pages.push(page);
+            let fate = match last {
+                Some((number, fate)) if number == context => fate,
+                _ => {
+                    let fate = match seen.iter().find(|&&(number, _)| number == context) {
+                        Some(&(_, fate)) => fate,
+                        None => {
+                            let fate = match spaces.live(context) {
+                                Some(space) => {
+                                    lists.push((space.key, Vec::new()));
+                                    Fate::Refill(lists.len() - 1)
+                                }
+                                None => Fate::Other(other.live(context).is_some()),
+                            };
+                            seen.push((context, fate));
+                            fate
+                        }
+                    };
+                    last = Some((context, fate));
+                    fate
                 }
-                return false;
+            };
+            match fate {
+                Fate::Refill(list) => {
+                    let pages = &mut lists[list].1;
+                    if pages.len() < REFILLS_PER_CONTEXT {
+                        pages.push(page);
+                    }
+                    false
+                }
+                Fate::Other(live) => live || chain::half(page) != half,
             }
-            other.live(context).is_some() || chain::half(page) != half
         });
         self.fill_next = self.fill_log.len() % FILL_LOG;
-        for pages in self.pending_refills.values_mut() {
+        for (key, mut pages) in lists {
             pages.sort_unstable();
             pages.dedup();
+            self.pending_refills.insert((half, key), pages);
         }
     }
 
@@ -2194,6 +2223,15 @@ const LEAF_FILL: u64 = 1 << 14;
 /// more one exit at a time (run 20261115-112116, beat 40: 880 such TLBIs
 /// per PE, `refilled` 427-495 K, `context` misses 430-566 K).
 const REFILLS_PER_CONTEXT: usize = 2048;
+
+/// What [`Machine::refill_after`] does with a context's fills: gather the
+/// pages in the list at this index, or keep the log's entries when the
+/// other half holds the context live or the page is not of the half.
+#[derive(Clone, Copy)]
+enum Fate {
+    Refill(usize),
+    Other(bool),
+}
 /// The contexts whose pages TLBIs by VA dropped that a PE keeps for refill
 /// ([`Machine::keep_dropped`]).
 const DROPPED_CONTEXTS: usize = 64;

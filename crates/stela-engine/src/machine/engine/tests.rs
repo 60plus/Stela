@@ -9957,3 +9957,47 @@ fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {
     assert!(during(1) < u64::MAX / 2, "a kernel lock may be held");
     assert_eq!(during(0), u64::MAX / 2);
 }
+
+/// What a TLBI of everything costs the engine (`tlb_maintained`, its host
+/// side aside) as launches issue it: eight processes' contexts, the ITLB
+/// fills since the last one and the leaves their fetches recorded. Run:
+/// `cargo test --release -p stela-engine --lib -- --ignored --nocapture
+/// whole_tlbi_benchmark`.
+#[test]
+#[ignore]
+fn whole_tlbi_benchmark() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
+    const ROUNDS: u64 = 2000;
+    let mut machine = machine(&[]);
+    let variant = machine.current_variant(false, false);
+    let el = machine.cpu.pstate.el;
+    let ttbr0 = machine.cpu.read(SystemRegister::TTBR0_EL1);
+    let mut measure = |fills: u64| {
+        let mut ns = 0u128;
+        for round in 0..ROUNDS {
+            for process in 0..8u64 {
+                machine.cpu.state.x[0] = ttbr0 ^ (process << 48) ^ (process << 14);
+                machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+                let contexts = machine.contexts(el, variant);
+                for fill in 0..fills / 8 {
+                    let page =
+                        0x1_0000_0000 + (round * 131 + fill * 7 + process * 977) % 4096 * 0x4000;
+                    machine.log_fill(page, contexts[0]);
+                    machine.fetched_through(0, page, 0x4000, false);
+                    machine.log_fill(0xffff_fe00_0000_0000 + fill * 0x4000, contexts[1]);
+                }
+            }
+            let start = std::time::Instant::now();
+            machine.tlb_maintained(Reach::All, Everywhere::All, None);
+            ns += start.elapsed().as_nanos();
+        }
+        ns / u128::from(ROUNDS)
+    };
+    for fills in [0, 800, 4000] {
+        println!(
+            "TLBI VMALLE1 after {fills} ITLB fills: {} ns",
+            measure(fills)
+        );
+    }
+}
