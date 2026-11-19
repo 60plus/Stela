@@ -369,7 +369,7 @@ fn demand_read_pack_replay() {
                     "DEMAND disk={} cache={}MB reader={name} hit%={:.1} of_all%={:.1} \
                      in_flight={} longest_wait_us={} read={} ahead={} wasted={} refused={} last_read_s={}",
                     disk.name,
-                    cache as u64 * DECODED_BYTES >> 20,
+                    (cache as u64 * DECODED_BYTES) >> 20,
                     100.0 * outcome.hits as f64 / outcome.lookups.max(1) as f64,
                     100.0 * outcome.hits as f64 / outcome.all.max(1) as f64,
                     outcome.in_flight,
