@@ -19,15 +19,20 @@
 //! rendered texture keeps a device copy of its planes ([`PlaneCopy`]), whose
 //! linear images its sampled descriptors view: framebuffer reads (backdrop
 //! captures, blur copies) then run at the GPU's memory speed rather than
-//! across the bus. The copy holds what the planes hold. A command buffer
-//! that uses the texture refreshes it from the planes first when the CPU or
-//! another texture wrote them since (its aligned copies,
-//! [`Device::aligned_copy_commands`]); a pass after another texture over
-//! the same surface stored it in the same command buffer refreshes it
-//! before; and an encode writes each texel whose codes or alpha changed
-//! into the planes and the copy both, comparing with the copy, which
-//! replaces the working image's mirror. Decodes read the copy. The planes
-//! stay what the display, the CPU and other processes' textures read.
+//! across the bus. The copy holds what the planes hold whoever samples it,
+//! named or through an argument buffer (its aligned copies,
+//! [`Device::aligned_copy_commands`]): a command buffer refreshes it first
+//! when the CPU wrote the surface, whose new seed the guest reports of every
+//! live copied texture, and one that wrote the surface through another
+//! texture or a buffer refreshes it at its end; a pass after another
+//! texture over the same surface stored it in the same command buffer
+//! refreshes it before; and an encode writes each texel whose codes or
+//! alpha changed into the planes and the copy both, comparing with the
+//! copy, which replaces the working image's mirror. Decodes read the copy.
+//! The planes stay what the display, the CPU and other processes' textures
+//! read. A texture only sampled, as another process's over a surface it
+//! does not render, keeps no copy and samples the planes in guest RAM:
+//! correct, since they hold what the surface does, but across the bus.
 use super::{Backing, Device, TestedCopyObject, TextureId, TextureObject};
 use crate::metal::{
     abi::TextureUsage,
@@ -478,10 +483,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// they do, where a texture over it keeps one whose source rectangle
     /// `source` (`[x, y, width, height]`) lies in its texture: one no other
     /// texture's write left stale ([`Self::device_copy_holds_rows`]). The
-    /// CPU's writes, which change the surface's seed, are seen at the
-    /// texture's next reported use; the display composes two-plane layers
-    /// only of the lossless-compressed `&b38` form, which an Apple GPU's
-    /// encoder writes and no CPU reads or writes in place.
+    /// CPU's writes, which change the surface's seed, are seen at the next
+    /// command buffer, whose seed reports name it; the display composes
+    /// two-plane layers only of the lossless-compressed `&b38` form, which
+    /// an Apple GPU's encoder writes and no CPU reads or writes in place.
     pub(in crate::metal::device) fn surface_copy(
         &self,
         surface: u32,
@@ -1374,8 +1379,9 @@ mod tests {
 
     /// The display finds a surface's device copy by its IOSurface ID once
     /// a reported pass rendered it, while the copy holds the rows: not
-    /// before, not for a source past the texture, and not once another
-    /// texture over the surface wrote it, until a use refreshes it.
+    /// before, nor for a source past the texture. Another texture over the
+    /// surface that writes it refreshes the copy at its command buffer's
+    /// end, which then holds the rows again.
     #[test]
     fn the_display_finds_a_rendered_surfaces_device_copy_while_it_holds_the_rows() {
         let mut device = device();
@@ -1422,11 +1428,16 @@ mod tests {
         commands.surfaces.push(note(other));
         commands.written.push(other);
         device.commit(commands).unwrap();
-        assert_eq!(device.surface_copy(7, whole), None);
-        // The texture's next use refreshes its copy.
-        let mut commands = device.new_command_buffer();
-        commands.surfaces.push(note(texture));
-        device.commit(commands).unwrap();
+        let refreshed = device
+            .backend()
+            .submissions
+            .last()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment.commands.iter())
+            .filter(|command| matches!(command, Command::CopyBufferToImage { .. }))
+            .count();
+        assert_eq!(refreshed, 2, "both planes' copies, after the write");
         assert_eq!(device.surface_copy(7, whole), copy);
         for texture in [texture, other] {
             device.destroy_texture(texture).unwrap();

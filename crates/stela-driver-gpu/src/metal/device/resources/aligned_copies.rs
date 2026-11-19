@@ -43,19 +43,23 @@
 //! surface), is kept in device memory as well, though its rows fit: sampled
 //! in place, every texel cache miss is a bus read of guest RAM with no L2
 //! caching, so one 3840x2160 surface cost a Mission Control frame 10-19 ms of
-//! GPU time on the 5080. Its copy is refreshed only in a command buffer that
-//! uses it, and only when the surface changed since it was last copied,
-//! whether or not its rows fit: the guest reports each IOSurface object a
-//! command buffer uses with the surface's ID and seed as committed
-//! (`SurfaceUse`); the CPU's writes change the seed, and a command buffer
-//! that writes a surface (a pass attachment, a blit destination, a texture
-//! shaders may write, any buffer over it) marks its copies stale for later
-//! command buffers, but for the one texture over the surface it wrote,
-//! whose copy then holds the rows: its end copies the copy back into them,
-//! or its encode wrote them and refreshed the copy after. A texture reached
-//! only through an argument buffer and a residency set, which the guest
-//! does not report, is not refreshed: its copy keeps what its last reported
-//! use copied.
+//! GPU time on the 5080. Its copy is refreshed only when the surface
+//! changed since it was last copied, whether or not its rows fit, and is
+//! current at the start of every command buffer, which may sample it named
+//! or through an argument buffer or a residency set:
+//! - the guest reports each IOSurface object a command buffer uses with the
+//!   surface's ID and seed as committed (`SurfaceUse`), and each other live
+//!   texture the service keeps a copy of (`TextureResponse::copied`) whose
+//!   seed changed since a commit last reported it; the CPU's writes change
+//!   the seed, so the command buffer begins by refreshing those copies;
+//! - a command buffer that writes a surface (a pass attachment, a blit
+//!   destination, a texture shaders may write, any buffer over it) ends by
+//!   refreshing every copy over it but the one texture over the surface it
+//!   wrote whose copy then holds the rows: its end copies the copy back
+//!   into them, or its encode wrote them and refreshed the copy after;
+//! - the service's own writes of the rows for the CPU (`replaceRegion`),
+//!   which change no seed, make the next command buffer refresh the copies
+//!   over them.
 use super::{Device, TextureId};
 use crate::metal::{
     abi::TextureUsage,
@@ -93,6 +97,10 @@ pub(in crate::metal::device) struct AlignedCopy {
     ///
     /// [`PlaneCopy`]: crate::metal::pass::PlaneCopy
     device: bool,
+    /// The service wrote the rows for the CPU since the copy was filled
+    /// ([`Device::write_aligned_rows`]), which changes no seed: the next
+    /// command buffer refreshes it, whether or not it names the texture.
+    rows_written: bool,
 }
 
 /// When an aligned copy is refreshed from its rows.
@@ -255,6 +263,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 bytes_per_row: layout.bytes_per_row,
                 texel_bytes,
                 device: false,
+                rows_written: false,
             }),
         ))
     }
@@ -310,6 +319,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             bytes_per_row: layout.bytes_per_row,
             texel_bytes,
             device: true,
+            rows_written: false,
         })
     }
 
@@ -406,25 +416,36 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
     }
 
-    /// The copies a command buffer begins with, and those it ends with,
-    /// back into the rows of the textures it wrote (`written`); each
-    /// followed by a full barrier, and empty when there are none. It begins
-    /// with every [`Refresh::Always`] copy, and each [`Refresh::Changed`]
-    /// copy of a texture it uses (`surfaces`) whose surface's seed differs
-    /// from the one last copied, which it then records; a use reported of
-    /// an `Always` copy's texture makes it `Changed`. The surfaces it may
-    /// write (`writes`: the textures it writes; any buffer over a surface)
-    /// leave their copies stale for later command buffers, but for a
-    /// surface's one texture it wrote whose copies hold the rows once it
-    /// ends ([`Self::holds_rows_at_end`]).
+    /// The copies a command buffer begins with, and those it ends with; each
+    /// group followed by a full barrier, and empty when there are none.
+    ///
+    /// It begins with every [`Refresh::Always`] copy, and each
+    /// [`Refresh::Changed`] copy whose surface's seed differs from the one
+    /// it was last filled at: of a texture it uses (`surfaces`), or of one
+    /// kept in device memory it may reach unnamed whose seed changed
+    /// (`seeds`, which the guest reports of every such live texture). A
+    /// device copy no command buffer filled yet, of a texture it writes
+    /// unreported, is filled first as well. A reported texture's `Always`
+    /// copies become `Changed`.
+    ///
+    /// It ends by copying back into their rows the copies of the textures
+    /// it wrote (`written`), then refreshing every other copy of a surface
+    /// it may have written (`writes`: the textures it writes; any buffer
+    /// over a surface), but for that surface's one texture it wrote whose
+    /// copies hold the rows once it ends ([`Self::holds_rows_at_end`]). A
+    /// copy is thus current at every command buffer's start whoever reads
+    /// it, named or through an argument buffer: the CPU's writes reach it
+    /// through the seed reports, the GPU's through these refreshes.
     pub(in crate::metal::device) fn aligned_copy_commands(
         &mut self,
         written: &[TextureId],
         surfaces: &[SurfaceNote],
+        seeds: &[SurfaceNote],
         writes: &[TextureId],
     ) -> (Vec<Command>, Vec<Command>) {
         let used: Vec<(TextureId, SurfaceNote)> = surfaces
             .iter()
+            .chain(seeds)
             .filter_map(|note| Some((self.aligned_root(note.texture?)?, *note)))
             .collect();
         // A reported use says the texture is an IOSurface's, whose writes
@@ -445,14 +466,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
             }
         }
-        let mut lead: Vec<Command> = self
-            .resources
-            .aligned_copies
-            .values()
-            .flatten()
-            .filter(|copy| copy.refresh == Refresh::Always)
-            .map(|copy| copy.rows.refresh())
-            .collect();
+        let mut lead: Vec<Command> = Vec::new();
+        for copy in self.resources.aligned_copies.values_mut().flatten() {
+            if copy.refresh == Refresh::Always || core::mem::take(&mut copy.rows_written) {
+                lead.push(copy.rows.refresh());
+            }
+        }
         // A device copy no command buffer filled yet, of a texture this one
         // writes without reporting it, is filled first: encodes compare
         // with it.
@@ -481,51 +500,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     *surface = Some(note.surface);
                     if *filled != Some(note.seed) {
                         *filled = Some(note.seed);
-                        lead.push(copy.rows.refresh());
-                    }
-                }
-            }
-        }
-        let dirty: Vec<&SurfaceNote> = surfaces
-            .iter()
-            .filter(|note| note.texture.is_none_or(|texture| writes.contains(&texture)))
-            .collect();
-        if !dirty.is_empty() {
-            for copy in self.resources.aligned_copies.values_mut().flatten() {
-                if let Refresh::Changed {
-                    surface: Some(surface),
-                    filled,
-                } = &mut copy.refresh
-                    && dirty.iter().any(|note| note.surface == *surface)
-                {
-                    *filled = None;
-                }
-            }
-            // The one texture of a surface the command buffer wrote holds
-            // the rows in its copies once it ends: they are current.
-            for (root, note) in used
-                .iter()
-                .filter(|(_, note)| dirty.iter().any(|dirty| dirty.surface == note.surface))
-            {
-                let sole = dirty.iter().all(|dirty| {
-                    dirty.surface != note.surface
-                        || dirty
-                            .texture
-                            .and_then(|texture| self.aligned_root(texture))
-                            .is_some_and(|other| other == *root)
-                });
-                if !sole || !self.holds_rows_at_end(*root, written) {
-                    continue;
-                }
-                for copy in self
-                    .resources
-                    .aligned_copies
-                    .get_mut(&root.0)
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Refresh::Changed { filled, .. } = &mut copy.refresh {
-                        *filled = Some(note.seed);
+                        // Unless refreshed above for the CPU's writes.
+                        if !lead.contains(&copy.rows.refresh()) {
+                            lead.push(copy.rows.refresh());
+                        }
                     }
                 }
             }
@@ -537,6 +515,59 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .flatten()
             .map(|copy| copy.rows.write_back())
             .collect();
+        let dirty: Vec<&SurfaceNote> = surfaces
+            .iter()
+            .filter(|note| note.texture.is_none_or(|texture| writes.contains(&texture)))
+            .collect();
+        // Each surface written, its seed, and its one texture written whose
+        // copies hold the rows once the command buffer ends.
+        let mut written_surfaces: Vec<(u32, u32, Option<TextureId>)> = Vec::new();
+        for note in &dirty {
+            if written_surfaces
+                .iter()
+                .any(|(surface, ..)| *surface == note.surface)
+            {
+                continue;
+            }
+            let mut writers = dirty
+                .iter()
+                .filter(|other| other.surface == note.surface)
+                .map(|other| other.texture.and_then(|texture| self.aligned_root(texture)));
+            let first = writers.next().flatten();
+            let sole = first.filter(|first| {
+                writers.all(|other| other == Some(*first))
+                    && self.holds_rows_at_end(*first, written)
+            });
+            written_surfaces.push((note.surface, note.seed, sole));
+        }
+        let mut refreshes = Vec::new();
+        for (texture, copies) in &mut self.resources.aligned_copies {
+            for copy in copies {
+                let Refresh::Changed {
+                    surface: Some(surface),
+                    filled,
+                } = &mut copy.refresh
+                else {
+                    continue;
+                };
+                let Some(&(_, seed, sole)) = written_surfaces
+                    .iter()
+                    .find(|(written, ..)| written == surface)
+                else {
+                    continue;
+                };
+                if sole.map(|sole| sole.0) != Some(*texture) {
+                    refreshes.push(copy.rows.refresh());
+                }
+                *filled = Some(seed);
+            }
+        }
+        if !refreshes.is_empty() {
+            if !tail.is_empty() {
+                tail.push(Command::Barrier(FULL));
+            }
+            tail.extend(refreshes);
+        }
         for commands in [&mut lead, &mut tail] {
             if !commands.is_empty() {
                 commands.push(Command::Barrier(FULL));
@@ -577,7 +608,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// Whether texture `id` keeps a device copy of its planes that holds
     /// their rows as of the surface's seed last reported: filled, and not
-    /// left stale by another texture's write since.
+    /// written for the CPU by the service since.
     pub(in crate::metal::device) fn device_copy_holds_rows(&self, id: TextureId) -> bool {
         let mut copies = self
             .resources
@@ -589,13 +620,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .peekable();
         copies.peek().is_some()
             && copies.all(|copy| {
-                matches!(
-                    copy.refresh,
-                    Refresh::Changed {
-                        filled: Some(_),
-                        ..
-                    }
-                )
+                !copy.rows_written
+                    && matches!(
+                        copy.refresh,
+                        Refresh::Changed {
+                            filled: Some(_),
+                            ..
+                        }
+                    )
             })
     }
 
@@ -634,8 +666,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         for (offset, packed) in rows {
             self.backend.write_memory(memory, offset, &bytes[packed])?;
         }
-        // The next command buffer that uses it, or another texture over the
-        // same surface, copies the rows again.
+        // The next command buffer copies the rows again into its copies and
+        // those of other textures over the same surface.
         let surfaces: Vec<u32> = self
             .resources
             .aligned_copies
@@ -649,10 +681,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .collect();
         for (texture, copies) in &mut self.resources.aligned_copies {
             for copy in copies {
-                if let Refresh::Changed { surface, filled } = &mut copy.refresh
-                    && (*texture == id.0 || surface.is_some_and(|known| surfaces.contains(&known)))
-                {
-                    *filled = None;
+                let over = match copy.refresh {
+                    Refresh::Changed { surface, .. } => {
+                        *texture == id.0 || surface.is_some_and(|known| surfaces.contains(&known))
+                    }
+                    Refresh::Always => false,
+                };
+                if over {
+                    copy.rows_written = true;
                 }
             }
         }

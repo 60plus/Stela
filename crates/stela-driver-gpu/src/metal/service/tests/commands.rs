@@ -17,7 +17,7 @@ use crate::metal::{
             ComputeCode, CopyBuffer, DepthStencilRecord, Dispatch, DrawPrimitives, FillBuffer,
             MappingRecord, Mode, PassAttachmentRecord, RenderCode, ResolveCounters, Resource,
             ResourceStateCode, SampleCounters, SetBuffer, SetBytes, SetPipeline, StageSampler,
-            StencilRecord, UpdateMappings, ViewportRecord,
+            StencilRecord, SurfaceUse, UpdateMappings, ViewportRecord,
         },
     },
     vulkan::{PipelineBindPoint, command::Command},
@@ -719,6 +719,55 @@ fn mapping_updates_name_sparse_textures() {
     assert_eq!(
         commit(&mut service, connection, &stream).map_err(|outcome| outcome.reason),
         Err("the texture is not sparse")
+    );
+}
+
+/// A seed report names a texture the service keeps in device memory, which
+/// a command buffer may reach unnamed: one of a buffer, or with flags the
+/// service does not know, is refused.
+#[test]
+fn seed_reports_name_textures_only() {
+    let mut service = service();
+    let connection = connect(&mut service);
+    let response: TextureResponse = call(
+        &mut service,
+        connection,
+        Operation::NewTexture,
+        &texture(StorageMode::Private),
+        &mut Memory::default(),
+    )
+    .unwrap();
+    assert_eq!(response.copied, 0, "no copy of a private texture");
+    let buffer = new_buffer(&mut service, connection, StorageMode::Shared);
+    let report = |object, buffer, flags| {
+        let mut stream = Stream::default();
+        let record = SurfaceUse {
+            object,
+            surface: 3,
+            seed: 1,
+            buffer,
+            flags,
+        };
+        stream.push(CommandBufferCode::SurfaceUse.raw(), &record, &[]);
+        stream
+    };
+    let mut accepted = |stream: Stream| status(commit(&mut service, connection, &stream));
+    assert_eq!(
+        [
+            report(response.handle, 0, SurfaceUse::SEED_ONLY),
+            report(response.handle, 0, 0),
+            report(buffer, 1, 0),
+            report(buffer, 1, SurfaceUse::SEED_ONLY),
+            report(response.handle, 0, 2),
+        ]
+        .map(&mut accepted),
+        [
+            Status::Ok,
+            Status::Ok,
+            Status::Ok,
+            Status::Malformed,
+            Status::Malformed,
+        ]
     );
 }
 

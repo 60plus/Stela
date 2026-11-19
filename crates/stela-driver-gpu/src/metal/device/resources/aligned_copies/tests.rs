@@ -344,9 +344,10 @@ fn rows_another_connections_work_refreshes_from_outlive_it() {
 
 /// A video wallpaper's 10-bit 4:2:0 surface, whose rows the GPU could
 /// address in place, is sampled from device memory: both planes' copies are
-/// refreshed only by a command buffer that uses the texture, only when the
-/// surface's seed changed since the last copy, and again after a command
-/// buffer wrote the surface through another object. Before, it was sampled
+/// refreshed only by a command buffer that uses the texture or may reach it
+/// unnamed (a seed report), only when the surface's seed changed since the
+/// last copy, and at the end of a command buffer that wrote the surface
+/// through another object. Before, it was sampled
 /// from guest RAM: 10.6 ms for one 1280x896 quad over a 3840x2160 surface.
 #[test]
 fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
@@ -395,8 +396,20 @@ fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
     assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), []);
     // The CPU wrote it: a new seed.
     assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    // The CPU wrote it again, and a command buffer may sample it through an
+    // argument buffer: the guest reports the new seed, which copies.
+    let seeds = |device: &mut TestDevice, notes: &[SurfaceNote]| {
+        let mut commands = device.new_command_buffer();
+        commands.seeds.extend_from_slice(notes);
+        device.commit(commands).unwrap();
+        row_copies(device)
+    };
+    assert_eq!(seeds(&mut device, &[note(Some(texture), 9)]), both);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 9)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
     // Another texture over the same surface (another connection's, as the
-    // surface's ID says) written by a command buffer: the next use copies.
+    // surface's ID says) written by a command buffer: its end copies, so a
+    // later sample through an argument buffer reads what it wrote.
     let other = device
         .new_texture_from_buffer(
             buffer,
@@ -410,14 +423,14 @@ fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
             3840,
         )
         .unwrap();
-    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[other]), []);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[other]), both);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), []);
     // Read, not written, it changes nothing.
     assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[]), []);
     assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), []);
     // A buffer over the surface may be written by any shader.
-    assert_eq!(commit(&mut device, &[note(None, 8)], &[]), []);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(None, 8)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), []);
     device.destroy_texture(other).unwrap();
     device.destroy_texture(texture).unwrap();
 }
@@ -508,8 +521,9 @@ fn a_sampled_surface_of_unaligned_rows_is_copied_only_where_used_and_changed() {
 /// aligned copy: until a command buffer reports the texture, every one
 /// refreshes it; once reported, only one that uses it after the surface
 /// changed. Its own pass encodes the rows and refreshes the copy after, so
-/// the next use copies nothing; another texture's write to the surface, a
-/// buffer over it or the CPU (a new seed) make the next use copy again.
+/// the next use copies nothing; the CPU (a new seed) makes the next use
+/// copy again, and another texture's write to the surface or a buffer over
+/// it the end of the command buffer that writes it.
 #[test]
 fn a_reported_screen_surface_is_refreshed_only_where_used_and_changed() {
     let (width, height, alpha_offset) = (1680u32, 1050u32, 7_227_392u64);
@@ -580,13 +594,13 @@ fn a_reported_screen_surface_is_refreshed_only_where_used_and_changed() {
         .unwrap();
     assert_eq!(
         commit(&mut device, &[note(Some(other), 2)], &[other]).len(),
-        1,
-        "the other texture's own copy"
+        3,
+        "the other texture's own copy, then both copies after the write"
     );
-    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), [alpha]);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), []);
     // A buffer over the surface, which any shader may write.
-    assert_eq!(commit(&mut device, &[note(None, 2)], &[]), []);
-    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), [alpha]);
+    assert_eq!(commit(&mut device, &[note(None, 2)], &[]).len(), 2);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), []);
     device.destroy_texture(other).unwrap();
     device.destroy_texture(screen).unwrap();
 }
@@ -594,7 +608,8 @@ fn a_reported_screen_surface_is_refreshed_only_where_used_and_changed() {
 /// A reported buffer texture of unaligned rows that a pass writes is copied
 /// back into its rows at the end; its copy then holds them, so the next use
 /// at the same seed copies nothing in. Written beside another texture over
-/// the same surface, which also copies back, it is copied in again.
+/// the same surface, which also copies back, both are copied in again once
+/// both copied back.
 #[test]
 fn a_reported_texture_its_command_buffer_wrote_keeps_its_copy() {
     let mut device = device();
@@ -639,8 +654,11 @@ fn a_reported_texture_its_command_buffer_wrote_keeps_its_copy() {
     let other = device
         .new_texture_from_buffer(buffer, &odd, 65_536, 4016)
         .unwrap();
-    assert_eq!(write(&mut device, &[texture, other]).len(), 3);
-    assert_eq!(read(&mut device), [into]);
+    assert_eq!(
+        write(&mut device, &[texture, other]),
+        [into, back, back, into, into]
+    );
+    assert_eq!(read(&mut device), []);
     device.destroy_texture(other).unwrap();
     device.destroy_texture(texture).unwrap();
 }
@@ -650,8 +668,8 @@ fn a_reported_texture_its_command_buffer_wrote_keeps_its_copy() {
 /// it before one uses it. One that writes it unreported fills it first,
 /// while nothing filled it yet; a reported use fills it when the seed
 /// changed; its own pass's encode writes it with the rows, so nothing is
-/// copied after, nor back. Another texture's write to the surface or the
-/// CPU make the next use copy again.
+/// copied after, nor back. The CPU makes the next use copy again, a buffer
+/// over the surface the end of the command buffer that may write it.
 #[test]
 fn a_rendered_screen_surface_keeps_a_device_copy_of_both_planes() {
     let (width, height, alpha_offset) = (1680u32, 1050u32, 7_227_392u64);
@@ -716,7 +734,51 @@ fn a_rendered_screen_surface_keeps_a_device_copy_of_both_planes() {
     // The CPU wrote the surface.
     assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), both);
     // A buffer over the surface, which any shader may write.
-    assert_eq!(commit(&mut device, &[note(None, 2)], &[]), []);
-    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(None, 2)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(Some(screen), 2)], &[]), []);
     device.destroy_texture(screen).unwrap();
+}
+
+/// The service's writes for the CPU (`replaceRegion`) change no seed: the
+/// next command buffer refreshes the copies over the rows, whether or not
+/// it names the texture, so one sampling it through an argument buffer
+/// reads them.
+#[test]
+fn rows_the_service_writes_for_the_cpu_refresh_the_next_command_buffer() {
+    let mut device = device();
+    let buffer = buffer(&mut device, 1 << 16);
+    let odd = descriptor(PixelFormat::R8Unorm, 40, 3, TextureUsage::SHADER_READ);
+    let texture = device
+        .new_texture_from_buffer(buffer, &odd, 16, 48)
+        .unwrap();
+    let copy = [(true, 16, 48, [40, 3, 1])];
+    // Reported once: refreshed only where used and changed from then on.
+    let mut commands = device.new_command_buffer();
+    commands.surfaces.push(SurfaceNote {
+        texture: Some(texture),
+        surface: 3,
+        seed: 1,
+    });
+    device.commit(commands).unwrap();
+    assert_eq!(row_copies(&mut device), copy);
+    commit_empty(&mut device);
+    assert_eq!(row_copies(&mut device), []);
+    let region = Region {
+        slice: 0,
+        level: 0,
+        origin: [0; 3],
+        size: [4, 1, 1],
+    };
+    let tight = Strides {
+        bytes_per_row: 4,
+        bytes_per_image: 0,
+    };
+    device
+        .replace_region(texture, &region, &[1, 2, 3, 4], tight)
+        .unwrap();
+    commit_empty(&mut device);
+    assert_eq!(row_copies(&mut device), copy);
+    commit_empty(&mut device);
+    assert_eq!(row_copies(&mut device), []);
+    device.destroy_texture(texture).unwrap();
 }
