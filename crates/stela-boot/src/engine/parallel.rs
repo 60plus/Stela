@@ -25,10 +25,6 @@ pub(crate) use stela_engine::machine::engine::{Counts, RunBudget};
 use stela_engine::machine::exception::Pstate;
 use stela_soc::machine::AppleDevices;
 
-/// Engine heap bytes per byte of kept block buffers and index/FIFO metadata
-/// shared by the PEs (`translations::share`).
-pub(crate) const SHARED_CODE_SHARE: usize = 8;
-
 /// The board's devices as every PE's machine reaches them.
 pub(crate) type Board = SharedDevices<AppleDevices>;
 

@@ -862,6 +862,7 @@ fn load(
     } = image;
     let memory::EngineMemory {
         heap,
+        kept_code,
         native_resources,
         native_task_allocations,
         stack,
@@ -1103,6 +1104,7 @@ fn load(
             files,
             file_count,
             heap,
+            kept_code,
             stack,
             code,
             pool,

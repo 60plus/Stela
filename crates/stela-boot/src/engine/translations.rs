@@ -942,7 +942,9 @@ pub fn store() -> Option<&'static mut Shared> {
     available(READ_PACK | WRITE_PACK | SHARE_BLOCKS).then(|| Box::leak(Box::new(Shared)))
 }
 
-/// Keep up to `bound` bytes of compiled code for the PEs: a quarter for
+/// Keep up to `bound` bytes of compiled code for the PEs, the planner's
+/// share of the code budget beside the window (`host_memory::Sizes::kept`):
+/// a quarter for
 /// blocks shared as they are compiled (buffers and cache metadata in the
 /// loader's store or a store for this boot), the rest for stored forms of
 /// blocks the ring took away and the guest runs again, which the board

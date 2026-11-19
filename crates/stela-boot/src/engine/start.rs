@@ -1442,7 +1442,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
                 "still"
             }
         ));
-        translations::share(handoff.heap.bytes as usize / parallel::SHARED_CODE_SHARE);
+        translations::share(handoff.kept_code as usize);
         parallel::spawn(
             &machine,
             &worker_bindings,
