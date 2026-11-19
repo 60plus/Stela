@@ -208,6 +208,9 @@ pub struct Opened {
     pub region: Region,
     pub writable: bool,
     pub pack: PackRead,
+    /// The previous translator's pack, for a first boot's refill
+    /// ([`previous::FILE`]).
+    pub previous: Option<Region>,
 }
 
 /// The store on the first volume with `store.cfg`, as the handoff file's
@@ -236,10 +239,24 @@ pub fn read(budget: u64) -> Option<Opened> {
         }
         // A read-only volume's pack is read and never written; a missing
         // one leaves the boot's translations in memory.
-        let opened = open(&mut root, &path, FileMode::ReadWrite)
+        let mut opened = open(&mut root, &path, FileMode::ReadWrite)
             .map(|file| (file, true))
             .or_else(|| open(&mut root, &path, FileMode::Read).map(|file| (file, false)));
         let partition = partition(handle);
+        // A pack that commits nothing is its translator's first boot: the
+        // previous translator's pack, within a share of the budget, is read
+        // to refill from, and the arena gives up as much.
+        let first = opened.as_mut().is_none_or(|(file, _)| {
+            let size = file
+                .get_boxed_info::<FileInfo>()
+                .map_or(0, |info| info.file_size());
+            !previous::committed(file, &translator, size)
+        });
+        let previous = match first && limit >= PACK_FLOOR {
+            true => previous::read(&mut root, &translator, limit / previous::PREVIOUS_SHARE),
+            false => None,
+        };
+        let previous_bytes = previous.as_ref().map_or(0, |(_, bytes)| *bytes);
         let reading = output::now();
         let (loaded, size, allocated) = match opened {
             Some((mut file, writable)) => {
@@ -250,7 +267,13 @@ pub fn read(budget: u64) -> Option<Opened> {
                 // A pack the boot may write gets the rest of its limit as
                 // the arena its new segments' records move to.
                 let arena = allocated && partition.is_some() && limit >= PACK_FLOOR;
-                let loaded = read_journal(&mut file, &translator, size, limit, arena)?;
+                let loaded = read_journal(
+                    &mut file,
+                    &translator,
+                    size,
+                    limit.saturating_sub(previous_bytes),
+                    arena,
+                )?;
                 (loaded, size, allocated)
             }
             None => (blank()?, 0, false),
@@ -292,6 +315,7 @@ pub fn read(budget: u64) -> Option<Opened> {
             region: loaded.region,
             writable,
             pack: loaded.pack,
+            previous: previous.map(|(region, _)| region),
         });
     }
     None
@@ -838,6 +862,16 @@ impl Translations for Shared {
         }
     }
 
+    fn refilled(&mut self, key: &Digest, entry: translations::Entry) {
+        if available(WRITE_PACK) {
+            part(key).with(|store| {
+                if let Some(store) = store.as_mut() {
+                    store.refilled(*key, entry);
+                }
+            });
+        }
+    }
+
     fn note(&mut self, event: StoreEvent) {
         match event {
             StoreEvent::PageRead { ticks } => {
@@ -957,6 +991,9 @@ fn ahead_job(
         Err(outcome) => outcome,
     }
 }
+
+mod previous;
+pub use previous::{FILE as PREVIOUS_FILE, install as install_previous, step as refill};
 
 /// The store the engine uses, if the loader read one or the PEs share one.
 pub fn store() -> Option<&'static mut Shared> {
@@ -1194,6 +1231,7 @@ fn millis(ticks: u64) -> u64 {
 /// Report what the store did and cost this boot: lookups and their causes,
 /// shared misses by reason, stored forms kept and checked, and lock waits.
 fn report(counters: &pack::Counters) {
+    previous::report_now();
     let ahead = AHEAD.with(|queue| queue.as_ref().map(ahead::Queue::counts));
     let ahead = ahead.unwrap_or_default();
     output::arguments(format_args!(

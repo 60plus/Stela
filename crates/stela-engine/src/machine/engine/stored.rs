@@ -240,6 +240,10 @@ pub trait Translations {
     }
     /// A block the engine compiled from a page the store had no entry for.
     fn offer(&mut self, offer: Offer);
+    /// The stored form this translator gives a block of the previous
+    /// translator's pack, of the page whose bytes hash to `key`
+    /// (`refill.rs`), for the store to keep as it keeps an offer's.
+    fn refilled(&mut self, _key: &Digest, _entry: Entry) {}
     /// What a machine's use of the store cost or found, for the store's
     /// counters.
     fn note(&mut self, _event: StoreEvent) {}

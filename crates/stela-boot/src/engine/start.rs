@@ -400,6 +400,15 @@ fn open_host(
         // region is the store's for the rest of the boot.
         .and_then(|file| translations::install(unsafe { bundle::contents_mut(file) }))
         .filter(|_| handoff.storage.present);
+    // The previous translator's pack, which a first boot refills from.
+    if let Some(file) = handoff.files[..handoff.file_count]
+        .iter()
+        .find(|file| file.name() == translations::PREVIOUS_FILE)
+    {
+        // SAFETY: the file is read here alone, once, and its region is the
+        // refill's for the rest of the boot.
+        translations::install_previous(unsafe { bundle::contents_mut(file) });
+    }
     // The Metal device's stored pipelines, before any GPU opens.
     #[cfg(feature = "nvk")]
     if let Some(file) = handoff.files[..handoff.file_count]

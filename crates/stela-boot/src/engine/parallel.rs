@@ -288,6 +288,14 @@ impl Pe {
                             &mut |frame, bytes| machine.host.read_ram(frame, bytes),
                             &|| watch.pending(host::fresh_counter()).is_some(),
                         );
+                        // Then the previous translator's blocks, compiled
+                        // again for this one on its first boot.
+                        let room = machine.refill_room();
+                        super::translations::refill(
+                            room,
+                            &mut |key, record, counts| machine.refill(key, record, counts),
+                            &|| watch.pending(host::fresh_counter()).is_some(),
+                        );
                         // A GPU compilation a guest call deferred.
                         #[cfg(feature = "nvk")]
                         super::gpu::gate::run_job(super::gpu::gate::Taker::Waiting);

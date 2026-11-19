@@ -289,6 +289,12 @@ impl<'a> Pack<'a> {
         }
     }
 
+    /// Every record's page key and the most uses a boot made of it (none
+    /// in a pack of a schema before the count), in key order.
+    pub fn uses(&self) -> impl Iterator<Item = (Digest, u8)> + '_ {
+        (0..self.count).map(|index| (entry(self.bytes, index).0, entry_uses(self.bytes, index)))
+    }
+
     /// Every record's page key and bytes, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (Digest, &'a [u8])> + '_ {
         (0..self.count).map(|index| {
@@ -2174,6 +2180,24 @@ impl<'a> Store<'a> {
             self.counters.unstorable += 1;
             return;
         };
+        self.add(key, entry);
+    }
+
+    /// Keep `entry`, this translator's stored form of a block of the
+    /// previous translator's pack, of the page `key` names
+    /// (the engine's `refill.rs`), as an offer's, within half
+    /// the bound of the entries added: the blocks this boot compiles keep
+    /// the rest. Unused yet, a merge keeps it only while boots use it.
+    pub fn refilled(&mut self, key: Digest, entry: Entry) {
+        if self.shedding || self.added_bytes + entry.retained_bytes() > self.added_bound / 2 {
+            return;
+        }
+        self.add(key, entry);
+    }
+
+    /// Add `entry` to the entries of `key` added this boot, within their
+    /// bound.
+    fn add(&mut self, key: Digest, entry: Entry) {
         if self
             .added
             .get(&key)
