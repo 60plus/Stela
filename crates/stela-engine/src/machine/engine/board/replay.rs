@@ -201,7 +201,7 @@ fn a_window_that_holds_sign_ins_hot_code_with_a_small_nursery_keeps_it() {
 
 /// The table behind it: hot pools, windows and nurseries.
 #[test]
-#[ignore = "manual: the table"]
+#[ignore = "manual: opt-in"]
 fn sign_in_replay_on_the_real_ring() {
     for hot in [9_500, 13_000, 14_000] {
         let guest = Guest {

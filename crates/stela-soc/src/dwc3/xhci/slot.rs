@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing"]
+    #[ignore = "manual: opt-in"]
     fn schedule_scan_cost() {
         extern crate std;
         let x = guest_schedule();

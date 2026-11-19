@@ -566,7 +566,7 @@ impl crate::machine::mmu::TableMemory for Reader<'_> {
 /// 16 KiB-granule, 47-bit lower half (levels 1 to 3) in registered guest
 /// RAM. Faults land on random pages of 64 MiB of mapped user memory.
 #[test]
-#[ignore = "benchmark: cargo test --release -p stela-engine --lib -- --ignored --nocapture fill_walks"]
+#[ignore = "manual: opt-in"]
 fn fill_walks_benchmark() {
     use crate::machine::mmu::{
         self, Access, Controls, Outcome, Requester, translate, translate_from, translate_noting,

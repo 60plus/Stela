@@ -729,7 +729,7 @@ fn mapping_updates_name_sparse_textures() {
 /// draw over the mock backend, whose submit copies the commands instead of
 /// recording them. Run with `--ignored --nocapture` in release.
 #[test]
-#[ignore = "a timing, not a check"]
+#[ignore = "manual: opt-in"]
 fn bench_compositor_commit_replay() {
     extern crate std;
     use crate::metal::service::wire::commands::{StageBuffer, StageBytes, StageTexture};

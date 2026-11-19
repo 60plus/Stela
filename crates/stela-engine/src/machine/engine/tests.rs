@@ -10006,7 +10006,7 @@ fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {
 /// `cargo test --release -p stela-engine --lib -- --ignored --nocapture
 /// whole_tlbi_benchmark`.
 #[test]
-#[ignore]
+#[ignore = "manual: opt-in"]
 fn whole_tlbi_benchmark() {
     use mmu::tlbi::{Everywhere, Reach};
     const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
