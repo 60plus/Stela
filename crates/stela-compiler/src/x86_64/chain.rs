@@ -3669,7 +3669,7 @@ pub fn cell_tail(
 
 /// A [`cell_tail`] that takes the target in RAX as it is: for tests that
 /// send other targets through a cell.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 fn rax_cell_tail(
     at: u64,
     cell: u64,

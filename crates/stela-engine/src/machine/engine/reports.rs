@@ -786,6 +786,10 @@ pub enum MailWait {
 /// counts, most first where they were merged: a PC not held takes the
 /// place of the least frequent when it has issued more. `[0, 0]` is free.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    all(feature = "std", feature = "native-profile"),
+    derive(serde::Serialize)
+)]
 pub struct WholeTlbiSites(pub [[u64; 2]; 4]);
 
 impl WholeTlbiSites {

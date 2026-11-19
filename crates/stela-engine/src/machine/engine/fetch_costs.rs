@@ -107,6 +107,7 @@ impl Polluter {
 /// interrupted instruction's address, for `nm` to name offline
 /// (`FETCH_PROFILE` names the file: one hex address a line, less the
 /// binary's load address).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod sampler {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     const SAMPLES: usize = 1 << 20;
@@ -308,13 +309,16 @@ fn fetch_phase_costs() {
         batch,
         polluter.as_ref(),
     );
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let profile = std::env::var("FETCH_PROFILE").ok();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if profile.is_some() {
         sampler::start();
     }
     let started = Instant::now();
     let phases = measure(&image, base, batch, polluter.as_ref());
     let wall = started.elapsed();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(path) = &profile {
         sampler::stop(path);
     }

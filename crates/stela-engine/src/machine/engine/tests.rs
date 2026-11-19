@@ -4610,7 +4610,12 @@ fn indirect_branches_learn_a_second_target_at_their_first_miss() {
             .contains(&(miss as usize, chain::jump(miss, tail).unwrap().to_vec()))
     );
     let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
-    let cell = machine.code.cache().targets.site_cell(exit).expect("its cell");
+    let cell = machine
+        .code
+        .cache()
+        .targets
+        .site_cell(exit)
+        .expect("its cell");
     assert_eq!(cell.pc, second);
 }
 
