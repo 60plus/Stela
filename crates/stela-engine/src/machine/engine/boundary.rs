@@ -493,6 +493,11 @@ pub trait Host {
     fn profile_exit(&mut self, _slot: usize, now: u64) {
         self.profile_boundary(step_timing::Phase::Exit, now);
     }
+    /// Under `--profile`, a waiting PE starts (`true`) or ends (`false`)
+    /// its spin for a wake before it halts: a host that samples where its
+    /// time goes counts that time as idle rather than as the scheduler's
+    /// ([`step_timing::Phase::Schedule`]), which holds it.
+    fn profile_idle(&mut self, _idle: bool) {}
     /// Under `--profile`, the `bytes` of code just installed at `code` are
     /// `regions`: `(offset, region)` pairs in ascending offsets, each
     /// running to the next one's offset and the last to `bytes`

@@ -175,6 +175,8 @@ pub(super) struct FakeHost {
     pub(super) host_work_at: Option<u64>,
     /// The code installs described ([`Host::profile_code`]).
     pub(super) described: Vec<Described>,
+    /// The idle marks of [`Host::profile_idle`], in order.
+    pub(super) idle_marks: Vec<bool>,
 }
 
 /// A described install: its code, length and regions.
@@ -382,6 +384,9 @@ impl Host for FakeHost {
         regions: &[(u32, step_timing::CodeRegion)],
     ) {
         self.described.push((code.0, bytes, regions.to_vec()));
+    }
+    fn profile_idle(&mut self, idle: bool) {
+        self.idle_marks.push(idle);
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
@@ -609,6 +614,7 @@ pub(super) fn board_on<D: Devices>(
         parts: Vec::new(),
         host_work_at: None,
         described: Vec::new(),
+        idle_marks: Vec::new(),
     };
     let profile = CpuProfile {
         name: "test",

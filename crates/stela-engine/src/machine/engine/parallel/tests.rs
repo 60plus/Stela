@@ -3182,6 +3182,24 @@ fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
     hub.home.store(0, Ordering::Relaxed);
     wfe(&mut machine).unwrap();
     assert_eq!(machine.statistics.short_waits, 0);
+    // Under step timing the spin, and a pass's poll, are idle time; only
+    // under it.
+    assert!(machine.host.idle_marks.is_empty());
+    for home in [1, 0] {
+        let (hub, mut machine) = start(6);
+        hub.home.store(home, Ordering::Relaxed);
+        machine.set_step_timing(true);
+        wfe(&mut machine).unwrap();
+        let marks = &machine.host.idle_marks;
+        assert!(
+            !marks.is_empty() && marks.len() % 2 == 0,
+            "{home} {marks:?}"
+        );
+        assert!(
+            marks.chunks(2).all(|pair| pair == [true, false]),
+            "{home} {marks:?}"
+        );
+    }
 }
 
 /// A WFE that spins on its Exclusives monitor, as XNU's ticket waiters do,

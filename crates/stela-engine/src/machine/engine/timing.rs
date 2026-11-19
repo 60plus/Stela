@@ -40,6 +40,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.clock.mark(|| self.host.counter(), retired, phases);
     }
 
+    /// Under step timing, tell the host a waiting PE's poll for a wake
+    /// starts (`true`) or ends ([`super::Host::profile_idle`]).
+    #[inline]
+    pub(super) fn profile_idle(&mut self, idle: bool) {
+        if self.step_timing.is_some() {
+            self.host.profile_idle(idle);
+        }
+    }
+
     /// The profile clock and the step loop's phase totals, under step
     /// timing: what the stall report names a gap's phase by.
     pub(super) fn clock_phases(&mut self) -> Option<clock::Phases> {

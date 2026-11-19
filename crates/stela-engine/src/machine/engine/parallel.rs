@@ -2346,33 +2346,43 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if until > start.saturating_add(self.idle_poll) {
                 return None;
             }
-            loop {
-                let hub = self.parallel.as_ref()?;
+            // The spin is idle time, as the passes' halt-poll is.
+            self.profile_idle(true);
+            let ended = 'spin: loop {
+                let Some(hub) = self.parallel.as_ref() else {
+                    break 'spin Some(None);
+                };
                 if hub.woken(pe, self.lines_epoch) {
                     if let Err(stop) = self.read_mail() {
-                        return Some(Err(stop));
+                        break 'spin Some(Some(Err(stop)));
                     }
                     let now = self.now();
-                    let hub = self.parallel.as_ref()?;
+                    let Some(hub) = self.parallel.as_ref() else {
+                        break 'spin Some(None);
+                    };
                     if hub.woken(pe, self.lines_epoch) || !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 if self.host.poll_interrupt() {
                     self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                    return None;
+                    break 'spin Some(None);
                 }
                 if self.host.counter() >= until {
                     let now = self.now();
                     if !self.ready(pe, now) {
                         self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
-                        return None;
+                        break 'spin Some(None);
                     }
-                    break;
+                    break 'spin None;
                 }
                 self.host.relax();
+            };
+            self.profile_idle(false);
+            if let Some(ended) = ended {
+                return ended;
             }
         }
         self.statistics.waits += 1;

@@ -694,6 +694,10 @@ impl Host for BareHost<'_> {
         pmu::boundary(phase, now);
     }
 
+    fn profile_idle(&mut self, idle: bool) {
+        super::sampling::idle(idle);
+    }
+
     fn profile_exit(&mut self, slot: usize, now: u64) {
         let phase = stela_engine::machine::engine::step_timing::Phase::Exit;
         super::sampling::charge(phase, Some(slot));

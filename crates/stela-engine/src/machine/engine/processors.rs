@@ -452,7 +452,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     None => until,
                 };
                 let slept = self.host.counter();
-                if !self.poll_for_wake(slept, until) {
+                // The poll is idle time; the halt after it counts nothing.
+                self.profile_idle(true);
+                let polled = self.poll_for_wake(slept, until);
+                self.profile_idle(false);
+                if !polled {
                     let (blocked, halted) = self.outside_run(|machine| {
                         let halt = machine.host.counter();
                         machine.host.arm_timer(Some(until));
