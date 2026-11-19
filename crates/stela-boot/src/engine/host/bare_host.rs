@@ -641,11 +641,13 @@ impl Host for BareHost<'_> {
             }
         }
         const { assert!(INVLPG_PAGES <= u16::BITS as u64) };
+        state.empty_tlbis += u64::from(!whole && first_range.is_none());
         let precise = !whole && pages <= INVLPG_PAGES;
         let current = state.root_of(state.current);
         let mut reload_current = false;
         for (first, last) in first_range.into_iter().chain(extra_ranges) {
             let base = first & !(PAGE - 1);
+            state.unmap_walks += (state.roots.len() * (1 + state.banks.len())) as u64;
             for (view, root) in state.roots.into_iter().enumerate() {
                 let mut removed = 0u16;
                 tables::unmap(&state.pool, root, first, last, |address| {

@@ -91,7 +91,7 @@ impl TranslatedSeen {
 #[derive(Default)]
 pub(super) struct ShadowSeen {
     pub(super) counts: [u64; 29],
-    pub(super) gate: [u64; 4],
+    pub(super) gate: [u64; 6],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
@@ -118,7 +118,8 @@ impl ShadowSeen {
     /// again at their first fill after their half was lost, the fills the
     /// #PF gate made without saving extended state, and a fill's mean time
     /// by segment: its walk, its mapping and prefill, fault-around and
-    /// restores.
+    /// restores; then the TLBIs by address that reached nothing of the
+    /// shadow and the root walks the others' unmapping took.
     pub(super) fn report(&mut self) {
         let host = host::statistics();
         let counts = [
@@ -157,6 +158,8 @@ impl ShadowSeen {
             host.fill_segment_ns[0],
             host.fill_segment_ns[1],
             host.fill_segment_ns[2],
+            host.empty_tlbis,
+            host.unmap_walks,
         ];
         let [
             fills,
@@ -190,7 +193,7 @@ impl ShadowSeen {
             restored,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
-        let [gate_fills, walk_ns, map_ns, around_ns] =
+        let [gate_fills, walk_ns, map_ns, around_ns, empty_tlbis, unmap_walks] =
             core::array::from_fn(|index| gate[index] - self.gate[index]);
         self.gate = gate;
         let fill_ns_each = fill_ns / fills.max(1);
@@ -227,7 +230,8 @@ impl ShadowSeen {
              view={view} unmapped={unmapped} lost={lost} upgrade={upgrade} walks={walks} \
              table_walks={table_walks} frames={frames} reclaimed={reclaimed} \
              restored={restored} gate_fills={gate_fills} walk_ns_each={walk_ns_each} \
-             map_ns_each={map_ns_each} around_ns_each={around_ns_each}\n"
+             map_ns_each={map_ns_each} around_ns_each={around_ns_each} \
+             empty_tlbis={empty_tlbis} unmap_walks={unmap_walks}\n"
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0

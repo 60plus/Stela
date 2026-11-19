@@ -606,6 +606,8 @@ pub struct Counts {
     /// The guest PCs of its own TLBIs of everything
     /// ([`super::Statistics::whole_tlbi_sites`]).
     pub whole_tlbi_sites: super::WholeTlbiSites,
+    /// ([`super::Statistics::whole_tlbi_times`]).
+    pub whole_tlbi_times: [u64; 3],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
@@ -2704,6 +2706,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             lookup_forgets: statistics.lookup_forgets,
             itlb_sources: statistics.itlb_sources,
             whole_tlbi_sites: statistics.whole_tlbi_sites,
+            whole_tlbi_times: statistics.whole_tlbi_times,
             transitions: [
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],
                 statistics.engine_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],

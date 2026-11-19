@@ -528,6 +528,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
+        let mut whole = None;
         match everywhere {
             mmu::tlbi::Everywhere::Addresses(addresses)
             | mmu::tlbi::Everywhere::AsidAddresses(addresses, _) => {
@@ -557,20 +558,33 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 // (`itlb_drops`' mail_all tells them apart).
                 let source = match self.applying_mail {
                     true => ItlbSource::AllReceived,
-                    false => {
-                        self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
-                        ItlbSource::AllLocal
-                    }
+                    false => ItlbSource::AllLocal,
                 };
                 self.statistics.itlb_sources[source as usize] += 1;
+                let started = self.host.counter();
+                let live =
+                    !self.fill_log.is_empty() || self.spaces.iter().any(|spaces| spaces.len() != 0);
                 self.forget_spaces(0..=1, 1);
+                if !self.applying_mail {
+                    whole = Some((started, live));
+                }
             }
         }
         self.statistics.tlb_maintenance += 1;
         if reach != mmu::tlbi::Reach::All {
             self.statistics.scoped_maintenance += 1;
         }
+        let forgot = whole.map(|_| self.host.counter());
         self.host.invalidate_reach(reach, everywhere);
+        // A local TLBI of everything: its PC, whether the ITLB held
+        // anything, and the time of the engine's and the host's parts.
+        if let (Some((started, live)), Some(forgot)) = (whole, forgot) {
+            self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
+            let times = &mut self.statistics.whole_tlbi_times;
+            times[0] += u64::from(live);
+            times[1] += forgot.wrapping_sub(started);
+            times[2] += self.host.counter().wrapping_sub(forgot);
+        }
     }
 
     /// A TTBR0 write, which changes the translation of the lower half

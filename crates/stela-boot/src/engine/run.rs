@@ -2655,12 +2655,25 @@ impl Heartbeat {
             // Where TLBIs of everything came from, over the whole run: the
             // guest PCs that issued the most, merged over the PEs.
             let mut sites = stela_engine::machine::engine::WholeTlbiSites::default();
+            let mut times = [0u64; 3];
             for counts in per_pe.iter() {
                 for [pc, count] in counts.whole_tlbi_sites.0 {
                     sites.add(pc, count);
                 }
+                for (total, count) in times.iter_mut().zip(counts.whole_tlbi_times) {
+                    *total += count;
+                }
             }
-            let mut line = String::from("PES WHOLE TLBI pc=count");
+            let all = sites.0.iter().map(|site| site[1]).sum::<u64>().max(1);
+            let [live, engine_ticks, host_ticks] = times;
+            let ns = |ticks: u64| {
+                (u128::from(ticks) * 1_000_000_000 / u128::from(host::COUNTER_HZ * all)) as u64
+            };
+            let mut line = format!(
+                "PES WHOLE TLBI live={live} engine_ns_each={} host_ns_each={} pc=count",
+                ns(engine_ticks),
+                ns(host_ticks)
+            );
             for [pc, count] in sites.0.into_iter().filter(|site| site[1] != 0) {
                 line.push_str(&format!(" {pc:#x}={count}"));
             }

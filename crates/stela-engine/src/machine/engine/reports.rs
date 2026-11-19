@@ -622,6 +622,10 @@ pub struct Statistics {
     /// brought) and how many each issued, the most frequent kept
     /// ([`WholeTlbiSites`]).
     pub whole_tlbi_sites: WholeTlbiSites,
+    /// Of those TLBIs, the ones that found the ITLB holding anything, and
+    /// the counter ticks of all of them in the engine's forgetting and in
+    /// the host's shadow.
+    pub whole_tlbi_times: [u64; 3],
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
@@ -842,6 +846,7 @@ impl core::ops::AddAssign for Statistics {
             itlb_drops,
             itlb_sources,
             whole_tlbi_sites,
+            whole_tlbi_times,
             compiled,
             self_loops,
             compile_ticks,
@@ -986,6 +991,9 @@ impl core::ops::AddAssign for Statistics {
         }
         for [pc, count] in whole_tlbi_sites.0 {
             self.whole_tlbi_sites.add(pc, count);
+        }
+        for (total, count) in self.whole_tlbi_times.iter_mut().zip(whole_tlbi_times) {
+            *total += count;
         }
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;
