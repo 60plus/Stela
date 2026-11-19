@@ -575,6 +575,30 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         refreshes
     }
 
+    /// Whether texture `id` keeps a device copy of its planes that holds
+    /// their rows as of the surface's seed last reported: filled, and not
+    /// left stale by another texture's write since.
+    pub(in crate::metal::device) fn device_copy_holds_rows(&self, id: TextureId) -> bool {
+        let mut copies = self
+            .resources
+            .aligned_copies
+            .get(&id.0)
+            .into_iter()
+            .flatten()
+            .filter(|copy| copy.device)
+            .peekable();
+        copies.peek().is_some()
+            && copies.all(|copy| {
+                matches!(
+                    copy.refresh,
+                    Refresh::Changed {
+                        filled: Some(_),
+                        ..
+                    }
+                )
+            })
+    }
+
     /// The copies between an extended-range IOSurface texture's device
     /// copy and its planes' rows: the first plane's and the second's.
     pub(in crate::metal::device) fn device_copy_rows(&self, id: TextureId) -> [Option<RowCopy>; 2] {

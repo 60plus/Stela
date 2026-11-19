@@ -111,10 +111,14 @@ impl Composition {
             .service
             .compose_display(&shared.target, index, &frame)
         {
-            Ok(serial) => {
+            Ok((serial, copied)) => {
                 if let Some((_, committed)) = self.pending.replace((serial, host::rdtsc())) {
                     self.note(committed, tsc_hz, replaced);
                 }
+                self.stats.copied = self
+                    .stats
+                    .copied
+                    .saturating_add(u32::try_from(copied).unwrap_or(u32::MAX));
                 GpuPresent::Taken
             }
             Err(Error::DeviceLost) => {
@@ -311,6 +315,7 @@ fn display_layers(
                 premultiplied: layer.premultiplied,
                 source: rect(layer.source),
                 destination: rect(layer.destination),
+                surface: layer.id,
             })
         })
         .collect()

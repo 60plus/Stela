@@ -30,6 +30,7 @@ fn layer() -> DisplayLayer {
         premultiplied: true,
         source: [0, 0, 4, 2],
         destination: [2, 1, 8, 4],
+        surface: 0,
     }
 }
 

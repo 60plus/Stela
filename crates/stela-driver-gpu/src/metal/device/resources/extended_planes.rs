@@ -474,6 +474,33 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
     }
 
+    /// The device copy of the planes of IOSurface `surface` that holds what
+    /// they do, where a texture over it keeps one whose source rectangle
+    /// `source` (`[x, y, width, height]`) lies in its texture: one no other
+    /// texture's write left stale ([`Self::device_copy_holds_rows`]). The
+    /// CPU's writes, which change the surface's seed, are seen at the
+    /// texture's next reported use; the display composes two-plane layers
+    /// only of the lossless-compressed `&b38` form, which an Apple GPU's
+    /// encoder writes and no CPU reads or writes in place.
+    pub(in crate::metal::device) fn surface_copy(
+        &self,
+        surface: u32,
+        source: [u32; 4],
+    ) -> Option<PlaneCopy> {
+        let [x, y, width, height] = source.map(u64::from);
+        self.resources
+            .extended_planes
+            .iter()
+            .filter(|(_, state)| state.surface.is_some_and(|(id, _)| id == surface))
+            .find_map(|(&id, state)| {
+                let copy = state.copy?;
+                let texture = self.resources.textures.get(id).ok()?;
+                let fits = x + width <= texture.descriptor.width
+                    && y + height <= texture.descriptor.height;
+                (fits && self.device_copy_holds_rows(TextureId(id))).then_some(copy)
+            })
+    }
+
     /// Whether `id` is an IOSurface texture of extended-range planes.
     pub(super) fn has_extended_planes(&self, id: TextureId) -> bool {
         self.resources.extended_planes.contains_key(&id.0)
@@ -1341,6 +1368,67 @@ mod tests {
             .unwrap();
         assert!(device.resources.extended_planes[&unified.0].copy.is_none());
         for texture in [texture, other, read, unified] {
+            device.destroy_texture(texture).unwrap();
+        }
+    }
+
+    /// The display finds a surface's device copy by its IOSurface ID once
+    /// a reported pass rendered it, while the copy holds the rows: not
+    /// before, not for a source past the texture, and not once another
+    /// texture over the surface wrote it, until a use refreshes it.
+    #[test]
+    fn the_display_finds_a_rendered_surfaces_device_copy_while_it_holds_the_rows() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let rendered = surface_texture(PixelFormat::Rgb10A8_2pXr10);
+        let texture = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        let copy = device.resources.extended_planes[&texture.0].copy;
+        let whole = [0, 0, 1280, 800];
+        assert_eq!(device.surface_copy(7, whole), None);
+        let note = |texture| crate::metal::device::resources::SurfaceNote {
+            texture: Some(texture),
+            surface: 7,
+            seed: 1,
+        };
+        let render = |device: &mut crate::metal::device::fixture::TestDevice, texture| {
+            let mut commands = device.new_command_buffer();
+            device
+                .begin_render(
+                    &mut commands,
+                    &reported(texture, LoadAction::Load, Some((7, 1))),
+                )
+                .unwrap();
+            commands.end_encoding(&mut device.resolver()).unwrap();
+            commands.surfaces.push(note(texture));
+            device.commit(commands).unwrap();
+        };
+        render(&mut device, texture);
+        assert_eq!(device.surface_copy(7, whole), copy);
+        assert_eq!(device.surface_copy(8, whole), None);
+        assert_eq!(device.surface_copy(7, [1, 0, 1280, 800]), None);
+        // Another texture over the surface without a copy of its own.
+        let sampled = TextureDescriptor {
+            usage: TextureUsage::SHADER_READ,
+            ..rendered
+        };
+        let other = device
+            .new_extended_plane_texture(buffer, &sampled, PLANES)
+            .unwrap();
+        let mut commands = device.new_command_buffer();
+        commands.surfaces.push(note(other));
+        commands.written.push(other);
+        device.commit(commands).unwrap();
+        assert_eq!(device.surface_copy(7, whole), None);
+        // The texture's next use refreshes its copy.
+        let mut commands = device.new_command_buffer();
+        commands.surfaces.push(note(texture));
+        device.commit(commands).unwrap();
+        assert_eq!(device.surface_copy(7, whole), copy);
+        for texture in [texture, other] {
             device.destroy_texture(texture).unwrap();
         }
     }

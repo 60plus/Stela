@@ -75,13 +75,14 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
 
     /// Commits the composition of `frame` into `target`'s buffer `index`,
     /// answering the command buffer whose completion makes it the
-    /// display's.
+    /// display's, and how many of its layers are composed from a device
+    /// copy of their planes.
     pub fn compose_display(
         &self,
         target: &DisplayTarget,
         index: usize,
         frame: &DisplayFrame,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         let scanout = target.scanouts.get(index).ok_or(Error::Invalid(
             "a display composition names a shared buffer",
         ))?;
@@ -89,7 +90,9 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             if target.epoch != self.read_backs.generation.current() {
                 return Err(Error::DeviceLost);
             }
-            service.device().compose_display(scanout, frame)
+            let device = service.device();
+            let serial = device.compose_display(scanout, frame)?;
+            Ok((serial, device.take_display_copies()))
         })?
     }
 

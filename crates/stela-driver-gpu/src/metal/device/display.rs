@@ -8,7 +8,10 @@
 //! buffer, and the CPU only flips it once the command buffer completes.
 //! The guest RAM imports are the device's own, so freeing them retires no
 //! guest token, and a later frame over the same pages takes the kept
-//! binding back.
+//! binding back. A two-plane extended-range layer the device rendered
+//! itself, whose planes it keeps a device copy of, is composed from the
+//! copy instead: a WindowServer framebuffer's rows then never cross the bus
+//! twice.
 use super::{Device, pins::Scope};
 use crate::metal::{
     binding::{ComposeArguments, ComposeFormat, ComposeLayer},
@@ -71,6 +74,11 @@ pub struct DisplayLayer {
     pub premultiplied: bool,
     pub source: [u32; 4],
     pub destination: [u32; 4],
+    /// The layer's IOSurface ID, zero where none is known. A two-plane
+    /// layer the device rendered is composed from its planes' device copy
+    /// ([`PlaneCopy`](crate::metal::pass::PlaneCopy)), which holds what they
+    /// do, rather than from the guest RAM of `color` and `alpha`.
+    pub surface: u32,
 }
 
 /// A frame's rows to compose into a scanout buffer of `width` BGRX pixels
@@ -91,6 +99,12 @@ struct Imported {
 }
 
 impl<B: Backend, C: Compiler> Device<B, C> {
+    /// Takes the count of display layers composed from a device copy of
+    /// their planes since the last call.
+    pub fn take_display_copies(&mut self) -> u64 {
+        core::mem::take(&mut self.display_copies)
+    }
+
     /// Imports the dma-buf `fd` of `bytes`, a display's scanout buffer.
     /// The driver owns `fd` once this succeeds, and after an error once
     /// the memory was imported but no buffer could be placed on it.
@@ -155,6 +169,26 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     ) -> Result<u64> {
         let mut layers = Vec::new();
         for layer in &frame.layers {
+            let copy = match layer.format {
+                ComposeFormat::Xr10A8 if layer.surface != 0 => {
+                    self.surface_copy(layer.surface, layer.source)
+                }
+                _ => None,
+            };
+            if let Some(copy) = copy {
+                self.display_copies += 1;
+                layers.push(ComposeLayer {
+                    color: copy.color,
+                    alpha: copy.alpha,
+                    stride: copy.color_bytes_per_row,
+                    alpha_stride: copy.alpha_bytes_per_row,
+                    format: layer.format,
+                    premultiplied: layer.premultiplied,
+                    source: layer.source,
+                    destination: layer.destination,
+                });
+                continue;
+            }
             let alpha = match (layer.format, &layer.alpha) {
                 (ComposeFormat::Xr10A8, Some(alpha)) => Some(alpha),
                 (ComposeFormat::Xr10A8, None) => {

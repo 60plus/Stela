@@ -409,6 +409,9 @@ pub struct GpuStats {
     pub replaced: u32,
     pub total_ns: u64,
     pub longest_ns: u64,
+    /// Layers the GPU composed from a copy of their planes in its own
+    /// memory rather than from guest RAM.
+    pub copied: u32,
 }
 
 /// One surface plane the model reads pixels from: its format, size and the
@@ -482,6 +485,10 @@ pub struct Layer {
     pub source: Rect,
     pub destination: Rect,
     pub premultiplied: bool,
+    /// The surface's IOSurface ID as the swap names it (`getSurfaceID`),
+    /// zero where none is known: by it a GPU that rendered the surface
+    /// finds a copy of it in its own memory.
+    pub id: u32,
 }
 
 impl Layer {
@@ -507,7 +514,13 @@ impl Layer {
             source,
             destination,
             premultiplied,
+            id: 0,
         })
+    }
+
+    /// This layer of the surface whose IOSurface ID is `id`.
+    pub fn with_id(self, id: u32) -> Self {
+        Self { id, ..self }
     }
 
     /// The planes of the layer's surface its source rows occupy, the

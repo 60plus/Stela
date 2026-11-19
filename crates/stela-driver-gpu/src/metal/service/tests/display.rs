@@ -43,6 +43,7 @@ fn frame() -> DisplayFrame {
             format: ComposeFormat::Bgra8,
             premultiplied: false,
             source: [0, 0, 16, 2],
+            surface: 0,
             destination: [0, 0, 16, 2],
         }],
     }
@@ -53,7 +54,8 @@ fn a_display_composition_completes_as_the_gpu_finishes_it() {
     let shared = Shared::new(service(), HOST);
     let target = shared.share_scanouts(&[(3, 128), (4, 128)]).unwrap();
     assert_eq!(target.len(), 2);
-    let serial = shared.compose_display(&target, 1, &frame()).unwrap();
+    let (serial, copied) = shared.compose_display(&target, 1, &frame()).unwrap();
+    assert_eq!(copied, 0);
     assert_eq!(shared.display_composed(&target, serial), Some(false));
     {
         let mut turn = shared.try_turn().unwrap();

@@ -570,13 +570,15 @@ impl core::fmt::Display for Pacing {
         let gpu = self.gpu;
         write!(
             f,
-            " composed=gpu:{}/cpu:{} gpu_frames=flipped:{}/replaced:{} gpu_ms={:.2}/{:.2}",
+            " composed=gpu:{}/cpu:{} gpu_frames=flipped:{}/replaced:{} gpu_ms={:.2}/{:.2} \
+             gpu_copied_layers={}",
             self.gpu_composed,
             self.cpu_composed,
             gpu.flipped,
             gpu.replaced,
             gpu.total_ns as f64 / 1e6 / f64::from(gpu.flipped + gpu.replaced).max(1.0),
             gpu.longest_ns as f64 / 1e6,
+            gpu.copied,
         )?;
         let Some(first) = self.swaps.first() else {
             return Ok(());
@@ -2774,12 +2776,15 @@ fn visible(
     let mut shown = [None; swap::LAYERS];
     for (shown, layer) in shown.iter_mut().zip(planes) {
         if let Some(layer) = layer {
-            *shown = Some(scanout::Layer::new(
-                layer.record.surface(layer.dva)?,
-                layer.source,
-                layer.destination,
-                layer.record.premultiplied,
-            )?);
+            *shown = Some(
+                scanout::Layer::new(
+                    layer.record.surface(layer.dva)?,
+                    layer.source,
+                    layer.destination,
+                    layer.record.premultiplied,
+                )?
+                .with_id(layer.id),
+            );
         }
     }
     Ok(shown)

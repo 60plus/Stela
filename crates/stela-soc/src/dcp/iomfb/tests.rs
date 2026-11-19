@@ -1680,7 +1680,7 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
             && line.contains(" burst_fps=")
             && line.contains(" overlapped=1/1 ")
             && line.ends_with(
-                " composed=gpu:0/cpu:0 gpu_frames=flipped:0/replaced:0 gpu_ms=0.00/0.00"
+                " composed=gpu:0/cpu:0 gpu_frames=flipped:0/replaced:0 gpu_ms=0.00/0.00 gpu_copied_layers=0"
             ),
         "{line}"
     );
@@ -2159,6 +2159,7 @@ fn a_present_that_moves_a_layer_whole_counts_as_moved() {
                 height: 32,
             },
             premultiplied: true,
+            id: 0,
         })
     };
     let shown = [layer(0, 0, 640), layer(10, 20, 32), None, None];
