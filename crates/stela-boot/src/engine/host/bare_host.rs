@@ -585,7 +585,13 @@ impl Host for BareHost<'_> {
 
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {
         let state = state();
-        if !state.kept.is_empty() {
+        // A TLBI of everything that empties the shadow below drops the
+        // kept halves with the lower half's frames: no table of theirs
+        // needs walking first.
+        let emptied = reach == Reach::All
+            && matches!(everywhere, Everywhere::All)
+            && state.legacy_translations_dirty;
+        if !state.kept.is_empty() && !emptied {
             let bounds = state.half_range(LOWER);
             let entry_bits = 12 + 9 * layout::top_level();
             let pool = &state.pool;
