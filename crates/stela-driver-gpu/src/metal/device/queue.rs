@@ -253,6 +253,8 @@ struct SpanShape {
     kind: SpanKind,
     target: Option<ImageView>,
     texels: u64,
+    /// The workgroups of its direct dispatches.
+    groups: u64,
     /// The last pass's note, zero for none.
     note: u32,
 }
@@ -299,7 +301,14 @@ impl SpanShape {
             | Command::DrawIndexedIndirect { .. }
             | Command::DrawMeshTasks(_)
             | Command::DrawMeshTasksIndirect { .. } => self.draws += 1,
-            Command::Dispatch(_) | Command::DispatchIndirect { .. } => self.dispatches += 1,
+            Command::Dispatch(groups) => {
+                self.dispatches += 1;
+                self.groups += groups
+                    .iter()
+                    .map(|&count| u64::from(count))
+                    .product::<u64>();
+            }
+            Command::DispatchIndirect { .. } => self.dispatches += 1,
             _ => {}
         }
     }
@@ -2181,6 +2190,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                                         draws: shape.draws.into(),
                                         dispatches: shape.dispatches.into(),
                                         texels: shape.texels,
+                                        groups: shape.groups,
                                     },
                                 );
                                 if let (Some(key), Some(note)) = (noted, note) {

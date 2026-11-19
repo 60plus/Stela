@@ -294,6 +294,8 @@ pub struct Entry {
     pub draws: u64,
     pub dispatches: u64,
     pub texels: u64,
+    /// The workgroups its direct dispatches ran.
+    pub groups: u64,
 }
 
 /// What one span did, as [`PassTimes::span`] sums it.
@@ -303,6 +305,8 @@ pub struct SpanWork {
     pub draws: u64,
     pub dispatches: u64,
     pub texels: u64,
+    /// The workgroups its direct dispatches ran.
+    pub groups: u64,
 }
 
 /// A sum and the largest of one count per command buffer.
@@ -414,6 +418,7 @@ impl PassTimes {
         entry.draws += work.draws;
         entry.dispatches += work.dispatches;
         entry.texels += work.texels;
+        entry.groups += work.groups;
     }
 
     /// Keeps `note` as what `key`'s span of `ns` sampled when it is the
@@ -483,7 +488,7 @@ pub fn span_key(
 /// `GPU PASSES command_buffers=… spans=… busy_us=… out_of_marks=…
 /// per_cb=submits:avg/max segments:… passes:… copies:… copied_ktexels:…
 /// planes=direct:count/ktexels copied:count/ktexels stamped:count/tiles
-/// decoded:count/ktexels top=key:count/total_us/longest_us/draws/dispatches/ktexels …`,
+/// decoded:count/ktexels top=key:count/total_us/longest_us/draws/dispatches/ktexels/kgroups …`,
 /// then on a line of its own `GPU SAMPLED longest key:us:note …` of the
 /// keys' longest noted spans, longest first.
 impl fmt::Display for PassTimes {
@@ -525,13 +530,14 @@ impl fmt::Display for PassTimes {
         for (key, entry) in self.top().into_iter().take(SHOWN) {
             write!(
                 formatter,
-                " {key}:{}/{}/{}/{}/{}/{}",
+                " {key}:{}/{}/{}/{}/{}/{}/{}",
                 entry.count,
                 entry.total_ns / 1000,
                 entry.longest_ns / 1000,
                 entry.draws,
                 entry.dispatches,
                 entry.texels / 1000,
+                entry.groups / 1000,
             )?;
         }
         // The longest noted passes, longest first.
@@ -571,10 +577,22 @@ mod tests {
             draws,
             dispatches: 0,
             texels,
+            groups: 0,
         };
         times.span(render.clone(), work(3_000_000, 4, 0));
         times.span(render, work(1_000_000, 2, 0));
         times.span(store, work(2_500_000, 0, 3_686_400));
+        // A compute span: its dispatches' workgroups.
+        let blur = span_key(SpanKind::Compute, "blur", [0, 0], None);
+        times.span(
+            blur,
+            SpanWork {
+                ns: 1_500_000,
+                dispatches: 2,
+                groups: 8_000,
+                ..SpanWork::default()
+            },
+        );
         times.command_buffer(CommandBufferCounts {
             submits: 1,
             segments: 1,
@@ -605,18 +623,19 @@ mod tests {
                 draws: 6,
                 dispatches: 0,
                 texels: 0,
+                groups: 0,
             }
         );
         let line = alloc::format!("{times}");
         assert_eq!(
             line,
-            "GPU PASSES command_buffers=1 spans=3 busy_us=6500 out_of_marks=0 \
+            "GPU PASSES command_buffers=1 spans=4 busy_us=8000 out_of_marks=0 \
              per_cb=submits:1.0/1 segments:1.0/1 passes:2.0/2 copies:1.0/1 \
              copied_ktexels:3686/3686 planes=direct:2/5 copied:1/3686 stamped:1/920 \
-             decoded:1/2 in_place:4 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0 \
-             store_texels:-:1/2500/2500/0/0/3686"
+             decoded:1/2 in_place:4 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0/0 \
+             store_texels:-:1/2500/2500/0/0/3686/0 compute:blur:1/1500/1500/0/2/0/8"
         );
-        assert_eq!(times.take().spans, 3);
+        assert_eq!(times.take().spans, 4);
         assert_eq!(times, PassTimes::default());
     }
 
