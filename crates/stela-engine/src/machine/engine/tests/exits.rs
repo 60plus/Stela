@@ -180,8 +180,14 @@ fn exit_transition_costs() {
         let ns = time(&mut machine, 1, part);
         std::println!("EXITS part={name} ns={ns}");
     }
-    // The memory-management words a kernel exits on most, at EL1.
-    let words: [(&str, Round); 2] = [
+    // The memory-management words a kernel exits on most, at EL1, and a
+    // WFE that finds an event (an event stream edge native WFEs now take).
+    let words: [(&str, Round); 3] = [
+        ("wfe-at-once", |machine| {
+            machine.cpu.signal_event();
+            machine.cpu.pc = USER;
+            exit(machine, 0xd503_205f);
+        }),
         ("tlbi-vale1is", |machine| {
             machine.cpu.state.x[8] = 0x4_0000;
             machine.cpu.pc = USER;

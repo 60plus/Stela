@@ -444,7 +444,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if self.mirrors.fast_ipi.wakes != 0 {
             self.take_fast_ipi_wakes();
         }
-        if self.mirrors.spin.completed | self.mirrors.spin.missed | self.mirrors.spin.held != 0 {
+        let spin = &self.mirrors.spin;
+        if spin.completed | spin.missed | spin.held | spin.streamed != 0 {
             self.take_event_spins();
         }
         let transitions = self.mirrors.transitions.take_counts();

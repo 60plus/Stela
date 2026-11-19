@@ -3931,6 +3931,7 @@ fn engine_waits_open_native_event_spins_only_where_other_pes_run() {
         counts: 96,
         start: 7,
         turns: 9,
+        streamed: 4,
     };
     machine.take_event_spins();
     let levels = machine.step_timing().unwrap().levels;
@@ -3939,9 +3940,10 @@ fn engine_waits_open_native_event_spins_only_where_other_pes_run() {
             levels.wfe_spun,
             levels.wfe_spin_missed,
             levels.wfe_held,
-            levels.wfe_spin_counts
+            levels.wfe_spin_counts,
+            levels.wfe_streamed
         ],
-        [2, 3, 1, 96]
+        [2, 3, 1, 96, 4]
     );
     assert_eq!(machine.mirrors.spin, EventSpin::default());
 }

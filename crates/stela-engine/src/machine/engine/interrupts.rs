@@ -593,6 +593,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// ([`Mirrors::spin`](super::mirrors::Mirrors::spin)).
     pub(super) fn take_event_spins(&mut self) {
         let spin = core::mem::take(&mut self.mirrors.spin);
+        // Native WFEs sampled the event streams: their sample is the PE's.
+        if spin.streamed != 0 && self.event_sample.is_some() {
+            let sampled = self.mirrors.stream.sampled;
+            self.event_sample = Some(sampled);
+            self.stream_sample = Some(sampled);
+        }
         if let Some(timing) = &mut self.step_timing {
             timing.levels.event_spins(spin);
         }

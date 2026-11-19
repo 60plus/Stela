@@ -1957,6 +1957,9 @@ pub struct Levels {
     pub wfe_spin_missed: u64,
     pub wfe_held: u64,
     pub wfe_spin_counts: u64,
+    /// WFEs native code completed on an event stream edge since the last
+    /// sample (`x86_64::register_read::EventStream`).
+    pub wfe_streamed: u64,
     /// At each WFI, the kernel ticks charged since the PE last ran EL0 code
     /// or reached a WFI: wake-ups that found nothing for user code, idle
     /// paths and kernel threads.
@@ -2019,6 +2022,7 @@ impl Levels {
         self.wfe_spin_missed += spin.missed;
         self.wfe_held += spin.held;
         self.wfe_spin_counts += spin.counts;
+        self.wfe_streamed += spin.streamed;
     }
 
     /// The counts since `earlier`; the state is this one's.
@@ -2039,6 +2043,7 @@ impl Levels {
             wfe_spin_missed: self.wfe_spin_missed.wrapping_sub(earlier.wfe_spin_missed),
             wfe_held: self.wfe_held.wrapping_sub(earlier.wfe_held),
             wfe_spin_counts: self.wfe_spin_counts.wrapping_sub(earlier.wfe_spin_counts),
+            wfe_streamed: self.wfe_streamed.wrapping_sub(earlier.wfe_streamed),
             kernel_before_wfi: self
                 .kernel_before_wfi
                 .wrapping_sub(earlier.kernel_before_wfi),

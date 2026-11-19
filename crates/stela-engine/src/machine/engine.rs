@@ -990,6 +990,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
     self_loops: bool,
+    /// The [`Self::event_sample`] the event stream native WFEs sample
+    /// was published for ([`Self::enter_events`]); `None` once the
+    /// streams' controls may have changed.
+    stream_sample: Option<u64>,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1454,6 +1458,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             native_system: None,
             self_loops: true,
             event_sample: None,
+            stream_sample: None,
             debug: None,
             device_lines: None,
             device_generation: None,

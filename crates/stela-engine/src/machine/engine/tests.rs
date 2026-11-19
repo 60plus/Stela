@@ -7977,6 +7977,64 @@ fn event_instructions_complete_natively_on_the_event_register() {
     );
 }
 
+/// Native WFEs sample the event stream the engine publishes from the PE's
+/// last sample: none before a sample or without a stream; the next edge
+/// and its period after one; what native code took becomes the PE's
+/// sample and stays published; the engine's own sample, a control write
+/// and a PE switch publish it again.
+#[test]
+fn native_waits_sample_the_event_stream_the_engine_publishes() {
+    use crate::machine::timer;
+    const STREAM: u64 = 1 << 2 | 3 << 4; // CNTHCTL_EL2.EVNTEN, EVNTI 3
+    let mut machine = machine_on(stela_contracts::Chip::AppleM2, &[]);
+    machine.cpu.pstate = Pstate::reset(2);
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::CNTHCTL_EL2, 0, STREAM);
+    machine.enter_events();
+    let none = register_read::EventStream::default();
+    assert_eq!(machine.mirrors.stream, none);
+    machine.event_sample = Some(99);
+    // Native code reads no count yet.
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, none);
+    machine.clock.native((0, 1 << 32));
+    machine.event_sample = Some(100);
+    machine.enter_events();
+    let (next, period) = timer::sampled_event(&machine.cpu, 100).unwrap();
+    let period = period.unwrap();
+    let published = register_read::EventStream {
+        next,
+        period,
+        sampled: 100,
+    };
+    assert_eq!(machine.mirrors.stream, published);
+    // Native code took the edge at `next` at count next + 1.
+    machine.mirrors.stream = register_read::EventStream {
+        next: next + period,
+        sampled: next + 1,
+        ..published
+    };
+    machine.mirrors.spin.streamed = 1;
+    machine.take_event_spins();
+    assert_eq!(machine.event_sample, Some(next + 1));
+    let moved = machine.mirrors.stream;
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, moved);
+    // The engine's own sample.
+    machine.sample_events(next + 3 * period);
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream.sampled, next + 3 * period);
+    let (again, _) = timer::sampled_event(&machine.cpu, next + 3 * period).unwrap();
+    assert_eq!(machine.mirrors.stream.next, again);
+    // A control write that ends the stream.
+    machine.cpu.registers.set(SystemRegister::CNTHCTL_EL2, 0, 0);
+    machine.derived_changed();
+    machine.enter_events();
+    assert_eq!(machine.mirrors.stream, none);
+}
+
 /// CLREX completes natively on the frame's monitor while the engine holds
 /// none of its own, in any state; with an engine monitor it exits for the
 /// engine to clear it.

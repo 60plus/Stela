@@ -589,7 +589,38 @@ pub struct EventSpin {
     /// The count the spin in progress began at, and its turns left.
     pub start: u64,
     pub turns: u64,
+    /// WFEs that found the register clear but an event stream edge since
+    /// the engine's last sample ([`EventStream`]), and completed.
+    pub streamed: u64,
 }
+
+/// The event stream an [`event_wait_thunk`] samples: the first system
+/// count after the engine's last sample at which an edge sets the event
+/// register (`u64::MAX`: none the thunk may take), the edges' period
+/// where they come every `period` counts (0: the thunk takes one edge and
+/// leaves the next to the engine), and the count the thunk last sampled
+/// at, which the engine takes as its own sample when native code returns.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventStream {
+    pub next: u64,
+    pub period: u64,
+    pub sampled: u64,
+}
+
+impl Default for EventStream {
+    fn default() -> Self {
+        Self {
+            next: u64::MAX,
+            period: 1,
+            sampled: 0,
+        }
+    }
+}
+
+const STREAM_NEXT: i8 = core::mem::offset_of!(EventStream, next) as i8;
+const STREAM_PERIOD: i8 = core::mem::offset_of!(EventStream, period) as i8;
+const STREAM_SAMPLED: i8 = core::mem::offset_of!(EventStream, sampled) as i8;
 
 const SPIN_COMPLETED: i8 = core::mem::offset_of!(EventSpin, completed) as i8;
 const SPIN_MISSED: i8 = core::mem::offset_of!(EventSpin, missed) as i8;
@@ -597,6 +628,7 @@ const SPIN_HELD: i8 = core::mem::offset_of!(EventSpin, held) as i8;
 const SPIN_COUNTS: i8 = core::mem::offset_of!(EventSpin, counts) as i8;
 const SPIN_START: i8 = core::mem::offset_of!(EventSpin, start) as i8;
 const SPIN_TURNS: i8 = core::mem::offset_of!(EventSpin, turns) as i8;
+const SPIN_STREAMED: i8 = core::mem::offset_of!(EventSpin, streamed) as i8;
 const INTERRUPT_EPOCH: i8 =
     core::mem::offset_of!(super::chain::ChainControl, interrupt_epoch) as i8;
 const OBSERVED_INTERRUPT_EPOCH: i8 =
@@ -610,7 +642,8 @@ const OBSERVED_INTERRUPT_EPOCH: i8 =
 /// ([`super::chain::ChainControl`]), whose interrupt epoch moves when
 /// anything is posted for the PE; the count before which time alone changes
 /// no interrupt line ([`crate::x86_64::transition::Places::lines_until`]),
-/// the count reader, and the spin's counts.
+/// the count reader, the spin's counts and the event stream
+/// ([`EventStream`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventWaitPlaces {
     pub events: Place,
@@ -620,11 +653,16 @@ pub struct EventWaitPlaces {
     pub lines_until: Place,
     pub count: Place,
     pub spin: Place,
+    pub stream: Place,
 }
 
 /// The thunk completing WFE at `pc` while the `events` cell is open and the
 /// event register is set: it clears the register in one exchange, as
-/// another PE may set it, and completes. With the register clear, where the
+/// another PE may set it, and completes. With the register clear, an event
+/// stream edge since the engine's last sample sets it as the engine's own
+/// sample would (`stream`), and the WFE takes it and completes, recording
+/// the count it sampled at and the next edge, before any trap check, as
+/// the engine does. With the register clear, where the
 /// WFE would wait (`waits` open), it spins for up to [`WFE_SPIN_COUNTS`]
 /// for the register and completes as soon as it finds it set. It spins only
 /// while nothing else would wake the WFE, all of which the engine's wait
@@ -649,6 +687,34 @@ pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
     asm.xchg(Byte, Mem::base(Rcx, 0), Rdx);
     asm.test(Byte, Rdx, Rdx);
     let set = asm.jcc(Cond::Ne);
+    // An event stream edge since the last sample: next += (k + 1) * period
+    // for k = (count - next) / period. Without a stream no count is read.
+    asm.place(Rcx, places.stream);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base_disp8(Rcx, STREAM_NEXT), -1);
+    let unpublished = asm.jcc(Cond::E);
+    read_count(&mut asm, places.count);
+    asm.place(Rcx, places.stream);
+    asm.mov(Qword, Rax, Rdx);
+    asm.alu_load(Alu::Sub, Qword, Rax, Mem::base_disp8(Rcx, STREAM_NEXT));
+    let no_edge = asm.jcc(Cond::B);
+    asm.mov_store(Qword, Mem::base_disp8(Rcx, STREAM_SAMPLED), Rdx);
+    // Without a period, the edge after it is the engine's to find.
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD), 0);
+    let periodic = asm.jcc(Cond::Ne);
+    asm.mov_rm_imm32(Qword, Mem::base_disp8(Rcx, STREAM_NEXT), -1);
+    let taken = asm.jmp();
+    asm.bind(periodic);
+    asm.alu(Alu::Xor, Dword, Rdx, Rdx);
+    asm.unary(Unary::Div, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD));
+    asm.alu_imm8(Alu::Add, Qword, Rax, 1);
+    asm.unary(Unary::Mul, Qword, Mem::base_disp8(Rcx, STREAM_PERIOD));
+    asm.alu(Alu::Add, Qword, Mem::base_disp8(Rcx, STREAM_NEXT), Rax);
+    asm.bind(taken);
+    asm.place(Rcx, places.spin);
+    asm.alu_imm8(Alu::Add, Qword, spin(SPIN_STREAMED), 1);
+    let streamed = asm.jmp();
+    asm.bind(no_edge);
+    asm.bind(unpublished);
     // Whether the WFE may spin.
     asm.place(Rax, places.waits);
     asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
@@ -730,6 +796,7 @@ pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
     let held = asm.jmp();
     asm.bind(set);
     asm.bind(found);
+    asm.bind(streamed);
     finish_unless(
         code,
         [closed, traps, interrupt, notified, due, missed, held],
@@ -2462,6 +2529,7 @@ mod tests {
         monitor: u64,
         lines_until: u64,
         spin: EventSpin,
+        stream: EventStream,
     }
 
     /// The event thunks of these tests, and their words: an event register,
@@ -2493,6 +2561,7 @@ mod tests {
                 lines_until: place(offset_of!(Waits, lines_until)),
                 count: READER,
                 spin: place(offset_of!(Waits, spin)),
+                stream: place(offset_of!(Waits, stream)),
             };
             let published = alloc::boxed::Box::new(CountState::default());
             published.offset.store(100, Relaxed);
@@ -2578,6 +2647,45 @@ mod tests {
         assert_eq!(events.event.load(Relaxed), 0);
         assert_eq!(events.wait(), MISS);
         assert_eq!(events.waits.spin, EventSpin::default(), "no spin");
+    }
+
+    /// With the register clear, an event stream edge at or before the count
+    /// (held at 100) completes the WFE, before a monitor or a trap is
+    /// looked at: the sample moves to the count and the next edge to the
+    /// first one past it. Without one, the WFE goes on as before.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn event_waits_take_a_stream_edge_since_the_sample() {
+        let mut events = Events::new(0);
+        events.open();
+        events.waits.monitor = 1;
+        assert_eq!(events.wait(), MISS, "no stream");
+        for (next, after) in [(100, 108), (60, 108), (93, 101)] {
+            events.waits.stream = EventStream {
+                next,
+                period: 8,
+                sampled: 7,
+            };
+            assert_eq!(events.wait(), NEXT, "{next}");
+            let stream = events.waits.stream;
+            assert_eq!((stream.next, stream.sampled), (after, 100), "{next}");
+            // The edge is taken: the next WFE finds none.
+            assert_eq!(events.wait(), MISS, "{next}");
+        }
+        assert_eq!(events.waits.spin.streamed, 3);
+        events.waits.stream.next = 101;
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.stream.sampled, 100);
+        // Edges without a period: one is taken, the next is the engine's.
+        events.waits.stream = EventStream {
+            next: 99,
+            period: 0,
+            sampled: 7,
+        };
+        assert_eq!(events.wait(), NEXT);
+        assert_eq!(events.waits.stream.next, u64::MAX);
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.spin.streamed, 4);
     }
 
     /// Where the WFE would wait, a clear event register makes it spin: it

@@ -722,6 +722,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.peers[self.current] = Peer::Parked(Box::new(outgoing));
         self.current = next;
         self.statistics.switches += 1;
+        // The incoming PE's event streams are its own.
+        self.stream_sample = None;
         // The switch changes no device: what derives from the PE goes, the
         // devices' lines and deadline stay, and the incoming PE's mirrored
         // reads reopen as it left them.

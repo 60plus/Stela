@@ -2255,7 +2255,7 @@ impl Heartbeat {
             // spins that missed, the WFEs an exclusive monitor kept from
             // spinning and the time spins took.
             let mut levels = String::from(
-                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns",
+                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns/wfe_stream",
             );
             let mut totals = parallel::Counts::default();
             // Per PE in any boot: its shares of the interval idle, in guest
@@ -2482,7 +2482,7 @@ impl Heartbeat {
                 }
                 let level = now.levels.since(&before.levels);
                 levels.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     tsc_percent(level.ticks[step_timing::Level::User as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Kernel as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Guarded as usize]),
@@ -2498,6 +2498,7 @@ impl Heartbeat {
                     level.wfe_held,
                     u128::from(level.wfe_spin_counts) * 1_000_000_000
                         / u128::from(host::COUNTER_HZ),
+                    level.wfe_streamed,
                 ));
                 for (total, (now, before)) in
                     exits.iter_mut().zip(now.exits.iter().zip(before.exits))

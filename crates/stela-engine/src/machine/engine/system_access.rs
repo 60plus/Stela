@@ -448,6 +448,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
             readable: 1,
             value: self.cpu.event_storage(),
         };
+        // The event stream native WFEs sample from the PE's last sample:
+        // kept while the sample is the one it was made from, or moved
+        // natively to, and the stream's controls are unchanged. None where
+        // native code reads no count.
+        if self.stream_sample != self.event_sample || self.event_sample.is_none() {
+            self.stream_sample = self.event_sample;
+            self.mirrors.stream = self
+                .event_sample
+                .filter(|_| self.clock.reads_natively())
+                .and_then(|sample| {
+                    let (next, period) = timer::sampled_event(&self.cpu, sample)?;
+                    Some(register_read::EventStream {
+                        next,
+                        period: period.unwrap_or(0),
+                        sampled: sample,
+                    })
+                })
+                .unwrap_or_default();
+        }
         self.mirrors.exclusive = register_read::Cell {
             readable: u64::from(self.cpu.monitor.is_none() && !self.monitor_tracing),
             value: self.cpu.reservation_word(),

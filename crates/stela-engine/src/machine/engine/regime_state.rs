@@ -115,6 +115,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the device lines.
     pub(super) fn forget_derived(&mut self) {
         self.timers = None;
+        // The event streams' controls may have changed.
+        self.stream_sample = None;
         self.mirrors.transitions.forget();
         self.forget_pstate_derived();
     }
