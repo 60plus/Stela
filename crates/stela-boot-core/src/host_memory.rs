@@ -246,10 +246,6 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
     Err(Shortfall { free, needed }.refusal())
 }
 
-/// Read on demand, the share of the pack's budget (a fraction's
-/// denominator) the arena of the boot's new segments takes; the rest,
-/// beyond the segments' indexes, is the room [`sizes_with_room`] gives.
-pub const DEMAND_ARENA_SHARE: u64 = 4;
 /// The code window per runner past which a larger one cuts reinstalls
 /// steeply no more (the ring replay at 8 PEs: 816 MiB reinstalls 15 % of
 /// what 640 MiB does): a window under it takes a pack's room first.

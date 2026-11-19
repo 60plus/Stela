@@ -640,10 +640,10 @@ fn small_hosts_move_their_kept_code_into_the_window() {
     }
 }
 
-/// A pack read on demand holds its indexes and an arena of
-/// [`DEMAND_ARENA_SHARE`] of its budget; the room it leaves goes to the
-/// window up to the knee, then half to the window up to
-/// [`SHARED_PER_RUNNER`] and half to the guest, then all to the guest.
+/// A pack read on demand, its merges too, holds its indexes alone; the
+/// room it leaves goes to the window up to the knee, then half to the
+/// window up to [`SHARED_PER_RUNNER`] and half to the guest, then all to
+/// the guest.
 #[test]
 fn a_pack_read_on_demand_splits_its_room_between_the_window_and_the_guest() {
     // The indexes of a whole footprint's pack: 175 thousand records.
@@ -652,7 +652,7 @@ fn a_pack_read_on_demand_splits_its_room_between_the_window_and_the_guest() {
         let free = free(gib);
         let budget = pack_budget(free, 8, 8);
         let before = sizes(free - budget - PACK_MARGIN, 8, 8).unwrap();
-        let held = (budget / DEMAND_ARENA_SHARE).max(INDEX);
+        let held = INDEX;
         let room = budget - held;
         let after = sizes_with_room(free - held - PACK_MARGIN, 8, 8, room).unwrap();
         std::println!(

@@ -95,6 +95,11 @@ pub(super) struct Reader {
     pub(super) launch: usize,
     /// A lookup whose record arrives within this long waits for it.
     pub(super) wait_us: u64,
+    /// The pack lays its records out in the order a boot first used them
+    /// (a merge's layout); else in key order, by page hash, as merges laid
+    /// them out before: reads ahead and a launch's then seek, and the
+    /// records after a page in the file are any pages.
+    pub(super) first_use: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,6 +254,16 @@ pub(super) fn replay(held: f64, disk: Disk, reader: Reader, cache: usize) -> Out
     for (at, &page) in order.iter().enumerate() {
         rank[page] = at;
     }
+    // Key order: the pages by hash, which says nothing of their use.
+    let mut key_seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut by_key: Vec<(u64, usize)> =
+        (0..PAGES).map(|page| (next(&mut key_seed), page)).collect();
+    by_key.sort_unstable();
+    let by_key: Vec<usize> = by_key.into_iter().map(|(_, page)| page).collect();
+    let mut key_rank = vec![0usize; PAGES];
+    for (at, &page) in by_key.iter().enumerate() {
+        key_rank[page] = at;
+    }
     let mut lookups: Vec<(u64, usize)> = Vec::with_capacity(PAGES * BLOCKS_PER_PAGE as usize);
     for (page, &at) in first.iter().enumerate() {
         lookups.push((at, page));
@@ -286,9 +301,9 @@ pub(super) fn replay(held: f64, disk: Disk, reader: Reader, cache: usize) -> Out
             }
             let next = order[ahead_at];
             ahead_at += 1;
-            // The pack lays its records out in the order of their first
-            // use: reading ahead reads the file in order.
-            if run.issue(next, idle, true, false) {
+            // Laid out in the order of their first use, reading ahead reads
+            // the file in order; in key order, each read seeks.
+            if run.issue(next, idle, true, !reader.first_use) {
                 run.outcome.ahead += 1;
             }
         }
@@ -312,7 +327,13 @@ pub(super) fn replay(held: f64, disk: Disk, reader: Reader, cache: usize) -> Out
             }
             None => {
                 run.issue(page, now, false, true);
-                for &next in order[rank[page] + 1..].iter().take(reader.launch) {
+                // The records laid out after it: those the previous boot
+                // used next, or in key order any pages.
+                let after = match reader.first_use {
+                    true => &order[rank[page] + 1..],
+                    false => &by_key[key_rank[page] + 1..],
+                };
+                for &next in after.iter().take(reader.launch) {
                     if run.unused >= cache / 2 {
                         break;
                     }
@@ -342,6 +363,7 @@ fn demand_read_pack_replay() {
                 ahead: false,
                 launch: 0,
                 wait_us: 0,
+                first_use: true,
             },
         ),
         (
@@ -350,6 +372,7 @@ fn demand_read_pack_replay() {
                 ahead: true,
                 launch: 16,
                 wait_us: 0,
+                first_use: true,
             },
         ),
         (
@@ -358,6 +381,7 @@ fn demand_read_pack_replay() {
                 ahead: true,
                 launch: 16,
                 wait_us: 200,
+                first_use: true,
             },
         ),
     ];
@@ -380,6 +404,41 @@ fn demand_read_pack_replay() {
                     outcome.refused,
                     outcome.last_read_us / 1_000_000,
                 );
+            }
+        }
+    }
+}
+
+/// The layout's part: the same readers over a pack laid out in key order
+/// (merges before) and in the order of first use (a merge's now), and the
+/// reader of a disk whose reads seek, which reads ahead only.
+#[test]
+#[ignore = "manual: the table"]
+fn demand_read_layout_replay() {
+    for disk in DISKS {
+        for cache in [8_192, 32_768] {
+            for first_use in [false, true] {
+                for (name, ahead, launch) in [("ahead+launch16", true, 16), ("ahead", true, 0)] {
+                    let reader = Reader {
+                        ahead,
+                        launch,
+                        wait_us: 0,
+                        first_use,
+                    };
+                    let outcome = replay(0.8, disk, reader, cache);
+                    std::println!(
+                        "LAYOUT disk={} cache={}MB first_use={first_use} reader={name} hit%={:.1} \
+                         of_all%={:.1} read={} wasted={} refused={} last_read_s={}",
+                        disk.name,
+                        (cache as u64 * DECODED_BYTES) >> 20,
+                        100.0 * outcome.hits as f64 / outcome.lookups.max(1) as f64,
+                        100.0 * outcome.hits as f64 / outcome.all.max(1) as f64,
+                        outcome.read,
+                        outcome.wasted,
+                        outcome.refused,
+                        outcome.last_read_us / 1_000_000,
+                    );
+                }
             }
         }
     }

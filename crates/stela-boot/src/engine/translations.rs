@@ -32,7 +32,7 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
-use stela_boot_core::host_memory::{DEMAND_ARENA_SHARE, PACK_FLOOR};
+use stela_boot_core::host_memory::PACK_FLOOR;
 use stela_crypto::{Sha256, digest::Digest as _};
 use stela_drivers::block::BlockDevice;
 use stela_engine::machine::Offer;
@@ -276,18 +276,15 @@ pub fn read(budget: u64) -> Option<Opened> {
                     .get_boxed_info::<FileInfo>()
                     .map_or(0, |info| info.file_size());
                 let allocated = writable && size >= bound;
-                // A pack the boot may write gets the rest of its limit as
-                // the arena its new segments' records move to.
-                let arena = allocated && partition.is_some() && limit >= PACK_FLOOR;
                 // The engine reads records from the partition it writes:
-                // a pack it may write is read on demand.
+                // a pack it may write is read on demand, its merges too.
+                let demand = allocated && partition.is_some() && limit >= PACK_FLOOR;
                 let loaded = read_journal(
                     &mut file,
                     &translator,
                     size,
                     limit.saturating_sub(previous_bytes),
-                    arena,
-                    arena,
+                    demand,
                 )?;
                 (loaded, size, allocated)
             }
@@ -411,16 +408,15 @@ fn blank() -> Option<Loaded> {
 /// records that end within what is left, its index trimmed to name only
 /// them (`translation_store::within`). Segments are not checked whole here:
 /// a pack checks its index, and each record its own bytes when first used.
-/// With `arena`, the region holds `limit` bytes of blobs in all: the room
-/// the pack read leaves is the writer's arena ([`pack::Arena`]), outside
-/// the heap as the pack is. `None` only when no memory is left for the
-/// region.
+/// With `demand`, every segment's header and index alone are held: its
+/// records are read from the file as lookups and merges need them, and
+/// the budget they leave goes to the window and the guest. `None` only when
+/// no memory is left for the region.
 fn read_journal(
     file: &mut RegularFile,
     translator: &Digest,
     size: u64,
     limit: u64,
-    arena: bool,
     demand: bool,
 ) -> Option<Loaded> {
     let mut slots = vec![0; DATA_START as usize];
@@ -444,11 +440,6 @@ fn read_journal(
         .sum();
     // Read on demand, every segment's records stay in the file: only its
     // header and index are held.
-    // A file of [`writer::MERGE_AT`] segments or more is read whole, so
-    // this boot's writer can merge them (a merge reads its segments from
-    // memory).
-    let demand =
-        demand && entries.iter().filter(|entry| entry.kind == SEGMENT).count() < writer::MERGE_AT;
     let mut room = if demand {
         0
     } else {
@@ -497,23 +488,7 @@ fn read_journal(
         .map(|&length| ((length & !INDEX_ONLY) as usize).next_multiple_of(8))
         .sum();
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize + 8 * entries.len();
-    // Read on demand, the new segments' records take a share of the limit:
-    // the rest is the room the boot gives its window and guest.
-    let arena_limit = if demand {
-        limit / DEMAND_ARENA_SHARE
-    } else {
-        limit
-    };
-    let spare = if arena {
-        usize::try_from(arena_limit)
-            .unwrap_or(usize::MAX)
-            .saturating_sub(blobs)
-            / PAGE
-            * PAGE
-    } else {
-        0
-    };
-    let bytes = head + blobs + spare;
+    let bytes = head + blobs;
     let pages = bytes.div_ceil(PAGE);
     let physical = firmware::pages(pages).ok()?;
     // SAFETY: firmware returned this exclusive allocation of `bytes` or
@@ -589,7 +564,7 @@ fn read_journal(
         () if demand => PackRead::OnDisk {
             index: read,
             held: whole,
-            room: limit.saturating_sub(arena_limit.max(read)),
+            room: limit.saturating_sub(read),
         },
         () if partial => PackRead::Part { read, held: whole },
         () => PackRead::Whole(read),
@@ -811,7 +786,10 @@ fn install_parts(
     for lock in &STORES {
         let evicted = lock.with(|store| {
             let store = store.get_or_insert_with(|| {
-                Store::filtered(translator, segments.clone(), filters.clone())
+                let mut store = Store::filtered(translator, segments.clone(), filters.clone());
+                // Each part reads ahead the records of its own keys.
+                store.keep_ahead(|key| core::ptr::eq(part(key), lock));
+                store
             });
             store.share(shared / PARTS);
             store.set_bounds(bounds.share(PARTS))
@@ -1131,8 +1109,7 @@ pub fn share(bound: usize) {
 }
 
 /// Make the store of the handoff file `region` the engine's: the GPT
-/// partition to open for writing it, when it can be written. What follows
-/// its blobs is the writer's arena.
+/// partition to open for writing it, when it can be written.
 pub fn install(region: &'static mut [u8]) -> Option<Guid> {
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize;
     if region.len() < head || region[..8] != PLACEMENT_MAGIC {
@@ -1155,8 +1132,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             )
         })?
         .min(region.len());
-    let (contents, arena) = region.split_at_mut(blobs);
-    let contents: &'static [u8] = contents;
+    let contents: &'static [u8] = &region[..blobs];
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let word = |at: usize| u32::from_le_bytes(contents[at..at + 4].try_into().expect("a word"));
     let (limit, flags, size) = (field(8), word(32), field(40));
@@ -1217,15 +1193,19 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
         limit,
         file_bytes: size,
         committed,
-        segments: segments.clone(),
+        segments: segments
+            .iter()
+            .zip(&offsets)
+            .map(|(&pack, &offset)| pack::Segment::at(pack, offset))
+            .collect(),
         used,
         partial,
-        arena: pack::Arena::new(arena),
     };
     let held = PackWriter {
         writer: Writer::new(file, super::host::COUNTER_HZ),
         extents: None,
         queued: Queued::default(),
+        reads: WriterReads::default(),
         steps: 0,
         longest: 0,
     };
@@ -1241,15 +1221,23 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             .map(|(pack, &offset)| (!pack.resident()).then_some(offset))
             .collect();
         if offsets.iter().any(Option::is_some) {
+            let order = pack::LayoutOrder::new(&segments);
+            let segments = segments.clone();
             READER.holding(true, |slot| {
                 *slot = Some(Reader {
+                    segments,
                     offsets,
+                    order,
                     extents: None,
                     flights: Vec::new(),
+                    launch: alloc::collections::VecDeque::new(),
+                    cursor: (0, 0),
                     latency: 0,
                     longest: 0,
                     failed: 0,
                     next: 0,
+                    launched: 0,
+                    dropped: 0,
                 })
             });
         }
@@ -1427,6 +1415,7 @@ struct PackWriter {
     writer: Writer<'static>,
     extents: Option<Vec<Extent>>,
     queued: Queued,
+    reads: WriterReads,
     steps: u64,
     longest: u64,
 }
@@ -1486,15 +1475,13 @@ impl Entries for Parts {
             .sum::<usize>() as u64
     }
 
-    fn uses(&mut self) -> BTreeMap<Digest, u32> {
-        let mut uses = BTreeMap::<Digest, u32>::new();
+    fn uses(&mut self) -> BTreeMap<Digest, pack::Use> {
+        // Each key belongs to one part: the parts' maps are disjoint.
+        let mut uses = BTreeMap::<Digest, pack::Use>::new();
         for lock in &STORES {
             lock.with(|store| {
                 if let Some(store) = store {
-                    for (key, count) in store.uses() {
-                        let held = uses.entry(*key).or_default();
-                        *held = held.saturating_add(*count);
-                    }
+                    uses.extend(store.uses().iter().map(|(key, uses)| (*key, *uses)));
                 }
             });
         }
@@ -1560,12 +1547,19 @@ fn report_event(event: &Event) {
                 writer::ShedReason::Pack => "past the share of the pack a boot leaves",
             }
         )),
-        Event::ArenaFull { used, resident } => output::arguments(format_args!(
-            "TRANSLATIONS arena full used={}M resident={}M: written records stay in the heap, \
-             within its share\n",
-            used >> 20,
-            resident >> 20
+        Event::Abandoned { full } => output::arguments(format_args!(
+            "TRANSLATIONS merge full={full} given up: a read of the pack file failed; the file \
+             keeps what it held and no merge runs again this boot\n"
         )),
+        Event::Retired => {
+            output::arguments(format_args!(
+                "TRANSLATIONS retired: the file's only room was where the segments read at boot \
+                 lay; their records are read no more and compile instead\n"
+            ));
+            for lock in &STORES {
+                lock.with(|store| store.as_mut().map(Store::retire));
+            }
+        }
         Event::Released { room, bytes, lost } => output::arguments(format_args!(
             "TRANSLATIONS released room={}M bytes={}M lost={lost}: the heap is nearly full; \
              the segments stay in the file and no more are added this boot\n",
@@ -1594,6 +1588,7 @@ pub fn step() {
         let idle = held.writer.idle();
         let deadline = started + super::host::COUNTER_HZ * STEP_MICROS / 1_000_000;
         let queued = &mut held.queued;
+        let reads = &mut held.reads;
         let stepped = held.writer.step(
             &mut super::host::fresh_counter,
             deadline,
@@ -1607,6 +1602,9 @@ pub fn step() {
                     };
                     execution.advance(&mut target, writer::PIECE_BYTES)
                 })
+            },
+            &mut |asked| {
+                lend_staged_partition(|device| reads.step(device, extents, asked));
             },
         );
         match stepped {
@@ -1627,32 +1625,119 @@ const MAX_FLIGHTS: usize = 16;
 /// microseconds, so a step stays far from a PE's exit bound.
 const DECODES_PER_STEP: usize = 8;
 /// A mean read latency past this (microseconds) is a disk whose reads
-/// seek: lookups no longer ask it, and the reader only reads ahead.
+/// seek: the reader reads ahead in the order the records lie in the file,
+/// and keeps only the reads lookups asked for that end within
+/// [`QUEUE_MICROS`].
 const SLOW_READ_MICROS: u64 = 3_000;
+/// The longest a lookup's read may wait on a disk whose reads seek: the
+/// host replay of a sign-in over a seeking disk (9 ms a read, one at a
+/// time) serves 97.8 % of the pack's lookups with a 1 s bound, read-ahead in
+/// layout order and the records laid out after each asked (1 GiB cache).
+const QUEUE_MICROS: u64 = 1_000_000;
+/// The records laid out after one a lookup asked for that the reader reads
+/// next: those the boot that laid them out used after it, a launch's.
+const LAUNCH: usize = 16;
+/// The most of those waiting to be read.
+const LAUNCH_QUEUE: usize = 256;
 
-/// One record being read: what was asked, each piece's blocks and where
-/// the record starts in them, the reads in flight (segment, tag, where its
-/// bytes go), when it started, and whether a read failed.
+/// One read of `bytes` bytes of the pack file at `at` in flight: the
+/// blocks' buffer, where the bytes start in it, and the device reads (tag,
+/// where each lands in the buffer).
+struct FileRead {
+    buffer: Vec<u8>,
+    skip: usize,
+    bytes: usize,
+    reads: Vec<(u32, usize)>,
+    failed: bool,
+}
+
+impl FileRead {
+    /// Start the read: `None` when the range is outside the file or the
+    /// device refused a command.
+    fn start(
+        device: &mut dyn BlockDevice,
+        extents: &[Extent],
+        at: u64,
+        bytes: u64,
+    ) -> Option<Self> {
+        let block = u64::from(device.identity().block_size).max(1);
+        let start = at / block * block;
+        let end = at.checked_add(bytes)?.next_multiple_of(block);
+        let ranges = journal::device_ranges(extents, block, start, end - start)?;
+        let mut read = Self {
+            buffer: vec![0; (end - start) as usize],
+            skip: (at - start) as usize,
+            bytes: bytes as usize,
+            reads: Vec::new(),
+            failed: false,
+        };
+        for (lba, length, from) in ranges {
+            let command = stela_drivers::block::Command::Read {
+                lba,
+                bytes: length as usize,
+            };
+            let tag = device.start_more(command).ok()?;
+            read.reads.push((tag, from));
+        }
+        Some(read)
+    }
+
+    /// Take the device reads that ended: whether every one did.
+    fn poll(&mut self, device: &mut dyn BlockDevice) -> bool {
+        let (buffer, failed) = (&mut self.buffer, &mut self.failed);
+        self.reads.retain(|&(tag, from)| match device.finish(tag) {
+            None => true,
+            Some(Ok(Some(data))) => {
+                match buffer.get_mut(from..from + data.len()) {
+                    Some(into) => into.copy_from_slice(&data),
+                    None => *failed = true,
+                }
+                false
+            }
+            Some(_) => {
+                *failed = true;
+                false
+            }
+        });
+        self.reads.is_empty()
+    }
+
+    /// The bytes read, once every device read ended: `None` when one failed.
+    fn bytes(&self) -> Option<&[u8]> {
+        (!self.failed).then(|| &self.buffer[self.skip..self.skip + self.bytes])
+    }
+}
+
+/// One record being read: what was asked, each piece's read, when it
+/// started, and whether a read could not start.
 struct Flight {
     wanted: pack::Wanted,
-    buffers: [Option<(Vec<u8>, usize)>; pack::MAX_SEGMENTS],
-    reads: Vec<(usize, u32, usize)>,
+    reads: [Option<FileRead>; pack::MAX_SEGMENTS],
     started: u64,
     failed: bool,
 }
 
-/// The reader of a pack read on demand: each segment's offset in the file
-/// (`None` for one held whole), the pack file's extents, the records in
-/// flight, the mean and longest time a record took to read in counter
-/// ticks, the part asked next, and the records it gave up.
+/// The reader of a pack read on demand: the segments read (their indexes),
+/// each one's offset in the file (`None` for one held whole), the order
+/// their records lie in there, the pack file's extents, the records in
+/// flight, those laid out after a record a lookup asked for (to read
+/// next), how far reading ahead in layout order went, the mean and longest
+/// time a record took to read in counter ticks, the part asked next, and
+/// the records it gave up.
 struct Reader {
+    segments: Vec<Pack<'static>>,
     offsets: Vec<Option<u64>>,
+    order: alloc::sync::Arc<pack::LayoutOrder>,
     extents: Option<Vec<Extent>>,
     flights: Vec<Flight>,
+    launch: alloc::collections::VecDeque<(usize, u32)>,
+    cursor: (usize, usize),
     latency: u64,
     longest: u64,
     next: usize,
     failed: u64,
+    launched: u64,
+    dropped: u64,
 }
 
 static READER: Held<Reader> = Held::new();
@@ -1690,25 +1775,12 @@ impl Reader {
         let mut at = 0;
         while at < self.flights.len() && done.len() < DECODES_PER_STEP {
             let flight = &mut self.flights[at];
-            flight
-                .reads
-                .retain(|&(segment, tag, from)| match device.finish(tag) {
-                    None => true,
-                    Some(Ok(Some(data))) => {
-                        match flight.buffers[segment].as_mut() {
-                            Some((buffer, _)) if from + data.len() <= buffer.len() => {
-                                buffer[from..from + data.len()].copy_from_slice(&data);
-                            }
-                            _ => flight.failed = true,
-                        }
-                        false
-                    }
-                    Some(_) => {
-                        flight.failed = true;
-                        false
-                    }
-                });
-            if flight.reads.is_empty() {
+            // Every read polled, so each takes what ended.
+            let mut ended = true;
+            for read in flight.reads.iter_mut().flatten() {
+                ended &= read.poll(device);
+            }
+            if ended {
                 let flight = self.flights.swap_remove(at);
                 let took = super::host::fresh_counter().wrapping_sub(flight.started);
                 self.latency = (self.latency * 7 + took) / 8;
@@ -1726,32 +1798,92 @@ impl Reader {
         self.latency > super::host::COUNTER_HZ / 1_000_000 * SLOW_READ_MICROS
     }
 
-    /// Start reads while the disk has room: what lookups asked, the parts
-    /// in turn, else one record read ahead.
+    /// The next record to read: what lookups asked (on a seeking disk, those
+    /// that can end within [`QUEUE_MICROS`]), with the records laid out
+    /// after each queued to follow; else those,
+    /// the most used ahead on a disk that does not seek, and on one that
+    /// does the next in the order the file holds them.
+    fn take(&mut self) -> Option<pack::Wanted> {
+        let slow = self.slow();
+        // On a seeking disk, the reads that would wait past the bound.
+        let keep = match slow {
+            true => {
+                let latency = (self.latency * 1_000_000 / super::host::COUNTER_HZ).max(1);
+                (QUEUE_MICROS / latency) as usize / PARTS + 1
+            }
+            false => usize::MAX,
+        };
+        for _ in 0..PARTS {
+            let lock = &STORES[self.next % PARTS];
+            self.next = self.next.wrapping_add(1);
+            let (dropped, wanted) = lock.with(|store| match store.as_mut() {
+                Some(store) => (store.trim_wanted(keep), store.take_wanted()),
+                None => (0, None),
+            });
+            self.dropped += dropped as u64;
+            if let Some(wanted) = wanted {
+                let after = self.order.after(&self.segments, &wanted.key, LAUNCH);
+                if self.launch.len() + after.len() <= LAUNCH_QUEUE {
+                    self.launch.extend(after);
+                }
+                return Some(wanted);
+            }
+        }
+        while let Some((segment, index)) = self.launch.pop_front() {
+            if let Some(wanted) = self.claim(segment, index) {
+                self.launched += 1;
+                return Some(wanted);
+            }
+        }
+        if slow {
+            // In layout order, a bounded number of records looked at.
+            for _ in 0..pack::AHEAD_SCAN {
+                let (segment, n) = self.cursor;
+                self.segments.get(segment)?;
+                match self.order.nth(segment, n) {
+                    Some(index) => {
+                        self.cursor.1 += 1;
+                        if let Some(wanted) = self.claim(segment, index) {
+                            return Some(wanted);
+                        }
+                    }
+                    None => self.cursor = (segment + 1, 0),
+                }
+            }
+            return None;
+        }
+        for _ in 0..PARTS {
+            let lock = &STORES[self.next % PARTS];
+            self.next = self.next.wrapping_add(1);
+            let ahead = lock.with(|store| {
+                let store = store.as_mut()?;
+                store.ahead_room().then(|| store.take_ahead()).flatten()
+            });
+            if ahead.is_some() {
+                return ahead;
+            }
+        }
+        None
+    }
+
+    /// The record of index entry `index` of segment `segment`, to read
+    /// ahead, from the part that owns its key, while its cache has room.
+    fn claim(&self, segment: usize, index: u32) -> Option<pack::Wanted> {
+        let key = self.segments.get(segment)?.key_at(index as usize);
+        part(&key).with(|store| {
+            let store = store.as_mut()?;
+            store.ahead_room().then(|| store.claim(&key)).flatten()
+        })
+    }
+
+    /// Start reads while the disk has room.
     fn start(&mut self, device: &mut dyn BlockDevice, extents: &[Extent]) {
         let depth = device.depth().clamp(1, MAX_FLIGHTS);
         let mut started = false;
-        let mut tried = 0;
-        while self.flights.len() < depth && device.room() && tried < PARTS {
-            let lock = &STORES[self.next % PARTS];
-            self.next = self.next.wrapping_add(1);
-            let slow = self.slow();
-            let taken = lock.with(|store| {
-                let store = store.as_mut()?;
-                let wanted = if slow { None } else { store.take_wanted() };
-                match wanted {
-                    Some(wanted) => Some(wanted),
-                    None if store.ahead_room() => {
-                        store.take_ahead(|key| core::ptr::eq(part(key), lock))
-                    }
-                    None => None,
-                }
-            });
-            let Some(wanted) = taken else {
-                tried += 1;
-                continue;
+        while self.flights.len() < depth && device.room() {
+            let Some(wanted) = self.take() else {
+                break;
             };
-            tried = 0;
             match self.flight(device, extents, wanted) {
                 Some(flight) => {
                     started = true;
@@ -1759,7 +1891,7 @@ impl Reader {
                 }
                 None => {
                     self.failed += 1;
-                    let evicted = lock.with(|store| {
+                    let evicted = part(&wanted.key).with(|store| {
                         store
                             .as_mut()
                             .map(|store| store.finish_read(&wanted.key, 0, None))
@@ -1780,53 +1912,42 @@ impl Reader {
         extents: &[Extent],
         wanted: pack::Wanted,
     ) -> Option<Flight> {
-        let block = u64::from(device.identity().block_size).max(1);
         let mut flight = Flight {
             wanted,
-            buffers: Default::default(),
-            reads: Vec::new(),
+            reads: Default::default(),
             started: super::host::fresh_counter(),
             failed: false,
         };
+        let mut any = false;
         for (segment, piece) in wanted.pieces.iter().enumerate() {
             let (Some((offset, bytes)), Some(Some(base))) = (*piece, self.offsets.get(segment))
             else {
                 continue;
             };
-            let at = base.checked_add(offset)?;
-            let start = at / block * block;
-            let end = at.checked_add(bytes)?.next_multiple_of(block);
-            let ranges = journal::device_ranges(extents, block, start, end - start)?;
-            flight.buffers[segment] =
-                Some((vec![0; (end - start) as usize], (at - start) as usize));
-            for (lba, length, from) in ranges {
-                let command = stela_drivers::block::Command::Read {
-                    lba,
-                    bytes: length as usize,
-                };
-                let tag = device.start_more(command).ok()?;
-                flight.reads.push((segment, tag, from));
-            }
+            let read = FileRead::start(device, extents, base.checked_add(offset)?, bytes);
+            flight.failed |= read.is_none();
+            any |= read.is_some();
+            flight.reads[segment] = read;
         }
-        (!flight.reads.is_empty()).then_some(flight)
+        any.then_some(flight)
     }
 
     /// Decode a flight's record, outside the store's lock, and give it to
     /// the store; a failed read is given up, to be asked for again.
     fn decode(&mut self, flight: Flight) {
-        self.failed += u64::from(flight.failed);
+        let mut read: [Option<&[u8]>; pack::MAX_SEGMENTS] = [None; pack::MAX_SEGMENTS];
+        let mut failed = flight.failed;
+        for (slot, file) in read.iter_mut().zip(&flight.reads) {
+            if let Some(file) = file {
+                *slot = file.bytes();
+                failed |= slot.is_none();
+            }
+        }
+        self.failed += u64::from(failed);
         let key = flight.wanted.key;
         let lock = part(&key);
         let bytes = flight.wanted.bytes();
-        let mut read: [Option<&[u8]>; pack::MAX_SEGMENTS] = [None; pack::MAX_SEGMENTS];
-        for (segment, slot) in read.iter_mut().enumerate() {
-            if let (Some((buffer, skip)), Some((_, length))) =
-                (&flight.buffers[segment], flight.wanted.pieces[segment])
-            {
-                *slot = buffer.get(*skip..*skip + length as usize);
-            }
-        }
-        let source = (!flight.failed)
+        let source = (!failed)
             .then(|| {
                 lock.with(|store| {
                     let store = store.as_mut()?;
@@ -1850,19 +1971,71 @@ impl Reader {
     }
 }
 
+/// The reads of the pack file the writer's merges ask for
+/// ([`pack::FileReads`]), on the staged partition: those in flight by id.
+#[derive(Default)]
+struct WriterReads {
+    flights: Vec<(u64, FileRead)>,
+}
+
+impl WriterReads {
+    /// Take the reads that ended and start those asked while the disk has
+    /// room, never waiting for it.
+    fn step(
+        &mut self,
+        device: &mut dyn BlockDevice,
+        extents: &[Extent],
+        reads: &mut pack::FileReads,
+    ) {
+        let mut at = 0;
+        while at < self.flights.len() {
+            if self.flights[at].1.poll(device) {
+                let (id, read) = self.flights.swap_remove(at);
+                reads.finish(id, read.bytes().map(<[u8]>::to_vec));
+            } else {
+                at += 1;
+            }
+        }
+        let depth = device.depth().clamp(1, MAX_FLIGHTS);
+        let mut started = false;
+        while self.flights.len() < depth && device.room() {
+            let Some((id, offset, bytes)) = reads.take_asked() else {
+                break;
+            };
+            match FileRead::start(device, extents, offset, bytes) {
+                Some(read) => {
+                    started = true;
+                    self.flights.push((id, read));
+                }
+                None => reads.finish(id, None),
+            }
+        }
+        if started {
+            device.commit();
+        }
+    }
+}
+
 /// Report the reader: the records left in the file it read, the time a
 /// record took (mean and longest), whether lookups stopped asking a slow
 /// disk, and the reads it gave up.
 fn report_reader(counters: &pack::Counters) {
-    let Some((latency, longest, slow, failed)) =
-        READER.with(|reader| (reader.latency, reader.longest, reader.slow(), reader.failed))
-    else {
+    let Some((latency, longest, slow, failed, launched, dropped)) = READER.with(|reader| {
+        (
+            reader.latency,
+            reader.longest,
+            reader.slow(),
+            reader.failed,
+            reader.launched,
+            reader.dropped,
+        )
+    }) else {
         return;
     };
     let micros = |ticks: u64| ticks * 1_000_000 / super::host::COUNTER_HZ;
     output::arguments(format_args!(
-        "TRANSLATIONS reader awaited={} read={} read_mb={} ahead={} mean_us={} longest_us={} \
-         slow={slow} failed={failed}\n",
+        "TRANSLATIONS reader awaited={} read={} read_mb={} ahead={} launched={launched} \
+         dropped={dropped} mean_us={} longest_us={} slow={slow} failed={failed}\n",
         counters.awaited,
         counters.read,
         counters.read_bytes >> 20,
@@ -1885,7 +2058,7 @@ pub fn write() {
         output::arguments(format_args!(
             "TRANSLATIONS writer steps={} longest_us={} segments={} records={} bytes={} \
              pressed={} held={} pairs={} merges={} sheds={} resident_peak={}M released={} \
-             arena={}M/{}M compacted={}/{}M\n",
+             merge_reads={} merge_read_mb={} abandoned={}\n",
             held.steps,
             held.longest * 1_000_000 / super::host::COUNTER_HZ,
             stats.deltas,
@@ -1898,10 +2071,9 @@ pub fn write() {
             stats.sheds,
             stats.resident_peak >> 20,
             held.writer.shedding().1,
-            held.writer.arena().0 >> 20,
-            (held.writer.arena().0 + held.writer.arena().1) >> 20,
-            stats.compactions,
-            stats.compacted >> 20,
+            stats.file_reads,
+            stats.file_read_bytes >> 20,
+            stats.abandoned,
         ));
         let name = pack_name(&translations::translator_id());
         let stopped = held.writer.stop(&mut Parts, &mut |execution| {

@@ -793,6 +793,8 @@ fn the_translator_id_covers_every_engine_item_its_inputs_name() {
                 "crate::machine::Preparation",
                 "crate::machine::Translations",
                 "crate::machine::test_preparation",
+                "crate::platform::sync::Mutex",
+                "crate::platform::sync::MutexGuard",
                 "crate::translations::PAGE_BYTES",
                 "crate::translations::translator_id",
             ],
