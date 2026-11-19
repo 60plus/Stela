@@ -370,7 +370,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.cpu.pstate.pan = !self.cpu.pstate.pan;
             self.sync_host_regime(step_timing::SyncSource::NativePan);
         }
-        let remaining = self.chain.budget().load(Ordering::Relaxed);
+        let exhausted = self.chain.exhausted();
         let (block, retired, hits, _) = self.chain.completed();
         let (cell_probes, sampled_cell) = self.chain.cell_probes();
         self.statistics.cell_probes += cell_probes;
@@ -382,11 +382,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.promote_hot_exits();
         }
         // A link spends a transfer and counts nothing else.
-        let chained = if remaining > budget {
-            budget
-        } else {
-            budget - remaining
-        };
+        let chained = self.chain.chained();
         let last = (block & u64::from(u32::MAX)) as usize;
         // A block another PE retired since this run entered it is still
         // in its slot: the slot is given again only after this PE's grace.
@@ -398,7 +394,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // A sampled run whose budget ran out was in `last` at a uniformly
         // chosen transfer (`step_timing::HotBlocks`).
         if sampled
-            && remaining > budget
+            && exhausted
             && let Some(block) = self.code.blocks.get(last)
         {
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);
@@ -471,7 +467,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if let Some(count) = self.statistics.exit_kinds.get_mut(kind as usize) {
                     *count += 1;
                 }
-                let probed = self.lookup_miss(last, next_pc, kind, remaining > budget);
+                let probed = self.lookup_miss(last, next_pc, kind, exhausted);
                 if let Some(miss) = probed {
                     self.statistics.lookup_misses[miss] += 1;
                 }
@@ -490,7 +486,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // (`step_timing::numerical_key`, `pointer_key`).
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
-                let spent = remaining > budget;
+                let spent = exhausted;
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
                 self.trace_point_now(step_timing::PATH_SERVED);

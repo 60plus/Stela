@@ -143,7 +143,7 @@ impl World {
             table.insert(table.slot(pc, KEY), entry(region, target));
         }
         let control = Box::new(ChainControl {
-            budget: u64::MAX / 2,
+            account: ChainControl::account_of(1 << 31, 0),
             table: table.address(),
             itlb: itlb.address(),
             contexts: CONTEXTS,

@@ -1275,7 +1275,7 @@ pub fn instruction_counter_thunk(
     );
     let closed = asm.jcc(Cond::E);
     asm.place(Rax, super::chain::CONTROL_PLACE);
-    asm.mov_load(Qword, Rdx, Mem::base(Rax, super::chain::RETIRED_OFFSET));
+    super::chain::account_retired(&mut asm, Rdx, Rax);
     if before != 0 {
         asm.alu_imm32(Alu::Add, Qword, Rdx, before);
     }
@@ -2867,8 +2867,9 @@ mod tests {
                 steps: [0; crate::x86_64::transition::STATES],
             },
         });
+        // A budget beside the instructions, which the read leaves out.
         let mut control = alloc::boxed::Box::new(ChainControl {
-            retired: 40,
+            account: ChainControl::account_of(3, 40),
             ..ChainControl::default()
         });
         let read = instruction_counter_thunk(PC, 3, CELL, PLAIN, COUNTER, 5).unwrap();
@@ -2892,25 +2893,25 @@ mod tests {
             }
         );
         // Open: its value until the cell closes again.
-        control.retired = 400;
+        control.set_retired(400);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], 1_045);
         cells.cell.readable = 0;
-        for retired in [0, 1, 400, 1 << 40] {
-            control.retired = retired;
+        for retired in [0, 1, 400, crate::x86_64::chain::ACCOUNT_RETIRED] {
+            control.set_retired(retired);
             assert_eq!(run(&read.code, &mut state), NEXT, "{retired}");
             assert_eq!(Some(state.x[3]), cells.counter.at(retired + 5), "{retired}");
             cells.cell.readable = 0;
         }
         // Wrapped to the counter's width.
-        control.retired = 0;
+        control.set_retired(0);
         cells.counter.base = u64::MAX >> 16;
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], 4);
         cells.cell.readable = 0;
         // Not counting: the count as it stands.
         cells.counter.step = 0;
-        control.retired = 1 << 40;
+        control.set_retired(crate::x86_64::chain::ACCOUNT_RETIRED);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], u64::MAX >> 16);
         cells.cell.readable = 0;
@@ -2930,7 +2931,7 @@ mod tests {
             overflow: 0,
             steps: [0; crate::x86_64::transition::STATES],
         };
-        control.retired = 7;
+        control.set_retired(7);
         let discard = instruction_counter_thunk(PC, 31, CELL, PLAIN, COUNTER, 0).unwrap();
         assert!(discard.code.len() < read.code.len());
         assert_eq!(run(&discard.code, &mut state), NEXT);
@@ -2941,12 +2942,12 @@ mod tests {
         cells.counter.overflow = 1 << 63;
         cells.counter.base = (1 << 63) - 13;
         cells.cell.readable = 0;
-        control.retired = 7;
+        control.set_retired(7);
         assert_eq!(run(&read.code, &mut state), NEXT);
         assert_eq!(state.x[3], (1 << 63) - 1);
         assert_eq!(cells.counter.at(12), Some((1 << 63) - 1));
         cells.cell.readable = 0;
-        control.retired = 8;
+        control.set_retired(8);
         state.x[3] = 0xdead;
         assert_eq!(cells.counter.at(13), None);
         assert_eq!(run(&read.code, &mut state), MISS);

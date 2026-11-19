@@ -158,7 +158,7 @@ impl Run {
     fn new(bound: u32) -> Self {
         let mut epoch = Box::new(7);
         let control = Box::new(ChainControl {
-            budget: 100,
+            account: ChainControl::account_of(100, 0),
             block: CALLER,
             contexts: CONTEXTS,
             frame_room: bound * FRAME_BYTES as u32,
@@ -205,11 +205,11 @@ fn a_return_to_its_call_takes_the_continuation() {
     // The return counted its block and named the caller again, with the
     // BTYPE a continuation enters with.
     assert_eq!(
-        (run.control.retired, run.control.block),
+        (run.control.retired(), run.control.block),
         (u64::from(RAN), CALLER & 0xffff_ffff)
     );
     // The continuation's own transfer spends the budget, not the return.
-    assert_eq!(run.control.budget, 100);
+    assert_eq!(run.control.budget(), 100);
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn a_return_elsewhere_takes_the_lookup_and_leaves_the_frame() {
     // the exit's return reaches the entry all the same.
     assert_eq!(run.enter(&code, 0, OTHER), (OTHER, RETURNED));
     assert_eq!(run.pairs(), [0, 1, 0]);
-    assert_eq!(run.control.retired, 0);
+    assert_eq!(run.control.retired(), 0);
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn what_runs_between_call_and_return_decides_the_frame() {
 fn no_budget_left_takes_the_exit() {
     let code = pages(&call_and_return(Callee::Return));
     let mut run = Run::new(DEFAULT_FRAME_BOUND);
-    run.control.budget = 0;
+    run.control.set_budget(0);
     assert_eq!(run.enter(&code, 0, RETURN), (RETURN, RETURNED));
     assert_eq!(run.pairs(), [0, 1, 0]);
 }
@@ -369,7 +369,7 @@ fn recursion_past_the_bound_refuses_the_deeper_frames() {
             [pushed, 0, depth - 1 - pushed],
             "{bound} {depth}"
         );
-        assert_eq!(run.control.retired, pushed * u64::from(RAN));
+        assert_eq!(run.control.retired(), pushed * u64::from(RAN));
         // The frames are all the stack the recursion took.
         let used = entered - *deepest;
         assert!(
@@ -663,7 +663,7 @@ fn paired_and_looked_up_return_costs() {
             }
             let stamps = table.new_stamps();
             let mut run = Run::new(DEFAULT_FRAME_BOUND);
-            run.control.budget = u64::MAX / 2;
+            run.control.set_budget(1 << 31);
             run.control.table = table.address();
             run.control.itlb = itlb.address();
             run.control.salts = [itlb.salt(CONTEXTS[0]), itlb.salt(CONTEXTS[1])];

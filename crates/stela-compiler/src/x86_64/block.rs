@@ -375,8 +375,8 @@ struct LoopExits {
 /// `GuestState::loop_retired`.
 const LOOP_RETIRED: u32 = core::mem::offset_of!(crate::GuestState, loop_retired) as u32;
 
-/// Move `GuestState::loop_retired`, less `less`, to the chain's retired
-/// count and clear it, before an exit of a [`SelfLoop`].
+/// Move `GuestState::loop_retired`, less `less`, to the instructions the
+/// chain's account counts and clear it, before an exit of a [`SelfLoop`].
 fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
     asm.mov_load(Size::Qword, Gpr::Rax, super::frame(LOOP_RETIRED));
     if less != 0 {
@@ -386,7 +386,7 @@ fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
     asm.alu(
         Alu::Add,
         Size::Qword,
-        Mem::base(Gpr::Rcx, super::chain::RETIRED_OFFSET),
+        Mem::base(Gpr::Rcx, super::chain::ACCOUNT_OFFSET),
         Gpr::Rax,
     );
     // The engine's counts, while it profiles: the entry and what its

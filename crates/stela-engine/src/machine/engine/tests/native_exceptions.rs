@@ -820,7 +820,7 @@ fn run_retired(machine: &mut Machine<FakeHost, NoDevices>, retired: u64) {
     let control = machine.chain.address() as *mut chain::ChainControl;
     // SAFETY: the machine's own control, which no native code runs over
     // meanwhile.
-    unsafe { core::ptr::addr_of_mut!((*control).retired).write(retired) };
+    unsafe { (*control).set_retired(retired) };
 }
 
 /// PMC0 and PMC1 as their thunks read them within a native run, after it

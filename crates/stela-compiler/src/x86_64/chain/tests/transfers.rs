@@ -338,7 +338,7 @@ impl Program {
         assert!(stub.len() <= BLOCKS_AT);
         arena.write(STUB_AT, &stub);
         let control = Box::new(ChainControl {
-            budget: 1 << 20,
+            account: ChainControl::account_of(1 << 20, 0),
             ..ChainControl::default()
         });
         Self {
@@ -664,16 +664,16 @@ fn the_cost_decoder_classes_transfer_instructions() {
 fn transfers_cost_what_their_path_runs() {
     let costs = transfer_costs();
     let expected = [
-        ("b forward", Cost::new(7, 1, 1, 2)),
-        ("b back", Cost::new(10, 3, 1, 2)),
-        ("cbz back, fallthrough", Cost::new(9, 1, 1, 2)),
-        ("cbz back, taken", Cost::new(13, 3, 1, 2)),
-        ("cbz forward, side exit", Cost::new(9, 1, 1, 2)),
+        ("b forward", Cost::new(6, 1, 1, 1)),
+        ("b back", Cost::new(9, 3, 1, 1)),
+        ("cbz back, fallthrough", Cost::new(8, 1, 1, 1)),
+        ("cbz back, taken", Cost::new(12, 3, 1, 1)),
+        ("cbz forward, side exit", Cost::new(8, 1, 1, 1)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.
     assert_eq!(loop_iteration(true), Cost::new(6, 1, 0, 1));
-    assert_eq!(loop_iteration(false), Cost::new(13, 3, 1, 2));
+    assert_eq!(loop_iteration(false), Cost::new(12, 3, 1, 1));
 }
 
 /// The scanner's linked blocks count what they ran: its counts, the
@@ -686,13 +686,13 @@ fn a_linked_scanner_counts_every_transfer_and_instruction() {
     let mut program = Program::new(&SCANNER, 0, true);
     assert_eq!(program.blocks.len(), 6);
     let mut frame = scanner_frame(&mut program, &text);
-    let budget = program.control.budget;
+    let budget = program.control.budget();
     let (next, _) = program.run(&mut frame);
     assert_eq!(next, BASE + 15 * 4);
     assert_eq!((frame.x[9], frame.x[12], frame.x[14]), (words, lines, 0));
     let control = &program.control;
-    assert_eq!(control.retired, retired);
-    assert_eq!(budget - control.budget, transfers);
+    assert_eq!(control.retired(), retired);
+    assert_eq!(budget - control.budget(), transfers);
 }
 
 /// The host time and instructions the scanner takes per guest instruction
@@ -713,7 +713,7 @@ fn scanner_time_on_this_host() {
     for _ in 0..5 {
         let start = std::time::Instant::now();
         for _ in 0..REPEATS {
-            program.control.budget = 1 << 20;
+            program.control.set_budget(1 << 20);
             let mut frame = scanner_frame(&mut program, &text);
             program.run(&mut frame);
         }

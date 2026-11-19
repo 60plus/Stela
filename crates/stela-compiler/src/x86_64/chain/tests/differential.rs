@@ -80,10 +80,9 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.pop(R8);
     asm.mov(Dword, R8, R8);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
+    misses.push(spend_transfer(&mut asm, policy));
     asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
     for miss in misses {
@@ -159,10 +158,9 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let torn = legacy_seqlock_check(&mut asm);
     asm.pop(R9);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
+    misses.push(spend_transfer(&mut asm, policy));
     asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     for bit in 0..2 {
         if btype & 1 << bit != 0 {
@@ -439,8 +437,7 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         put(&old, 0, &stub);
         put(&old, 3, &before);
         let base = ChainControl {
-            budget: [0, 1, 2, 5][rng.below(4) as usize],
-            retired: 100,
+            account: ChainControl::account_of([0, 1, 2, 5][rng.below(4) as usize], 100),
             block: 7,
             contexts: match rng.below(4) {
                 0 => [
@@ -569,7 +566,7 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
         let stamps = fresh[next.get()];
         next.set(next.get() + 1);
         let mut control = ChainControl {
-            budget: 5,
+            account: ChainControl::account_of(5, 0),
             contexts: [CONTEXTS[0], CONTEXTS[1]],
             table: table.address(),
             itlb: itlb.address(),

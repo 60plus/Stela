@@ -256,9 +256,11 @@ fn prepare(state: &mut GuestState) {
                 .cast::<u64>()
                 .write(area as u64);
         }
-        // ChainControl's budget, open tag words for the cipher, and the
+        // ChainControl's account, open tag words for the cipher, and the
         // pointer routine.
-        anchors.cast::<u64>().write(u64::MAX / 2);
+        anchors
+            .cast::<u64>()
+            .write(super::chain::ChainControl::account_of(1 << 31, 0));
         for key in 0..pointer::TAG_WORDS {
             anchors
                 .add(3 << 16)
