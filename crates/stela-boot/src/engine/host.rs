@@ -653,6 +653,8 @@ pub struct State {
     /// bank's root, for each range).
     pub empty_tlbis: u64,
     pub unmap_walks: u64,
+    /// TSC ticks of the shadow's part of TLBIs that did not reach it all.
+    pub scoped_ticks: u64,
     /// The TSC ticks of all fills by segment: the fault's walk, its
     /// mapping (with the leaf's prefill), fault-around and restores.
     pub fill_segments: [u64; 3],
@@ -884,6 +886,7 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             gate_fills: 0,
             empty_tlbis: 0,
             unmap_walks: 0,
+            scoped_ticks: 0,
             fill_segments: [0; 3],
             stray: 0,
             placement: config.placement,
@@ -937,6 +940,8 @@ pub struct Statistics {
     /// [`State::empty_tlbis`] and [`State::unmap_walks`].
     pub empty_tlbis: u64,
     pub unmap_walks: u64,
+    /// Nanoseconds of [`State::scoped_ticks`].
+    pub scoped_ns: u64,
     /// Resets of the whole shadow, those because a half ran out of frames,
     /// of the lower half alone, and TLBIs that unmapped ranges instead.
     pub resets: u64,
@@ -999,6 +1004,8 @@ pub fn statistics() -> Statistics {
         gate_fills: state.gate_fills,
         empty_tlbis: state.empty_tlbis,
         unmap_walks: state.unmap_walks,
+        scoped_ns: (u128::from(state.scoped_ticks) * 1_000_000_000
+            / u128::from(state.tsc_hz.max(1))) as u64,
         fill_segment_ns: state.fill_segments.map(|ticks| {
             (u128::from(ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1))) as u64
         }),

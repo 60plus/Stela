@@ -91,7 +91,7 @@ impl TranslatedSeen {
 #[derive(Default)]
 pub(super) struct ShadowSeen {
     pub(super) counts: [u64; 29],
-    pub(super) gate: [u64; 6],
+    pub(super) gate: [u64; 7],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
@@ -119,7 +119,8 @@ impl ShadowSeen {
     /// #PF gate made without saving extended state, and a fill's mean time
     /// by segment: its walk, its mapping and prefill, fault-around and
     /// restores; then the TLBIs by address that reached nothing of the
-    /// shadow and the root walks the others' unmapping took.
+    /// shadow, the root walks the others' unmapping took, and the mean
+    /// nanoseconds of the shadow's part of each.
     pub(super) fn report(&mut self) {
         let host = host::statistics();
         let counts = [
@@ -160,6 +161,7 @@ impl ShadowSeen {
             host.fill_segment_ns[2],
             host.empty_tlbis,
             host.unmap_walks,
+            host.scoped_ns,
         ];
         let [
             fills,
@@ -193,7 +195,7 @@ impl ShadowSeen {
             restored,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
-        let [gate_fills, walk_ns, map_ns, around_ns, empty_tlbis, unmap_walks] =
+        let [gate_fills, walk_ns, map_ns, around_ns, empty_tlbis, unmap_walks, scoped_ns] =
             core::array::from_fn(|index| gate[index] - self.gate[index]);
         self.gate = gate;
         let fill_ns_each = fill_ns / fills.max(1);
@@ -231,7 +233,9 @@ impl ShadowSeen {
              table_walks={table_walks} frames={frames} reclaimed={reclaimed} \
              restored={restored} gate_fills={gate_fills} walk_ns_each={walk_ns_each} \
              map_ns_each={map_ns_each} around_ns_each={around_ns_each} \
-             empty_tlbis={empty_tlbis} unmap_walks={unmap_walks}\n"
+             empty_tlbis={empty_tlbis} unmap_walks={unmap_walks} \
+             scoped_ns_each={}\n",
+            scoped_ns / scoped.max(1)
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0

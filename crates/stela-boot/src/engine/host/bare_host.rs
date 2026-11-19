@@ -584,6 +584,7 @@ impl Host for BareHost<'_> {
     }
 
     fn invalidate_reach(&mut self, reach: Reach, everywhere: Everywhere) {
+        let entered = rdtsc();
         let state = state();
         // A TLBI of everything that empties the shadow below drops the
         // kept halves with the lower half's frames: no table of theirs
@@ -688,6 +689,7 @@ impl Host for BareHost<'_> {
         } else {
             state.scoped += 1;
         }
+        state.scoped_ticks += rdtsc().wrapping_sub(entered);
     }
 
     fn profile_ticks(&mut self) -> u64 {
