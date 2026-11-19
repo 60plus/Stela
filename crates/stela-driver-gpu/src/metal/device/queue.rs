@@ -926,6 +926,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             let surfaces = core::mem::take(&mut commands.surfaces);
             let writes = core::mem::take(&mut commands.written);
             let seeds = core::mem::take(&mut commands.seeds);
+            if self.passes_profiled() {
+                let in_place = self.planes_in_place(&surfaces);
+                self.note_plane_counts(pass_times::PlaneCounts {
+                    in_place,
+                    ..Default::default()
+                });
+            }
             let (lead, tail) = self.aligned_copy_commands(&written, &surfaces, &seeds, &writes);
             commands.surround(lead, tail);
         }

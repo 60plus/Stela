@@ -32,7 +32,8 @@
 //! The planes stay what the display, the CPU and other processes' textures
 //! read. A texture only sampled, as another process's over a surface it
 //! does not render, keeps no copy and samples the planes in guest RAM:
-//! correct, since they hold what the surface does, but across the bus.
+//! correct, since they hold what the surface does, but across the bus,
+//! which the profile counts (`in_place` in GPU PASSES).
 use super::{Backing, Device, TestedCopyObject, TextureId, TextureObject};
 use crate::metal::{
     abi::TextureUsage,
@@ -504,6 +505,37 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     && y + height <= texture.descriptor.height;
                 (fits && self.device_copy_holds_rows(TextureId(id))).then_some(copy)
             })
+    }
+
+    /// How many of a command buffer's reported textures sample extended-range
+    /// planes in guest RAM on a GPU of its own memory: textures of such
+    /// planes, or views of one, that keep no device copy. Correct, as the
+    /// planes hold what the surface does, but each sample crosses the bus.
+    pub(in crate::metal::device) fn planes_in_place(&self, surfaces: &[super::SurfaceNote]) -> u64 {
+        if self.capabilities.has_unified_memory {
+            return 0;
+        }
+        let root = |mut id: TextureId| {
+            for _ in 0..8 {
+                let parent = self.resources.textures.get(id.0).ok()?.parent;
+                match parent {
+                    Some(parent) => id = parent,
+                    None => return Some(id),
+                }
+            }
+            None
+        };
+        let in_place = surfaces
+            .iter()
+            .filter_map(|note| root(note.texture?))
+            .filter(|id| {
+                self.resources
+                    .extended_planes
+                    .get(&id.0)
+                    .is_some_and(|state| state.copy.is_none())
+            })
+            .count();
+        in_place as u64
     }
 
     /// Whether `id` is an IOSurface texture of extended-range planes.
@@ -1276,7 +1308,7 @@ mod tests {
     /// with the planes. A pass after another texture over
     /// the same surface stored it in the same command buffer refreshes the
     /// copy first. A texture only sampled, and any over unified memory,
-    /// keeps none.
+    /// keeps none; the former's uses are counted for the profile.
     #[test]
     fn rendered_surfaces_keep_a_device_copy_their_shaders_sample() {
         let mut device = device();
@@ -1367,11 +1399,21 @@ mod tests {
             .new_extended_plane_texture(buffer, &sampled, PLANES)
             .unwrap();
         assert!(device.resources.extended_planes[&read.0].copy.is_none());
+        // Its reported uses sample the planes in guest RAM, which the
+        // profile counts; a buffer's or a copied texture's do not.
+        let note = |texture| crate::metal::device::resources::SurfaceNote {
+            texture,
+            surface: 7,
+            seed: 1,
+        };
+        let uses = [note(Some(read)), note(Some(texture)), note(None)];
+        assert_eq!(device.planes_in_place(&uses), 1);
         device.capabilities.has_unified_memory = true;
         let unified = device
             .new_extended_plane_texture(buffer, &rendered, PLANES)
             .unwrap();
         assert!(device.resources.extended_planes[&unified.0].copy.is_none());
+        assert_eq!(device.planes_in_place(&uses), 0, "in place by design");
         for texture in [texture, other, read, unified] {
             device.destroy_texture(texture).unwrap();
         }

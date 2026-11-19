@@ -358,6 +358,11 @@ pub struct PlaneCounts {
     /// Decodes, and their texels.
     pub decoded: u64,
     pub decoded_texels: u64,
+    /// Reported uses of such a texture without a device copy on a GPU of
+    /// its own memory, which samples the planes in guest RAM across the
+    /// bus: one only sampled, such as another process's over a surface it
+    /// does not render.
+    pub in_place: u64,
 }
 
 impl PlaneCounts {
@@ -370,6 +375,7 @@ impl PlaneCounts {
         self.stamped_tiles += other.stamped_tiles;
         self.decoded += other.decoded;
         self.decoded_texels += other.decoded_texels;
+        self.in_place += other.in_place;
     }
 }
 
@@ -495,7 +501,7 @@ impl fmt::Display for PassTimes {
             formatter,
             "GPU PASSES command_buffers={} spans={} busy_us={} out_of_marks={} per_cb=submits:{} \
              segments:{} passes:{} copies:{} copied_ktexels:{}/{} planes=direct:{}/{} \
-             copied:{}/{} stamped:{}/{} decoded:{}/{} top",
+             copied:{}/{} stamped:{}/{} decoded:{}/{} in_place:{} top",
             self.command_buffers,
             self.spans,
             self.busy_ns / 1000,
@@ -514,6 +520,7 @@ impl fmt::Display for PassTimes {
             self.planes.stamped_tiles,
             self.planes.decoded,
             self.planes.decoded_texels / 1000,
+            self.planes.in_place,
         )?;
         for (key, entry) in self.top().into_iter().take(SHOWN) {
             write!(
@@ -585,6 +592,7 @@ mod tests {
             stamped_tiles: 920,
             decoded: 1,
             decoded_texels: 2_000,
+            in_place: 4,
         });
         let top = times.top();
         assert_eq!(top[0].0, "render:a+b@2560x1440/Bgra8Unorm/linear-sys");
@@ -605,7 +613,7 @@ mod tests {
             "GPU PASSES command_buffers=1 spans=3 busy_us=6500 out_of_marks=0 \
              per_cb=submits:1.0/1 segments:1.0/1 passes:2.0/2 copies:1.0/1 \
              copied_ktexels:3686/3686 planes=direct:2/5 copied:1/3686 stamped:1/920 \
-             decoded:1/2 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0 \
+             decoded:1/2 in_place:4 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0 \
              store_texels:-:1/2500/2500/0/0/3686"
         );
         assert_eq!(times.take().spans, 3);
