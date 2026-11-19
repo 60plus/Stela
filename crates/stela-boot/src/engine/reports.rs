@@ -195,8 +195,15 @@ impl ShadowSeen {
             restored,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
-        let [gate_fills, walk_ns, map_ns, around_ns, empty_tlbis, unmap_walks, scoped_ns] =
-            core::array::from_fn(|index| gate[index] - self.gate[index]);
+        let [
+            gate_fills,
+            walk_ns,
+            map_ns,
+            around_ns,
+            empty_tlbis,
+            unmap_walks,
+            scoped_ns,
+        ] = core::array::from_fn(|index| gate[index] - self.gate[index]);
         self.gate = gate;
         let fill_ns_each = fill_ns / fills.max(1);
         let fault_ns_each = fault_ns / faults.max(1);
