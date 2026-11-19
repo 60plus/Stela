@@ -182,6 +182,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// An architectural cache epoch must never wrap back to an old permission.
     pub(super) fn advance_translation_generation(&mut self) {
+        self.mirrors.table_switch.forget();
         self.mirrors.close_code_page();
         self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
@@ -192,7 +193,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// What TTBR0 or its ASID selects may have changed.
-    fn advance_table_generation(&mut self) {
+    pub(super) fn advance_table_generation(&mut self) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
@@ -227,6 +228,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// one process leaves of the others', which their ITLB entries stay good
     /// for.
     pub(super) fn forget_asid(&mut self, halves: core::ops::RangeInclusive<usize>, asid: u16) {
+        self.mirrors.table_switch.forget();
         for half in halves {
             self.statistics.lookup_forgets[0] += 1;
             self.spaces[half].retain(|space| !same_asid(space, asid));
@@ -240,6 +242,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// for the context the PE translates in): the contexts of other
     /// regimes go, which it may have reached, and `regime`'s stay.
     fn forget_other_regimes(&mut self, regime: mmu::Regime) {
+        self.mirrors.table_switch.forget();
         let mut forgot = false;
         for half in 0..2 {
             if self.spaces[half].len() == 0 {
@@ -267,6 +270,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// [`Self::forget_spaces`] for a caller that advances the generation.
     fn forget_contexts(&mut self, halves: core::ops::RangeInclusive<usize>, cause: usize) {
+        // Native switches name contexts by number.
+        self.mirrors.table_switch.forget();
         let upper_stays = !halves.contains(&1);
         for half in halves {
             self.refill_after(half);

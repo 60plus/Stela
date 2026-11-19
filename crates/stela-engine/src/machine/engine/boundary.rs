@@ -429,6 +429,25 @@ pub trait Host {
     fn native_view(&mut self, _from: &Regime, _to: &Regime) -> Option<NativeView> {
         None
     }
+    /// The host's root sets as native TTBR0 switches load them
+    /// (`x86_64::table_switch::Sets`), and how native code reaches CR3:
+    /// `None` on a host whose translations need no CR3 load, where a native
+    /// switch changes the guest's state alone.
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        None
+    }
+    /// The set that holds what `controls` translate, as
+    /// [`Host::set_regime`] last kept it, if it differs from the current
+    /// regime's controls only in TTBR0 and a native switch may load it:
+    /// its index and generation (`x86_64::table_switch::Entry::set`).
+    fn native_set(&mut self, _controls: &mmu::Controls) -> Option<(u64, u64)> {
+        None
+    }
+    /// Whether [`Host::isolate_predictions`] issues IBPB and refills the
+    /// return stack, which a native TTBR0 switch then issues itself.
+    fn isolates_predictions(&self) -> bool {
+        false
+    }
     /// The PE invalidated instruction caches (IC IVAU of `Some(page)`, a
     /// physical page; IC IALLU or IALLUIS for `None`), which this machine
     /// already applied to its own compiled code. A host that runs other

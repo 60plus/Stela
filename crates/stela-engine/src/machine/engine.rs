@@ -57,6 +57,7 @@ mod pointer_authentication;
 mod regime_state;
 mod scheduler;
 mod system_access;
+mod table_switches;
 mod timing;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
@@ -155,7 +156,7 @@ use stela_compiler::{
     },
     x86_64::{
         MemoryChecks, NativeSystem, cache_clean, chain, native_exclusive,
-        pointer as x86_64_pointer, register_read, transition, zero_block,
+        pointer as x86_64_pointer, register_read, table_switch, transition, zero_block,
     },
 };
 pub use stela_contracts::bus::Transition;

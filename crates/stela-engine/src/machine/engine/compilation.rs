@@ -1775,7 +1775,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else if let Some(rt) = table_base_write(pc, word) {
             let cell = cell_place(TABLE_BASE_KEPT);
             let written = self.register_fixed_bits(SystemRegister::TTBR0_EL1);
-            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+            // Code in the lower half continues through a link its own
+            // half's translation found: only the upper half's survives a
+            // switch.
+            if chain::half(pc) == 1 {
+                let sets = self.host.native_sets();
+                self.mirrors.table_switch.sets = sets.map_or(0, |(at, _)| at);
+                let places =
+                    table_switch_places(sets.map(|(_, cr3)| cr3), self.host.isolates_predictions());
+                table_switch::switch_thunk(GuestAddress(pc), rt, cell, written, &places)
+            } else {
+                register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+            }
         } else if let Some((kept, rt)) = permission_write_word(word) {
             let all = register_read::Written {
                 keep: u64::MAX,

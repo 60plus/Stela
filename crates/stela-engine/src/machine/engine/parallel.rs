@@ -2481,6 +2481,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
+    /// Where native code publishes this PE's translating word and finds
+    /// its mail pending (`x86_64::table_switch::Table`), and the word a
+    /// regime's controls `controls` publish; zeros without a hub.
+    pub(super) fn switch_words(&self, controls: &mmu::Controls) -> (u64, u64, u64) {
+        let Some(hub) = &self.parallel else {
+            return (0, 0, 0);
+        };
+        let inbox = &hub.inboxes[self.current];
+        (
+            inbox.translating.as_ptr() as u64,
+            inbox.pending.as_ptr() as u64,
+            u64::from(context_word(controls.regime, mmu::current_asid(controls))),
+        )
+    }
+
     /// See [`GlobalSpan::widen`]: whether the leaf holding `address` widened
     /// this PE's span.
     pub(super) fn widen_lower_globals(&self, address: u64, size: u64) -> bool {

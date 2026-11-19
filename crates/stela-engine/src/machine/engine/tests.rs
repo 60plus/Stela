@@ -180,6 +180,75 @@ pub(super) struct FakeHost {
     pub(super) described: Vec<Described>,
     /// The idle marks of [`Host::profile_idle`], in order.
     pub(super) idle_marks: Vec<bool>,
+    /// Root sets a native TTBR0 switch loads, for the tests that give the
+    /// host some ([`FakeSets`]).
+    pub(super) sets: Option<Box<FakeSets>>,
+}
+
+/// A host's root sets as `x86_64::table_switch` reads them, one per TTBR0
+/// value, all of one class, and the word that stands for CR3: what
+/// [`Host::set_regime`] selects and native switches load.
+pub(super) struct FakeSets {
+    pub(super) sets: table_switch::Sets,
+    pub(super) cr3: u64,
+    /// The TTBR0 of each set made so far, and the current one.
+    pub(super) keys: Vec<u64>,
+    pub(super) current: usize,
+    /// Native switches the host followed.
+    pub(super) followed: usize,
+}
+
+/// Where [`FakeSets`] place set 0's first root.
+pub(super) const FAKE_SETS_BASE: u64 = 0x10_0000;
+
+impl FakeSets {
+    pub(super) fn new() -> Box<Self> {
+        let mut sets = table_switch::Sets {
+            open: 1,
+            base: FAKE_SETS_BASE,
+            tagged: 1,
+            ..table_switch::Sets::default()
+        };
+        sets.current = FAKE_SETS_BASE;
+        Box::new(Self {
+            sets,
+            cr3: FAKE_SETS_BASE | table_switch::FIRST_CONTEXT,
+            keys: Vec::new(),
+            current: 0,
+            followed: 0,
+        })
+    }
+
+    /// The root of set `set`'s first view.
+    pub(super) fn root(set: usize) -> u64 {
+        FAKE_SETS_BASE + (set * table_switch::SET_ROOTS) as u64 * 4096
+    }
+
+    /// Follow a native switch, then select the set of `ttbr0`.
+    fn select(&mut self, ttbr0: u64) {
+        let switched = core::mem::take(&mut self.sets.switched);
+        if switched != 0 {
+            self.current = switched as usize - 1;
+            self.followed += 1;
+        }
+        let set = match self.keys.iter().position(|&key| key == ttbr0) {
+            Some(set) => set,
+            None => {
+                self.keys.push(ttbr0);
+                let set = self.keys.len() - 1;
+                self.sets.classes[set] = 1;
+                self.sets.generations[set] = 1;
+                set
+            }
+        };
+        if self.keys.len() == 1 || set != self.current {
+            self.current = set;
+            let root = Self::root(set);
+            let context = table_switch::FIRST_CONTEXT + (set * table_switch::SET_ROOTS) as u64;
+            self.sets.current = root;
+            self.cr3 = root | context;
+        }
+    }
 }
 
 /// A described install: its code, length and regions.
@@ -343,6 +412,21 @@ impl Host for FakeHost {
     }
     fn set_regime(&mut self, regime: &Regime) {
         self.regimes.push(*regime);
+        if let Some(sets) = &mut self.sets {
+            sets.select(regime.controls.ttbr0);
+        }
+    }
+    fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
+        let sets = self.sets.as_ref()?;
+        Some((
+            &sets.sets as *const table_switch::Sets as u64,
+            table_switch::Cr3::Word(&sets.cr3 as *const u64 as u64),
+        ))
+    }
+    fn native_set(&mut self, controls: &mmu::Controls) -> Option<(u64, u64)> {
+        let sets = self.sets.as_ref()?;
+        let set = sets.keys.iter().position(|&key| key == controls.ttbr0)?;
+        Some((set as u64, sets.sets.generations[set]))
     }
     fn isolate_predictions(&mut self) {
         self.isolations += 1;
@@ -619,6 +703,7 @@ pub(super) fn board_on<D: Devices>(
         host_work_at: None,
         described: Vec::new(),
         idle_marks: Vec::new(),
+        sets: None,
     };
     let profile = CpuProfile {
         name: "test",

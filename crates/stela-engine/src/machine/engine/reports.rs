@@ -733,8 +733,10 @@ pub struct Statistics {
     /// everything.
     pub tlb_maintenance: u64,
     pub scoped_maintenance: u64,
-    /// TTBR0 writes, which drop the lower half's.
+    /// TTBR0 writes, which drop the lower half's, and those native code
+    /// completed (`x86_64::table_switch`).
     pub table_base_changes: u64,
+    pub native_table_switches: u64,
     /// Guest context changes at which the host isolated its branch
     /// predictions ([`PredictionContext`]).
     pub prediction_isolations: u64,
@@ -899,6 +901,7 @@ impl core::ops::AddAssign for Statistics {
             tlb_maintenance,
             scoped_maintenance,
             table_base_changes,
+            native_table_switches,
             prediction_isolations,
             translated_pages,
             tagged_pages,
@@ -1071,6 +1074,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.tlb_maintenance, tlb_maintenance),
             (&mut self.scoped_maintenance, scoped_maintenance),
             (&mut self.table_base_changes, table_base_changes),
+            (&mut self.native_table_switches, native_table_switches),
             (&mut self.prediction_isolations, prediction_isolations),
             (&mut self.translated_pages, translated_pages),
             (&mut self.tagged_pages, tagged_pages),

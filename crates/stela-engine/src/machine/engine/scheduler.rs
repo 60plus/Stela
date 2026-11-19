@@ -477,6 +477,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if transitioned {
             self.adopt_native_state();
         }
+        if self.mirrors.table_switch.switches != 0 {
+            self.settle_native_switches();
+        }
         // An exception return native code made ends the interrupt handler
         // the engine saw taken, as one the engine handles does.
         if transitions[transition::EXCEPTION_RETURN] != 0

@@ -757,6 +757,9 @@ pub(super) mod tests {
         if counts != [0; KINDS] {
             machine.adopt_native_state();
         }
+        if machine.mirrors.table_switch.switches != 0 {
+            machine.settle_native_switches();
+        }
         machine.cpu.pstate.daif = machine.cpu.state.daif as u8;
         machine.cpu.pstate.sp = machine.mirrors.selected != 0;
         machine.mirrors.leave(&mut machine.cpu.pstate);
