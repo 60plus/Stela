@@ -1554,6 +1554,9 @@ fn host_breakpoints_end_blocks_and_stop_before_their_instruction() {
 fn system_address_pair_keeps_an_independent_add_entry_and_breakpoint() {
     let words = [0xb000_0000, 0x9100_2000, 0x17ff_ffff]; // adrp; add; b to ADD
     let mut grouped = machine(&words);
+    // A block, not the region its B back to the ADD makes, whose landing
+    // there keeps the pair apart.
+    grouped.set_regions(false);
     let Ok(Fetched::Block(head)) = grouped.fetch_block(BASE, false) else {
         panic!("address pair block");
     };

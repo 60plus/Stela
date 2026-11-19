@@ -948,6 +948,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.statistics.compiled += 1;
         self.statistics.self_loops += u64::from(compiled.self_loop);
+        self.statistics.regions += u64::from(compiled.region);
         self.count_store_source(if stored.is_some() {
             StoreSource::Compiled
         } else {

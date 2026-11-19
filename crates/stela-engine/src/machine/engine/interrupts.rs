@@ -296,9 +296,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         step
     }
 
-    /// Count the instructions of block `index` before `pc` as retired.
+    /// Count the instructions of block `index` before `pc` as retired. A
+    /// region's forward edges may have left the count below its rows
+    /// (`GuestState::loop_retired`), which this completes: it wraps.
     pub(super) fn retire_before(&mut self, index: usize, pc: u64) {
-        self.cpu.retired += (pc - self.code.blocks[index].pc) / INSTRUCTION;
+        self.cpu.retired = self
+            .cpu
+            .retired
+            .wrapping_add((pc - self.code.blocks[index].pc) / INSTRUCTION);
     }
 
     /// Whether an interrupt routed to `target` is taken now (Arm ARM D1.3.6;

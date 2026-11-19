@@ -256,7 +256,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some(),
+            regions: self.regions,
         })
+    }
+
+    /// Form regions ([`NativeSystem::regions`]), the default, or blocks
+    /// alone, from the next compilation on; the blocks compiled so far stay.
+    /// For tests that compare the two.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_regions(&mut self, on: bool) {
+        self.regions = on;
+        self.native_system = None;
     }
 
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),

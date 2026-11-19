@@ -995,6 +995,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// was published for ([`Self::enter_events`]); `None` once the
     /// streams' controls may have changed.
     stream_sample: Option<u64>,
+    /// Whether blocks run on past their branches into regions that hold a
+    /// loop (`NativeSystem::regions`): on, but for tests that compare both.
+    regions: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1458,6 +1461,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             memory_checks: None,
             native_system: None,
             self_loops: true,
+            regions: true,
             event_sample: None,
             stream_sample: None,
             debug: None,

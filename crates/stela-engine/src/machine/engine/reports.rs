@@ -630,6 +630,8 @@ pub struct Statistics {
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
     pub self_loops: u64,
+    /// Of `compiled`, the regions (`CompiledBlock::region`).
+    pub regions: u64,
     /// Counter ticks spent analyzing and compiling `compiled`.
     pub compile_ticks: u64,
     /// Blocks taken from the persistent translation store instead of
@@ -849,6 +851,7 @@ impl core::ops::AddAssign for Statistics {
             whole_tlbi_times,
             compiled,
             self_loops,
+            regions,
             compile_ticks,
             stored,
             offered,
@@ -1028,6 +1031,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.lookup_hits, lookup_hits),
             (&mut self.compiled, compiled),
             (&mut self.self_loops, self_loops),
+            (&mut self.regions, regions),
             (&mut self.compile_ticks, compile_ticks),
             (&mut self.stored, stored),
             (&mut self.offered, offered),
