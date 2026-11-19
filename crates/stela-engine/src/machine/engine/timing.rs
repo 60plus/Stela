@@ -175,9 +175,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let [_, returned] = self.host.native_stamps();
         self.exit_trace.begin(returned, adopted, now);
         let word = self.timed_system_word(index, next_pc);
+        // Without naming the key, which would charge the name to the word.
         let traced = word != step_timing::DEVICE_SITE_KEY
-            && step_timing::SystemClass::of(step_timing::system_key(word))
-                != step_timing::SystemClass::Wait;
+            && !step_timing::wait_key(step_timing::system_key(word));
         if traced {
             self.trace_point_now(step_timing::PATH_SERVICE);
         } else {

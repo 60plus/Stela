@@ -146,6 +146,14 @@ fn register_word(key: u32) -> u32 {
     if key >> 24 == 0xd5 { key | 0x1f } else { key }
 }
 
+/// Whether [`system_key`] `key` is a WFE, WFI, WFET or WFIT: of class
+/// [`SystemClass::Wait`], found by one decode, without the name
+/// [`SystemClass::of`] builds for it.
+pub fn wait_key(key: u32) -> bool {
+    use stela_compiler::aarch64::system::synchronization::{Operation, decode};
+    matches!(decode(register_word(key)), Some(Operation::Wait { .. }))
+}
+
 /// A short name of [`system_key`] `key` for reports: the accessor's for
 /// MRS, MSR, SYS and SYSL (`MRS_TPIDR_EL1`, `TLBI_VAE1IS`), else the
 /// operation's kind and the key (`Exception.ExceptionReturn:0xd69f03e0`).
@@ -2103,7 +2111,22 @@ mod tests {
         for (key, class) in cases {
             let name = system_key_name(key);
             assert_eq!(SystemClass::of(key), class, "{key:#010x} {name}");
+            assert_eq!(wait_key(key), class == SystemClass::Wait, "{key:#010x}");
         }
+    }
+
+    /// `wait_key` finds the Wait class exactly, over the whole hint and
+    /// barrier space (CRn 1 to 3 of op0 0) and the timed waits.
+    #[test]
+    fn wait_keys_are_the_wait_class() {
+        let mut waits = 0;
+        for key in (0xd503_1000u32..0xd503_4000).step_by(0x20) {
+            let wait = SystemClass::of(key) == SystemClass::Wait;
+            assert_eq!(wait_key(key), wait, "{key:#010x} {}", system_key_name(key));
+            waits += usize::from(wait);
+        }
+        // WFE, WFI, WFET and WFIT.
+        assert_eq!(waits, 4);
     }
 
     #[test]
