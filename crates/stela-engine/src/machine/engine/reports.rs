@@ -783,8 +783,10 @@ pub enum MailWait {
 }
 
 /// The guest PCs that issued the most TLBIs of everything, with their
-/// counts, most first where they were merged: a PC not held takes the
-/// place of the least frequent when it has issued more. `[0, 0]` is free.
+/// counts, most first, by space-saving: a PC not held takes the place of
+/// the least frequent and its count plus that one's, so a PC that issued
+/// more than a fifth of all is held, its count an upper bound. `[0, 0]` is
+/// free.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(
     all(feature = "std", feature = "native-profile"),
@@ -800,10 +802,8 @@ impl WholeTlbiSites {
         }
         if let Some(site) = self.0.iter_mut().find(|site| site[0] == pc && site[1] != 0) {
             site[1] += count;
-        } else if let Some(least) = self.0.iter_mut().min_by_key(|site| site[1])
-            && least[1] < count
-        {
-            *least = [pc, count];
+        } else if let Some(least) = self.0.iter_mut().min_by_key(|site| site[1]) {
+            *least = [pc, least[1] + count];
         }
         self.0.sort_unstable_by(|a, b| b[1].cmp(&a[1]));
     }

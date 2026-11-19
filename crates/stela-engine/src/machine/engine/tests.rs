@@ -10045,28 +10045,32 @@ fn whole_tlbi_benchmark() {
 }
 
 /// The census of TLBIs of everything keeps the most frequent PCs, merges a
-/// PC it holds and orders them most first.
+/// PC it holds and orders them most first; a new PC takes the least
+/// frequent's place and count.
 #[test]
 fn whole_tlbi_sites_keep_the_most_frequent_pcs() {
     let mut sites = WholeTlbiSites::default();
     for (pc, count) in [
         (0x10, 3),
         (0x20, 1),
-        (0x30, 5),
+        (0x30, 7),
         (0x40, 2),
-        (0x50, 1),
-        (0x20, 3),
+        (0x50, 10),
+        (0x10, 1),
     ] {
         sites.add(pc, count);
     }
-    assert_eq!(sites.0, [[0x30, 5], [0x20, 4], [0x10, 3], [0x40, 2]]);
-    sites.add(0x60, 2);
-    assert_eq!(sites.0[3], [0x40, 2]);
-    sites.add(0x60, 6);
-    assert_eq!(sites.0, [[0x60, 6], [0x30, 5], [0x20, 4], [0x10, 3]]);
+    assert_eq!(sites.0, [[0x50, 11], [0x30, 7], [0x10, 4], [0x40, 2]]);
     let mut merged = WholeTlbiSites::default();
     for [pc, count] in sites.0 {
         merged.add(pc, count);
     }
     assert_eq!(merged, sites);
+    // Many single TLBIs at new PCs do not hide one PC that issued more.
+    let mut sites = WholeTlbiSites::default();
+    for round in 0..1000u64 {
+        sites.add(0x1000, 1);
+        sites.add(0x2000 + round, 1);
+    }
+    assert_eq!(sites.0[0][0], 0x1000);
 }
