@@ -290,7 +290,60 @@ pub(super) fn report() {
             )
         ));
         print_stacks("SAMPLED", &stacks);
+        for frame in by_frame(&blocks).iter().take(FRAMES_SHOWN) {
+            output::arguments(format_args!(
+                "HEAP SAMPLED FRAME {:#x} {}M blocks={}\n",
+                frame.offset,
+                frame.bytes >> 20,
+                frame.blocks
+            ));
+        }
     }
+}
+
+/// Code offsets the report names by the sampled bytes under them.
+const FRAMES_SHOWN: usize = 48;
+
+/// One code offset's sampled blocks: those with it anywhere on their
+/// allocating stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Frame {
+    offset: u64,
+    bytes: u64,
+    blocks: u64,
+}
+
+/// The sampled bytes under each code offset, counted once a stack, the
+/// most first: the owners a long tail of distinct stacks shares (a stack
+/// of its own for each caller of a common allocating function), which no
+/// single stack's line shows. `HEAP SAMPLED FRAME 0x12c03cb 210M
+/// blocks=840`.
+fn by_frame(blocks: &[(u64, [u64; WORDS])]) -> Vec<Frame> {
+    let mut seen: Vec<(u64, u64)> = Vec::with_capacity(blocks.len() * WORDS);
+    for (bytes, words) in blocks {
+        for (at, &offset) in words.iter().enumerate() {
+            if offset != 0 && !words[..at].contains(&offset) {
+                seen.push((offset, *bytes));
+            }
+        }
+    }
+    seen.sort_unstable_by_key(|&(offset, _)| offset);
+    let mut frames: Vec<Frame> = Vec::new();
+    for (offset, bytes) in seen {
+        match frames.last_mut() {
+            Some(frame) if frame.offset == offset => {
+                frame.bytes += bytes;
+                frame.blocks += 1;
+            }
+            _ => frames.push(Frame {
+                offset,
+                bytes,
+                blocks: 1,
+            }),
+        }
+    }
+    frames.sort_unstable_by_key(|frame| (core::cmp::Reverse(frame.bytes), frame.offset));
+    frames
 }
 
 /// The live blocks of `table`: the bytes each stands for and its stack.
