@@ -62,7 +62,7 @@ use crate::metal::{
     upload::{Chunk, ChunkPool, ChunkReport, ChunkSource, GivenUp},
     vulkan::{
         AttachmentLoadOp, AttachmentStoreOp, BufferCreate, BufferUsage, MemoryProperties,
-        PipelineStages, PipelineStatistics,
+        PipelineBindPoint, PipelineStages, PipelineStatistics,
         backend::{Backend, BufferAllocation, Object, Requirements},
         command::Command,
         object::{
@@ -177,6 +177,37 @@ enum Track {
 /// What a command buffer's timestamps after its start mark: for each span
 /// up to the next mark, the indices in its `pipelines` it bound and what it
 /// drew.
+/// The pipeline each bind point holds, as indices among a command
+/// buffer's pipelines ([`Marks::spans`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct BoundNow {
+    graphics: Option<u16>,
+    compute: Option<u16>,
+}
+
+impl BoundNow {
+    fn bind(&mut self, point: PipelineBindPoint, index: u16) {
+        match point {
+            PipelineBindPoint::Compute => self.compute = Some(index),
+            _ => self.graphics = Some(index),
+        }
+    }
+
+    /// The pipeline `command`'s work runs, for a draw or a dispatch.
+    fn used_by(&self, command: &Command) -> Option<u16> {
+        match command {
+            Command::Dispatch(_) | Command::DispatchIndirect { .. } => self.compute,
+            Command::Draw { .. }
+            | Command::DrawIndexed { .. }
+            | Command::DrawIndirect { .. }
+            | Command::DrawIndexedIndirect { .. }
+            | Command::DrawMeshTasks(_)
+            | Command::DrawMeshTasksIndirect { .. } => self.graphics,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Marks {
     spans: Vec<Vec<u16>>,
@@ -1058,6 +1089,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // bound each: the order its `pipelines` lists them in.
         let mut seen: Vec<Pipeline> = Vec::new();
         let mut bound: Vec<u16> = Vec::new();
+        // The pipelines in effect: a span whose work runs one bound before
+        // it is named by it too, as a compute encoder's dispatches after
+        // their barriers are, one span each.
+        let mut current = BoundNow::default();
         // Marks go where the GPU already waits: after a pass, and before the
         // barrier that follows dispatches, so a mark never stops dispatches
         // the encoder lets overlap.
@@ -1103,7 +1138,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     marks.counts.copied_texels += texels;
                 }
                 shape.add(&command);
-                if let Command::BindPipeline { pipeline, .. } = &command {
+                if let Command::BindPipeline {
+                    pipeline,
+                    bind_point,
+                } = &command
+                {
                     let index = seen
                         .iter()
                         .position(|known| known == pipeline)
@@ -1112,9 +1151,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                             seen.len() - 1
                         });
                     let index = u16::try_from(index).unwrap_or(u16::MAX);
+                    current.bind(*bind_point, index);
                     if !bound.contains(&index) {
                         bound.push(index);
                     }
+                }
+                if let Some(index) = current.used_by(&command)
+                    && !bound.contains(&index)
+                {
+                    bound.push(index);
                 }
                 segment.commands.push(command);
                 if pass_ends && marks.spans.len() < limit as usize {
@@ -2827,5 +2872,32 @@ fn mark_completion(
                 dst_access: Access::HOST_READ,
             }),
         ]);
+    }
+}
+
+#[cfg(test)]
+mod bound_now_tests {
+    use super::{BoundNow, Command, PipelineBindPoint};
+
+    /// A dispatch names the compute pipeline in effect and a draw the
+    /// graphics one, whichever span bound them; other work names none.
+    #[test]
+    fn work_is_named_by_the_pipeline_it_runs() {
+        let mut now = BoundNow::default();
+        let dispatch = Command::Dispatch([4, 1, 1]);
+        assert_eq!(now.used_by(&dispatch), None);
+        now.bind(PipelineBindPoint::Compute, 3);
+        now.bind(PipelineBindPoint::Graphics, 5);
+        assert_eq!(now.used_by(&dispatch), Some(3));
+        let draw = Command::Draw {
+            vertex_count: 3,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        assert_eq!(now.used_by(&draw), Some(5));
+        assert_eq!(now.used_by(&Command::EndRendering), None);
+        now.bind(PipelineBindPoint::Compute, 7);
+        assert_eq!(now.used_by(&dispatch), Some(7));
     }
 }
