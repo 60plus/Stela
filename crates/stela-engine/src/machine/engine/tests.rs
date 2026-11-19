@@ -4548,8 +4548,8 @@ fn sctlr_fields_outside_translation_keep_every_translation() {
     );
     assert_eq!(machine.translation_generation, generation);
     assert_eq!(machine.contexts(1, variant), contexts);
-    let last = machine.host.regimes[regimes..].last().unwrap();
-    assert_eq!(last.controls.sctlr & SCTLR_ENIA, 0);
+    // Nothing of the host's regime changes, so it is not synced.
+    assert_eq!(machine.host.regimes.len(), regimes);
     // M is translation's.
     machine.cpu.state.x[0] = sctlr ^ 1;
     machine.system_instruction(MSR_SCTLR_X0).unwrap();
