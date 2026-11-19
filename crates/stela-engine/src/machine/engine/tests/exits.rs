@@ -265,8 +265,14 @@ fn direct_rounds_alternate_between_the_blocks() {
 }
 
 /// The parts of one transition, at EL1 after an SVC.
-fn parts() -> [(&'static str, Round); 6] {
+fn parts() -> [(&'static str, Round); 7] {
     [
+        // What the engine does after a native run that made an SVC and its
+        // ERET (`execute`).
+        ("adopt-transitions", |machine| {
+            machine.adopt_transitions([1, 1, 0, 0], 0);
+            machine.host.regimes.clear();
+        }),
         ("cpu-take+return", |machine| {
             let exception = crate::machine::cpu::Exception::synchronous(
                 crate::machine::exception::Class::SupervisorCall,
