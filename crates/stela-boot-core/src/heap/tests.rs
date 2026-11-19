@@ -830,6 +830,64 @@ fn constrained_alignment_and_ordinary_pages_coalesce_together() {
     }
 }
 
+/// The sampled heap's range and what the sample hook heard of it.
+static SAMPLED_FROM: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_TO: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+static SAMPLED_FREES: AtomicUsize = AtomicUsize::new(0);
+
+fn heard(pointer: usize, bytes: usize, allocated: bool) {
+    let range = SAMPLED_FROM.load(Ordering::Relaxed)..SAMPLED_TO.load(Ordering::Relaxed);
+    if !range.contains(&pointer) {
+        return;
+    }
+    if allocated {
+        SAMPLED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        SAMPLED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SAMPLED_FREES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Sampling tells the hook one block in each sampled stretch of bytes, the
+/// samples standing for about the bytes allocated, a block of the stretch
+/// or more always, and every free under the tracked size; large blocks
+/// stay the large hook's alone.
+#[test]
+fn sampled_blocks_stand_for_the_bytes_allocated_and_every_free_is_told() {
+    const EVERY: usize = 64 << 10;
+    let heap = Heap::new();
+    let start = slab_aligned(&heap, 16 << 20);
+    SAMPLED_FROM.store(start, Ordering::Relaxed);
+    SAMPLED_TO.store(start + (16 << 20), Ordering::Relaxed);
+    set_sample_hook(heard, EVERY);
+    let small = Layout::from_size_align(64, 16).unwrap();
+    let medium = Layout::from_size_align(EVERY, 16).unwrap();
+    let large = Layout::from_size_align(TRACKED.load(Ordering::Relaxed), 16).unwrap();
+    // SAFETY: valid layouts, each block freed once.
+    unsafe {
+        let blocks: Vec<*mut u8> = (0..65536).map(|_| heap.alloc(small)).collect();
+        assert!(blocks.iter().all(|block| !block.is_null()));
+        // 4 MiB of 64-byte blocks: 64 samples of 64 KiB, give or take what
+        // other tests' heaps took from the first core's count meanwhile.
+        let samples = SAMPLED_BLOCKS.load(Ordering::Relaxed);
+        assert!((60..=68).contains(&samples), "{samples}");
+        assert_eq!(SAMPLED_BYTES.load(Ordering::Relaxed), samples * EVERY);
+        let block = heap.alloc(medium);
+        assert_eq!(SAMPLED_BLOCKS.load(Ordering::Relaxed), samples + 1);
+        heap.dealloc(block, medium);
+        let block = heap.alloc(large);
+        assert!(!block.is_null());
+        assert_eq!(SAMPLED_BLOCKS.load(Ordering::Relaxed), samples + 1);
+        heap.dealloc(block, large);
+        for block in blocks {
+            heap.dealloc(block, small);
+        }
+    }
+    assert_eq!(SAMPLED_FREES.load(Ordering::Relaxed), 65536 + 1);
+}
+
 /// A core's cache and counts share no cache line with another core's.
 #[test]
 fn each_cores_writes_stay_in_lines_of_its_own() {

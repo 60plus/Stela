@@ -117,9 +117,11 @@ pub fn set_tracked_bytes(bytes: usize) {
     TRACKED.store(bytes.max(PAGE_BYTES), Ordering::Relaxed);
 }
 
-fn tracked(pointer: *mut u8, bytes: usize, allocated: bool) {
+/// Whether a free-list block of `bytes` is one [`LARGE_HOOK`] hears of,
+/// telling it so.
+fn tracked(pointer: *mut u8, bytes: usize, allocated: bool) -> bool {
     if bytes < TRACKED.load(Ordering::Relaxed) || pointer.is_null() {
-        return;
+        return false;
     }
     let hook = LARGE_HOOK.load(Ordering::Acquire);
     if hook != 0 {
@@ -127,6 +129,45 @@ fn tracked(pointer: *mut u8, bytes: usize, allocated: bool) {
         // `fn(usize, usize, bool)`.
         let hook: fn(usize, usize, bool) = unsafe { core::mem::transmute(hook) };
         hook(pointer as usize, bytes, allocated);
+    }
+    true
+}
+
+/// Called, outside the heap's lock, with the payload address of one
+/// allocation under [`TRACKED`] in each [`SAMPLE_BYTES`] a core allocates
+/// and the bytes it stands for (`true`), and with the address of every such
+/// block freed while sampling is on (`false`) before it can be handed out
+/// again: it must neither allocate nor wait, and a free it was not told of
+/// is a cheap miss. The boot keeps the sampled blocks' stacks, so the
+/// size-class and medium blocks, too many to track one by one, name their
+/// code by estimate.
+static SAMPLE_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// The bytes a core allocates between samples; zero, as in every boot but
+/// a profile, samples nothing, at the cost of one load per allocation.
+static SAMPLE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Samples one allocation under [`TRACKED`] in each `every` bytes each core
+/// allocates, telling `hook` ([`SAMPLE_HOOK`]); set once, before the blocks
+/// it names are made.
+pub fn set_sample_hook(hook: fn(usize, usize, bool), every: usize) {
+    SAMPLE_HOOK.store(hook as usize, Ordering::Release);
+    SAMPLE_BYTES.store(every, Ordering::Release);
+}
+
+fn sample_hook() -> Option<fn(usize, usize, bool)> {
+    let hook = SAMPLE_HOOK.load(Ordering::Acquire);
+    // SAFETY: only `set_sample_hook` stores a nonzero value, a
+    // `fn(usize, usize, bool)`.
+    (hook != 0).then(|| unsafe { core::mem::transmute::<usize, fn(usize, usize, bool)>(hook) })
+}
+
+/// Tells [`SAMPLE_HOOK`] a block under [`TRACKED`] is freed, when sampling.
+fn unsampled(pointer: *mut u8) {
+    if SAMPLE_BYTES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if let Some(hook) = sample_hook() {
+        hook(pointer as usize, 0, false);
     }
 }
 
@@ -300,6 +341,9 @@ struct Core {
     own: AtomicIsize,
     /// [`Self::own`]'s size-class blocks by class.
     own_classes: [AtomicIsize; CLASSES],
+    /// The bytes the core allocates before its next sample
+    /// ([`SAMPLE_BYTES`]).
+    sample_left: AtomicIsize,
 }
 
 impl Core {
@@ -309,6 +353,7 @@ impl Core {
             cached: AtomicIsize::new(0),
             own: AtomicIsize::new(0),
             own_classes: [const { AtomicIsize::new(0) }; CLASSES],
+            sample_left: AtomicIsize::new(0),
         }
     }
 }
@@ -1153,6 +1198,33 @@ impl Heap {
         }
     }
 
+    /// Counts `bytes` allocated at `pointer` against core `cpu`'s next
+    /// sample, telling [`SAMPLE_HOOK`] when they reach it: the sample
+    /// stands for [`SAMPLE_BYTES`], the bytes between samples, so the
+    /// sampled blocks' bytes estimate the live ones whatever their sizes. A
+    /// block of that many bytes or more is always told, for its own bytes.
+    fn sample(&self, cpu: usize, pointer: *mut u8, bytes: usize) {
+        let every = SAMPLE_BYTES.load(Ordering::Relaxed);
+        if every == 0 {
+            return;
+        }
+        let stands_for = if bytes >= every {
+            bytes
+        } else {
+            let left = &self.cores[cpu].sample_left;
+            let now = left.load(Ordering::Relaxed) - bytes as isize;
+            if now > 0 {
+                left.store(now, Ordering::Relaxed);
+                return;
+            }
+            left.store(now + every as isize, Ordering::Relaxed);
+            every
+        };
+        if let Some(hook) = sample_hook() {
+            hook(pointer as usize, stands_for, true);
+        }
+    }
+
     /// Live size-class bytes by class (16 bytes doubling to 4 KiB), as the
     /// tagged cores counted them: allocations before tagging are not in it.
     pub fn class_live(&self) -> [isize; CLASSES] {
@@ -1377,11 +1449,15 @@ unsafe impl GlobalAlloc for Heap {
             self.failures.fetch_add(1, Ordering::Relaxed);
             failure::report(self, layout);
         } else {
+            let large = class.is_none() && tracked(block, layout.size(), true);
             if let Some(cpu) = cpu {
                 self.count_own(cpu, layout, class, true);
             }
-            if class.is_none() {
-                tracked(block, layout.size(), true);
+            if !large {
+                let bytes = class.map_or(layout.size(), |class| SMALLEST << class);
+                // Before the cores are tagged, one core runs: the first's
+                // count serves it.
+                self.sample(cpu.unwrap_or(0), block, bytes);
             }
         }
         block
@@ -1392,6 +1468,9 @@ unsafe impl GlobalAlloc for Heap {
             return unsafe { self.stop_dealloc(pointer, layout) };
         }
         let class = class(layout);
+        if class.is_some() || !tracked(pointer, layout.size(), false) {
+            unsampled(pointer);
+        }
         if let Some(cpu) = self.cpu() {
             self.count_own(cpu, layout, class, false);
             if let Some(class) = class {
@@ -1402,9 +1481,6 @@ unsafe impl GlobalAlloc for Heap {
                 restore_interrupts(flags);
                 return;
             }
-        }
-        if class.is_none() {
-            tracked(pointer, layout.size(), false);
         }
         let _guard = self.lock();
         // SAFETY: this live acquire/release guard excludes every metadata
@@ -1457,12 +1533,18 @@ unsafe impl GlobalAlloc for Heap {
                 resized
             };
             if resized {
-                if let Some(cpu) = self.cpu() {
+                if !tracked(pointer, layout.size(), false) {
+                    unsampled(pointer);
+                }
+                let large = tracked(pointer, new_size, true);
+                let cpu = self.cpu();
+                if let Some(cpu) = cpu {
                     self.count_own(cpu, layout, None, false);
                     self.count_own(cpu, new_layout, None, true);
                 }
-                tracked(pointer, layout.size(), false);
-                tracked(pointer, new_size, true);
+                if !large {
+                    self.sample(cpu.unwrap_or(0), pointer, new_size);
+                }
                 return pointer;
             }
         }

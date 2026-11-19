@@ -4,11 +4,13 @@
 //! LARGE` lines that `stela.pdb` resolves. The heap calls
 //! [`allocated_or_freed`] only for such blocks, a few hundred live at most
 //! (a few thousand in a profile), so the cost stays off every ordinary
-//! allocation.
+//! allocation. A profile also samples the smaller blocks, one in each
+//! [`SAMPLE_EVERY`] bytes a core allocates, for `HEAP SAMPLED` lines that
+//! estimate what holds the size classes and the medium blocks.
 use crate::output;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering};
 use stela_boot_core::stack_scan;
 
 /// Live large blocks kept; past them a block is only counted. A profile's
@@ -45,17 +47,85 @@ static BLOCKS: [Slot; SLOTS] = [const {
     }
 }; SLOTS];
 
-/// The slots a search for `pointer` visits, from its hash.
-fn probes(pointer: u64) -> impl Iterator<Item = &'static Slot> {
-    // Payloads are 16-byte aligned: the multiply spreads the rest.
-    let start = ((pointer >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize;
-    (0..PROBES).map(move |step| &BLOCKS[(start + step) % SLOTS])
+/// `pointer`'s hash: payloads are 16-byte aligned, the multiply spreads the
+/// rest into the high bits.
+fn hash(pointer: u64) -> u64 {
+    (pointer >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// Tracks blocks from [`PROFILE_BYTES`] on, for a profile's report of what
-/// holds the heap: before the engine's own allocations.
+/// The slots of `table` a search for `pointer` visits, from its hash.
+fn probes(table: &'static [Slot], pointer: u64) -> impl Iterator<Item = &'static Slot> {
+    let start = (hash(pointer) >> 40) as usize;
+    (0..PROBES).map(move |step| &table[(start + step) % table.len()])
+}
+
+/// The bytes each core allocates between sampled blocks in a profile: in a
+/// desktop session's 2 GiB of size-class and medium blocks about 8000 are
+/// live, each standing for this many bytes.
+const SAMPLE_EVERY: usize = 256 << 10;
+/// Live sampled blocks kept.
+const SAMPLE_SLOTS: usize = 16384;
+/// Buckets of the count of live samples by hash, which a free of a block
+/// that was not sampled, nearly every free, reads alone.
+const FILTER: usize = 1 << 16;
+
+/// A profile's sampled blocks: their slots and the count in each bucket of
+/// their hashes. Allocated by [`track_profile`], so a boot without a
+/// profile holds none of it.
+struct Samples {
+    slots: [Slot; SAMPLE_SLOTS],
+    filter: [AtomicU16; FILTER],
+}
+
+static SAMPLES: AtomicPtr<Samples> = AtomicPtr::new(core::ptr::null_mut());
+/// Sampled blocks made while their slots were taken.
+static SAMPLES_UNTRACKED: AtomicU64 = AtomicU64::new(0);
+
+fn samples() -> Option<&'static Samples> {
+    // SAFETY: only `track_profile` stores a nonzero value, a zeroed
+    // allocation of `Samples` that is never freed.
+    unsafe { SAMPLES.load(Ordering::Acquire).as_ref() }
+}
+
+fn filter_bucket(samples: &'static Samples, pointer: u64) -> &'static AtomicU16 {
+    &samples.filter[(hash(pointer) >> 48) as usize % FILTER]
+}
+
+/// Tracks blocks from [`PROFILE_BYTES`] on and samples those under it, for
+/// a profile's report of what holds the heap: before the engine's own
+/// allocations.
 pub(super) fn track_profile() {
     stela_boot_core::heap::set_tracked_bytes(PROFILE_BYTES);
+    let layout = core::alloc::Layout::new::<Samples>();
+    // SAFETY: a nonzero layout; atomics of zero are valid `Samples`.
+    let table = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<Samples>();
+    if table.is_null() {
+        return;
+    }
+    SAMPLES.store(table, Ordering::Release);
+    stela_boot_core::heap::set_sample_hook(sampled_or_freed, SAMPLE_EVERY);
+}
+
+/// The heap's sample hook, under the same rules as [`allocated_or_freed`].
+fn sampled_or_freed(pointer: usize, bytes: usize, allocated: bool) {
+    let Some(samples) = samples() else {
+        return;
+    };
+    let pointer = pointer as u64;
+    let bucket = filter_bucket(samples, pointer);
+    if !allocated {
+        if bucket.load(Ordering::Relaxed) != 0 && forget(&samples.slots, pointer) {
+            bucket.fetch_sub(1, Ordering::Relaxed);
+            CHANGES.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if record(&samples.slots, pointer, bytes) {
+        bucket.fetch_add(1, Ordering::Relaxed);
+        CHANGES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SAMPLES_UNTRACKED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 /// Large blocks made while every slot was taken, which no line names: a
 /// count of blocks made, not of live ones.
@@ -80,26 +150,38 @@ fn allocated_or_freed(pointer: usize, bytes: usize, allocated: bool) {
     let pointer = pointer as u64;
     CHANGES.fetch_add(1, Ordering::Relaxed);
     if !allocated {
-        // The heap calls this before the block can be handed out again. A
-        // search ends at a slot never taken: no block went past it.
-        if let Some(slot) = probes(pointer)
-            .take_while(|slot| slot.pointer.load(Ordering::Relaxed) != 0)
-            .find(|slot| slot.pointer.load(Ordering::Relaxed) == pointer)
-        {
-            slot.bytes.store(0, Ordering::Relaxed);
-            slot.pointer.store(VACATED, Ordering::Release);
-        }
-        return;
+        forget(&BLOCKS, pointer);
+    } else if !record(&BLOCKS, pointer, bytes) {
+        UNTRACKED.fetch_add(1, Ordering::Relaxed);
     }
-    let Some(slot) = probes(pointer).find(|slot| {
+}
+
+/// Frees `pointer`'s slot in `table`, if it has one. The heap calls this
+/// before the block can be handed out again. A search ends at a slot never
+/// taken: no block went past it.
+fn forget(table: &'static [Slot], pointer: u64) -> bool {
+    let Some(slot) = probes(table, pointer)
+        .take_while(|slot| slot.pointer.load(Ordering::Relaxed) != 0)
+        .find(|slot| slot.pointer.load(Ordering::Relaxed) == pointer)
+    else {
+        return false;
+    };
+    slot.bytes.store(0, Ordering::Relaxed);
+    slot.pointer.store(VACATED, Ordering::Release);
+    true
+}
+
+/// Takes a slot of `table` for the block at `pointer` standing for `bytes`,
+/// with its allocating stack; false with every slot it may take taken.
+fn record(table: &'static [Slot], pointer: u64, bytes: usize) -> bool {
+    let Some(slot) = probes(table, pointer).find(|slot| {
         [0, VACATED].into_iter().any(|empty| {
             slot.pointer
                 .compare_exchange(empty, pointer, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         })
     }) else {
-        UNTRACKED.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     };
     let mut words = [0; WORDS];
     if !stack_offsets(&mut words) {
@@ -109,6 +191,7 @@ fn allocated_or_freed(pointer: usize, bytes: usize, allocated: bool) {
         word.store(offset, Ordering::Relaxed);
     }
     slot.bytes.store(bytes as u64, Ordering::Release);
+    true
 }
 
 /// The image offsets among the allocating stack's words, for its slot.
@@ -191,7 +274,28 @@ pub(super) fn report() {
     if REPORTED.swap(changes, Ordering::Relaxed) == changes {
         return;
     }
-    let blocks: Vec<(u64, [u64; WORDS])> = BLOCKS
+    let blocks = live(&BLOCKS);
+    let stacks = by_stack(blocks.iter().copied());
+    output::arguments(format_args!("{}\n", summary(&blocks, stacks.len())));
+    print_stacks("LARGE", &stacks);
+    if let Some(samples) = samples() {
+        let blocks = live(&samples.slots);
+        let stacks = by_stack(blocks.iter().copied());
+        output::arguments(format_args!(
+            "{}\n",
+            sampled_summary(
+                &blocks,
+                stacks.len(),
+                SAMPLES_UNTRACKED.load(Ordering::Relaxed)
+            )
+        ));
+        print_stacks("SAMPLED", &stacks);
+    }
+}
+
+/// The live blocks of `table`: the bytes each stands for and its stack.
+fn live(table: &'static [Slot]) -> Vec<(u64, [u64; WORDS])> {
+    table
         .iter()
         .filter(|slot| slot.pointer.load(Ordering::Acquire) > VACATED)
         .map(|slot| {
@@ -202,20 +306,37 @@ pub(super) fn report() {
             )
         })
         .filter(|&(bytes, _)| bytes != 0)
-        .collect();
-    let stacks = by_stack(blocks.iter().copied());
-    output::arguments(format_args!("{}\n", summary(&blocks, stacks.len())));
+        .collect()
+}
+
+/// The first [`SHOWN`] of `stacks` as `HEAP {kind}` lines, then the rest
+/// summed.
+fn print_stacks(kind: &str, stacks: &[Stack]) {
     for stack in stacks.iter().take(SHOWN) {
-        output::arguments(format_args!("{}\n", line(stack)));
+        output::arguments(format_args!("{}\n", line(kind, stack)));
     }
     if let Some(rest) = stacks.get(SHOWN..).filter(|rest| !rest.is_empty()) {
         output::arguments(format_args!(
-            "HEAP LARGE {}M blocks={} other stacks={}\n",
+            "HEAP {kind} {}M blocks={} other stacks={}\n",
             rest.iter().map(|stack| stack.bytes).sum::<u64>() >> 20,
             rest.iter().map(|stack| stack.blocks).sum::<u64>(),
             rest.len()
         ));
     }
+}
+
+/// `HEAP SAMPLED blocks=8012 bytes=2003M every=256K stacks=410
+/// untracked=0`: the sampled blocks under [`PROFILE_BYTES`] live now, the
+/// bytes they stand for (an estimate of the live bytes of such blocks), and
+/// the stacks that made them.
+fn sampled_summary(blocks: &[(u64, [u64; WORDS])], stacks: usize, untracked: u64) -> String {
+    let bytes: u64 = blocks.iter().map(|&(bytes, _)| bytes).sum();
+    format!(
+        "HEAP SAMPLED blocks={} bytes={}M every={}K stacks={stacks} untracked={untracked}",
+        blocks.len(),
+        bytes >> 20,
+        SAMPLE_EVERY >> 10,
+    )
 }
 
 /// One allocating stack's live blocks.
@@ -257,9 +378,9 @@ fn summary(blocks: &[(u64, [u64; WORDS])], stacks: usize) -> String {
     )
 }
 
-fn line(stack: &Stack) -> String {
+fn line(kind: &str, stack: &Stack) -> String {
     let mut line = format!(
-        "HEAP LARGE {}M blocks={} stack",
+        "HEAP {kind} {}M blocks={} stack",
         stack.bytes >> 20,
         stack.blocks
     );
