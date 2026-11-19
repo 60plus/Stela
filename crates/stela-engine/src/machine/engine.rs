@@ -1121,6 +1121,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// The instruction just completed wrote PSTATE.PACM (PACM, or an
     /// exception return), so it does not lapse.
     pacm_written: bool,
+    /// The System exit just completed left everything the run loop's
+    /// schedule and device step look at as the last full step found it, so
+    /// the loop fetches at once ([`Self::continues_directly`]).
+    direct_next: bool,
+    /// The run loop's fetches at once since its last full step.
+    direct_runs: u32,
     /// The engine-path transition whose record the next native entry at
     /// its target makes (`transitions`).
     transition_note: Option<transitions::Note>,
@@ -1496,6 +1502,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             wait_limit: None,
             waited: 0,
             pacm_written: false,
+            direct_next: false,
+            direct_runs: 0,
             transition_note: None,
             completing: None,
             chain: chain_control::Owner::default(),

@@ -227,6 +227,23 @@ fn exit_transition_costs() {
         machine.execute(index, budget).unwrap();
     });
     std::println!("EXITS direct part=execute ns={ns}");
+    // A System exit and a direct exit through the run loop, fetching at
+    // once after the System exit (`continues_directly`), and with every
+    // full step, as another PE's interrupt keeps it.
+    for full in [false, true] {
+        let mut machine = kernel_loop(MSR_TPIDR_EL2_X0, 3);
+        machine.set_step_timing(false);
+        if full {
+            let storage = machine.chain.weak_storage().upgrade().unwrap();
+            storage.interrupt_epoch().fetch_add(1, Ordering::Relaxed);
+        }
+        let ns = time(&mut machine, 2, |machine| {
+            switch_exits(machine, 1);
+            let limit = machine.statistics.blocks + 2;
+            machine.run_blocks(limit);
+        });
+        std::println!("EXITS system round_trip full_step={full} ns_per_exit={ns}");
+    }
 }
 
 /// `b .+8`, a word no run reaches, and `b .-8`: two blocks whose direct
@@ -516,4 +533,97 @@ fn system_exit_round_trips_are_traced_through_the_run_loop() {
         machine.take_system_exits().paths,
         step_timing::ExitPaths::default()
     );
+}
+
+/// `MSR TPIDR_EL2, X0`.
+const MSR_TPIDR_EL2_X0: u32 = 0xd51c_d040;
+
+/// `first` then `b .-4` at EL2 under step timing, with X0 `x0`: the System
+/// exit at `first`, then the branch's direct exit back.
+fn kernel_loop(first: u32, x0: u64) -> Machine<FakeHost, NoDevices> {
+    const BACK: u32 = 0x17ff_ffff;
+    let mut machine = machine(&[first, BACK]);
+    machine.cpu.set_pstate(Pstate::reset(2));
+    machine.cpu.state.x[0] = x0;
+    machine.host.counter_step = 1;
+    machine.set_step_timing(true);
+    machine
+}
+
+/// The run loop for `blocks` blocks, or a few thousand host counter
+/// ticks: a run that went astray (an exception loop runs no block) stops.
+fn bounded_run(machine: &mut Machine<FakeHost, NoDevices>, blocks: u64) -> Stop {
+    machine.run_blocks_with_budget(RunBudget {
+        blocks,
+        host_ticks: Some(100_000),
+    })
+}
+
+/// `rounds` of [`kernel_loop`] in the run loop: the fetches at once and
+/// the architectural state the runs end in.
+fn kernel_rounds(
+    machine: &mut Machine<FakeHost, NoDevices>,
+    rounds: usize,
+) -> (u64, (u64, Pstate, u64, u64, u64)) {
+    switch_exits(machine, rounds);
+    let stop = bounded_run(machine, 2 * rounds as u64);
+    assert!(matches!(stop, Stop::Budget), "{stop:?}");
+    assert!(machine.host.exits.is_empty());
+    let direct = machine.take_system_exits().paths.direct;
+    let state = (
+        machine.cpu.pc,
+        machine.cpu.pstate,
+        machine.cpu.retired,
+        machine.statistics.blocks,
+        machine.cpu.read(SystemRegister::TPIDR_EL2),
+    );
+    (direct, state)
+}
+
+/// After a System exit that leaves PSTATE, the device lines and the timer
+/// deadline as the last full step found them, the run loop fetches at
+/// once, and a traced one's schedule and devices take no time.
+#[test]
+fn plain_system_exits_fetch_at_once() {
+    let mut machine = kernel_loop(MSR_TPIDR_EL2_X0, 0x1234);
+    let rounds = step_timing::PATH_EVERY as usize + 1;
+    switch_exits(&mut machine, rounds);
+    let stop = bounded_run(&mut machine, 2 * rounds as u64);
+    assert!(matches!(stop, Stop::Budget), "{stop:?}");
+    assert!(machine.host.exits.is_empty());
+    assert_eq!(machine.cpu.read(SystemRegister::TPIDR_EL2), 0x1234);
+    let paths = machine.take_system_exits().paths;
+    assert_eq!(paths.direct, rounds as u64, "{paths:?}");
+    assert_eq!((paths.traced, paths.abandoned), (2, 0), "{paths:?}");
+    for name in ["schedule", "devices"] {
+        let segment = step_timing::PATH_NAMES.iter().position(|&n| n == name);
+        assert_eq!(paths.ticks[segment.unwrap()], 0, "{name} {paths:?}");
+    }
+}
+
+/// Each source a full step reads stops the fetch at once: an interrupt
+/// epoch another PE moved, an EL whose lines no count bounds, a write of
+/// PSTATE, and one of a timer; the same write again changes nothing, and
+/// fetches at once. A run that fetches at once ends in the architectural
+/// state of one that takes every full step.
+#[test]
+fn system_exits_that_change_what_a_step_reads_take_the_full_step() {
+    const MSR_DAIFCLR_I: u32 = 0xd503_42ff;
+    const MSR_CNTV_CTL_EL0_X0: u32 = 0xd51b_e320;
+    const ROUNDS: usize = 4;
+    let (direct, plain) = kernel_rounds(&mut kernel_loop(MSR_TPIDR_EL2_X0, 3), ROUNDS);
+    assert_eq!(direct, ROUNDS as u64);
+    let mut moved = kernel_loop(MSR_TPIDR_EL2_X0, 3);
+    let storage = moved.chain.weak_storage().upgrade().unwrap();
+    storage.interrupt_epoch().fetch_add(1, Ordering::Relaxed);
+    assert_eq!(kernel_rounds(&mut moved, ROUNDS), (0, plain));
+    const MSR_TPIDR_EL1_X0: u32 = 0xd518_d080;
+    let mut kernel = kernel_loop(MSR_TPIDR_EL1_X0, 3);
+    kernel.cpu.set_pstate(Pstate::reset(1));
+    let (direct, _) = kernel_rounds(&mut kernel, ROUNDS);
+    assert_eq!(direct, 0, "EL1's lines hold until no count");
+    for word in [MSR_DAIFCLR_I, MSR_CNTV_CTL_EL0_X0] {
+        let (direct, _) = kernel_rounds(&mut kernel_loop(word, 3), ROUNDS);
+        assert_eq!(direct, ROUNDS as u64 - 1, "{word:#010x}");
+    }
 }

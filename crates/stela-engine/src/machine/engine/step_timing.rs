@@ -366,7 +366,8 @@ pub const PATH_EVERY: u32 = 64;
 /// state that closed every mirror cell, with the open cells it closed, each
 /// of which costs an exit to open again where code reaches it; and the TCR
 /// writes that kept them (`Machine::layout_written`), with the open cells
-/// they kept.
+/// they kept; and the System exits after which the run loop fetched at once
+/// (`Machine::continues_directly`), traced or not.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ExitPaths {
     pub traced: u64,
@@ -380,6 +381,7 @@ pub struct ExitPaths {
     pub cells_closed: u64,
     pub layouts: u64,
     pub cells_kept: u64,
+    pub direct: u64,
 }
 
 impl ExitPaths {
@@ -398,6 +400,7 @@ impl ExitPaths {
         self.cells_closed += other.cells_closed;
         self.layouts += other.layouts;
         self.cells_kept += other.cells_kept;
+        self.direct += other.direct;
     }
 }
 

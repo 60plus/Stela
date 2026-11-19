@@ -309,7 +309,7 @@ fn exit_path_report(
     }
     let each = |ticks: u64, count: u64| nanos(ticks) / u128::from(count.max(1));
     line.push_str(&format!(
-        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={} layouts={} kept_each={}",
+        ",total={sum} syncs={}/100@{} isolations={}/100@{} closes={} cells_each={} layouts={} kept_each={} direct={}",
         u128::from(total.syncs) * 100 / traced,
         each(total.sync_ticks, total.syncs),
         u128::from(total.isolations) * 100 / traced,
@@ -318,6 +318,7 @@ fn exit_path_report(
         total.cells_closed / total.closes.max(1),
         total.layouts,
         total.cells_kept / total.layouts.max(1),
+        total.direct,
     ));
     output::arguments(format_args!("{line}\n"));
     *total = step_timing::ExitPaths::default();

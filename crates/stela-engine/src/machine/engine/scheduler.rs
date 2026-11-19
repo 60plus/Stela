@@ -14,6 +14,15 @@ pub(super) const HOT_SAMPLES: u8 = 2;
 /// Exits whose cells promotion steps read once that the PE keeps before
 /// it starts over, so a count stays recent.
 const SAMPLED_EXITS: usize = 4096;
+/// Fetches at once after System exits ([`Machine::continues_directly`])
+/// between two full steps of the run loop: what reaches the PE without
+/// moving its interrupt epoch (mail left for its next read, a device's
+/// reset or start) waits at most this many native runs more.
+const DIRECT_RUNS: u32 = 8;
+
+/// What a step left for the native run it entered: PSTATE, the device
+/// lines and the timer deadline ([`Machine::continues_directly`]).
+type Stepped = (Pstate, Option<(Lines, u64, usize)>, Option<Option<u64>>);
 
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Run until a stop. `budget` limits executed blocks (0 = unlimited).
@@ -73,6 +82,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // The host may have changed the devices between runs (`devices` is
         // theirs too): their lines are asked again.
         self.device_lines = None;
+        self.direct_next = false;
         loop {
             if self.statistics.blocks >= self.block_limit
                 || deadline
@@ -84,6 +94,27 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if let Some(hub) = &self.parallel {
                 hub.pass(self.current);
             }
+            if core::mem::take(&mut self.direct_next) {
+                self.direct_runs += 1;
+                // The trace's schedule and devices take no time.
+                let now = self.timing_start();
+                for point in [
+                    step_timing::PATH_SCHEDULE,
+                    step_timing::PATH_SCHEDULED,
+                    step_timing::PATH_DEVICES,
+                ] {
+                    self.trace_point(point, now);
+                }
+                if let Err(stop) = self
+                    .step_at_pc()
+                    .or_else(|stop| self.undefined_instead(stop))
+                {
+                    self.leave_run_loop();
+                    return stop;
+                }
+                continue;
+            }
+            self.direct_runs = 0;
             let started = self.timing_start();
             self.trace_point(step_timing::PATH_SCHEDULE, started);
             let scheduled = match deadline {
@@ -165,6 +196,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if delivered {
             return Ok(());
         }
+        self.step_at_pc()
+    }
+
+    /// The step's checks of the instruction at the PC, then its fetch and
+    /// run: what follows the devices and interrupts.
+    fn step_at_pc(&mut self) -> Step {
         let pc = self.cpu.pc;
         let mode = self.debug_mode();
         // Active-pending software step comes before every other exception
@@ -255,6 +292,63 @@ impl<H: Host, D: Devices> Machine<H, D> {
         step
     }
 
+    /// Whether the run loop may fetch at once after the System exit at
+    /// `next_pc` that just completed, skipping its schedule and its device
+    /// step, as native code chains on: the instruction completed plainly
+    /// (the PC at the next word, no exception), and PSTATE, the device
+    /// lines and the timer deadline are those the last full step found
+    /// (`stepped`), so its interrupt delivery would find what it found, until
+    /// the count where its lines may change by time alone (`lines_until`);
+    /// no other PE or device moved the interrupt epoch, and none of the
+    /// schedule's own sources holds work (mail on return, power changes or
+    /// code to forward, a wait, a pause, the time slice's end, a progress
+    /// mark, due DMA); and no debug check applies. At most [`DIRECT_RUNS`]
+    /// such fetches follow one full step.
+    pub(super) fn continues_directly(&mut self, next_pc: u64, stepped: Stepped) -> bool {
+        let (pstate, lines, timers) = stepped;
+        let now = Pstate {
+            btype: pstate.btype,
+            ..self.cpu.pstate
+        };
+        let lines_until = self.mirrors.lines_until;
+        if self.direct_runs >= DIRECT_RUNS
+            || self.cpu.pc != next_pc.wrapping_add(INSTRUCTION)
+            || now != pstate
+            || pstate.pacm
+            || pstate.il
+            || lines.is_none()
+            || self.device_lines != lines
+            || timers.is_none()
+            || self.timers != timers
+            || interrupts::native_timer_registers(&self.cpu) != self.timer_registers
+            || lines_until == 0
+            || self.waiting.is_some()
+            || self.mail_returned != 0
+            || !self.forwarded_power.is_empty()
+            || !self.deferred_code.is_empty()
+            || !self.breakpoints.is_empty()
+            || !self.traces.is_empty()
+            || self.native_failure.is_some()
+            || self.statistics.blocks >= self.slice_end
+            || self.processor_paused(self.current)
+            || self.clock.mark_due(self.cpu.retired)
+            || self.chain.interrupt_moved()
+        {
+            return false;
+        }
+        let mode = self.debug_mode();
+        if mode.breakpoints || mode.step {
+            return false;
+        }
+        let counter = self.host.counter();
+        (lines_until == u64::MAX || self.clock.below(lines_until, || counter))
+            && (self.peers.len() < 2 || counter < self.slice_deadline)
+            && self
+                .devices
+                .dma_deadline()
+                .is_none_or(|deadline| self.clock.below(deadline, || counter))
+    }
+
     /// Blocks the next native run may chain into: none past the time slice
     /// or the run's limit.
     /// Under step timing, tell the other PEs what this one does in its
@@ -303,6 +397,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Run compiled block `index` and the blocks it chains into, up to
     /// `budget` of them, and complete the last one's exit or fault.
     pub(super) fn execute(&mut self, index: usize, budget: u64) -> Step {
+        // What the step before found, for a fetch at once after a System
+        // exit that changes none of it.
+        let stepped: Stepped = (self.cpu.pstate, self.device_lines, self.timers);
         let (budget, sampled) = self.sampled_budget(budget);
         let entry = self.code.blocks[index].code;
         self.finish_transition(budget);
@@ -331,6 +428,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let exit = unsafe { self.host.execute(entry, &mut self.cpu.state) };
         self.finish_trace();
         self.set_doing(step_timing::BLOCKER_RETURNED);
+        // Native code switched no thread, woke no PE and spun on no event.
+        let quiet = self.mirrors.switches.len == 0
+            && self.mirrors.fast_ipi.wakes == 0
+            && self.mirrors.spin.completed | self.mirrors.spin.missed | self.mirrors.spin.held == 0;
         if self.mail_returned == 0
             && let Some(hub) = &self.parallel
             && hub.pending(self.current)
@@ -487,9 +588,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
                 let spent = exhausted;
+                let direct = quiet
+                    && !transitioned
+                    && kind == ExitKind::System as u64
+                    && !self.device_stub(last, next_pc);
                 self.set_doing(step_timing::exit_blocker(slot, self.timed_word));
                 let exited = self.exit(last, next_pc, kind);
                 self.trace_point_now(step_timing::PATH_SERVED);
+                if direct && exited.is_ok() && self.continues_directly(next_pc, stepped) {
+                    self.direct_next = true;
+                    if self.step_timing.is_some() {
+                        self.system_exits.paths.direct += 1;
+                    }
+                }
                 if exited.is_ok()
                     && let Some(miss) = self.branch_miss(last, next_pc, kind, spent, probed)
                 {

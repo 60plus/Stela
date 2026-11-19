@@ -613,7 +613,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
 /// The timer registers native code writes ([`TIMER_COMPARE`]), as the
 /// engine's cached timer deadline depends on them.
-fn native_timer_registers(cpu: &Cpu) -> [u64; 2] {
+pub(super) fn native_timer_registers(cpu: &Cpu) -> [u64; 2] {
     [
         cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0),
         cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0),
