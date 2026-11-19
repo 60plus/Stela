@@ -123,9 +123,24 @@ const PACK_MARGIN: u64 = 16 * MIB;
 /// share as they compile and the stored forms of blocks the ring took away
 /// (`translations::share`).
 pub const CODE_SHARE: u64 = 8;
-/// What of that share code beside the window keeps at least: the blocks
-/// shared at compile time took a quarter of it.
+/// The heap's share the pack's decoded records took (`translations::bounds`
+/// before one budget held them).
+pub const DECODED_SHARE: u64 = 64;
+/// What of those shares code beside the window keeps at least: the blocks
+/// shared at compile time took a quarter of the first, and the decoded
+/// records keep what they had.
 const KEPT_FLOOR_SHARE: u64 = 32;
+
+/// The heap's code beside the window before the budget: the code share and
+/// the decoded records' share.
+fn kept_share(heap: u64) -> u64 {
+    heap / CODE_SHARE + heap / DECODED_SHARE
+}
+
+/// The least of it the budget leaves.
+fn kept_floor(heap: u64) -> u64 {
+    heap / KEPT_FLOOR_SHARE + heap / DECODED_SHARE
+}
 
 /// The parts' sizes and the guest DRAM left after them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,10 +248,11 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 
 /// One budget for compiled code, the window's first: the window, its
 /// block records ([`HEAP_PER_WINDOW`]) and the code kept beside it in the
-/// heap (a [`CODE_SHARE`]th of the heap) are what they were, `2 * window +
-/// heap / CODE_SHARE`, and of that the window takes as much as leaves the
-/// kept code a [`KEPT_FLOOR_SHARE`]th of the heap, up to the most a window
-/// takes. The heap gives the window's growth back (its records come in,
+/// heap (a [`CODE_SHARE`]th of the heap for blocks and stored forms, a
+/// [`DECODED_SHARE`]th for the pack's decoded records) are what they were,
+/// and of that the window takes as much as leaves the kept code a
+/// [`KEPT_FLOOR_SHARE`]th of the heap and the decoded records their share,
+/// up to the most a window takes. The heap gives the window's growth back (its records come in,
 /// twice as much kept code goes out), so the guest keeps its DRAM.
 ///
 /// Code the window holds needs no stored form to come back from: the
@@ -247,9 +263,9 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 /// serving 25-190 thousand of 0.6-1.1 million installs a heartbeat).
 fn code_budget(sizes: Sizes) -> Sizes {
     let window = sizes.code.window;
-    let kept = sizes.heap / CODE_SHARE;
+    let kept = kept_share(sizes.heap);
     let budget = 2 * HEAP_PER_WINDOW * window + kept;
-    let floor = sizes.heap / KEPT_FLOOR_SHARE;
+    let floor = kept_floor(sizes.heap);
     let most = ((budget - floor) / (2 * HEAP_PER_WINDOW)).min(MAX_WINDOW) / CODE_ALIGNMENT
         * CODE_ALIGNMENT;
     if most <= window {
@@ -397,7 +413,7 @@ fn split(free: u64, heap: u64, code: CodeReservation, cores: usize, runners: usi
     Sizes {
         heap,
         code,
-        kept: heap / CODE_SHARE,
+        kept: kept_share(heap),
         pool,
         guest: rest.saturating_sub(pool),
     }

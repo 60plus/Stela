@@ -598,16 +598,16 @@ fn the_window_takes_the_code_budget_first_and_the_guest_keeps_its_dram() {
             );
             assert_eq!(
                 2 * after.code.window + after.kept,
-                2 * before.code.window + before.heap / CODE_SHARE,
+                2 * before.code.window + kept_share(before.heap),
                 "{name}"
             );
             assert!(after.code.window >= before.code.window, "{name}");
             assert!(after.code.window <= MAX_WINDOW, "{name}");
             assert!(after.code.window.is_multiple_of(CODE_ALIGNMENT), "{name}");
-            assert!(after.kept >= before.heap / KEPT_FLOOR_SHARE, "{name}");
+            assert!(after.kept >= kept_floor(before.heap), "{name}");
             if after.code.window < MAX_WINDOW {
                 assert!(
-                    after.kept < before.heap / KEPT_FLOOR_SHARE + 2 * CODE_ALIGNMENT,
+                    after.kept < kept_floor(before.heap) + 2 * CODE_ALIGNMENT,
                     "{name}"
                 );
             }
@@ -620,12 +620,16 @@ fn the_window_takes_the_code_budget_first_and_the_guest_keeps_its_dram() {
 #[test]
 fn small_hosts_move_their_kept_code_into_the_window() {
     for (free, window, heap, kept) in [
-        // From 496 MiB of window and 2800 MiB of heap (350 of it kept code).
-        (free(8), 624, 2672, 94),
-        // The 12 GiB VM with 10808 MiB free: from 672, 3266 and 408.
-        (10808 * MIB, 816, 3122, 120),
-        // From 992, 4576 and 572.
-        (free(16), 1200, 4368, 156),
+        // From 496 MiB of window and 2800 MiB of heap (394 of it kept code and decoded records).
+        (free(8), 624, 2672, 137),
+        // The 12 GiB VM with 10808 MiB free: from 672, 3266 and 459.
+        (10808 * MIB, 816, 3122, 171),
+        // From 992, 4576 and 643.
+        (free(16), 1200, 4368, 227),
+        // What the 12 GiB VM's parts are sized from beside an integrated
+        // GPU's 3280 MiB share and 2 MiB aperture (11528 MiB free with the
+        // pack's 720 MiB lent to the share): from 512, 2816 and 396.
+        (8246 * MIB, 640, 2688, 140),
     ] {
         let sizes = sizes(free, 8, 8).unwrap();
         assert_eq!(

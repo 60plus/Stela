@@ -684,8 +684,16 @@ fn bounds(heap: usize) -> (pack::Bounds, usize) {
 
 /// Make `parts` the store's, over the segments read, sharing up to
 /// `shared` bytes of blocks across PEs.
-fn install_parts(translator: Digest, segments: Vec<Pack<'static>>, shared: usize) {
-    let (bounds, kept_pages) = bounds(crate::ALLOCATOR.usage().total);
+fn install_parts(
+    translator: Digest,
+    segments: Vec<Pack<'static>>,
+    shared: usize,
+    decoded: Option<usize>,
+) {
+    let (mut bounds, kept_pages) = bounds(crate::ALLOCATOR.usage().total);
+    if let Some(decoded) = decoded {
+        bounds.decoded = decoded.max(pack::Bounds::default().decoded);
+    }
     AVAILABLE.kept_pages.store(kept_pages, Ordering::Release);
     let filters = pack::KeyFilters::new(&segments);
     for lock in &STORES {
@@ -944,7 +952,8 @@ pub fn store() -> Option<&'static mut Shared> {
 
 /// Keep up to `bound` bytes of compiled code for the PEs, the planner's
 /// share of the code budget beside the window (`host_memory::Sizes::kept`):
-/// a quarter for
+/// a third for the pack's decoded records, which held a sixty-fourth of
+/// the heap before the budget held them, a quarter for
 /// blocks shared as they are compiled (buffers and cache metadata in the
 /// loader's store or a store for this boot), the rest for stored forms of
 /// blocks the ring took away and the guest runs again, which the board
@@ -954,7 +963,8 @@ pub fn store() -> Option<&'static mut Shared> {
 /// 20261116-111302: 447 K hits, 28.6 M misses). Allocator overhead and
 /// shared immutable preparation storage are outside this budget.
 pub fn share(bound: usize) {
-    let kept = bound - bound / 4;
+    let decoded = bound / 3;
+    let kept = bound - bound / 4 - decoded;
     AVAILABLE.kept_entries.store(kept, Ordering::Release);
     let bound = bound / 4;
     BOOT.with(|boot| {
@@ -964,7 +974,7 @@ pub fn share(bound: usize) {
                 partition: None,
             })
             .translator;
-        install_parts(translator, Vec::new(), bound);
+        install_parts(translator, Vec::new(), bound, Some(decoded));
         AVAILABLE.shared_bound.store(bound, Ordering::Release);
         if bound != 0 {
             AVAILABLE
@@ -1074,7 +1084,7 @@ pub fn install(region: &'static mut [u8]) -> Option<Guid> {
             let old = lock.with(Option::take);
             drop(old);
         }
-        install_parts(translator, segments, 0);
+        install_parts(translator, segments, 0, None);
         *boot = Some(Boot {
             translator,
             partition: None,
