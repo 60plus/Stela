@@ -369,3 +369,89 @@ fn chained_runs_stop_where_single_blocks_do_at_every_transfer() -> Result<()> {
     std::eprintln!("{compared} runs compared, {chained} transfers, {aborts} aborts");
     Ok(())
 }
+
+/// What `PES RETIRED` reports is the instructions the guest ran, counted
+/// apart from the engine: a ring of blocks with a self-loop whose taken
+/// TBZ skips an instruction, and links within and across pages, stopped
+/// every few transfers, retires exactly what its registers say it ran: in
+/// blocks, self-loops and regions, profiled or not, on both link gates. A
+/// self-loop entry of one even iteration settles one below zero before its
+/// fall-through, so a run that stops there reads the account below zero.
+#[test]
+fn native_runs_retire_exactly_what_they_ran() -> Result<()> {
+    use stela_compiler::x86_64::chain::LinkGate;
+    let data = Mapping::new()?;
+    let code = Mapping::new()?;
+    let words = layout([
+        vec![
+            add_one(5),       // 0: add x5,x5,#1
+            tbz0(5, 1, 3),    //    tbz w5,#0,3f
+            add_one(6),       //    add x6,x6,#1
+            SUBS_X2,          // 3: subs x2,x2,#1
+            b_cond(NE, 4, 0), //    b.ne 0b
+            b(5, P1),         //    b P1
+        ],
+        vec![
+            add_one(7),   // P1: add x7,x7,#1
+            MOV_X2_X4,    //     mov x2,x4
+            b(P1 + 2, 0), //     b 0
+        ],
+        vec![],
+        vec![],
+    ]);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut gates = Vec::new();
+    for target in [TargetCpu::detect(), TargetCpu::Baseline] {
+        gates.push(LinkGate::for_target(target));
+        // Entries of one iteration, odd and even in turn, and of three.
+        for (config, iterations) in (0..8).flat_map(|config| [(config, 1), (config, 3)]) {
+            let (self_loops, regions, profiling) =
+                (config & 1 != 0, config & 2 != 0, config & 4 != 0);
+            let what = format!(
+                "{:?} loops {self_loops} regions {regions} profiling {profiling} \
+                 iterations {iterations}",
+                LinkGate::for_target(target)
+            );
+            let mut machine = machine(&code, &data, &words, target)?;
+            machine.set_self_loops(self_loops);
+            machine.set_regions(regions);
+            machine.set_step_timing(profiling);
+            let mut state = GuestState::default();
+            state.x[4] = iterations;
+            state.x[2] = state.x[4];
+            machine.cpu.state = state;
+            machine.cpu.pc = code.0;
+            let (retired, start) = (machine.cpu.retired, machine.statistics.blocks);
+            for _ in 0..300 {
+                let stop = machine.run(machine.statistics.blocks + 1 + rng.below(12));
+                ensure!(stop == Stop::Budget, "{what}: {stop:?}");
+                let state = &machine.cpu.state;
+                // Four per iteration and one more on odd x5; four per pass
+                // through P1, of which `b P1` runs before x7 counts it.
+                let ran = 4 * state.x[5] + state.x[6] + 4 * state.x[7];
+                let at = (machine.cpu.pc - code.0) as usize / 4;
+                let expected = match at {
+                    0 | 5 => ran,
+                    P1 => ran + 1,
+                    // In an iteration: its ADD and TBZ, and its ADD of x6.
+                    2 | 3 => ran - 2,
+                    _ => anyhow::bail!("{what}: stopped at word {at}"),
+                };
+                let counted = machine.cpu.retired - retired;
+                ensure!(
+                    counted == expected,
+                    "{what}: {counted} retired at word {at}, {expected} ran (x5 {} x6 {} x7 {})",
+                    state.x[5],
+                    state.x[6],
+                    state.x[7]
+                );
+            }
+            let transfers = machine.statistics.blocks - start;
+            ensure!(transfers > 1000, "{what}: {transfers} transfers");
+        }
+    }
+    if TargetCpu::detect().supports(TargetCpu::Baseline.with_bmi2().with_fast_pdep()) {
+        ensure!(gates == [LinkGate::Pext, LinkGate::Jrcxz], "{gates:?}");
+    }
+    Ok(())
+}
