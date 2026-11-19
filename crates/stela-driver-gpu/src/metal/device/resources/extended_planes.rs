@@ -475,8 +475,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// one of a plane the GPU reaches through an aligned copy (whose
     /// refresh follows the encode's writes in the rows), and when no device
     /// memory is left for it, which is reported once: its encodes then
-    /// write the planes in place.
+    /// write the planes in place. Over unified memory the planes are as near
+    /// the GPU as staging memory would be, and encodes write them in place.
     fn plane_staging(&mut self, id: TextureId) -> Result<Option<PlaneStaging>> {
+        if self.capabilities.has_unified_memory {
+            return Ok(None);
+        }
         let texture = self.resources.textures.get(id.0)?;
         let extent = [texture.descriptor.width, texture.descriptor.height].map(|side| side as u32);
         let (Some(color), Some(alpha)) = (texture.image, texture.second_plane) else {
@@ -699,8 +703,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             // The mirror holds what the planes do where the image did, or
             // once the pass decodes them all: its encode then writes only
             // the texels whose codes changed. Otherwise it writes all it
-            // encodes, and the mirror with them.
+            // encodes, and the mirror with them. Over unified memory the
+            // planes lie in the memory the mirror does: comparing reads
+            // as much as the writes it saves, and keeping it writes more,
+            // so no mirror is kept and encodes write the planes.
             mirror: match surface {
+                _ if self.capabilities.has_unified_memory => 0,
                 Some(_) if current || loads => TexelArguments::MIRROR_COMPARE,
                 Some(_) => TexelArguments::MIRROR_WRITE,
                 None => 0,
@@ -1115,6 +1123,71 @@ mod tests {
         // The working image has the mirror's layer.
         let working = device.extended_working(texture, view).unwrap();
         assert_eq!(working.layers, 1);
+        device.destroy_texture(texture).unwrap();
+    }
+
+    /// Over unified memory an encode writes the planes in place, every
+    /// texel it encodes, with no mirror to compare or keep and no staging
+    /// memory: either would move more bytes through the same memory than
+    /// the planes' writes they save.
+    #[test]
+    fn unified_memory_encodes_write_the_planes_with_no_mirror_or_staging() {
+        let mut device = device();
+        device.capabilities.has_unified_memory = true;
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let texture = device
+            .new_extended_plane_texture(
+                buffer,
+                &surface_texture(PixelFormat::Rgb10A8_2pXr10),
+                PLANES,
+            )
+            .unwrap();
+        let view = AttachmentView {
+            texture: (),
+            view_type: ImageViewType::D2,
+            range: SubresourceRange {
+                aspects: ImageAspects::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+        };
+        let extent = [1280, 800];
+        for (loads, seed) in [(true, 1), (false, 1), (true, 1), (false, 2)] {
+            let mut changes = PlaneChanges::default();
+            let actions = PlaneActions {
+                loads,
+                stores: true,
+                settled: true,
+                surface: Some((7, seed)),
+            };
+            let planes = device
+                .extended_pass_planes(texture, view, extent, actions, &mut changes)
+                .unwrap()
+                .unwrap();
+            device.apply_plane_changes(changes);
+            assert_eq!(planes.mirror, 0);
+            assert!(planes.staging.is_none());
+        }
+        // The same surface on a device of its own memory compares and
+        // stages.
+        device.capabilities.has_unified_memory = false;
+        let mut changes = PlaneChanges::default();
+        let actions = PlaneActions {
+            loads: true,
+            stores: true,
+            settled: true,
+            surface: Some((7, 2)),
+        };
+        let planes = device
+            .extended_pass_planes(texture, view, extent, actions, &mut changes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planes.mirror, TexelArguments::MIRROR_COMPARE);
+        assert!(planes.staging.is_some());
         device.destroy_texture(texture).unwrap();
     }
 
