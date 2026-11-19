@@ -561,7 +561,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     false => ItlbSource::AllLocal,
                 };
                 self.statistics.itlb_sources[source as usize] += 1;
-                let started = self.host.counter();
+                let started = self.whole_tlbi_clock();
                 let live =
                     !self.fill_log.is_empty() || self.spaces.iter().any(|spaces| spaces.len() != 0);
                 self.forget_spaces(0..=1, 1);
@@ -574,16 +574,32 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if reach != mmu::tlbi::Reach::All {
             self.statistics.scoped_maintenance += 1;
         }
-        let forgot = whole.map(|_| self.host.counter());
+        let forgot = match whole {
+            Some(_) => self.whole_tlbi_clock(),
+            None => 0,
+        };
         self.host.invalidate_reach(reach, everywhere);
         // A local TLBI of everything: its PC, whether the ITLB held
-        // anything, and the time of the engine's and the host's parts.
-        if let (Some((started, live)), Some(forgot)) = (whole, forgot) {
+        // anything, and, under step timing, the time of the engine's and
+        // the host's parts.
+        if let Some((started, live)) = whole {
+            let done = self.whole_tlbi_clock();
             self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
             let times = &mut self.statistics.whole_tlbi_times;
             times[0] += u64::from(live);
             times[1] += forgot.wrapping_sub(started);
-            times[2] += self.host.counter().wrapping_sub(forgot);
+            times[2] += done.wrapping_sub(forgot);
+        }
+    }
+
+    /// The counter, for the times of a TLBI of everything, while step
+    /// timing is on; zero otherwise. A guest flushes everything often, and
+    /// timing it is profiling, which normal runs do not pay for
+    /// (`system_access_samples_the_counter_and_interrupts_only_when_needed`).
+    fn whole_tlbi_clock(&mut self) -> u64 {
+        match self.step_timing {
+            Some(_) => self.host.counter(),
+            None => 0,
         }
     }
 

@@ -624,7 +624,7 @@ pub struct Statistics {
     pub whole_tlbi_sites: WholeTlbiSites,
     /// Of those TLBIs, the ones that found the ITLB holding anything, and
     /// the counter ticks of all of them in the engine's forgetting and in
-    /// the host's shadow.
+    /// the host's shadow, those two under step timing only.
     pub whole_tlbi_times: [u64; 3],
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
