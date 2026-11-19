@@ -615,6 +615,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else {
             written.unwrap_or(0)
         };
+        if self.step_timing.is_some()
+            && timer_word(word).is_some_and(|(kind, _)| kind == TimerWord::Value)
+        {
+            let reason = self.timer_value_exit(written);
+            if let Some(timing) = &mut self.step_timing {
+                timing.levels.timer_value_exits[reason as usize] += 1;
+            }
+        }
         let step = self.register_access(word, access);
         let pstate = self.cpu.pstate;
         if step.is_err()
@@ -660,6 +668,47 @@ impl<H: Host, D: Devices> Machine<H, D> {
             };
         }
         step
+    }
+
+    /// Why the MSR CNTV_TVAL_EL0 of `written` reached the engine, as the
+    /// native timer write tests it, under step timing.
+    fn timer_value_exit(&mut self, written: u64) -> step_timing::TimerExit {
+        use step_timing::TimerExit;
+        const HCR_E2H: u64 = 1 << 34;
+        let pstate = self.cpu.pstate;
+        if pstate.el != 2
+            || pstate.guarded
+            || timer::agt::present(self.cpu.registers.chip())
+            || self.cpu.read(SystemRegister::HCR_EL2) & HCR_E2H == 0
+        {
+            return TimerExit::State;
+        }
+        if self.mirrors[TIMER_COMPARE].readable == 0 || self.mirrors[TIMER_CONTROL].readable == 0 {
+            return TimerExit::Closed;
+        }
+        if self.mirrors.lines_until == 0 {
+            return if self.devices.own_fiq(self.current) {
+                TimerExit::LinesIpi
+            } else if self
+                .device_lines
+                .is_some_and(|(_, _, pe)| pe == self.current)
+            {
+                TimerExit::LinesMonitor
+            } else {
+                TimerExit::LinesDevices
+            };
+        }
+        let now = self.now();
+        let compare = self.cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0);
+        let control = self.cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0);
+        let armed = control & (timer::ENABLE | timer::IMASK) == timer::ENABLE;
+        if armed && now >= compare && self.mirrors.timer_quiet.readable == 0 {
+            return TimerExit::High;
+        }
+        if armed && now.wrapping_add(written as u32 as i32 as u64) <= now {
+            return TimerExit::Now;
+        }
+        TimerExit::Native
     }
 
     /// MSR of `WRITTEN[index]`: one that only reaches the register's

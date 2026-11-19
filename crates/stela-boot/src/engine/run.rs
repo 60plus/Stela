@@ -2255,7 +2255,7 @@ impl Heartbeat {
             // spins that missed, the WFEs an exclusive monitor kept from
             // spinning and the time spins took.
             let mut levels = String::from(
-                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns/wfe_stream",
+                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns/wfe_stream/tval_state/tval_closed/tval_lines_dev/tval_lines_pmu/tval_lines_ipi/tval_high/tval_now/tval_native",
             );
             let mut totals = parallel::Counts::default();
             // Per PE in any boot: its shares of the interval idle, in guest
@@ -2482,7 +2482,7 @@ impl Heartbeat {
                 }
                 let level = now.levels.since(&before.levels);
                 levels.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     tsc_percent(level.ticks[step_timing::Level::User as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Kernel as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Guarded as usize]),
@@ -2499,6 +2499,14 @@ impl Heartbeat {
                     u128::from(level.wfe_spin_counts) * 1_000_000_000
                         / u128::from(host::COUNTER_HZ),
                     level.wfe_streamed,
+                    level.timer_value_exits[0],
+                    level.timer_value_exits[1],
+                    level.timer_value_exits[2],
+                    level.timer_value_exits[3],
+                    level.timer_value_exits[4],
+                    level.timer_value_exits[5],
+                    level.timer_value_exits[6],
+                    level.timer_value_exits[7],
                 ));
                 for (total, (now, before)) in
                     exits.iter_mut().zip(now.exits.iter().zip(before.exits))

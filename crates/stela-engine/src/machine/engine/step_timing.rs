@@ -1960,6 +1960,9 @@ pub struct Levels {
     /// WFEs native code completed on an event stream edge since the last
     /// sample (`x86_64::register_read::EventStream`).
     pub wfe_streamed: u64,
+    /// MSR CNTV_TVAL_EL0s that reached the engine, by why native code left
+    /// them to it ([`TimerExit`]).
+    pub timer_value_exits: [u64; TimerExit::COUNT],
     /// At each WFI, the kernel ticks charged since the PE last ran EL0 code
     /// or reached a WFI: wake-ups that found nothing for user code, idle
     /// paths and kernel threads.
@@ -2044,12 +2047,45 @@ impl Levels {
             wfe_held: self.wfe_held.wrapping_sub(earlier.wfe_held),
             wfe_spin_counts: self.wfe_spin_counts.wrapping_sub(earlier.wfe_spin_counts),
             wfe_streamed: self.wfe_streamed.wrapping_sub(earlier.wfe_streamed),
+            timer_value_exits: core::array::from_fn(|reason| {
+                self.timer_value_exits[reason].wrapping_sub(earlier.timer_value_exits[reason])
+            }),
             kernel_before_wfi: self
                 .kernel_before_wfi
                 .wrapping_sub(earlier.kernel_before_wfi),
             ..*self
         }
     }
+}
+
+/// Why a timer write reached the engine, where the native timer write
+/// (`x86_64::register_read::timer_thunk`) would have completed it otherwise,
+/// in the order that thunk tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerExit {
+    /// Not at EL2 with HCR_EL2.E2H, at a guarded level, or a chip with two
+    /// timer banks: no native write serves the state.
+    State,
+    /// The timer cells are closed.
+    Closed,
+    /// The engine had not said when it looks at the lines again
+    /// (`Mirrors::lines_until`), as it kept no device lines for the PE...
+    LinesDevices,
+    /// ...as a performance monitor overflow was due or near...
+    LinesMonitor,
+    /// ...or as the PE's own fast IPI word was set.
+    LinesIpi,
+    /// The channel's output was high, and what lowering it leaves waiting
+    /// was not known.
+    High,
+    /// The write arms a compare the count has reached: the line rises.
+    Now,
+    /// Native code could have completed it (no thunk at the site).
+    Native,
+}
+
+impl TimerExit {
+    pub const COUNT: usize = 8;
 }
 
 /// Whether `word` is ERET, ERETAA or ERETAB.
