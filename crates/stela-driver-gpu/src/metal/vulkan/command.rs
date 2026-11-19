@@ -208,7 +208,11 @@ pub enum Command {
         pipeline: Pipeline,
     },
     PushConstants(PushConstants),
+    /// One viewport, which most passes set: no allocation.
+    SetViewport(Viewport),
     SetViewports(Vec<Viewport>),
+    /// One scissor rectangle, as [`Self::SetViewport`].
+    SetScissor(Rect),
     SetScissors(Vec<Rect>),
     SetDepthBias {
         enable: bool,
