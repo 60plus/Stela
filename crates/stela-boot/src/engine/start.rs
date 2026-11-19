@@ -336,6 +336,11 @@ fn start(handoff: u64) -> Started {
         Ok(options) => options,
         Err(error) => output::fatal(error),
     };
+    // A profile names the code holding the heap's blocks past the size
+    // classes, not only its largest.
+    if options.profile {
+        super::large_blocks::track_profile();
+    }
     // SAFETY: the loader handoff and all reservations stay pinned in the physmap.
     let native_processors = unsafe { crate::native_smp::validate(handoff, options.native_cores) }
         .unwrap_or_else(|error| output::fatal(error));

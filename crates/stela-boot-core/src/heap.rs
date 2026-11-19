@@ -98,17 +98,27 @@ fn passed_peak(carved: usize) {
 /// wait. The boot keeps their allocating stacks, so each large block on the
 /// heap names its code.
 static LARGE_HOOK: AtomicUsize = AtomicUsize::new(0);
-/// The least allocation [`LARGE_HOOK`] hears of: a few hundred live at most,
-/// rare enough that the hook costs nothing measurable.
+/// The least allocation [`LARGE_HOOK`] hears of by default: a few hundred
+/// live at most, rare enough that the hook costs nothing measurable.
 pub const TRACKED_BYTES: usize = 4 << 20;
+/// The least allocation [`LARGE_HOOK`] hears of now ([`set_tracked_bytes`]).
+static TRACKED: AtomicUsize = AtomicUsize::new(TRACKED_BYTES);
 
 /// Sets the hook [`LARGE_HOOK`] calls.
 pub fn set_large_hook(hook: fn(usize, usize, bool)) {
     LARGE_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Has [`LARGE_HOOK`] hear of free-list allocations from `bytes` on, for a
+/// profile of what holds the heap. A block made before a lower bound is
+/// freed unheard of; one made before a higher bound is freed unheard of too,
+/// so the bound is lowered only, once, before the blocks it names are made.
+pub fn set_tracked_bytes(bytes: usize) {
+    TRACKED.store(bytes.max(PAGE_BYTES), Ordering::Relaxed);
+}
+
 fn tracked(pointer: *mut u8, bytes: usize, allocated: bool) {
-    if bytes < TRACKED_BYTES || pointer.is_null() {
+    if bytes < TRACKED.load(Ordering::Relaxed) || pointer.is_null() {
         return;
     }
     let hook = LARGE_HOOK.load(Ordering::Acquire);

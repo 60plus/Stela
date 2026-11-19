@@ -1,23 +1,37 @@
 //! The engine heap's large blocks and the code that made them: each live
-//! allocation of at least `heap::TRACKED_BYTES`, with the image offsets on
-//! its allocating stack, for `HEAP LARGE` lines that `stela.pdb` resolves.
-//! The heap calls [`allocated_or_freed`] only for such blocks, a few
-//! hundred live at most, so the cost stays off every ordinary allocation.
+//! allocation of at least `heap::TRACKED_BYTES` (`PROFILE_BYTES` in a
+//! profile), with the image offsets on its allocating stack, for `HEAP
+//! LARGE` lines that `stela.pdb` resolves. The heap calls
+//! [`allocated_or_freed`] only for such blocks, a few hundred live at most
+//! (a few thousand in a profile), so the cost stays off every ordinary
+//! allocation.
 use crate::output;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 use stela_boot_core::stack_scan;
 
-/// Live large blocks kept; past them a block is only counted.
-const SLOTS: usize = 256;
+/// Live large blocks kept; past them a block is only counted. A profile's
+/// blocks from [`PROFILE_BYTES`] are about 1800 in a desktop session.
+const SLOTS: usize = 4096;
+/// Slots a block's search visits from its hash before it is only counted.
+const PROBES: usize = 64;
+/// A slot whose block was freed: a search goes past it, a new block takes it.
+const VACATED: u64 = 1;
+/// The least block a profile tracks: past the size classes' slabs, the
+/// bucket of the block records' chunks, which hold most of the heap's
+/// free-list bytes beside the larger blocks.
+pub(super) const PROFILE_BYTES: usize = 128 << 10;
 /// Image offsets kept from each allocating stack.
 const WORDS: usize = 12;
 /// The stack words searched for them.
 const SCANNED: usize = 512;
+/// Stacks the report names, the most bytes first; the rest are summed.
+const SHOWN: usize = 32;
 
 struct Slot {
-    /// The payload's address; zero for a free slot.
+    /// The payload's address; zero for a slot never taken, [`VACATED`] for
+    /// one whose block was freed.
     pointer: AtomicU64,
     bytes: AtomicU64,
     words: [AtomicU64; WORDS],
@@ -30,6 +44,19 @@ static BLOCKS: [Slot; SLOTS] = [const {
         words: [const { AtomicU64::new(0) }; WORDS],
     }
 }; SLOTS];
+
+/// The slots a search for `pointer` visits, from its hash.
+fn probes(pointer: u64) -> impl Iterator<Item = &'static Slot> {
+    // Payloads are 16-byte aligned: the multiply spreads the rest.
+    let start = ((pointer >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize;
+    (0..PROBES).map(move |step| &BLOCKS[(start + step) % SLOTS])
+}
+
+/// Tracks blocks from [`PROFILE_BYTES`] on, for a profile's report of what
+/// holds the heap: before the engine's own allocations.
+pub(super) fn track_profile() {
+    stela_boot_core::heap::set_tracked_bytes(PROFILE_BYTES);
+}
 /// Large blocks made while every slot was taken, which no line names: a
 /// count of blocks made, not of live ones.
 static UNTRACKED: AtomicU64 = AtomicU64::new(0);
@@ -53,20 +80,23 @@ fn allocated_or_freed(pointer: usize, bytes: usize, allocated: bool) {
     let pointer = pointer as u64;
     CHANGES.fetch_add(1, Ordering::Relaxed);
     if !allocated {
-        // The heap calls this before the block can be handed out again.
-        if let Some(slot) = BLOCKS
-            .iter()
+        // The heap calls this before the block can be handed out again. A
+        // search ends at a slot never taken: no block went past it.
+        if let Some(slot) = probes(pointer)
+            .take_while(|slot| slot.pointer.load(Ordering::Relaxed) != 0)
             .find(|slot| slot.pointer.load(Ordering::Relaxed) == pointer)
         {
             slot.bytes.store(0, Ordering::Relaxed);
-            slot.pointer.store(0, Ordering::Release);
+            slot.pointer.store(VACATED, Ordering::Release);
         }
         return;
     }
-    let Some(slot) = BLOCKS.iter().find(|slot| {
-        slot.pointer
-            .compare_exchange(0, pointer, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+    let Some(slot) = probes(pointer).find(|slot| {
+        [0, VACATED].into_iter().any(|empty| {
+            slot.pointer
+                .compare_exchange(empty, pointer, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        })
     }) else {
         UNTRACKED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -145,10 +175,11 @@ pub(in crate::engine) fn stack_code_offsets(scanned: usize, out: &mut [u64]) -> 
     kept
 }
 
-/// `HEAP LARGE blocks=31 bytes=612M untracked=0 empty_stacks=0`, then each live block,
-/// largest first, as `HEAP LARGE 64M stack 0x… 0x…`: every
-/// [`REPORT_CALLS`]th call, when blocks were made or freed since the last
-/// report.
+/// `HEAP LARGE blocks=31 bytes=612M stacks=12 untracked=0 empty_stacks=0`,
+/// then the live blocks of each allocating stack, the most bytes first, as
+/// `HEAP LARGE 64M blocks=16 stack 0x… 0x…` (the first [`SHOWN`], then
+/// `HEAP LARGE 3M blocks=40 other stacks=9`): every [`REPORT_CALLS`]th
+/// call, when blocks were made or freed since the last report.
 pub(super) fn report() {
     if !CALLS
         .fetch_add(1, Ordering::Relaxed)
@@ -160,9 +191,9 @@ pub(super) fn report() {
     if REPORTED.swap(changes, Ordering::Relaxed) == changes {
         return;
     }
-    let mut blocks: Vec<(u64, [u64; WORDS])> = BLOCKS
+    let blocks: Vec<(u64, [u64; WORDS])> = BLOCKS
         .iter()
-        .filter(|slot| slot.pointer.load(Ordering::Acquire) != 0)
+        .filter(|slot| slot.pointer.load(Ordering::Acquire) > VACATED)
         .map(|slot| {
             let bytes = slot.bytes.load(Ordering::Acquire);
             (
@@ -172,17 +203,53 @@ pub(super) fn report() {
         })
         .filter(|&(bytes, _)| bytes != 0)
         .collect();
-    blocks.sort_unstable_by_key(|&(bytes, _)| core::cmp::Reverse(bytes));
-    output::arguments(format_args!("{}\n", summary(&blocks)));
-    for (bytes, words) in &blocks {
-        output::arguments(format_args!("{}\n", line(*bytes, words)));
+    let stacks = by_stack(blocks.iter().copied());
+    output::arguments(format_args!("{}\n", summary(&blocks, stacks.len())));
+    for stack in stacks.iter().take(SHOWN) {
+        output::arguments(format_args!("{}\n", line(stack)));
+    }
+    if let Some(rest) = stacks.get(SHOWN..).filter(|rest| !rest.is_empty()) {
+        output::arguments(format_args!(
+            "HEAP LARGE {}M blocks={} other stacks={}\n",
+            rest.iter().map(|stack| stack.bytes).sum::<u64>() >> 20,
+            rest.iter().map(|stack| stack.blocks).sum::<u64>(),
+            rest.len()
+        ));
     }
 }
 
-fn summary(blocks: &[(u64, [u64; WORDS])]) -> String {
+/// One allocating stack's live blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stack {
+    bytes: u64,
+    blocks: u64,
+    words: [u64; WORDS],
+}
+
+/// The blocks grouped by allocating stack, the most bytes first.
+fn by_stack(blocks: impl Iterator<Item = (u64, [u64; WORDS])>) -> Vec<Stack> {
+    let mut stacks: Vec<Stack> = Vec::new();
+    for (bytes, words) in blocks {
+        match stacks.iter_mut().find(|stack| stack.words == words) {
+            Some(stack) => {
+                stack.bytes += bytes;
+                stack.blocks += 1;
+            }
+            None => stacks.push(Stack {
+                bytes,
+                blocks: 1,
+                words,
+            }),
+        }
+    }
+    stacks.sort_unstable_by_key(|stack| core::cmp::Reverse(stack.bytes));
+    stacks
+}
+
+fn summary(blocks: &[(u64, [u64; WORDS])], stacks: usize) -> String {
     let bytes: u64 = blocks.iter().map(|&(bytes, _)| bytes).sum();
     format!(
-        "HEAP LARGE blocks={} bytes={}M untracked={} empty_stacks={}",
+        "HEAP LARGE blocks={} bytes={}M stacks={stacks} untracked={} empty_stacks={}",
         blocks.len(),
         bytes >> 20,
         UNTRACKED.load(Ordering::Relaxed),
@@ -190,9 +257,13 @@ fn summary(blocks: &[(u64, [u64; WORDS])]) -> String {
     )
 }
 
-fn line(bytes: u64, words: &[u64; WORDS]) -> String {
-    let mut line = format!("HEAP LARGE {}M stack", bytes >> 20);
-    for &offset in words.iter().filter(|&&offset| offset != 0) {
+fn line(stack: &Stack) -> String {
+    let mut line = format!(
+        "HEAP LARGE {}M blocks={} stack",
+        stack.bytes >> 20,
+        stack.blocks
+    );
+    for &offset in stack.words.iter().filter(|&&offset| offset != 0) {
         let _ = write!(line, " {offset:#x}");
     }
     line
