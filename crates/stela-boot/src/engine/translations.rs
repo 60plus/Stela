@@ -821,12 +821,9 @@ impl Translations for Shared {
 
     fn offer(&mut self, offer: Offer) {
         let capabilities = AVAILABLE.capabilities.load(Ordering::Acquire);
-        // Its successors in its page, for a waiting PE to prepare.
+        // Its successors, for a waiting PE to prepare.
         if capabilities & SHARE_BLOCKS != 0 {
-            AHEAD.with(|queue| {
-                let queue = queue.get_or_insert_with(ahead::Queue::new);
-                offer.ahead_jobs().for_each(|job| queue.push(job));
-            });
+            AHEAD.with(|queue| queue.get_or_insert_with(ahead::Queue::new).offered(&offer));
         }
         // A block prepared ahead is only shared: the PE that installs it
         // first offers it again for the pack.
@@ -887,7 +884,7 @@ const AHEAD_MICROS: u64 = 500;
 /// whose guest waits calls it. `read` reads a guest-physical frame. A job
 /// whose block the store holds (in a pack record or among its shared
 /// blocks) or whose frame no longer holds its page's bytes is skipped; the
-/// others' blocks join the shared blocks, and their successors the queue.
+/// others' blocks join the shared blocks.
 pub fn prepare_ahead(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, stop: &dyn Fn() -> bool) {
     if !available(SHARE_BLOCKS) {
         return;
@@ -916,7 +913,23 @@ fn ahead_job(
     page: &mut [u8; translations::PAGE_BYTES],
     verified: &mut Option<(u64, Digest)>,
 ) -> ahead::Outcome {
-    let key = *job.key();
+    // A job for another page than its naming block's takes the key of the
+    // bytes its frame holds now.
+    let key = match job.key() {
+        Some(key) => *key,
+        None => match *verified {
+            Some((frame, key)) if frame == job.frame() => key,
+            _ => {
+                *verified = None;
+                if !read(job.frame(), page) {
+                    return ahead::Outcome::Stale;
+                }
+                let key = Digest::of(page);
+                *verified = Some((job.frame(), key));
+                key
+            }
+        },
+    };
     let held = part(&key).with(|store| {
         store
             .as_ref()
@@ -936,7 +949,7 @@ fn ahead_job(
         }
         *verified = Some((job.frame(), key));
     }
-    match ahead::prepare(job, page) {
+    match ahead::prepare(job, key, page) {
         Ok(offer) => {
             Shared.offer(offer);
             ahead::Outcome::Prepared
@@ -1184,9 +1197,11 @@ fn report(counters: &pack::Counters) {
     let ahead = AHEAD.with(|queue| queue.as_ref().map(ahead::Queue::counts));
     let ahead = ahead.unwrap_or_default();
     output::arguments(format_args!(
-        "TRANSLATIONS ahead queued={} repeated={} dropped={} prepared={} present={} stale={} \
-         refused={}\n",
+        "TRANSLATIONS ahead queued={} elsewhere={} unwalked={} repeated={} dropped={} \
+         prepared={} present={} stale={} refused={}\n",
         ahead.queued,
+        ahead.elsewhere,
+        ahead.unwalked,
         ahead.repeated,
         ahead.dropped,
         ahead.prepared,

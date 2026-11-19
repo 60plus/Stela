@@ -138,6 +138,9 @@ pub struct SharedTranslation {
     /// Prepared ahead of any fetch (`ahead.rs`), not offered for the
     /// pack yet: the PE that first installs it offers it.
     ahead: bool,
+    /// A block prepared ahead: the entry PCs of its static successors,
+    /// which its first install offers as a fetched block's. None otherwise.
+    successors: Vec<u64>,
 }
 impl SharedTranslation {
     pub fn input(&self) -> &[u8] {
@@ -153,16 +156,25 @@ impl SharedTranslation {
     pub fn ahead(&self) -> bool {
         self.ahead
     }
+    /// The entry PCs of its static successors, kept for a block prepared
+    /// ahead.
+    pub fn successors(&self) -> &[u64] {
+        &self.successors
+    }
     /// The offer of a block prepared ahead, made by the PE that installs it
-    /// first: the store keeps it for the pack as any block compiled anew.
-    pub(super) fn offer(&self, quiet: bool) -> Offer {
+    /// first: the store keeps it for the pack as any block compiled anew,
+    /// and its successors (`elsewhere`: in other pages, with the frames
+    /// the installing PE's fetch cache holds) become jobs as a fetched
+    /// block's do.
+    pub(super) fn offer(&self, quiet: bool, elsewhere: Vec<(u64, u64)>) -> Offer {
         Offer {
             key: self.key,
             page: self.page,
             pc: self.pc,
             context: self.context,
             emission: self.emission.clone(),
-            successors: Vec::new(),
+            successors: self.successors.clone(),
+            elsewhere,
             quiet,
             frame: self.frame,
             depth: 0,
@@ -282,6 +294,9 @@ pub struct Offer {
     /// The entry PCs of its static successors, for translation ahead of
     /// execution.
     pub(super) successors: Vec<u64>,
+    /// Those of them in other pages, each with the frame of its page where
+    /// the offering PE's fetch cache held its walk, else 0 (`ahead.rs`).
+    pub(super) elsewhere: Vec<(u64, u64)>,
     /// Compiled for EL0, where the PE holds no lock of the guest's kernel:
     /// a store may take time there for work of its own.
     pub(super) quiet: bool,
@@ -319,6 +334,7 @@ impl Offer {
             context,
             emission: Arc::new(Emission::new(input, block, preparation)),
             successors: Vec::new(),
+            elsewhere: Vec::new(),
             quiet: false,
             frame: 0,
             depth: 0,
@@ -370,6 +386,10 @@ impl Offer {
             context: self.context,
             frame: self.frame,
             ahead: self.depth > 0,
+            successors: match self.depth > 0 {
+                true => self.successors,
+                false => Vec::new(),
+            },
         })
     }
 

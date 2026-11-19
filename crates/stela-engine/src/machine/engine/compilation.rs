@@ -837,8 +837,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         let level = usize::from(self.cpu.pstate.el != 0);
                         self.statistics.ahead_installs[level] += 1;
                         let quiet = self.cpu.pstate.el == 0;
+                        let elsewhere = self.elsewhere(page, compiled.successors());
                         if let Some(translations) = self.host.translations() {
-                            translations.offer(compiled.offer(quiet));
+                            translations.offer(compiled.offer(quiet, elsewhere));
                         }
                     }
                     return self
@@ -979,24 +980,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // the engine's caches have grown, still keeps it, or the pack would
         // miss every block compiled after that. The other PEs take the block
         // either way.
-        if let (Some((key, _)), Some(context)) = (stored, context)
-            && let low = self.host.memory_low()
-            && let Some(translations) = self.host.translations()
-        {
-            let offer = Offer {
-                key,
-                page,
-                pc,
-                context,
-                emission: emission.clone(),
-                successors,
-                quiet: self.cpu.pstate.el == 0,
-                frame: physical & !(FETCH_PAGE - 1),
-                depth: 0,
-            };
-            translations.offer(offer);
-            self.statistics.offered += 1;
-            self.statistics.offered_low += u64::from(low);
+        if let (Some((key, _)), Some(context)) = (stored, context) {
+            let elsewhere = self.elsewhere(page, &successors);
+            let low = self.host.memory_low();
+            if let Some(translations) = self.host.translations() {
+                let offer = Offer {
+                    key,
+                    page,
+                    pc,
+                    context,
+                    emission: emission.clone(),
+                    successors,
+                    elsewhere,
+                    quiet: self.cpu.pstate.el == 0,
+                    frame: physical & !(FETCH_PAGE - 1),
+                    depth: 0,
+                };
+                translations.offer(offer);
+                self.statistics.offered += 1;
+                self.statistics.offered_low += u64::from(low);
+            }
         }
         self.install(
             pc,
@@ -1006,6 +1009,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
             recovery::Template::compiled(emission),
         )
         .map(Some)
+    }
+
+    /// The static successors of a block of the fetch page at `page` that lie
+    /// in other pages, each with the frame of its page where this PE's
+    /// fetch cache holds a walk of it for the current EL, else 0, for
+    /// translation ahead ([`Offer::elsewhere`]). A page with device sites
+    /// is left out: the store neither gives nor takes its blocks.
+    fn elsewhere(&self, page: u64, successors: &[u64]) -> Vec<(u64, u64)> {
+        successors
+            .iter()
+            .copied()
+            .filter(|&target| target & !(FETCH_PAGE - 1) != page)
+            .filter_map(|target| match self.cached_fetch(target) {
+                None => Some((target, 0)),
+                Some(entry) if self.page_has_device_sites(entry.physical) => None,
+                Some(entry) => Some((target, entry.physical & !(FETCH_PAGE - 1))),
+            })
+            .collect()
     }
 
     /// Count an install from `source` at the PE's level: EL0, or above.
