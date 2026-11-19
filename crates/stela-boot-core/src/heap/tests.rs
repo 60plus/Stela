@@ -460,8 +460,8 @@ fn size_class_reuse_preserves_other_live_bytes() {
 fn resizing_within_a_size_class_keeps_the_allocation() {
     let heap = Heap::new();
     let mut ram = backing();
-    let layout = Layout::from_size_align(50, 16).unwrap();
-    let smaller = Layout::from_size_align(34, 16).unwrap();
+    let layout = Layout::from_size_align(56, 16).unwrap();
+    let smaller = Layout::from_size_align(50, 16).unwrap();
     let larger = Layout::from_size_align(62, 16).unwrap();
     let next_class = Layout::from_size_align(65, 16).unwrap();
     // SAFETY: exclusive backing, valid nonzero layouts, and each resize
@@ -482,7 +482,7 @@ fn resizing_within_a_size_class_keeps_the_allocation() {
         assert!(!moved.is_null() && moved != shrunk);
         assert_eq!(
             core::slice::from_raw_parts(moved, smaller.size()),
-            &[0x5a; 34]
+            &[0x5a; 50]
         );
         heap.dealloc(moved, next_class);
     }
@@ -1185,4 +1185,27 @@ fn a_stop_without_a_reserve_fails_instead_of_waiting() {
         assert!(!block.is_null());
         heap.dealloc(block, layout);
     }
+}
+
+/// Each request takes the smallest class that holds it, past the power of
+/// two below it by at most a half: three 24-byte records take 96 bytes,
+/// not 128; past the largest class, or aligned past 16, the free list.
+#[test]
+fn a_request_takes_the_smallest_class_that_holds_it() {
+    for size in 0..=4096 {
+        let class = class(Layout::from_size_align(size, 8).unwrap()).unwrap();
+        assert!(class_bytes(class) >= size.max(1), "{size}");
+        assert!(class == 0 || class_bytes(class - 1) < size, "{size}");
+        assert!(slab_bytes(class).is_power_of_two(), "{size}");
+        assert!(
+            (slab_bytes(class) - SLAB_FIRST) / class_bytes(class) >= 15,
+            "{size}"
+        );
+    }
+    assert_eq!(
+        class_bytes(class(Layout::from_size_align(72, 8).unwrap()).unwrap()),
+        96
+    );
+    assert_eq!(class(Layout::from_size_align(4097, 8).unwrap()), None);
+    assert_eq!(class(Layout::from_size_align(64, 32).unwrap()), None);
 }

@@ -262,8 +262,31 @@ struct Small {
     next: *mut Small,
 }
 const SMALLEST: usize = 16;
-const CLASSES: usize = 9;
+/// The size classes' bytes: 16, 32, then each power of two from 64 to 4096
+/// with three quarters of it below it. Power-of-two classes alone rounded a
+/// request up by a quarter of its block on average; the 12 GiB VM's
+/// 500 MiB of size-class blocks held about 60 MiB of it (run
+/// 20261119-133831), and 24-byte records in threes (exits, entries) took
+/// 128 bytes for 72.
+const CLASS_BYTES: [usize; CLASSES] = [
+    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+];
+pub const CLASSES: usize = 16;
 const SMALL_ALIGNMENT: usize = 16;
+// Every class keeps the small alignment at a slab's first block.
+const _: () = {
+    let mut class = 0;
+    while class < CLASSES {
+        assert!(CLASS_BYTES[class].is_multiple_of(SMALL_ALIGNMENT));
+        class += 1;
+    }
+    assert!(SLAB_FIRST.is_multiple_of(SMALL_ALIGNMENT));
+};
+
+/// The bytes of a block of size class `class`.
+pub const fn class_bytes(class: usize) -> usize {
+    CLASS_BYTES[class]
+}
 
 /// A slab's bookkeeping, after the boundary tag at its aligned start; its
 /// blocks follow from [`SLAB_FIRST`]. Read and written with the lock held.
@@ -291,7 +314,7 @@ const SLAB_LARGEST: usize = 64 << 10;
 
 /// The bytes of a slab of `class`, a power of two its slabs are aligned to.
 const fn slab_bytes(class: usize) -> usize {
-    let bytes = (SMALLEST << class) * 64;
+    let bytes = (class_bytes(class) * 64).next_power_of_two();
     if bytes < SLAB_SMALLEST {
         SLAB_SMALLEST
     } else if bytes > SLAB_LARGEST {
@@ -370,9 +393,20 @@ fn large_bucket(bytes: usize) -> usize {
 
 /// The size class of `layout`, or `None` for the free list.
 fn class(layout: Layout) -> Option<usize> {
-    let bytes = layout.size().max(SMALLEST).next_power_of_two();
-    (layout.align() <= SMALL_ALIGNMENT && bytes <= SMALLEST << (CLASSES - 1))
-        .then(|| (bytes / SMALLEST).trailing_zeros() as usize)
+    let bytes = layout.size().max(SMALLEST);
+    if layout.align() > SMALL_ALIGNMENT || bytes > CLASS_BYTES[CLASSES - 1] {
+        return None;
+    }
+    // A power of two from 32 (2^5) is class 2k - 9; from 64 (2^6) the
+    // class below it is three quarters of it.
+    let power = bytes.next_power_of_two();
+    let bits = power.trailing_zeros() as usize;
+    Some(match bits {
+        4 => 0,
+        5 => 1,
+        _ if bytes <= power / 4 * 3 => 2 * bits - 10,
+        _ => 2 * bits - 9,
+    })
 }
 /// Free blocks by size: the nonempty levels, each level's nonempty bins, and
 /// the bins' blocks.
@@ -1121,7 +1155,7 @@ impl Heap {
             return ptr::null_mut();
         }
         cache.counts[class] -= 1;
-        self.count_cached(cpu, (SMALLEST << class) as isize);
+        self.count_cached(cpu, class_bytes(class) as isize);
         cache.blocks[class][cache.counts[class]].cast()
     }
 
@@ -1148,7 +1182,7 @@ impl Heap {
         }
         cache.blocks[class][cache.counts[class]] = block.cast();
         cache.counts[class] += 1;
-        self.count_cached(cpu, -((SMALLEST << class) as isize));
+        self.count_cached(cpu, -(class_bytes(class) as isize));
     }
 
     /// Add `bytes` to core `cpu`'s count, which only it writes.
@@ -1187,7 +1221,7 @@ impl Heap {
 
     /// Add `bytes` to the calling core's own count, which only it writes.
     fn count_own(&self, cpu: usize, layout: Layout, class: Option<usize>, allocated: bool) {
-        let bytes = class.map_or(layout.size(), |class| SMALLEST << class) as isize;
+        let bytes = class.map_or(layout.size(), class_bytes) as isize;
         let bytes = if allocated { bytes } else { -bytes };
         let core = &self.cores[cpu];
         let count = &core.own;
@@ -1409,7 +1443,7 @@ unsafe fn allocate_locked(state: &mut State, layout: Layout, class: Option<usize
     // SAFETY: guarded initialized state and a validated class.
     let block = unsafe { slab_take(state, class) };
     if !block.is_null() {
-        state.live += SMALLEST << class;
+        state.live += class_bytes(class);
     }
     block
 }
@@ -1454,7 +1488,7 @@ unsafe impl GlobalAlloc for Heap {
                 self.count_own(cpu, layout, class, true);
             }
             if !large {
-                let bytes = class.map_or(layout.size(), |class| SMALLEST << class);
+                let bytes = class.map_or(layout.size(), class_bytes);
                 // Before the cores are tagged, one core runs: the first's
                 // count serves it.
                 self.sample(cpu.unwrap_or(0), block, bytes);
@@ -1487,7 +1521,7 @@ unsafe impl GlobalAlloc for Heap {
         // writer and masks local reentry until this state borrow ends.
         let state = unsafe { &mut *self.state.get() };
         if let Some(class) = class {
-            state.live -= SMALLEST << class;
+            state.live -= class_bytes(class);
             // SAFETY: the caller's block of this class, which it no longer
             // accesses.
             unsafe { slab_give(state, class, pointer) };
@@ -1786,7 +1820,7 @@ unsafe fn release_spares(state: &mut State) -> bool {
 /// # Safety
 /// The heap's lock is held and `state` is initialized.
 unsafe fn slab_take(state: &mut State, class: usize) -> *mut u8 {
-    let bytes = SMALLEST << class;
+    let bytes = class_bytes(class);
     let mut slab = state.partial[class];
     if slab.is_null() {
         slab = core::mem::replace(&mut state.spare[class], ptr::null_mut());
@@ -1839,7 +1873,7 @@ unsafe fn slab_give(state: &mut State, class: usize, block: *mut u8) {
         freed.write(Small { next: (*slab).free });
         (*slab).free = freed;
         (*slab).used -= 1;
-        state.slab_free += SMALLEST << class;
+        state.slab_free += class_bytes(class);
         if (*slab).used == 0 {
             state.unlist_slab(class, slab);
             if state.spare[class].is_null() {
@@ -1872,7 +1906,7 @@ unsafe fn new_slab(state: &mut State, class: usize) -> *mut Slab {
         return ptr::null_mut();
     }
     let slab = (start + HEADER_BYTES) as *mut Slab;
-    let capacity = (bytes - SLAB_FIRST) / (SMALLEST << class);
+    let capacity = (bytes - SLAB_FIRST) / class_bytes(class);
     // SAFETY: the carved block's payload, which begins with the slab.
     unsafe {
         slab.write(Slab {
@@ -1885,7 +1919,7 @@ unsafe fn new_slab(state: &mut State, class: usize) -> *mut Slab {
         });
     }
     state.slabs += 1;
-    state.slab_free += capacity * (SMALLEST << class);
+    state.slab_free += capacity * class_bytes(class);
     slab
 }
 
@@ -1898,7 +1932,7 @@ unsafe fn release_slab(state: &mut State, class: usize, slab: *mut Slab) {
     // SAFETY: the caller's empty slab, the payload of a carved block.
     unsafe {
         state.slabs -= 1;
-        state.slab_free -= (*slab).capacity as usize * (SMALLEST << class);
+        state.slab_free -= (*slab).capacity as usize * class_bytes(class);
         release(state, slab.cast());
     }
 }

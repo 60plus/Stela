@@ -2953,7 +2953,13 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
         .class_live()
         .iter()
         .enumerate()
-        .map(|(class, &bytes)| format!("{}:{}M", 16 << class, bytes >> 20))
+        .map(|(class, &bytes)| {
+            format!(
+                "{}:{}M",
+                stela_boot_core::heap::class_bytes(class),
+                bytes >> 20
+            )
+        })
         .collect();
     line.push_str(&format!(" classes={}", classes.join(",")));
     // The size-class slabs, and the bytes of free blocks they keep.
