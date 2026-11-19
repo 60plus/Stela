@@ -79,12 +79,12 @@ pub use device_write::{
     CanonicalDeviceWrite, CanonicalWriteMemory, ConsumedWrite, DeviceWriteRequest, DeviceWriteShape,
 };
 pub mod ahead;
-pub mod refill;
 mod block_index;
 mod board;
 mod page_sets;
 mod processors;
 mod recovery;
+pub mod refill;
 mod scalable;
 mod shared_memory;
 pub mod step_timing;
