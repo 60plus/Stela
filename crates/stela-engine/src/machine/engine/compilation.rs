@@ -45,6 +45,7 @@ fn insert_target(
 
 impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
+        self.linked_at_install = None;
         let context = self.current_variant(single, false);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let contexts = self.contexts(el, context);
@@ -443,6 +444,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// An exit from another page links through a cell, which starts with
     /// the block table's entry of its target: the entry goes in first.
     fn remember_or_link(&mut self, pc: u64, index: usize) {
+        // The install's hold linked the exit that waited for it.
+        if self.linked_at_install.take() == Some(pc) {
+            return;
+        }
         let from_another_page = self.direct_exit.is_some_and(|(block, _, target, _)| {
             target == pc
                 && self
@@ -1302,18 +1307,33 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // Only indexed blocks are reached, which eviction relies on.
             self.detach(&mut cache, &[replaced as u32]);
         }
-        // The fetch that compiled the block would take the lock again for
-        // its block table entry right after; it takes it in this hold,
-        // unless a direct exit waits to link it instead
-        // ([`Self::remember_or_link`]).
-        if self.publishing_target == Some(pc)
-            && !self
+        // The fetch that compiled the block would take the lock again right
+        // after, to link the direct exit of its page that waits for it or
+        // else for its block table entry ([`Self::remember_or_link`]): it
+        // does either in this hold.
+        if self.publishing_target == Some(pc) {
+            let waiting = self.direct_exit.filter(|&(block, incarnation, target, _)| {
+                target == pc
+                    && shared.blocks.record(block).incarnation() == incarnation
+                    && shared
+                        .blocks
+                        .installed(block)
+                        .is_some_and(|block| (block.pc ^ pc) & !(FETCH_PAGE - 1) == 0)
+            });
+            let linked = waiting.is_some_and(|(block, _, _, word)| {
+                self.direct_exit = None;
+                self.link_held(&shared, &mut cache, block, pc, word)
+            });
+            if linked {
+                self.linked_at_install = Some(pc);
+            } else if !self
                 .direct_exit
                 .is_some_and(|(_, _, target, _)| target == pc)
-            && let Some((at, target)) = self.target_entry(pc, slot)
-            && shared.blocks.record(slot).remember()
-        {
-            insert_target(&shared, &mut cache, pc, slot, at, target);
+                && let Some((at, target)) = self.target_entry(pc, slot)
+                && shared.blocks.record(slot).remember()
+            {
+                insert_target(&shared, &mut cache, pc, slot, at, target);
+            }
         }
         drop(cache);
         self.mirrors.close_code_page();

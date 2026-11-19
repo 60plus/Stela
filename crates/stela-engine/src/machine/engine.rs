@@ -1065,6 +1065,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// its own after ([`Self::remember_target`]); none outside such a
     /// fetch.
     publishing_target: Option<u64>,
+    /// The PC whose fetch linked the direct exit waiting for it in its
+    /// install's hold, for that fetch's [`Self::remember_or_link`].
+    linked_at_install: Option<u64>,
     /// Maintenance for the other PEs that this PE's next DSB sends
     /// ([`Self::send_outgoing`]).
     outgoing: Vec<parallel::Maintenance>,
@@ -1465,6 +1468,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             mail_spare: Vec::new(),
             direct_exit: None,
             publishing_target: None,
+            linked_at_install: None,
             outgoing: Vec::new(),
             lines_epoch: 0,
             serving_since: None,

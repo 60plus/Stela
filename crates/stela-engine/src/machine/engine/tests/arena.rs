@@ -998,7 +998,7 @@ fn an_install_takes_the_code_lock_once_and_a_found_block_never() {
 
 /// A direct exit within its page to a PC that has no block yet waits for
 /// the fetch that compiles it without taking the code lock (the finder
-/// says so); that fetch's install and its link take one hold each, and the
+/// says so); that fetch's install links it in the same hold, and the
 /// block, which only the link enters, takes no block table entry. An exit
 /// to a PC that has a block links at once, in one hold.
 #[test]
@@ -1018,15 +1018,13 @@ fn an_exit_to_a_pc_without_a_block_waits_for_it_without_the_code_lock() {
             .direct_exit
             .is_some_and(|(block, _, target, _)| block == from && target == base + 8)
     );
+    let links = acquired(&first, board::LockSite::Link);
     let before = total(&first);
     let Ok(Fetched::Block(to)) = first.fetch_block(base + 8, false) else {
         panic!("a block")
     };
-    assert_eq!(
-        total(&first) - before - 1,
-        2,
-        "the install's and the link's"
-    );
+    assert_eq!(total(&first) - before - 1, 1, "the install's, which links");
+    assert_eq!(acquired(&first, board::LockSite::Link), links);
     assert!(first.code.blocks.record(from).chained(0));
     let pc = base + 8;
     let key = target_key(&first, pc);

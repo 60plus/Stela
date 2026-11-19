@@ -686,12 +686,39 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         let code = Arc::clone(&self.code);
-        let block = &code.blocks[index];
-        let record = code.blocks.record(index);
-        let find = || unlinked(&code);
         // Another PE may link or detach it meanwhile: found again under the
         // lock, for a block still installed.
         let mut cache = code.cache_at(board::LockSite::Link);
+        self.link_held(&code, &mut cache, index, next_pc, word)
+    }
+
+    /// [`Self::link`]'s work under the board's lock, `cache` its hold of
+    /// `code`: the exit of block `index` to `next_pc` with `word`, found
+    /// again, linked if both blocks are indexed.
+    pub(super) fn link_held(
+        &mut self,
+        code: &board::Code,
+        cache: &mut board::Cache,
+        index: usize,
+        next_pc: u64,
+        word: ExitWord,
+    ) -> bool {
+        let block = &code.blocks[index];
+        let record = code.blocks.record(index);
+        let find = || {
+            block
+                .successors
+                .iter()
+                .enumerate()
+                .position(|(position, exit)| {
+                    !record.linked(position) && exit.target.0 == next_pc && exit.word() == word
+                })
+        };
+        if self.variants[block.variant.0 as usize].single
+            || self.traces.binary_search(&next_pc).is_ok()
+        {
+            return false;
+        }
         // Only an indexed block links out: a detach finds the sources of
         // its links among the indexed blocks of the target's page, so a
         // link from a block an IC IVAU forgot would outlive its target.
@@ -711,12 +738,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // compiled never takes again. The fetch of the target that
             // follows translates its page and links the exit
             // ([`Self::link_direct_exit`]).
-            if self.translated_entry(&cache, next_pc).is_none() {
+            if self.translated_entry(cache, next_pc).is_none() {
                 self.direct_exit = Some((index, record.incarnation(), next_pc, word));
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, false) {
+            if self.link_through_cell(cache, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }
