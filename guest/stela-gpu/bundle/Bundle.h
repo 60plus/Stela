@@ -634,7 +634,7 @@ id stela_empty_logs(void);
 	StelaStream _stream;
 	NSMutableArray *_retained;
 	/* The textures kept in device memory its commit reports, each with the
-	 * seed reported, as [texture, seed]: noted once the service accepts it. */
+	 * seed reported, as texture then seed: noted once the service accepts it. */
 	NSMutableArray *_seeds;
 	StelaGPULogState *_logState;
 	uint64_t _serial;

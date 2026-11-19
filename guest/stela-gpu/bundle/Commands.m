@@ -418,14 +418,16 @@ static StelaGPUTexture *copied_root(id object)
 	if (!_seeds) {
 		_seeds = [NSMutableArray arrayWithCapacity:4];
 	}
-	id pair[2] = {texture, [NSNumber numberWithUnsignedLongLong:seed]};
-	[_seeds addObject:[NSArray arrayWithObjects:pair count:2]];
+	/* No strong C array: its cleanup would need a landing pad, which the
+	 * bundle's link takes no unwind information for. */
+	[_seeds addObject:texture];
+	[_seeds addObject:[NSNumber numberWithUnsignedLongLong:seed]];
 }
 
 - (BOOL)notedSeedOf:(StelaGPUTexture *)texture
 {
-	for (NSUInteger i = 0; i < _seeds.count; i++) {
-		if ([[_seeds objectAtIndex:i] objectAtIndex:0] == texture) {
+	for (NSUInteger i = 0; i < _seeds.count; i += 2) {
+		if ([_seeds objectAtIndex:i] == texture) {
 			return YES;
 		}
 	}
@@ -436,10 +438,9 @@ static StelaGPUTexture *copied_root(id object)
  * only when it changed since, and the service has seen this one first. */
 - (void)publishSeeds
 {
-	for (NSUInteger i = 0; i < _seeds.count; i++) {
-		NSArray *pair = [_seeds objectAtIndex:i];
-		StelaGPUTexture *texture = [pair objectAtIndex:0];
-		uint64_t seed = [[pair objectAtIndex:1] unsignedLongLongValue];
+	for (NSUInteger i = 0; i + 1 < _seeds.count; i += 2) {
+		StelaGPUTexture *texture = [_seeds objectAtIndex:i];
+		uint64_t seed = [[_seeds objectAtIndex:i + 1] unsignedLongLongValue];
 		atomic_store(&texture->_reportedSeed, STELA_SEED_KNOWN | seed);
 	}
 	_seeds = nil;
