@@ -38,8 +38,9 @@ stela_enter_owned:
     // block); the separate context ABI remains SysV (RSP%16=8 in the block).
     sub rsp, 8
     mov rax, rsi
-    // The pinned guest registers (`x86_64::pinned`) live in these while
-    // native code runs, with the flag word (`x86_64::flag_word`).
+    // The pinned guest registers and the chain's account (`x86_64::pinned`)
+    // live in these while native code runs, with the flag word
+    // (`x86_64::flag_word`).
     mov ecx, [rdi + {nzcv}]
     shr ecx, {arm_shift}
     imul ecx, ecx, {pack}
@@ -51,7 +52,7 @@ stela_enter_owned:
     mov r15, [rdi + 0]
     mov rbp, [rdi + 8]
     mov r12, [rdi + 128]
-    mov r13, [rdi + 136]
+    mov r13, [rdi + {account}]
     // Every exit reloads RSP from here before its RET (block ABI v14).
     lea r11, [rsp - 8]
     mov [rdi + {exit_rsp}], r11
@@ -62,7 +63,7 @@ stela_enter_owned:
     mov [rdi + 0], r15
     mov [rdi + 8], rbp
     mov [rdi + 128], r12
-    mov [rdi + 136], r13
+    mov [rdi + {account}], r13
     mov ecx, [rdi + {nzcv}]
     and ecx, {word_mask}
     imul ecx, ecx, {unpack}
@@ -98,6 +99,7 @@ stela_native_restore_host:
     ret
 "#,
     sp = const core::mem::offset_of!(GuestState, sp),
+    account = const core::mem::offset_of!(GuestState, account),
     exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     nzcv = const core::mem::offset_of!(GuestState, nzcv),
     arm_shift = const flag_word::ARM_SHIFT,

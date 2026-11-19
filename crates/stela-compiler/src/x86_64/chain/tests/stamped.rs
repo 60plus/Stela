@@ -101,15 +101,26 @@ fn region() -> Pages {
     region
 }
 
+/// Run the stub with `control` and the account in its `spare` word, which
+/// native code never reads, so comparing controls compares accounts too:
+/// what it returned, the account it left put back there.
 fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
     let mut frame = Box::new(GuestState::default());
     frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+    frame.account = control.spare;
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
+    let result = unsafe {
+        crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *frame, target, 0)
+    };
+    control.spare = frame.account;
     (result as u64, (result >> 64) as u64)
+}
+
+/// The account a run of [`run`] left.
+fn account(control: &ChainControl) -> Account {
+    Account(control.spare)
 }
 
 /// The stamped tail (`Some`, when the cell held an entry at the link) or
@@ -249,7 +260,9 @@ fn stamped_tails_transfer_as_their_cell_tails() {
         tail(&stamped, &table, site, pc, linked, ran);
         tail(&plain, &table, site, pc, None, ran);
         let base = ChainControl {
-            account: ChainControl::account_of([0, 1, 2, 5, 9][rng.below(5) as usize], 100),
+            spare: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize])
+                .with_retired(100)
+                .0,
             block: 7,
             contexts,
             table: table.address(),
@@ -317,7 +330,7 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             && linked.is_some_and(|linked| linked.entry == cell.entry)
             && (ra == (0x7700 + u64::from(cell.block), 99)
                 // Or no budget: the stamped tail spent it, as a transfer.
-                || (ra == exit && base.budget() == 0 && a.budget() == u64::MAX));
+                || (ra == exit && account(&base).budget() == 0 && account(&a).budget() == u64::MAX));
         if evicted {
             refilled += 1;
             continue;
@@ -362,7 +375,7 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     tail(&region, &table, 0x1000, pc, Some(held), 4);
     let mut control = ChainControl {
-        account: ChainControl::account_of(100, 0),
+        spare: Account::new(100).0,
         contexts: [CONTEXTS[0], context],
         table: table.address(),
         itlb: itlb.address(),
@@ -397,7 +410,11 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(through(&mut control, &table), ((0x7703, 99), true));
     assert_eq!(through(&mut control, &table), ((0x7703, 99), false));
     assert_eq!(
-        (control.budget(), control.retired(), control.block),
+        (
+            account(&control).budget(),
+            account(&control).retired(),
+            control.block
+        ),
         (98, 8, 3)
     );
     assert_eq!(counts(), [1, 1, 0, 0, 1, 0, 0]);
@@ -456,16 +473,16 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
     assert_eq!(count(was, StampCount::Restamped), 1);
     assert_eq!(count(was, StampCount::Hits), 1);
-    control.set_budget(0);
+    control.spare = account(&control).with_budget(0).0;
     assert_eq!(run(&region, &mut control, pc), (pc, word));
-    assert_eq!(control.budget(), u64::MAX);
+    assert_eq!(account(&control).budget(), u64::MAX);
     // A pending interruption: the probe's exit, nothing spent.
-    control.set_budget(10);
+    control.spare = account(&control).with_budget(10).0;
     control.interrupt_epoch = 1;
     let was = counts();
     assert_eq!(run(&region, &mut control, pc), (pc, word));
     assert_eq!(count(was, StampCount::Interrupted), 1);
-    assert_eq!(control.budget(), 10);
+    assert_eq!(account(&control).budget(), 10);
     control.interrupt_epoch = 0;
     // A cell past the stamped ones: one transfer in CELL_SAMPLE names its
     // cell, which names the exit's link.
@@ -473,7 +490,7 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     let number = table.site_cell_number(0x1000).unwrap();
     assert!(number as usize >= STAMPED_CELLS);
     tail(&region, &table, 0x1000, pc, None, 4);
-    control.set_budget(1000);
+    control.spare = account(&control).with_budget(1000).0;
     control.heat = 0;
     control.sampled = 0;
     let link = CellLink {
@@ -544,7 +561,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
             done.store(true, Ordering::SeqCst);
         });
         let mut control = ChainControl {
-            account: ChainControl::account_of(1 << 31, 0),
+            spare: 0,
             contexts: [context, CONTEXTS[1]],
             table: address,
             itlb: itlb.address(),
@@ -571,6 +588,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
                 tail(&region, &table, 0x1000, pc, Some(held), 2);
             }
             let seen = changed.load(Ordering::SeqCst);
+            control.spare = Account::new(MAX_BUDGET).0;
             let result = run(&region, &mut control, pc);
             if seen {
                 assert_eq!(result, (0x7702, 99), "a stale stamp entered block 1");

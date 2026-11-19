@@ -138,7 +138,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                 let (mut hits, mut exits) = (0u64, 0u64);
                 let mut round = 0u64;
                 while !stop.load(Ordering::Acquire) {
-                    control.set_budget(1);
+                    frame.account = Account::new(1).0;
                     control.block = 0;
                     let target = if round.is_multiple_of(2) {
                         TARGET
@@ -150,7 +150,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                     // the block ABI and touches the frame's control and the
                     // tables, which outlive the runners.
                     let result = unsafe {
-                        crate::x86_64::native::enter(
+                        crate::x86_64::native::enter_counted(
                             code.0.add(entry) as *const u8,
                             &mut *frame,
                             target,

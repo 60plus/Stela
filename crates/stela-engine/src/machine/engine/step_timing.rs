@@ -2209,7 +2209,10 @@ mod tests {
     /// without step timing.
     #[test]
     fn a_sampled_run_whose_budget_ran_out_names_its_last_block() {
-        use super::super::{NativeExit, chain::ChainControl};
+        use super::super::{
+            NativeExit,
+            chain::{Account, ChainControl},
+        };
         use stela_compiler::block::ExitKind;
         const ADD: u32 = 0x9100_0400; // add x0, x0, #1
         let mut machine = super::super::tests::machine(&[ADD, 0x1400_0002, 0, ADD, 0x17ff_fffc]);
@@ -2233,10 +2236,10 @@ mod tests {
                 machine.host.chained = Some((
                     machine.chain.address() as *mut ChainControl,
                     ChainControl {
-                        account: ChainControl::spent_account(0),
                         block: 1,
                         ..current
                     },
+                    Account::spent(0),
                 ));
                 machine.host.exits = alloc::vec![direct(next)];
                 machine.step().unwrap();

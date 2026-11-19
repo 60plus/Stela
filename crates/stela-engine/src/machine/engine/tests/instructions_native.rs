@@ -58,10 +58,9 @@ fn native(machine: &mut Machine<FakeHost, NoDevices>, chained: u64, before: u32)
         before,
     )
     .unwrap();
-    let control = machine.chain.address() as *mut chain::ChainControl;
-    // SAFETY: the machine's own control, which no native code runs over
-    // meanwhile.
-    unsafe { (*control).set_retired(chained) };
+    // The account the entry gives native code.
+    let account = chain::Account(machine.cpu.state.account);
+    machine.cpu.state.account = account.with_retired(chained).0;
     machine.cpu.state.x[10] = 0xdead;
     match run_native(machine, &thunk.code) {
         (pc, kind) if pc == BASE + 4 && kind == ExitKind::Fallthrough as u64 => {

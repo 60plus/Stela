@@ -257,13 +257,13 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     code[point..point + link.len()].copy_from_slice(&link);
 
     let mut control = chain::ChainControl {
-        account: chain::ChainControl::account_of(1, 0),
         interrupt_epoch: 2,
         observed_interrupt_epoch: 1,
         ..Default::default()
     };
     let mut state = GuestState {
         nzcv: 0xb000_0000,
+        account: chain::Account::new(1).0,
         ..Default::default()
     };
     state.anchors[Anchor::Control] = &raw mut control as u64;
@@ -273,8 +273,9 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     expected.x[8] = 5;
     assert_eq!(run(&pinned::entered(&code), &mut state), PC.0);
     assert_eq!(state, expected);
+    let account = chain::Account(state.account);
     assert_eq!(
-        (control.budget(), control.retired(), control.block),
+        (account.budget(), account.retired(), control.block),
         (1, 0, 0)
     );
 }

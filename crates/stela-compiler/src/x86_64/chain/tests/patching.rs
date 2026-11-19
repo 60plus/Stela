@@ -104,19 +104,22 @@ fn run_while_patching(
         let (page, stop, last, runs) = (page.clone(), stop.clone(), last.clone(), runs.clone());
         std::thread::spawn(move || {
             let _page = page;
-            let mut control = Box::new(ChainControl {
-                account: ChainControl::account_of(1 << 31, 0),
-                ..ChainControl::default()
-            });
+            let mut control = Box::new(ChainControl::default());
             let mut frame = Box::new(GuestState::default());
             frame.anchors[Anchor::Control] = &mut *control as *mut ChainControl as u64;
             let mut seen = Seen::default();
             while !stop.load(Ordering::Acquire) {
                 control.block = 0;
+                frame.account = Account::new(MAX_BUDGET).0;
                 // SAFETY: the page stays mapped until join; its code has the
                 // block ABI and touches only the frame's control.
                 let result = unsafe {
-                    crate::x86_64::native::enter(entry as usize as *const u8, &mut *frame, 0, 0)
+                    crate::x86_64::native::enter_counted(
+                        entry as usize as *const u8,
+                        &mut *frame,
+                        0,
+                        0,
+                    )
                 };
                 let (value, word) = (result as u64, (result >> 64) as u64);
                 if (value, ExitWord::split(word).0) == (TARGET.0, ExitKind::Direct as u64) {

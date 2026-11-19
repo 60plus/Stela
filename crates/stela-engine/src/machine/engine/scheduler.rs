@@ -409,7 +409,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.mirrors.transitions.chain = self.transition_chain();
         self.chain
             .set_frames(self.frame_bound, self.code.blocks.epoch_address());
-        self.chain.begin(index, budget);
+        self.cpu.state.account = self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
         self.mirrors.monitor = u64::from(self.cpu.monitor.is_some());
@@ -427,6 +427,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // chained blocks and thunks too.
         let exit = unsafe { self.host.execute(entry, &mut self.cpu.state) };
         self.finish_trace();
+        // The account native code kept in a host register: what its return
+        // put home, or what a fault's capture holds. The chain keeps it; the
+        // state's home is clear between native calls.
+        self.chain.finish(match &exit {
+            NativeExit::Exit { .. } => self.cpu.state.account,
+            NativeExit::Fault(fault) => {
+                stela_compiler::x86_64::pinned::settled_account(&fault.registers)
+            }
+        });
+        self.cpu.state.account = 0;
         self.set_doing(step_timing::BLOCKER_RETURNED);
         // Native code switched no thread, woke no PE and spun on no event.
         let quiet = self.mirrors.switches.len == 0

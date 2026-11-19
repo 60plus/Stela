@@ -620,8 +620,7 @@ fn commit(
     let segment = |field: usize| Mem::base(Rax, (offset_of!(Table, log) + field) as i32);
     asm.mov_load(Qword, Rcx, to(offset_of!(Record, to)));
     asm.mov_store(Qword, segment(offset_of!(Segment, to)), Rcx);
-    asm.place(Rcx, super::chain::CONTROL_PLACE);
-    super::chain::account_retired(&mut asm, Rcx, Rcx);
+    super::chain::account_retired(&mut asm, Rcx);
     if ending != 0 {
         let ending = i32::try_from(ending).expect("a block's instructions");
         asm.alu_imm32(Alu::Add, Qword, Rcx, ending);
@@ -1326,8 +1325,7 @@ mod tests {
             record.contexts_generation = contexts_generation;
             rig.table.logged = logged;
             // A budget beside the instructions, which the log leaves out.
-            rig.control.set_budget(9);
-            rig.control.set_retired(40);
+            rig.state.account = crate::x86_64::chain::Account::new(9).with_retired(40).0;
             rig.clock.offset.store(5_000, Relaxed);
             let exit = rig.run(&thunk);
             assert_eq!(
@@ -1385,7 +1383,7 @@ mod tests {
             let record = &mut rig.table.records[2][GUARDED_ENTER];
             record.chain = 1;
             record.contexts_generation = contexts_generation;
-            rig.control.set_retired(40);
+            rig.state.account = crate::x86_64::chain::Account::new(0).with_retired(40).0;
             rig.clock.offset.store(now, Relaxed);
             rig.words.instructions = instructions;
             rig.words.cycles = cycles;

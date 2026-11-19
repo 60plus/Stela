@@ -130,8 +130,9 @@ pub(super) struct FakeHost {
     executables: Vec<crate::execution::platform::Mapping>,
     pub(super) patches: Vec<(usize, Vec<u8>)>,
     live_patch_start: usize,
-    /// The chaining state the next native run leaves, as thunks would.
-    pub(super) chained: Option<(*mut ChainControl, ChainControl)>,
+    /// The chaining state and account the next native run leaves, as
+    /// links would.
+    pub(super) chained: Option<(*mut ChainControl, ChainControl, chain::Account)>,
     /// What the next native blocks return, in order: unit tests do not
     /// run native code.
     pub(super) exits: Vec<NativeExit>,
@@ -316,13 +317,11 @@ impl Host for FakeHost {
     }
     unsafe fn execute(&mut self, _: NativeCode, state: &mut GuestState) -> NativeExit {
         assert!(!self.exits.is_empty(), "unit tests do not run native code");
-        if let Some((control, chained)) = self.chained.take() {
+        if let Some((control, chained, account)) = self.chained.take() {
+            state.account = account.0;
             // SAFETY: this fixture names the owner's live control
-            // outside native execution. Match native disjoint field writes;
-            // the budget is always accessed atomically, even in fixtures.
+            // outside native execution. Match native disjoint field writes.
             unsafe {
-                AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).account))
-                    .store(chained.account, Ordering::Relaxed);
                 core::ptr::addr_of_mut!((*control).block).write(chained.block);
                 core::ptr::addr_of_mut!((*control).contexts).write(chained.contexts);
                 core::ptr::addr_of_mut!((*control).table).write(chained.table);
@@ -3048,11 +3047,11 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            account: ChainControl::account_of(CHAIN_LIMIT - 1, 2),
             block: 1,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(2),
     ));
     machine.host.exits = vec![direct(base)];
     machine.step().unwrap();
@@ -3068,11 +3067,11 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            account: ChainControl::spent_account(2 * budget),
             block: 0,
             linked: budget,
             ..current
         },
+        chain::Account::spent(2 * budget),
     ));
     machine.host.exits = vec![direct(base + 12)];
     machine.step().unwrap();
@@ -3087,11 +3086,11 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            account: ChainControl::account_of(CHAIN_LIMIT - 1, 2),
             block: 1,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(2),
     ));
     let offset = machine.code.blocks[1]
         .code
@@ -4831,11 +4830,11 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            account: ChainControl::account_of(CHAIN_LIMIT - 1, 1),
             block: 0b10 << chain::BLOCK_BTYPE_SHIFT | target as u64,
             linked: 1,
             ..current
         },
+        chain::Account::new(CHAIN_LIMIT - 1).with_retired(1),
     ));
     // From the block the step at the base enters, the BLR's.
     let offset = machine.code.blocks[target]

@@ -18,7 +18,7 @@
 //! [`Region::reach`] rows from a landing. A back edge to `to` jumps there
 //! only while `L + to + reach(to)` stays within the bound; otherwise it
 //! leaves through a direct exit to its target, whose link polls.
-use super::super::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Patch, Size};
+use super::super::asm::{Alu, Asm, Code, Cond, Gpr, Patch, Size};
 use super::super::pinned::Dirty;
 use crate::{
     GuestAddress,
@@ -247,12 +247,6 @@ pub(in crate::x86_64) fn settle(asm: &mut Asm, less: u32) {
     if less != 0 {
         asm.alu_imm32(Alu::Sub, Size::Qword, Gpr::Rax, less as i32);
     }
-    asm.place(Gpr::Rcx, super::super::chain::CONTROL_PLACE);
-    asm.alu(
-        Alu::Add,
-        Size::Qword,
-        Mem::base(Gpr::Rcx, super::super::chain::ACCOUNT_OFFSET),
-        Gpr::Rax,
-    );
+    super::super::chain::account_add(asm);
     asm.alu_imm8(Alu::And, Size::Qword, super::super::frame(L), 0);
 }

@@ -304,8 +304,12 @@ impl Run {
         put(&self.region, offset, &jump(site, at).unwrap());
     }
 
+    /// Run the entry with `control` and the account in its `spare` word,
+    /// which native code never reads, so comparing controls compares
+    /// accounts too; the account the run left put back there.
     fn run(&mut self, state: &mut GuestState, control: &mut ChainControl) -> (u64, u64) {
         state.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+        state.account = control.spare;
         // Each run starts with an empty jump cache, so the ways compare as
         // the table probe serves them; the cache's own differences are the
         // probes' and the jump cache's tests.
@@ -320,6 +324,7 @@ impl Run {
         // call, and call `service`.
         let result =
             unsafe { crate::x86_64::native::enter(self.region.0 as *const u8, state, 0, 0) };
+        control.spare = state.account;
         (result as u64, (result >> 64) as u64)
     }
 }
@@ -574,7 +579,9 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 0x5555
             };
             let base = ChainControl {
-                account: ChainControl::account_of([0, 1, 2, 5, 9][rng.below(5) as usize], 100),
+                spare: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize])
+                    .with_retired(100)
+                    .0,
                 block: 7,
                 contexts,
                 table: table.address(),
@@ -657,11 +664,12 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 predicted,
                 u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
             );
+            let account = Account(base.spare);
             let entered = ChainControl {
-                account: ChainControl::account_of(
-                    base.budget().saturating_sub(1),
-                    base.retired() + u64::from(RAN),
-                ),
+                spare: account
+                    .with_budget(account.budget().saturating_sub(1))
+                    .with_retired(account.retired() + u64::from(RAN))
+                    .0,
                 block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
                 ..base
             };
@@ -670,8 +678,8 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 && !(held.pc == predicted && held.key == cell.key)
                 && lookup == exit
                 && controls[0] == base
-                && if base.budget() == 0 {
-                    linked_way == exit && controls[1].budget() == u64::MAX
+                && if account.budget() == 0 {
+                    linked_way == exit && Account(controls[1].spare).budget() == u64::MAX
                 } else {
                     linked_way == (0x7700 + u64::from(cell.block), 99)
                         && ChainControl {
@@ -785,7 +793,6 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             );
             put(&region, 0, &code);
             let mut control = ChainControl {
-                account: ChainControl::account_of(5, 0),
                 contexts: [CONTEXTS[0], CONTEXTS[1]],
                 table: table.address(),
                 itlb: itlb.address(),
@@ -795,19 +802,22 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             };
             let mut frame = Box::new(GuestState::default());
             frame.anchors[Anchor::Control] = &raw mut control as u64;
+            frame.account = Account::new(5).0;
             // SAFETY: the region holds the stub, its tail and the probes;
             // they touch the frame, the control, the tables and the blocks.
-            let result =
-                unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, 0, 0) };
+            let result = unsafe {
+                crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *frame, 0, 0)
+            };
             let result = (result as u64, (result >> 64) as u64);
+            let account = Account(frame.account);
             if targets & 1 << btype != 0 {
                 assert_eq!(result, (0x7703, 99), "btype {btype} targets {targets:#b}");
                 assert_eq!(control.block, 3 | u64::from(btype) << BLOCK_BTYPE_SHIFT);
-                assert_eq!((control.budget(), control.retired()), (4, 2));
+                assert_eq!((account.budget(), account.retired()), (4, 2));
             } else {
                 let exit = u64::from(word.encoded() | 2 << ExitWord::RAN_SHIFT);
                 assert_eq!(result, (pc, exit), "btype {btype} targets {targets:#b}");
-                assert_eq!((control.block, control.budget()), (0, 5));
+                assert_eq!((control.block, account.budget()), (0, 5));
             }
         }
     }

@@ -109,8 +109,6 @@ use alloc::{
 use core::fmt;
 use core::mem::offset_of;
 use core::num::NonZeroU64;
-#[cfg(test)]
-use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use pointer::{PointerInputs, PointerOperation, PointerResult, SERVICE, TAGS, strip_place};
 #[cfg(test)]

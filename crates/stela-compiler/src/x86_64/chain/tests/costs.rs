@@ -126,7 +126,8 @@ fn fill(region: &Pages, target: Target, tail: &[u8], direct: bool) {
 }
 
 /// A board's tables with `targets` blocks in the region, each in the
-/// table and its page in the ITLB, and a control whose budget never ends.
+/// table and its page in the ITLB, and a control; each native run's budget
+/// outlasts the transfers its loop makes.
 struct World {
     table: LookupTable,
     _itlb: LookupTable,
@@ -153,7 +154,6 @@ impl World {
             table.insert(table.slot(pc, KEY), entry(target));
         }
         let control = Box::new(ChainControl {
-            account: ChainControl::account_of(1 << 31, 0),
             table: table.address(),
             itlb: itlb.address(),
             contexts: CONTEXTS,
@@ -171,8 +171,8 @@ impl World {
     }
 
     /// Enter the loop for `transfers` transfers, in native runs of at most
-    /// `run` transfers, each entered as the engine enters native code: TSC
-    /// ticks taken.
+    /// `run` transfers and fewer than [`MAX_BUDGET`], each entered as the
+    /// engine enters native code: TSC ticks taken.
     fn run(&mut self, region: &Pages, sequence: &[u64], transfers: u64, run: u64) -> u64 {
         let mut state = Box::new(GuestState::default());
         state.anchors[Anchor::Control] = &raw mut *self.control as u64;
@@ -180,13 +180,14 @@ impl World {
         let start = time();
         let mut left = transfers;
         while left > 0 {
-            let now = left.min(run);
+            let now = left.min(run).min(MAX_BUDGET - 1);
             left -= now;
+            state.account = Account::new(MAX_BUDGET).0;
             // SAFETY: the region holds the loop, a tail, probes and blocks
             // with the block ABI; they touch the state, the control, the
             // tables, the stamps and the sequence, which outlive the call.
             let result = unsafe {
-                crate::x86_64::native::enter(region.0 as *const u8, &mut *state, now + 1, 0)
+                crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *state, now + 1, 0)
             };
             assert_eq!((result as u64, (result >> 64) as u64), (1, 2));
         }
@@ -536,12 +537,13 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
         while left > 0 {
             let now = left.min(RUN);
             left -= now;
-            // SAFETY: the control the boxed world holds; nothing runs.
-            unsafe { (*control).set_budget(now) };
+            guest.account = Account::new(now).0;
             // SAFETY: the region holds the ring, its tails and probes with
             // the block ABI; they touch the state, the control and the
             // tables, which outlive the call; the budget or RSI ends it.
-            unsafe { crate::x86_64::native::enter(block_at(0) as *const u8, &mut *guest, now, 0) };
+            unsafe {
+                crate::x86_64::native::enter_counted(block_at(0) as *const u8, &mut *guest, now, 0)
+            };
         }
         time() - start
     };

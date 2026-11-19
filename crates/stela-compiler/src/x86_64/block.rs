@@ -304,7 +304,7 @@ pub(crate) fn emit_system_mode_looped(
 ///
 /// `GuestState::loop_retired` counts the instructions of the iterations
 /// before the running one. Every exit adds it to the chain's retired count
-/// (`chain::ChainControl::retired`) and clears it; a fault's settlement does
+/// (`chain::Account::retired`) and clears it; a fault's settlement does
 /// so in the engine. Exits and faults then count the running iteration's
 /// instructions as a block's do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,16 +404,10 @@ fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
     if less != 0 {
         asm.alu_imm8(Alu::Sub, Size::Qword, Gpr::Rax, less as i8);
     }
-    asm.place(Gpr::Rcx, super::chain::CONTROL_PLACE);
-    asm.alu(
-        Alu::Add,
-        Size::Qword,
-        Mem::base(Gpr::Rcx, super::chain::ACCOUNT_OFFSET),
-        Gpr::Rax,
-    );
     // The engine's counts, while it profiles: the entry and what its
     // iterations retired.
     if counts {
+        asm.place(Gpr::Rcx, super::chain::CONTROL_PLACE);
         asm.alu(
             Alu::Add,
             Size::Qword,
@@ -427,6 +421,7 @@ fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
             1,
         );
     }
+    super::chain::account_add(asm);
     asm.alu_imm8(Alu::And, Size::Qword, super::frame(LOOP_RETIRED), 0);
 }
 

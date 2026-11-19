@@ -4,7 +4,7 @@
 //! the x86 trap flag, which records every host instruction it executes.
 //! Guest registers point into a scratch arena whose words point back into
 //! it, so loads and pointer chasing stay mapped; the anchors point at zeroed
-//! areas with an unbounded chain budget, PAC instructions run the cipher
+//! areas with the most chain budget, PAC instructions run the cipher
 //! inline where the host has AES-NI, as the engine's blocks do, and the
 //! pointer-authentication routine returns its input. `DENSITY_OUT` gets, per block, a `B` line
 //! (PC, weight, exit, host instructions executed inline, out of line and
@@ -180,15 +180,8 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, u64, Vec<u32>)>
                 core::slice::from_raw_parts(core::ptr::addr_of!(TRACE).cast::<u32>(), count);
             write(fds[1], (&raw const exit).cast(), 8);
             write(fds[1], (&raw const word).cast(), 8);
-            // The instructions ChainControl's account counts (its first
-            // word) and the loop's.
-            let control = *(core::ptr::from_mut(state).cast::<u8>())
-                .add(core::mem::offset_of!(GuestState, anchors))
-                .cast::<*const u64>();
-            let account = crate::x86_64::chain::ChainControl {
-                account: *control,
-                ..Default::default()
-            };
+            // The instructions the chain's account counts and the loop's.
+            let account = crate::x86_64::chain::Account(state.account);
             let retired = account.retired().wrapping_add(state.loop_retired);
             write(fds[1], (&raw const retired).cast(), 8);
             write(fds[1], (&raw const count).cast(), 8);
@@ -238,7 +231,7 @@ fn traced(entry: &[u8], body_offset: usize) -> Option<(u64, u64, u64, Vec<u32>)>
 
 /// Registers and memory for a run: an 8 MiB arena whose words point into
 /// its middle, registers spread over it, IXC set (the usual running
-/// state), zeroed anchor areas with an unbounded chain budget.
+/// state), zeroed anchor areas and the most chain budget.
 fn prepare(state: &mut GuestState) {
     const ARENA: usize = 8 << 20;
     let arena = map(ARENA);
@@ -259,6 +252,7 @@ fn prepare(state: &mut GuestState) {
     let fault = map(4096);
     state.unreachable = fault as u64;
     state.lower_limit = crate::Limit(u64::MAX);
+    state.account = super::chain::Account::new(super::chain::MAX_BUDGET).0;
     let raw = (state as *mut GuestState).cast::<u8>();
     let anchor_offset = core::mem::offset_of!(GuestState, anchors);
     // SAFETY: the anchors are eight words in the state; each area is mapped.
@@ -269,11 +263,7 @@ fn prepare(state: &mut GuestState) {
                 .cast::<u64>()
                 .write(area as u64);
         }
-        // ChainControl's account, open tag words for the cipher, and the
-        // pointer routine.
-        anchors
-            .cast::<u64>()
-            .write(super::chain::ChainControl::account_of(1 << 31, 0));
+        // Open tag words for the cipher, and the pointer routine.
         for key in 0..pointer::TAG_WORDS {
             anchors
                 .add(3 << 16)

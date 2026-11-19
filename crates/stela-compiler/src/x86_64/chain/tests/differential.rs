@@ -82,9 +82,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.pop(R8);
     asm.mov(Dword, R8, R8);
     asm.place(Rcx, CONTROL);
-    misses.push(spend_transfer(&mut asm, policy));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    misses.push(spend_transfer(&mut asm));
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
     for miss in misses {
@@ -160,9 +158,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let torn = legacy_seqlock_check(&mut asm);
     asm.pop(R9);
     asm.place(Rcx, CONTROL);
-    misses.push(spend_transfer(&mut asm, policy));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, ACCOUNT), Rdx);
+    misses.push(spend_transfer(&mut asm));
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     for bit in 0..2 {
         if btype & 1 << bit != 0 {
@@ -281,15 +277,20 @@ fn put(pages: &Pages, offset: usize, bytes: &[u8]) {
 }
 
 /// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`
-/// and its account: what it returned.
+/// and the account in its `spare` word, which native code never reads, so
+/// comparing controls compares accounts too: what it returned, the account
+/// it left put back there.
 fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
     let mut frame = Box::new(GuestState::default());
     frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+    frame.account = control.spare;
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
+    let result = unsafe {
+        crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *frame, target, 0)
+    };
+    control.spare = frame.account;
     (result as u64, (result >> 64) as u64)
 }
 
@@ -377,7 +378,7 @@ fn reference(
         Reference::Absent
     } else if entry.targets & 1 << btype == 0 {
         Reference::Refused(entry)
-    } else if control.budget() == 0 {
+    } else if Account(control.spare).budget() == 0 {
         Reference::Spent(entry)
     } else {
         Reference::Entered(entry)
@@ -612,7 +613,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         put(&new, 3, &fresh);
         let budget = [0, 1, 2, 5][rng.below(4) as usize];
         let mut base = ChainControl {
-            account: ChainControl::account_of(budget, 100),
+            spare: Account::new(budget).with_retired(100).0,
             block: 7,
             contexts: match rng.below(4) {
                 0 => [
@@ -676,10 +677,12 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         let named = |block: u32| u64::from(block) | u64::from(btype) << BLOCK_BTYPE_SHIFT;
         // A transfer takes one of the budget and adds its block's
         // instructions; one that found none left takes it all the same.
-        let spent = ChainControl::account_of(budget.saturating_sub(1), 100 + u64::from(RAN));
+        let spent = Account::new(budget.saturating_sub(1))
+            .with_retired(100 + u64::from(RAN))
+            .0;
         let unspent = match expected {
-            Reference::Spent(_) => ChainControl::spent_account(100),
-            _ => base.account,
+            Reference::Spent(_) => Account::spent(100).0,
+            _ => base.spare,
         };
         // The table probe counts its transfers apart; a cell of the target
         // with its page's key spares it.
@@ -689,7 +692,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         match expected {
             Reference::Entered(entry) if ra.1 == 99 && ra.0 == marker(entry.block as usize) => {
                 assert_eq!(a.block, named(entry.block), "{}", context());
-                assert_eq!(a.account, spent, "{}", context());
+                assert_eq!(a.spare, spent, "{}", context());
                 assert_eq!(a.hits, hits, "{}", context());
                 entered += 1;
             }
@@ -702,7 +705,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 );
                 assert_eq!(ra, (target, u64::from(word)), "{}", context());
                 assert_eq!(
-                    (a.block, a.account, a.hits),
+                    (a.block, a.spare, a.hits),
                     (base.block, unspent, base.hits),
                     "{}",
                     context()
@@ -740,7 +743,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                     context()
                 );
                 assert_eq!(a.block, named(block), "{}", context());
-                assert_eq!(a.account, spent, "{}", context());
+                assert_eq!(a.spare, spent, "{}", context());
                 cached += 1;
             }
         }
@@ -819,7 +822,7 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
         let stamps = fresh[next.get()];
         next.set(next.get() + 1);
         let mut control = ChainControl {
-            account: ChainControl::account_of(5, 0),
+            spare: Account::new(5).0,
             contexts: [CONTEXTS[0], CONTEXTS[1]],
             table: table.address(),
             itlb: itlb.address(),

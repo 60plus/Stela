@@ -94,15 +94,20 @@ fn region() -> Pages {
     region
 }
 
-/// Run the stub at `stub` with the target in RSI: RAX and RDX it returns.
+/// Run the stub at `stub` with the target in RSI and the account in the
+/// control's `spare` word, which native code never reads, so comparing
+/// controls compares accounts too: RAX and RDX it returns, the account it
+/// left put back there.
 fn run(region: &Pages, stub: usize, control: &mut ChainControl, target: u64) -> (u64, u64) {
     let mut frame = Box::new(GuestState::default());
     frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
+    frame.account = control.spare;
     // SAFETY: the region holds the stubs, tails and probes with the block
     // ABI; they touch the frame's control, the tables, the stamps and the
     // blocks, which outlive the call.
     let result =
-        unsafe { crate::x86_64::native::enter(region.0.add(stub), &mut *frame, target, 0) };
+        unsafe { crate::x86_64::native::enter_counted(region.0.add(stub), &mut *frame, target, 0) };
+    control.spare = frame.account;
     (result as u64, (result >> 64) as u64)
 }
 
@@ -120,7 +125,7 @@ impl World {
         let itlb = LookupTable::itlb();
         let stamps = table.new_stamps();
         let control = Box::new(ChainControl {
-            account: ChainControl::account_of(1 << 20, 0),
+            spare: Account::new(MAX_BUDGET).0,
             table: table.address(),
             itlb: itlb.address(),
             contexts: CONTEXTS,
@@ -185,7 +190,7 @@ fn a_filled_entry_holds_until_its_page_goes() {
     assert_eq!(
         (
             world.control.hits,
-            world.control.retired(),
+            Account(world.control.spare).retired(),
             world.control.block
         ),
         (1, u64::from(RAN), 3)
@@ -266,9 +271,9 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     let branch = (REFUSING, ExitKind::Indirect as u64 | (RAN as u64) << 20);
     assert_eq!(world.run(32, REFUSING), branch);
     // A spent budget returns with the word and the instructions run.
-    world.control.set_budget(0);
+    world.control.spare = Account(world.control.spare).with_budget(0).0;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.set_budget(100);
+    world.control.spare = Account(world.control.spare).with_budget(100).0;
     // An interruption posted: the probe's gate exits.
     world.control.interrupt_epoch = 1;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
@@ -333,10 +338,10 @@ fn cached_tails_run_as_plain_tails() {
                 assert_eq!(
                     (
                         world.control.block,
-                        world.control.retired(),
+                        Account(world.control.spare).retired(),
                         world.control.hits
                     ),
-                    (plain.block, plain.retired(), plain.hits),
+                    (plain.block, Account(plain.spare).retired(), plain.hits),
                     "{pc:#x}"
                 );
                 compared += 1;
