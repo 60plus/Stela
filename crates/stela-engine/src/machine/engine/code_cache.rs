@@ -946,6 +946,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// fetches would write. The choice needs only the parts' order by
     /// heat, which a batch of at most that many fetches per PE leaves.
     pub(super) fn entered(&mut self, slot: usize) {
+        if self.step_timing.is_some() {
+            self.code.blocks.record(slot).fetched();
+        }
         let part = self.code.blocks[slot].part;
         if part == board::NO_PART {
             return;

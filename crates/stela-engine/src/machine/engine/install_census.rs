@@ -59,6 +59,18 @@ pub struct InstallCauses {
     /// blocks' own takes.
     pub window_bytes: u64,
     pub window_pieces: u64,
+    /// Blocks evicted by this machine, by the engine fetches that found
+    /// them since their install: none (prepared ahead, or reached only
+    /// through links), one (the fetch that compiled or found it), or more.
+    /// A block whose only fetch was its own and that no link reached ran
+    /// once; links are not counted here, so the first two are an upper
+    /// bound on code compiled and never run again. While step timing is on.
+    pub departed: [u64; 3],
+    /// Installs of a block the census remembers evicting (by this machine,
+    /// or on a shared board by any PE), by the time since: within one
+    /// second, ten (with the first, `thrash`), a minute, or longer. While
+    /// step timing is on.
+    pub reinstall_ages: [u64; 4],
 }
 
 /// FNV-1a, for a block's identity.
@@ -118,16 +130,23 @@ impl Census {
     }
 
     /// Note an install of `identity` at counter `now`: whether this
-    /// machine evicted it within `window` ticks, and whether it is the
-    /// first install of it here.
-    pub(super) fn installed(&mut self, identity: u64, now: u64, window: u64) -> (bool, bool) {
+    /// machine evicted it within `window` ticks, whether it is the first
+    /// install of it here, and the ticks since its eviction when the
+    /// census remembers one.
+    pub(super) fn installed(
+        &mut self,
+        identity: u64,
+        now: u64,
+        window: u64,
+    ) -> (bool, bool, Option<u64>) {
         let slots = self.evicted.len();
         let slot = &mut self.evicted[identity as usize % slots];
         let held = *slot;
-        let thrash = (held >> 32) as u32 == tag(identity)
-            && (now >> TIME_SHIFT).wrapping_sub(held & 0xffff_ffff) & 0xffff_ffff
-                <= window >> TIME_SHIFT;
-        if thrash {
+        let age = ((held >> 32) as u32 == tag(identity)).then(|| {
+            ((now >> TIME_SHIFT).wrapping_sub(held & 0xffff_ffff) & 0xffff_ffff) << TIME_SHIFT
+        });
+        let thrash = age.is_some_and(|age| age >> TIME_SHIFT <= window >> TIME_SHIFT);
+        if age.is_some() {
             *slot = 0;
         }
         let mut first = false;
@@ -138,7 +157,7 @@ impl Census {
             first |= *word & 1 << (bit % 64) == 0;
             *word |= 1 << (bit % 64);
         }
-        (thrash, first)
+        (thrash, first, age)
     }
 
     /// Note an eviction of `identity` at counter `now`.
@@ -240,16 +259,16 @@ mod tests {
         let mut census = Census::new();
         let block = identity(0x1000, 0x8000_1000, &3u8);
         let window = 10 << TIME_SHIFT;
-        assert_eq!(census.installed(block, 0, window), (false, true));
+        assert_eq!(census.installed(block, 0, window), (false, true, None));
         census.evicted(block, 100 << TIME_SHIFT);
         assert_eq!(
             census.installed(block, 105 << TIME_SHIFT, window),
-            (true, false)
+            (true, false, Some(5 << TIME_SHIFT))
         );
         census.evicted(block, 200 << TIME_SHIFT);
         assert_eq!(
             census.installed(block, 300 << TIME_SHIFT, window),
-            (false, false)
+            (false, false, Some(100 << TIME_SHIFT))
         );
         // Another variant of the same PC and frame is another block.
         let other = identity(0x1000, 0x8000_1000, &4u8);

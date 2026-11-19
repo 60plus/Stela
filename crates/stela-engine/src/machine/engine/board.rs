@@ -32,7 +32,7 @@ use crate::platform::sync::{Mutex, MutexGuard};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
 
@@ -844,6 +844,9 @@ pub(super) struct Record {
     /// Jump cache hits that found no block table entry of it and went for
     /// the lock to add one ([`Self::remember`]).
     remembers: AtomicU32,
+    /// Engine fetches that found it since its install, up to two, while
+    /// step timing counts them ([`Self::fetched`]).
+    fetches: AtomicU8,
     /// Its fault recovery rows, under a lock of their own: a PE faulting
     /// in the block reads them, its first fault may qualify them. They stay
     /// after the block retires until the slot takes its next block, as a
@@ -866,6 +869,7 @@ impl Default for Record {
             second_target: AtomicU64::new(0),
             lost: AtomicBool::new(false),
             remembers: AtomicU32::new(0),
+            fetches: AtomicU8::new(0),
             recovery: Mutex::new(None),
         }
     }
@@ -961,6 +965,20 @@ impl Record {
 
     pub(super) fn live(&self) -> bool {
         self.live.load(Ordering::Acquire)
+    }
+
+    /// Count an engine fetch that found its block, up to two. A plain load
+    /// and store: PEs fetching it at once may count one fetch for two.
+    pub(super) fn fetched(&self) {
+        let fetches = self.fetches.load(Ordering::Relaxed);
+        if fetches < 2 {
+            self.fetches.store(fetches + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// The engine fetches that found its block since its install, up to two.
+    pub(super) fn fetches(&self) -> usize {
+        usize::from(self.fetches.load(Ordering::Relaxed))
     }
 
     /// Whether successor `position` is linked or settled: not to link.
@@ -1187,6 +1205,7 @@ impl Blocks {
         record.second.store(0, Ordering::Relaxed);
         record.lost.store(false, Ordering::Relaxed);
         record.remembers.store(0, Ordering::Relaxed);
+        record.fetches.store(0, Ordering::Relaxed);
         record.incarnation.fetch_add(1, Ordering::Release);
         record.live.store(true, Ordering::Release);
         self.live.fetch_add(1, Ordering::Relaxed);

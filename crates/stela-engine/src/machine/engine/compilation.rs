@@ -1533,7 +1533,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.census
                 .get_or_insert_with(|| Box::new(install_census::Census::new()))
         };
-        let (thrash, first) = census.installed(identity, now, window);
+        let (thrash, first, age) = census.installed(identity, now, window);
+        if let Some(age) = age {
+            let second = self.profile.counter_frequency;
+            let bucket = [second, 10 * second, 60 * second]
+                .iter()
+                .position(|&bound| age <= bound)
+                .unwrap_or(3);
+            self.install_causes.reinstall_ages[bucket] += 1;
+        }
         let elsewhere = !shared
             && self
                 .parallel
@@ -1565,6 +1573,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some(census) = census else {
             return;
         };
+        let fetches = self.code.blocks.record(index).fetches();
+        self.install_causes.departed[fetches.min(2)] += 1;
         let block = &self.code.blocks[index];
         let variant = &self.variants[block.variant.0 as usize];
         let identity = install_census::identity(block.pc, block.physical, variant);

@@ -2237,7 +2237,7 @@ impl Heartbeat {
             // tails, dispatchers and other thunks beside the blocks, and
             // their alignment.
             let mut installs = String::from(
-                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns/window_kb/pieces",
+                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns/window_kb/pieces/gone_unfetched/gone_fetched_once/gone_fetched_again/again_1s/again_10s/again_60s/again_later",
             );
             let tsc_percent = |ticks: u64| u128::from(ticks) * 100 / u128::from(elapsed.max(1));
             // With `--profile`: the exits of every PE together, by kind, as
@@ -2455,7 +2455,7 @@ impl Heartbeat {
                 }
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     cause.installs.saturating_sub(was.installs),
                     cause.thrash.saturating_sub(was.thrash),
                     cause.elsewhere.saturating_sub(was.elsewhere),
@@ -2472,7 +2472,13 @@ impl Heartbeat {
                         .saturating_sub(was.upper_instructions),
                     cause.window_bytes.saturating_sub(was.window_bytes) / 1024,
                     cause.window_pieces.saturating_sub(was.window_pieces),
+                    cause.departed[0].saturating_sub(was.departed[0]),
+                    cause.departed[1].saturating_sub(was.departed[1]),
+                    cause.departed[2].saturating_sub(was.departed[2]),
                 ));
+                for (now, before) in cause.reinstall_ages.iter().zip(&was.reinstall_ages) {
+                    installs.push_str(&format!("/{}", now.saturating_sub(*before)));
+                }
                 phases.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.phases.iter().zip(before.phases).enumerate() {
                     if slot > 0 {
