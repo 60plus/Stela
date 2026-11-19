@@ -538,13 +538,13 @@ fn regions_time_their_programs() -> Result<()> {
             let mut machine = machine(&code, &data, &words, TargetCpu::detect())?;
             machine.set_regions(regions);
             // A case that ends in an abort leaves EL1; each starts at EL0.
-            let pstate = machine.cpu.pstate.clone();
+            let pstate = machine.cpu.pstate;
             let (mut nanos, mut retired, mut blocks) = (0u128, 0u64, 0u64);
             for round in 0..50 {
                 for (initial, contents) in &cases {
                     ensure!(data.write(data.0, contents), "write data");
                     machine.cpu.state = initial.clone();
-                    machine.cpu.pstate = pstate.clone();
+                    machine.cpu.pstate = pstate;
                     machine.cpu.pc = code.0;
                     let (before, transfers) = (machine.cpu.retired, machine.statistics.blocks);
                     let start = std::time::Instant::now();
