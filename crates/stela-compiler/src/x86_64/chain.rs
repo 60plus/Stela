@@ -1628,6 +1628,12 @@ impl LookupTable {
     /// a lookup keeps reaching put each other out, round after round,
     /// while a third that nothing reaches stayed: a random victim leaves
     /// that third the one out after a few rounds.
+    ///
+    /// The entry's older self beside it, which a resident put there, leaves
+    /// the set, its place free for the resident, and its PC the jump caches
+    /// ([`Self::put`]). Kept, it would come back when the new entry leaves,
+    /// and a jump cache entry filled from it would go on entering the block
+    /// and BTYPEs it named while the probes take the new entry's.
     pub fn insert(&mut self, slot: usize, entry: LookupEntry) {
         if self.grouping == Grouping::Pc {
             self.note_rekey(slot, &entry);
@@ -1636,9 +1642,15 @@ impl LookupTable {
         if resident == entry {
             return;
         }
-        if resident.key != 0 && (resident.pc != entry.pc || resident.key != entry.key) {
-            let beside = self.entry(neighbour(slot));
-            let keep_resident = if beside.key == 0 {
+        let beside = self.entry(neighbour(slot));
+        let older_beside = beside.key != 0 && beside.pc == entry.pc && beside.key == entry.key;
+        let other_resident =
+            resident.key != 0 && (resident.pc != entry.pc || resident.key != entry.key);
+        if older_beside && !other_resident {
+            self.put(neighbour(slot), LookupEntry::default());
+        }
+        if other_resident {
+            let keep_resident = if beside.key == 0 || older_beside {
                 true
             } else {
                 self.victims ^= self.victims << 13;
