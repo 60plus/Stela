@@ -52,6 +52,13 @@ pub struct InstallCauses {
     pub upper_instructions: u64,
     /// Counter ticks spent evicting ([`super::Machine::evict_code`]).
     pub evict_ticks: u64,
+    /// Bytes taken from the board's code window, at its 16-byte
+    /// alignment, and the pieces taken: blocks and everything else the
+    /// window holds for them (link thunks, tails, dispatchers, PAC and
+    /// transition thunks). Less `installed_bytes`, what code beside the
+    /// blocks' own takes.
+    pub window_bytes: u64,
+    pub window_pieces: u64,
 }
 
 /// FNV-1a, for a block's identity.

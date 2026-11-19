@@ -2231,9 +2231,12 @@ impl Heartbeat {
             // before), the KiB of block code installed and evicted, and the
             // interval's share evicting. On a shared board one census
             // counts for the board: evicted by any PE, never on the board
-            // before, and never elsewhere.
+            // before, and never elsewhere. Then the KiB and pieces the PE
+            // took from the board's window: less in_kb, the link thunks,
+            // tails, dispatchers and other thunks beside the blocks, and
+            // their alignment.
             let mut installs = String::from(
-                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns",
+                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns/window_kb/pieces",
             );
             let tsc_percent = |ticks: u64| u128::from(ticks) * 100 / u128::from(elapsed.max(1));
             // With `--profile`: the exits of every PE together, by kind, as
@@ -2451,7 +2454,7 @@ impl Heartbeat {
                 }
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     cause.installs.saturating_sub(was.installs),
                     cause.thrash.saturating_sub(was.thrash),
                     cause.elsewhere.saturating_sub(was.elsewhere),
@@ -2466,6 +2469,8 @@ impl Heartbeat {
                     cause
                         .upper_instructions
                         .saturating_sub(was.upper_instructions),
+                    cause.window_bytes.saturating_sub(was.window_bytes) / 1024,
+                    cause.window_pieces.saturating_sub(was.window_pieces),
                 ));
                 phases.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.phases.iter().zip(before.phases).enumerate() {

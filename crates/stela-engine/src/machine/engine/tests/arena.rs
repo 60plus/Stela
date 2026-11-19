@@ -1477,7 +1477,13 @@ fn the_board_counts_why_it_compiles_a_block_again() {
         fetched += 1;
     }
     let counts = churn(&machine);
-    assert_eq!(counts.installs, machine.install_causes().installs);
+    let causes = machine.install_causes();
+    assert_eq!(counts.installs, causes.installs);
+    // Every block took its code and alignment from the window, and the
+    // window counts what else went there for them.
+    assert!(causes.window_pieces >= causes.installs, "{causes:?}");
+    assert!(causes.window_bytes >= causes.installed_bytes, "{causes:?}");
+    assert!(causes.window_bytes.is_multiple_of(16));
     // Ghosts are direct-mapped: one a collision lost counts as new.
     assert!(
         counts.new >= 512 && counts.new < counts.installs / 2,

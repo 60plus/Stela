@@ -754,6 +754,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 Ok(place) => {
                     let address = arena.address(place);
                     arena.write(address, bytes);
+                    self.install_causes.window_bytes += bytes.len().next_multiple_of(16) as u64;
+                    self.install_causes.window_pieces += 1;
                     self.host.serialize_code();
                     if retire {
                         self.held_places.push(place);
