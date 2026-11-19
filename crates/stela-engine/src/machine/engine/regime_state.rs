@@ -56,13 +56,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// A TCR write changed the layout of translation
-    /// (`system::layout`): what derives from System registers goes, the
-    /// transition records and PAC's layout with it, but the mirror cells
-    /// stay, as no System register access traps on TCR or reads a value
-    /// derived from it. What translates goes after it
-    /// ([`Self::layout_changed`]).
+    /// (`system::layout`): what derives from System registers goes, PAC's
+    /// layout with it, but the mirror cells stay, as no System register
+    /// access traps on TCR or reads a value derived from it. Of the
+    /// transition records, those of SVC and ERET go, as after a write of
+    /// PAC's inputs ([`Self::forget_pointer_derived`]): EL2 and its guarded
+    /// level translate through one TCR, so a GENTER or GEXIT record changes
+    /// no input TCR gives, and the rest of what it keeps is checked where
+    /// it is used (the host's root and view) or moves with translation
+    /// (its lookup contexts, [`Self::layout_changed`]).
     pub(super) fn layout_written(&mut self) {
-        self.forget_derived();
+        self.forget_pointer_derived();
         self.device_lines = None;
         if self.step_timing.is_some() {
             let paths = &mut self.system_exits.paths;

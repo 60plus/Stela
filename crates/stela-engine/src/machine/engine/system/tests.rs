@@ -1730,6 +1730,7 @@ fn mirrored_cells_open_exactly_on_the_plain_reads() {
 #[test]
 fn layout_writes_keep_exactly_the_cells_reads_open_again() {
     use super::super::{COUNT_MIRRORS, COUNTER_MIRRORS, MIRRORED};
+    use stela_compiler::x86_64::transition;
     const TCR_EL1: Encoding = Encoding::new(3, 0, 2, 0, 2);
     const TBI0: u64 = 1 << 37;
     let mut kept = 0;
@@ -1749,6 +1750,11 @@ fn layout_writes_keep_exactly_the_cells_reads_open_again() {
             machine.translation_generation,
             machine.device_read_generation,
         );
+        // Every transition record holds.
+        let table = &mut machine.mirrors.transitions;
+        for record in table.records.iter_mut().flatten() {
+            record.generation = table.generation;
+        }
         machine.cpu.state.x[0] = machine.cpu.regime_tcr() ^ TBI0;
         let exceptions = machine.statistics.exceptions;
         let Ok(()) = machine.system_instruction(access(false, TCR_EL1, 0)) else {
@@ -1762,6 +1768,14 @@ fn layout_writes_keep_exactly_the_cells_reads_open_again() {
         written += 1;
         assert!(machine.translation_generation > translations, "{case}");
         assert!(machine.device_read_generation > devices, "{case}");
+        // GENTER's and GEXIT's records hold on, SVC's and ERET's go.
+        let table = &machine.mirrors.transitions;
+        for records in &table.records {
+            for (kind, record) in records.iter().enumerate() {
+                let kept = matches!(kind, transition::GUARDED_ENTER | transition::GUARDED_EXIT);
+                assert_eq!(record.generation == table.generation, kept, "{case} {kind}");
+            }
+        }
         let after = *machine.mirrors;
         read_all(machine);
         for index in 0..MIRRORED.len() {
