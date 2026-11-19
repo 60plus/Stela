@@ -14,6 +14,8 @@ use crate::translations::{Entry, Relocated};
 use alloc::{sync::Arc, vec::Vec};
 use std::time::{Duration, Instant};
 use stela_compiler::{GuestAddress, block};
+use stela_crypto::Sha256;
+use stela_crypto::digest::Digest as _;
 
 /// The memory checks and native system features a boot's kernel PEs compile
 /// with (as the store's `compile_bench`): range checks, exclusives, pointer
@@ -186,6 +188,11 @@ struct Phases {
     /// Blocks whose first window did not hold them, analysed twice.
     redone: u64,
     refused: u64,
+    /// With `FETCH_DIGEST`: the SHA-256 of every block compiled (its PC and
+    /// all of `CompiledBlock`) and every refusal, in order, so that a
+    /// change of the compiler that must emit the same bytes is checked over
+    /// real code.
+    digest: Option<Sha256>,
 }
 
 /// Compile every block of `image` as the engine compiles one it fetches
@@ -194,7 +201,10 @@ fn measure(image: &[u8], base: u64, batch: usize, polluter: Option<&Polluter>) -
     let preparation = Arc::new(system_preparation());
     let options = system_options();
     let window_bytes = first_window();
-    let mut phases = Phases::default();
+    let mut phases = Phases {
+        digest: std::env::var("FETCH_DIGEST").is_ok().then(Sha256::new),
+        ..Phases::default()
+    };
     let mut relocated = Relocated::default();
     let mut at = 0usize;
     let mut in_batch = 0usize;
@@ -242,15 +252,22 @@ fn measure(image: &[u8], base: u64, batch: usize, polluter: Option<&Polluter>) -
         let source = &staging[..length];
         let Ok((analysis, Ok(plan))) = analyzed else {
             phases.refused += 1;
+            if let Some(digest) = &mut phases.digest {
+                digest.update(std::format!("refused {pc:x}").as_bytes());
+            }
             at += 4;
             continue;
         };
-        let Ok(compiled) = plan.compile() else {
+        let compiled = plan.compile();
+        phases.emit += emitting.elapsed();
+        if let Some(digest) = &mut phases.digest {
+            digest.update(std::format!("{pc:x} {compiled:?}").as_bytes());
+        }
+        let Ok(compiled) = compiled else {
             phases.refused += 1;
             at += 4;
             continue;
         };
-        phases.emit += emitting.elapsed();
         let input = analysis.source_bytes;
         let source_bytes = compiled.source_bytes;
         phases.blocks += 1;
@@ -321,6 +338,10 @@ fn fetch_phase_costs() {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(path) = &profile {
         sampler::stop(path);
+    }
+    if let Some(digest) = phases.digest.clone() {
+        let digest: [u8; 32] = digest.finalize().into();
+        std::println!("digest {}", hex::encode(digest));
     }
     let per = |time: Duration| time.as_secs_f64() * 1e9 / phases.instructions.max(1) as f64;
     let compile = phases.admit + phases.decode + phases.emit;
