@@ -6,6 +6,7 @@
 //! read-modify-write, so a change to the transfer path shows here as
 //! numbers, not as a reading of its bytes.
 use super::super::*;
+use super::gate;
 use crate::{
     GuestState, Options, TargetCpu,
     block::{BlockProfile, CompilationPlan, Features},
@@ -319,7 +320,7 @@ impl Program {
                 }
                 let at = block.at + exit.offset as u64 - slot as u64;
                 let retired = block.instructions - u32::from(exit.skipped);
-                let linking = link(at, slot, retired, target as u32, blocks[target].at)
+                let linking = link(at, slot, retired, target as u32, blocks[target].at, gate())
                     .expect("a link in reach");
                 let offset = |address: u64| (address - arena.at(0)) as usize;
                 arena.write(offset(linking.rest_at), &linking.rest);
@@ -662,17 +663,23 @@ fn the_cost_decoder_classes_transfer_instructions() {
 #[test]
 fn transfers_cost_what_their_path_runs() {
     let costs = transfer_costs();
+    // A polled link's checks: PEXT and a JRCXZ, or two of each MOV and
+    // JRCXZ ([`LinkGate`]).
+    let polled = match gate() {
+        LinkGate::Pext => 0,
+        LinkGate::Jrcxz => 2,
+    };
     let expected = [
         ("b forward", Cost::new(6, 1, 1, 0)),
-        ("b back", Cost::new(11, 3, 1, 0)),
+        ("b back", Cost::new(6 + polled, 2, 1, 0)),
         ("cbz back, fallthrough", Cost::new(8, 1, 1, 0)),
-        ("cbz back, taken", Cost::new(14, 3, 1, 0)),
+        ("cbz back, taken", Cost::new(9 + polled, 2, 1, 0)),
         ("cbz forward, side exit", Cost::new(8, 1, 1, 0)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.
     assert_eq!(loop_iteration(true), Cost::new(6, 1, 0, 1));
-    assert_eq!(loop_iteration(false), Cost::new(14, 3, 1, 0));
+    assert_eq!(loop_iteration(false), Cost::new(9 + polled, 2, 1, 0));
 }
 
 /// The scanner's linked blocks count what they ran: its counts, the

@@ -631,6 +631,7 @@ const SPIN_TURNS: i8 = core::mem::offset_of!(EventSpin, turns) as i8;
 const SPIN_STREAMED: i8 = core::mem::offset_of!(EventSpin, streamed) as i8;
 const INTERRUPT_EPOCH: i8 =
     core::mem::offset_of!(super::chain::ChainControl, interrupt_epoch) as i8;
+const QUIET: i8 = core::mem::offset_of!(super::chain::ChainControl, quiet) as i8;
 const OBSERVED_INTERRUPT_EPOCH: i8 =
     core::mem::offset_of!(super::chain::ChainControl, observed_interrupt_epoch) as i8;
 
@@ -825,8 +826,9 @@ pub struct FastIpi {
 
 /// The bytes of one entry of the table [`FastIpi::base`] names, and the
 /// offsets of its words: the target's IPI_SR (`u64`), deferred-IPI flag
-/// (`u8`), line-change counter (`u64`), interruption epoch (`u64`), halted
-/// flag (`u8`) and PE number, each but the last an address.
+/// (`u8`), line-change counter (`u64`), chaining control
+/// ([`super::chain::ChainControl`]), halted flag (`u8`) and PE number, each
+/// but the last an address.
 pub const FAST_IPI_TARGET_BYTES: usize = 48;
 pub const FAST_IPI_TARGET_STATUS: usize = 0;
 pub const FAST_IPI_TARGET_ARMED: usize = 8;
@@ -861,12 +863,13 @@ pub struct FastIpiPlaces {
     pub interrupt_status: Place,
 }
 
-/// Add 1 to the epoch at `[RCX + offset]` unless it is `u64::MAX`, which
-/// stays, in a LOCK CMPXCHG loop. Clobbers RAX and RDX.
-fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
+/// Post an interruption to the control at RCX as `chain::interrupt` does:
+/// add 1 to its epoch unless it is `u64::MAX`, which stays, in a LOCK
+/// CMPXCHG loop, then zero its quiet word. Clobbers RAX and RDX.
+fn bump_epoch(asm: &mut Asm<'_>) {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
-    let epoch = Mem::base_disp8(Rcx, offset);
+    let epoch = Mem::base_disp8(Rcx, INTERRUPT_EPOCH);
     asm.mov_load(Qword, Rax, epoch);
     let top = asm.len();
     asm.alu_imm8(Alu::Cmp, Qword, Rax, -1);
@@ -877,6 +880,7 @@ fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
     let lost = asm.jcc(Cond::Ne);
     asm.bind_back(lost, top);
     asm.bind(saturated);
+    asm.mov_rm_imm32(Qword, Mem::base(Rcx, QUIET.into()), 0);
 }
 
 /// The thunk completing an immediate fast-IPI request, MSR IPI_RR_LOCAL
@@ -962,7 +966,7 @@ pub fn fast_ipi_request_thunk(
     asm.lock();
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, 0), 1);
     asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_INTERRUPT));
-    bump_epoch(&mut asm, 0);
+    bump_epoch(&mut asm);
     reload(&mut asm);
     asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_SLEEPING));
     asm.movzx(Dword, Rcx, Byte, Mem::base(Rcx, 0));
@@ -973,7 +977,7 @@ pub fn fast_ipi_request_thunk(
     asm.shift_cl(ShiftOp::Shl, Qword, Rdx);
     asm.alu(Alu::Or, Qword, ipi(IPI_WAKES), Rdx);
     asm.place(Rcx, places.control);
-    bump_epoch(&mut asm, INTERRUPT_EPOCH);
+    bump_epoch(&mut asm);
     asm.bind(pending);
     asm.bind(running);
     finish_unless(

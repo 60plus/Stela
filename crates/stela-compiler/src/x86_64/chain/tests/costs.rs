@@ -7,6 +7,7 @@
 //! prints nanoseconds and TSC ticks per transfer, less a loop whose
 //! transfer is a direct jump, and asserts only the counts.
 use super::super::*;
+use super::gate;
 use crate::GuestState;
 use alloc::{boxed::Box, vec::Vec};
 use core::ffi::c_void;
@@ -463,7 +464,7 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
                 (code, None)
             }
             Ring::Link => {
-                let linking = link(at, LINK_BYTES, RAN, held.block, entry).unwrap();
+                let linking = link(at, LINK_BYTES, RAN, held.block, entry, gate()).unwrap();
                 let point = (linking.rest_at - PATCH_BYTES as u64 - at) as usize;
                 let mut code = vec![0x90; point];
                 code.extend(linking.body());
@@ -473,7 +474,7 @@ fn spread_cost(ring: Ring, blocks: usize) -> (f64, [f64; STAMP_COUNTS]) {
             }
             Ring::Thunk => (
                 jump(at, tail).unwrap().to_vec(),
-                Some(thunk(tail, RAN, held.block, entry, base).unwrap()),
+                Some(thunk(tail, RAN, held.block, entry, base, gate()).unwrap()),
             ),
             Ring::Stamped => {
                 world.table.link_hot_cell(site, pc, Some(held)).unwrap();

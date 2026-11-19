@@ -1184,8 +1184,11 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
     let instruction = arena_bytes(arena, point, chain::PATCH_BYTES)?;
     if exit.slot != 0 && instruction == chain::LINKED_SLOT {
         let at = exit.site - u64::from(exit.slot);
-        return read_link(arena, point, near, |block, entry| {
-            chain::link(at, exit.slot.into(), retired, block, entry).map(|linking| linking.body())
+        return GATES.into_iter().find_map(|gate| {
+            read_link(arena, point, near, |block, entry| {
+                chain::link(at, exit.slot.into(), retired, block, entry, gate)
+                    .map(|linking| linking.body())
+            })
         });
     }
     // Else a `jmp rel32` to a thunk.
@@ -1194,10 +1197,15 @@ fn entered(code: &board::Code, slot: usize, position: usize) -> Option<(usize, u
     };
     let distance = i32::from_le_bytes(distance.try_into().ok()?);
     let thunk = (point + chain::PATCH_BYTES as u64).wrapping_add_signed(i64::from(distance));
-    read_link(arena, thunk, near, |block, entry| {
-        chain::thunk(thunk, retired, block, entry, fallback)
+    GATES.into_iter().find_map(|gate| {
+        read_link(arena, thunk, near, |block, entry| {
+            chain::thunk(thunk, retired, block, entry, fallback, gate)
+        })
     })
 }
+
+/// Either tier's links, whichever the machine's target took.
+const GATES: [chain::LinkGate; 2] = [chain::LinkGate::Jrcxz, chain::LinkGate::Pext];
 
 /// Check that block `slot`'s chained exit at `position` enters, by the
 /// bytes a core runs, a live block of its target at that block's code:

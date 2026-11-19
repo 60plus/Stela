@@ -897,9 +897,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if exit.slot != 0 && !record.used(position) {
             let at = site - u64::from(exit.slot);
             let point = chain::slot_patch(at);
-            let Some(linking) = chain::link(at, exit.slot.into(), retired, target as u32, entry)
-                .filter(|_| chain::patchable(point))
-            else {
+            let Some(linking) = chain::link(
+                at,
+                exit.slot.into(),
+                retired,
+                target as u32,
+                entry,
+                chain::LinkGate::for_target(self.target),
+            )
+            .filter(|_| chain::patchable(point)) else {
                 return false;
             };
             self.patch_native(NativeCode(linking.rest_at as usize), &linking.rest);
@@ -931,7 +937,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         }
         let (Some(bytes), Some(jump)) = (
-            chain::thunk(at, retired, target as u32, entry, fallback),
+            chain::thunk(
+                at,
+                retired,
+                target as u32,
+                entry,
+                fallback,
+                chain::LinkGate::for_target(self.target),
+            ),
             chain::jump(point, at),
         ) else {
             return false;

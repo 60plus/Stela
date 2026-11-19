@@ -641,7 +641,7 @@ impl<D: Devices> SharedDevices<D> {
                 let inbox = &hub.inboxes[pe];
                 (
                     inbox.lines.as_ptr() as u64,
-                    inbox.chain.interrupt_epoch().as_ptr() as u64,
+                    inbox.chain.control(),
                     inbox.sleeping.as_ptr() as u64,
                 )
             }))

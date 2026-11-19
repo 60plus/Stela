@@ -2,6 +2,7 @@
 //! changes with one aligned 8-byte store, and a core running the exit in a
 //! loop meanwhile only ever takes the old way or the new one.
 use super::super::*;
+use super::gate;
 use crate::GuestState;
 use alloc::boxed::Box;
 use core::ffi::c_void;
@@ -165,7 +166,7 @@ fn install_targets(page: &Page, fallback: u64) -> [u64; 2] {
     page.write(block, &[0xb8, 0x51, 0x51, 0, 0, 0xba, 99, 0, 0, 0, 0xc3]);
     [2, 3].map(|named| {
         let at = page.address() + (THUNKS_AT + 64 * named as usize) as u64;
-        page.write(at, &thunk(at, 1, named, block, fallback).unwrap());
+        page.write(at, &thunk(at, 1, named, block, fallback, gate()).unwrap());
         at
     })
 }
@@ -186,7 +187,7 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
     assert_ne!(point, at);
     let thunks = install_targets(&page, site);
     let block = page.address() + BLOCK_AT as u64;
-    let linking = link(at, POLLED_LINK_BYTES, 1, 1, block).unwrap();
+    let linking = link(at, POLLED_LINK_BYTES, 1, 1, block, gate()).unwrap();
     let (unlink_at, unlink) = unlinked(site, POLLED_LINK_BYTES).unwrap();
     assert_eq!(unlink_at, point);
     let seen = run_while_patching(&page, at, |step| {

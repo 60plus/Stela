@@ -11,6 +11,7 @@
 //! transfers. An unlinked direct exit returns what the thunk's own exit
 //! returns.
 use super::super::*;
+use super::Controlled;
 use crate::block::{
     PointerAuthenticationKey as Key, PointerAuthenticationModifier as Modifier,
     PointerAuthenticationOperation as Operation,
@@ -304,12 +305,10 @@ impl Run {
         put(&self.region, offset, &jump(site, at).unwrap());
     }
 
-    /// Run the entry with `control` and the account in its `spare` word,
-    /// which native code never reads, so comparing controls compares
-    /// accounts too; the account the run left put back there.
-    fn run(&mut self, state: &mut GuestState, control: &mut ChainControl) -> (u64, u64) {
-        state.anchors[Anchor::Control] = control as *mut ChainControl as u64;
-        state.account = control.spare;
+    /// Run the entry with `control` and its account.
+    fn run(&mut self, state: &mut GuestState, control: &mut Controlled) -> (u64, u64) {
+        state.anchors[Anchor::Control] = &mut control.control as *mut ChainControl as u64;
+        state.account = control.account.0;
         // Each run starts with an empty jump cache, so the ways compare as
         // the table probe serves them; the cache's own differences are the
         // probes' and the jump cache's tests.
@@ -324,7 +323,7 @@ impl Run {
         // call, and call `service`.
         let result =
             unsafe { crate::x86_64::native::enter(self.region.0 as *const u8, state, 0, 0) };
-        control.spare = state.account;
+        control.account = Account(state.account);
         (result as u64, (result >> 64) as u64)
     }
 }
@@ -578,22 +577,24 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
             } else {
                 0x5555
             };
-            let base = ChainControl {
-                spare: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize])
-                    .with_retired(100)
-                    .0,
-                block: 7,
-                contexts,
-                table: table.address(),
-                hits: 3,
-                interrupt_epoch: u64::from(rng.below(12) == 0),
-                itlb: itlb.address(),
-                masks: [table.mask(), itlb.mask()],
-                salts: contexts.map(|context| itlb.salt(context)),
-                stamps,
-                cells,
-                ..ChainControl::default()
+            let mut base = Controlled {
+                control: ChainControl {
+                    block: 7,
+                    contexts,
+                    table: table.address(),
+                    hits: 3,
+                    itlb: itlb.address(),
+                    masks: [table.mask(), itlb.mask()],
+                    salts: contexts.map(|context| itlb.salt(context)),
+                    stamps,
+                    cells,
+                    ..ChainControl::default()
+                },
+                account: Account::new([0, 1, 2, 5, 9][rng.below(5) as usize]).with_retired(100),
             };
+            if rng.below(12) == 0 {
+                base.interrupt();
+            }
             // SAFETY: the table made the stamps, which live with it.
             let hits_of = || unsafe { stamp_counts(stamps) }[StampCount::Hits as usize];
             let stamped_hits = hits_of();
@@ -664,14 +665,15 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 predicted,
                 u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
             );
-            let account = Account(base.spare);
-            let entered = ChainControl {
-                spare: account
+            let account = base.account;
+            let entered = Controlled {
+                control: ChainControl {
+                    block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
+                    ..base.control
+                },
+                account: account
                     .with_budget(account.budget().saturating_sub(1))
-                    .with_retired(account.retired() + u64::from(RAN))
-                    .0,
-                block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
-                ..base
+                    .with_retired(account.retired() + u64::from(RAN)),
             };
             let put_out = resident_key == Some(cell.key)
                 && cell.pc == predicted
@@ -679,11 +681,14 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 && lookup == exit
                 && controls[0] == base
                 && if account.budget() == 0 {
-                    linked_way == exit && Account(controls[1].spare).budget() == u64::MAX
+                    linked_way == exit && controls[1] == base
                 } else {
                     linked_way == (0x7700 + u64::from(cell.block), 99)
-                        && ChainControl {
-                            hits: entered.hits,
+                        && Controlled {
+                            control: ChainControl {
+                                hits: entered.hits,
+                                ..controls[1].control
+                            },
                             ..controls[1]
                         } == entered
                 };

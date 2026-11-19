@@ -2989,7 +2989,15 @@ fn side_exits_retire_the_instructions_that_ran() {
     // Its body first, then the slot's patch point falls into it.
     let entry = machine.code.blocks[1].code.0 as u64;
     let slot = exit.site - exit.slot as u64;
-    let linking = chain::link(slot, exit.slot.into(), 1, 1, entry).unwrap();
+    let linking = chain::link(
+        slot,
+        exit.slot.into(),
+        1,
+        1,
+        entry,
+        chain::LinkGate::for_target(machine.target),
+    )
+    .unwrap();
     assert_eq!(
         machine.host.patches[0],
         (linking.rest_at as usize, linking.rest)
@@ -3034,7 +3042,15 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
         let site = from.code.0 + code.len() - chain::DIRECT_EXIT_BYTES;
         let slot = chain::link_slot(Some(from.pc), GuestAddress(target), ExitKind::Direct);
         let at = (site - slot) as u64;
-        let linking = chain::link(at, slot, 2, index, to.code.0 as u64).unwrap();
+        let linking = chain::link(
+            at,
+            slot,
+            2,
+            index,
+            to.code.0 as u64,
+            chain::LinkGate::for_target(machine.target),
+        )
+        .unwrap();
         assert_eq!(patches[0], (linking.rest_at as usize, linking.rest));
         let point = chain::slot_patch(at) as usize;
         assert_eq!(patches[1], (point, linking.point.to_vec()));

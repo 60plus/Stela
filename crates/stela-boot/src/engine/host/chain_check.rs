@@ -196,6 +196,7 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
                 next as u32,
                 block_at(next),
                 chain::unlinked_return(point),
+                chain::LinkGate::for_target(crate::engine::target(true)),
             )?,
             Ring::Cell => {
                 let current = table.find(table.slot(pc(next), key), pc(next), key);

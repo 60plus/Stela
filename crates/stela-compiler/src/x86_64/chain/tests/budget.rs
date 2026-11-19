@@ -1,5 +1,6 @@
 //! Native interruption-gate safety and CPU measurements.
 use super::super::*;
+use super::gate;
 use crate::GuestState;
 use alloc::{boxed::Box, format, vec::Vec};
 use core::ffi::c_void;
@@ -92,7 +93,7 @@ fn frame(control: u64) -> Box<GuestState> {
 /// The direct exit to [`TARGET`] at host address `at`, its patch point
 /// linked to a thunk right after it into `entry`, and the thunk, which
 /// returns through the exit's unlinked path.
-fn exit_into_thunk(at: u64, entry: u64, policy: Interruption) -> Vec<u8> {
+fn exit_into_thunk(at: u64, entry: u64, policy: Interruption, gate: LinkGate) -> Vec<u8> {
     let mut code = direct_exit_at(at, TARGET, ExitKind::Direct).to_vec();
     let thunk_at = at + code.len() as u64;
     let point = direct_patch(at);
@@ -105,6 +106,7 @@ fn exit_into_thunk(at: u64, entry: u64, policy: Interruption) -> Vec<u8> {
             block: 3,
             entry,
             exit: unlinked_return(point),
+            gate,
         },
         policy,
     )
@@ -114,13 +116,16 @@ fn exit_into_thunk(at: u64, entry: u64, policy: Interruption) -> Vec<u8> {
 }
 
 /// [`exit_into_thunk`] at the mapping's start, into itself.
-fn direct(mapping: &Mapping, policy: Interruption) -> Vec<u8> {
-    exit_into_thunk(mapping.address(), mapping.address(), policy)
+fn direct(mapping: &Mapping, policy: Interruption, gate: LinkGate) -> Vec<u8> {
+    exit_into_thunk(mapping.address(), mapping.address(), policy, gate)
 }
+
+/// Both link tiers ([`LinkGate`]), each tested whatever the host picks.
+const GATES: [LinkGate; 2] = [LinkGate::Jrcxz, LinkGate::Pext];
 
 /// The link slot of an exit to [`TARGET`] at the mapping's start, linked
 /// into itself, and the exit.
-fn slot(mapping: &Mapping) -> Vec<u8> {
+fn slot(mapping: &Mapping, gate: LinkGate) -> Vec<u8> {
     let at = mapping.address();
     let mut code = alloc::vec![0; POLLED_LINK_BYTES];
     empty_link_at(at, &mut code);
@@ -129,7 +134,7 @@ fn slot(mapping: &Mapping) -> Vec<u8> {
         TARGET,
         ExitKind::Direct,
     ));
-    let linking = link(at, POLLED_LINK_BYTES, 7, 3, at).unwrap();
+    let linking = link(at, POLLED_LINK_BYTES, 7, 3, at, gate).unwrap();
     let point = (slot_patch(at) - at) as usize;
     let body = linking.body();
     code[point..point + body.len()].copy_from_slice(&body);
@@ -141,25 +146,49 @@ fn exited(value: u128) -> (u64, u64) {
 
 #[test]
 fn epoch_mismatch_exits_before_spending_or_changing_accounting() {
+    for gate in GATES {
+        for slotted in [false, true] {
+            pending_epochs_stop(gate, slotted);
+        }
+    }
+}
+
+/// A thunk's or slot's link of `gate` exits with a notification pending,
+/// and with a saturated epoch, nothing spent.
+fn pending_epochs_stop(gate: LinkGate, slotted: bool) {
     let mut control = Box::new(ChainControl {
         linked: 23,
         block: 29,
-        interrupt_epoch: 1,
-        observed_interrupt_epoch: 0,
         ..ChainControl::default()
     });
     let address = (&mut *control as *mut ChainControl) as u64;
+    // SAFETY: the control is live; nothing runs on it.
+    unsafe { interrupt(&mut *control) };
     let native = Mapping::new();
-    native.install(&direct(&native, Interruption::Epoch));
+    native.install(&match slotted {
+        false => direct(&native, Interruption::Quiet, gate),
+        true => slot(&native, gate),
+    });
     let account = Account::new(17).with_retired(19);
     let (result, left) = native.run(address, account);
     assert_eq!(exited(result), (TARGET.0, ExitKind::Direct as u64));
     assert_eq!((left, control.linked, control.block), (account, 23, 29));
+    // A saturated epoch: no acknowledgment makes the control quiet.
     control.interrupt_epoch = u64::MAX;
-    control.observed_interrupt_epoch = u64::MAX - 1;
+    // SAFETY: as above.
+    unsafe { acknowledge(&mut *control, u64::MAX) };
+    assert_eq!(control.observed_interrupt_epoch, u64::MAX - 1);
     let (result, left) = native.run(address, account);
     assert_eq!(exited(result), (TARGET.0, ExitKind::Direct as u64));
     assert_eq!((left, control.linked, control.block), (account, 23, 29));
+    // Acknowledged: the same link runs its budget out, into itself, and
+    // stops with none left, its instructions counted for each transfer.
+    control.interrupt_epoch = 4;
+    // SAFETY: as above.
+    unsafe { acknowledge(&mut *control, 4) };
+    let (result, left) = native.run(address, account);
+    assert_eq!(exited(result), (TARGET.0, ExitKind::Direct as u64));
+    assert_eq!((left, control.block), (Account::spent(19 + 17 * 7), 3));
 }
 
 #[test]
@@ -179,9 +208,14 @@ fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
         code.extend(lookup_thunk(7, None, kind, btype).unwrap());
         let address = (&mut *control as *mut ChainControl) as u64;
         native.install(&code);
-        for (epoch, observed) in [(1, 0), (u64::MAX, u64::MAX - 1)] {
-            control.interrupt_epoch = epoch;
-            control.observed_interrupt_epoch = observed;
+        for epoch in [1, u64::MAX] {
+            control.interrupt_epoch = epoch - 1;
+            // SAFETY: the control is live; nothing runs on it.
+            unsafe {
+                acknowledge(&mut *control, epoch - 1);
+                interrupt(&mut *control);
+            }
+            assert_eq!(control.interrupt_epoch, epoch);
             let account = Account::new(17).with_retired(19);
             let prior = (account, control.hits, control.linked, control.block);
             let (result, left) = native.run(address, account);
@@ -193,12 +227,12 @@ fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
 
 /// Every Rust access is atomic; native aligned loads/stores implement x86's
 /// corresponding atomic-width memory accesses. The native runner alone writes
-/// the local prefix; the notifying CPU writes only the separate epoch word.
+/// the local prefix; the notifying CPU writes only the epoch and quiet words.
 /// `account` is where the test's prefix publishes the runner's account,
 /// which production code keeps in [`ACCOUNT`] alone.
 #[repr(C, align(64))]
 struct Shared {
-    account: AtomicU64,
+    quiet: AtomicU64,
     block: AtomicU64,
     contexts: [AtomicU64; 2],
     table: AtomicU64,
@@ -209,18 +243,18 @@ struct Shared {
     observed: AtomicU64,
     salts: [AtomicU32; 2],
     itlb: AtomicU64,
+    account: AtomicU64,
 }
 const _: () = assert!(core::mem::offset_of!(Shared, epoch) == INTERRUPT_EPOCH as usize);
 const _: () = assert!(core::mem::offset_of!(Shared, observed) == OBSERVED_INTERRUPT_EPOCH as usize);
 const _: () = assert!(core::mem::offset_of!(Shared, linked) == LINKED as usize);
 const _: () = assert!(core::mem::offset_of!(Shared, itlb) == ITLB as usize);
-const _: () =
-    assert!(core::mem::offset_of!(Shared, account) == core::mem::offset_of!(ChainControl, spare));
+const _: () = assert!(core::mem::offset_of!(Shared, quiet) == QUIET_OFFSET as usize);
 const _: () = assert!(core::mem::offset_of!(Shared, block) == BLOCK as usize);
 impl Shared {
     fn new() -> Self {
         Self {
-            account: AtomicU64::new(Account::new(INTERRUPT_TEST_BUDGET).0),
+            quiet: AtomicU64::new(QUIET),
             block: AtomicU64::new(0),
             contexts: [AtomicU64::new(0), AtomicU64::new(0)],
             table: AtomicU64::new(0),
@@ -231,6 +265,7 @@ impl Shared {
             observed: AtomicU64::new(0),
             salts: [AtomicU32::new(0), AtomicU32::new(0)],
             itlb: AtomicU64::new(0),
+            account: AtomicU64::new(Account::new(INTERRUPT_TEST_BUDGET).0),
         }
     }
 }
@@ -271,11 +306,17 @@ impl InterruptionOutcome {
 
 /// Only the successor prefix is test synchronization; the thunk is emitted by
 /// the production constructor with its normal guard and accounting unchanged.
-fn rendezvous_backedge(native: &Mapping, control: u64, gate: u64, policy: Interruption) -> Vec<u8> {
+fn rendezvous_backedge(
+    native: &Mapping,
+    control: u64,
+    gate: u64,
+    policy: Interruption,
+    link: LinkGate,
+) -> Vec<u8> {
     let mut prefix = Code::new();
     prefix.asm().mov_imm64(Rcx, control);
     // The account, published for the notifier; thunks count a transfer in
-    // its low word alone, the transfers left plus one.
+    // its low word alone, the transfers left.
     prefix.asm().mov_store(
         Qword,
         Mem::base(Rcx, core::mem::offset_of!(Shared, account) as i32),
@@ -286,7 +327,7 @@ fn rendezvous_backedge(native: &Mapping, control: u64, gate: u64, policy: Interr
         Alu::Cmp,
         Qword,
         Rdx,
-        (INTERRUPT_TEST_BUDGET - RENDEZVOUS_AFTER + 1) as i32,
+        (INTERRUPT_TEST_BUDGET - RENDEZVOUS_AFTER) as i32,
     );
     let ordinary = prefix.asm().jcc8(Cond::Ne);
     prefix.asm().mov_imm64(Rax, gate);
@@ -318,6 +359,7 @@ fn rendezvous_backedge(native: &Mapping, control: u64, gate: u64, policy: Interr
         native.address() + prefix.len() as u64,
         native.address(),
         policy,
+        link,
     );
     let mut bytes = prefix.into_bytes();
     bytes.extend(exit);
@@ -325,15 +367,18 @@ fn rendezvous_backedge(native: &Mapping, control: u64, gate: u64, policy: Interr
 }
 
 /// The transfers thunks made from the test budget to the account
-/// `account`, all of it once one found none left.
+/// `account`.
 fn transfers(account: u64) -> u64 {
-    match Account(account).budget() {
-        u64::MAX => INTERRUPT_TEST_BUDGET,
-        budget => INTERRUPT_TEST_BUDGET - budget,
-    }
+    INTERRUPT_TEST_BUDGET - Account(account).budget()
 }
 
-fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
+/// Post an interruption to `control` as [`interrupt`] does.
+fn post(control: &Shared) {
+    control.epoch.fetch_add(1, Ordering::SeqCst);
+    control.quiet.store(0, Ordering::SeqCst);
+}
+
+fn interrupt_at_rendezvous(policy: Interruption, link: LinkGate) -> InterruptionOutcome {
     let control = Arc::new(Shared::new());
     let gate = Arc::new(Rendezvous {
         ready: AtomicU64::new(0),
@@ -345,6 +390,7 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
         Arc::as_ptr(&control) as u64,
         Arc::as_ptr(&gate) as u64,
         policy,
+        link,
     ));
     let entry = native.address() as usize;
     let retained = Arc::clone(&control);
@@ -362,7 +408,7 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
     let began = Instant::now();
     while gate.ready.load(Ordering::Acquire) == 0 {
         if began.elapsed() >= Duration::from_secs(5) {
-            control.epoch.fetch_add(1, Ordering::Release);
+            post(&control);
             gate.release.store(1, Ordering::Release);
             let _ = worker.join();
             panic!("native backedge did not reach the ordered rendezvous");
@@ -372,7 +418,7 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
     // Ready synchronizes the native accounting prefix. Publish before opening
     // the rendezvous; the next production guard must observe the epoch.
     let published = transfers(control.account.load(Ordering::Acquire));
-    control.epoch.fetch_add(1, Ordering::Release);
+    post(&control);
     gate.release.store(1, Ordering::Release);
     let (result, account, retained, _retained_gate) = worker.join().unwrap();
     InterruptionOutcome {
@@ -389,32 +435,39 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
 
 #[test]
 fn foreign_epoch_interrupts_the_native_backedge_after_an_ordered_rendezvous() {
-    for _ in 0..32 {
-        let outcome = interrupt_at_rendezvous(Interruption::Epoch);
-        assert!(outcome.interrupted_at_rendezvous(), "{outcome:?}");
+    for gate in GATES {
+        for _ in 0..32 {
+            let outcome = interrupt_at_rendezvous(Interruption::Quiet, gate);
+            assert!(outcome.interrupted_at_rendezvous(), "{gate:?} {outcome:?}");
+        }
     }
 }
 
 #[test]
 fn rendezvous_oracle_rejects_an_ignored_epoch() {
-    let outcome = interrupt_at_rendezvous(Interruption::Legacy);
+    let outcome = interrupt_at_rendezvous(Interruption::Legacy, LinkGate::Jrcxz);
     assert!(!outcome.interrupted_at_rendezvous(), "{outcome:?}");
     assert_eq!(
         (outcome.published, outcome.epoch, outcome.observed),
         (RENDEZVOUS_AFTER, 1, 0)
     );
     assert_eq!(outcome.linked, INTERRUPT_TEST_BUDGET);
-    assert_eq!(outcome.budget, u64::MAX);
+    assert_eq!(outcome.budget, 0);
     assert_eq!(outcome.retired, INTERRUPT_TEST_BUDGET * 7);
     assert_eq!(outcome.result, (TARGET.0, ExitKind::Direct as u64));
 }
 
 #[test]
 fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
-    let mut control = Box::new(ChainControl {
-        interrupt_epoch: 1,
-        ..ChainControl::default()
-    });
+    for gate in GATES {
+        one_transfer_past_the_gate(gate);
+    }
+}
+
+fn one_transfer_past_the_gate(gate: LinkGate) {
+    let mut control = Box::new(ChainControl::default());
+    // SAFETY: the control is live; nothing runs on it.
+    unsafe { interrupt(&mut *control) };
     let native = Mapping::new();
     let address = (&mut *control as *mut ChainControl) as u64;
     let mut prefix = Code::new();
@@ -422,30 +475,32 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     let enter_tail = prefix.asm().jmp();
     let exit = native.address() + prefix.len() as u64;
     let at = exit + DIRECT_EXIT_BYTES as u64;
-    let body = thunk(at, 7, 3, at, exit).unwrap();
+    let body = thunk(at, 7, 3, at, exit, gate).unwrap();
     // Golden encodings identify the exact post-guard native window. The
     // first entry has already admitted a transfer with the old epoch; its
     // backedge re-enters the full, unchanged production thunk.
-    const AFTER_GUARD: usize = 25;
+    let (guard, rest): (&[u8], &[u8]) = match gate {
+        // mov ecx,[rdx], the quiet word; then movzx ecx,r13w; jrcxz, a
+        // transfer left.
+        LinkGate::Jrcxz => (&[0x8b, 0x0a], &[0x41, 0x0f, 0xb7, 0xcd, 0xe3, 20]),
+        // pext ecx,r13d,[rdx]: both at once.
+        LinkGate::Pext => (&[0xc4, 0xe2, 0x12, 0xf5, 0x0a], &[]),
+    };
+    let after_guard = 7 + guard.len() + 2;
+    assert_eq!(&body[7..7 + guard.len()], guard);
+    // The guard's jrcxz to the jump back.
+    assert_eq!(body[after_guard - 2], 0xe3);
     assert_eq!(
-        &body[7..23],
-        &[
-            0x48, 0x8b, 0x42, 0x48, // mov rax,[rdx+observed]
-            0x48, 0xf7, 0xd0, // not rax
-            0x48, 0x8b, 0x4a, 0x40, // mov rcx,[rdx+epoch]
-            0x48, 0x8d, 0x4c, 0x01, 0x02, // lea rcx,[rcx+rax+2]
-        ]
+        after_guard + usize::from(body[after_guard - 1]),
+        body.len() - JUMP_BYTES
     );
-    assert_eq!(body[23], 0xe2);
-    assert_eq!(AFTER_GUARD + usize::from(body[24]), body.len() - JUMP_BYTES);
     // lea r13,[r13 + (7 << 16) - 1]: one transfer and seven instructions.
-    assert_eq!(
-        &body[AFTER_GUARD..AFTER_GUARD + 7],
-        &[0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]
-    );
+    let lea = [0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00];
+    assert_eq!(&body[after_guard..after_guard + rest.len()], rest);
+    assert_eq!(&body[after_guard + rest.len()..][..7], &lea);
     let distance = relative(
         native.address() + enter_tail.end() as u64,
-        at + AFTER_GUARD as u64,
+        at + after_guard as u64,
     )
     .unwrap();
     prefix.patch(enter_tail.offset(), distance.to_le_bytes());
@@ -463,6 +518,51 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
         (control.interrupt_epoch, control.observed_interrupt_epoch),
         (1, 0)
     );
+}
+
+/// A notifier's [`interrupt`] racing its owner's [`acknowledge`] of a
+/// snapshot: whatever the interleaving, a notification the snapshot missed
+/// leaves the control's quiet word 0, so the next polled transfer stops.
+#[test]
+fn a_notification_the_snapshot_missed_stays_pending() {
+    let mut raced = [0u32; 2];
+    for round in 0..20_000u64 {
+        let control = Box::into_raw(Box::new(ChainControl {
+            interrupt_epoch: round,
+            observed_interrupt_epoch: round,
+            ..ChainControl::default()
+        }));
+        let address = control as usize;
+        let start = Arc::new(AtomicU64::new(0));
+        let notifier = {
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                while start.load(Ordering::Acquire) == 0 {
+                    core::hint::spin_loop();
+                }
+                // SAFETY: the control lives until both threads are done.
+                unsafe { interrupt(address as *mut ChainControl) };
+            })
+        };
+        start.store(1, Ordering::Release);
+        // SAFETY: as above; only this thread writes the observed epoch.
+        let snapshot = unsafe {
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch))
+                .load(Ordering::Acquire)
+        };
+        // SAFETY: as above.
+        unsafe { acknowledge(control, snapshot) };
+        notifier.join().unwrap();
+        // SAFETY: both threads are done; this takes the control back.
+        let control = unsafe { Box::from_raw(control) };
+        assert_eq!(control.interrupt_epoch, round + 1);
+        if control.observed_interrupt_epoch != control.interrupt_epoch {
+            assert_eq!(control.quiet, Quiet(0), "round {round}");
+        }
+        raced[usize::from(snapshot == round + 1)] += 1;
+    }
+    // Both orders happened: the snapshot before the notification and after.
+    assert!(raced[0] > 0 && raced[1] > 0, "{raced:?}");
 }
 
 #[repr(align(64))]
@@ -520,13 +620,9 @@ fn native_interruption_gate_costs() {
             LookupEntry::page(TARGET.0 & !0xfff, context, KEY),
         );
         let pointer = (&mut control.0 as *mut ChainControl) as u64;
-        for policy in [
-            Interruption::Legacy,
-            Interruption::Flag,
-            Interruption::Epoch,
-        ] {
+        for policy in [Interruption::Legacy, Interruption::Quiet] {
             // A slot's body has the production gate alone.
-            if mode == Mode::Slot && policy != Interruption::Epoch {
+            if mode == Mode::Slot && policy != Interruption::Quiet {
                 continue;
             }
             let native = Mapping::new();
@@ -580,8 +676,8 @@ fn native_interruption_gate_costs() {
                 code
             };
             let code = match mode {
-                Mode::Direct => direct(&native, policy),
-                Mode::Slot => slot(&native),
+                Mode::Direct => direct(&native, policy, gate()),
+                Mode::Slot => slot(&native, gate()),
                 Mode::Lookup => {
                     table.set(lookup_slot(TARGET.0, KEY), entry);
                     through_tail(None)
@@ -601,7 +697,7 @@ fn native_interruption_gate_costs() {
                 for _ in 0..RUNS {
                     let (result, left) = native.run(pointer, Account::new(RUN));
                     assert_eq!(exited(result), (TARGET.0, ExitKind::Direct as u64));
-                    assert_eq!((left.retired(), left.budget()), (RUN * 7, u64::MAX));
+                    assert_eq!((left.retired(), left.budget()), (RUN * 7, 0));
                 }
                 let elapsed = start.elapsed();
                 let hits = if mode == Mode::Lookup { ITERATIONS } else { 0 };

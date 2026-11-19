@@ -109,19 +109,17 @@ pub const PATCH_BYTES: usize = JUMP_BYTES;
 /// The most NOP bytes before a patch point that keep its instruction in
 /// one aligned 8-byte word ([`patch_pad`]).
 const MAX_PAD: usize = 4;
-/// Bytes of a [`link`]'s body, without and with the interruption gate.
+/// Bytes of a [`link`]'s body, without and with the interruption gate, at
+/// most ([`LinkGate::Jrcxz`]'s): a slot keeps room for either tier's.
 pub const LINK_BODY_BYTES: usize = 33;
-pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 18;
-/// Bytes of the largest [`refund`] of a link that found no budget left.
-const REFUND_BYTES: usize = 7;
-/// Bytes in the largest [`thunk`]: the body, the refund and the jump to
-/// the exit.
-pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + REFUND_BYTES + JUMP_BYTES;
+pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 4;
+/// Bytes in the largest [`thunk`]: the body and the jump to the exit.
+pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + JUMP_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
-/// pad, the body, which starts at the patch point, and the refund, without
-/// and with the gate.
-pub const LINK_BYTES: usize = MAX_PAD + LINK_BODY_BYTES + REFUND_BYTES;
-pub const POLLED_LINK_BYTES: usize = MAX_PAD + POLLED_LINK_BODY_BYTES + REFUND_BYTES;
+/// pad and the body, which starts at the patch point, without and with the
+/// gate.
+pub const LINK_BYTES: usize = MAX_PAD + LINK_BODY_BYTES;
+pub const POLLED_LINK_BYTES: usize = MAX_PAD + POLLED_LINK_BODY_BYTES;
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
 /// Bytes in an exit to a dynamic target in RAX: its patch point with the
@@ -325,10 +323,10 @@ impl From<ExitKind> for ExitWord {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChainControl {
-    /// Keeps `interrupt_epoch`, which other cores write, off the cache line
-    /// of `block`, which every transfer writes. Native code neither reads
-    /// nor writes it.
-    pub spare: u64,
+    /// Whether no interruption is pending, which every polled link, tail and
+    /// probe reads on the cache line of `block` that it writes anyway: the
+    /// epoch protocol keeps it ([`interrupt`], [`acknowledge`]).
+    pub quiet: Quiet,
     /// The index of the block running, and above it the BTYPE it was
     /// entered with.
     pub block: u64,
@@ -347,7 +345,7 @@ pub struct ChainControl {
     /// engine zeroes it before each native call and adds it to its counts
     /// after.
     pub heat: u64,
-    /// Sources are published before a Release increment by a notifier.
+    /// Sources are published before a notifier's increment ([`interrupt`]).
     /// Saturates at MAX; no owner may acknowledge that exhausted epoch.
     pub interrupt_epoch: u64,
     /// The attached owner's Acquire snapshot taken before draining sources.
@@ -439,28 +437,93 @@ const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
 const _: () = assert!(core::mem::size_of::<ChainControl>() == 184);
+// The gates read the quiet word with no displacement, on `block`'s line.
+const _: () = assert!(core::mem::offset_of!(ChainControl, quiet) == 0);
 
-/// The bits of an [`Account`] below its instructions: the transfers left
-/// plus one, which [`Account::new`] allows up to [`MAX_BUDGET`].
+/// The bits of an [`Account`] below its instructions: the transfers left.
 pub const ACCOUNT_LANE_BITS: u32 = 16;
 /// The most transfers one native run may allow.
-pub const MAX_BUDGET: u64 = (1 << ACCOUNT_LANE_BITS) - 2;
+pub const MAX_BUDGET: u64 = ACCOUNT_LANE;
 /// The bits of an [`Account`]'s transfers part.
 const ACCOUNT_LANE: u64 = (1 << ACCOUNT_LANE_BITS) - 1;
+
+/// [`ChainControl::quiet`] while no interruption is pending: the account's
+/// whole transfers part, so a tail's `test [control], r13w` finds a
+/// transfer left and no interruption in one AND. 0 once one is pending.
+pub const QUIET: u64 = ACCOUNT_LANE;
+
+/// [`ChainControl::quiet`]: [`QUIET`] or 0. A control is made quiet.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiet(pub u64);
+
+impl Default for Quiet {
+    fn default() -> Self {
+        Self(QUIET)
+    }
+}
+
+/// Post an interruption to the PE whose control is at `control`: its epoch
+/// moves on (but past `u64::MAX`, where it stays), then its quiet word
+/// becomes 0, both sequentially consistent, so the PE's next polled
+/// transfer exits. Its owner's [`acknowledge`] of a snapshot taken before
+/// the epoch moved either finds the move after it makes the word quiet, or
+/// this zeroes the word after that.
+///
+/// # Safety
+///
+/// `control` is a live [`ChainControl`], whose epoch and quiet words every
+/// other writer accesses atomically.
+pub unsafe fn interrupt(control: *mut ChainControl) {
+    // SAFETY: the caller's; both words are naturally aligned.
+    let (epoch, quiet) = unsafe {
+        (
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch)),
+            AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).quiet.0)),
+        )
+    };
+    let _ = epoch.try_update(Ordering::SeqCst, Ordering::Relaxed, |epoch| {
+        epoch.checked_add(1)
+    });
+    quiet.store(0, Ordering::SeqCst);
+}
+
+/// The owner's acknowledgment of `epoch`, its snapshot of the control's
+/// epoch taken before it drained the sources: the observed epoch becomes
+/// it (at most `u64::MAX - 1`, so a saturated epoch stays pending), and the
+/// quiet word [`QUIET`] unless the epoch moved since, which a notifier's
+/// [`interrupt`] may have done before this made the word quiet.
+///
+/// # Safety
+///
+/// As for [`interrupt`]; the caller owns the control, outside its native
+/// calls.
+pub unsafe fn acknowledge(control: *mut ChainControl, epoch: u64) {
+    let observed = epoch.min(u64::MAX - 1);
+    // SAFETY: the caller's; both words are naturally aligned, and only the
+    // owner writes the observed epoch.
+    unsafe {
+        core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(observed);
+        let epoch = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).interrupt_epoch));
+        let quiet = AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).quiet.0));
+        quiet.store(QUIET, Ordering::SeqCst);
+        if epoch.load(Ordering::SeqCst) != observed {
+            quiet.store(0, Ordering::SeqCst);
+        }
+    }
+}
 
 /// A native run's account, which [`ACCOUNT`] holds while native code runs
 /// and `GuestState::account` outside it: the instructions of the blocks
 /// transfers left, a signed count, from bit [`ACCOUNT_LANE_BITS`] up, and
-/// the transfers still allowed plus one below it, 0 once a transfer found
-/// none left. A transfer from a block of `ran` instructions adds `ran <<
-/// ACCOUNT_LANE_BITS` less one in one LEA, which never borrows: while
-/// native code runs the lane is at least 1, and a transfer that takes it to
-/// 0 takes its instructions off again and exits, leaving it 0. The
-/// instructions are signed as a self-loop's or region's settle before an
-/// exit may add less than zero (`GuestState::loop_retired` short of the
-/// exit's rows), which the exit's rows then repay, in the link that counts
-/// them or in the rows the engine adds; the lane is apart from them, so a
-/// settle never borrows a transfer.
+/// the transfers still allowed below it. A transfer checks the lane first
+/// and exits at 0, else adds `ran << ACCOUNT_LANE_BITS` less one in one
+/// LEA, which never borrows; nothing is ever taken back. The instructions
+/// are signed as a self-loop's or region's settle before an exit may add
+/// less than zero (`GuestState::loop_retired` short of the exit's rows),
+/// which the exit's rows then repay, in the link that counts them or in the
+/// rows the engine adds; the lane is apart from them, so a settle never
+/// borrows a transfer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Account(pub u64);
 
@@ -469,29 +532,19 @@ impl Account {
     /// [`MAX_BUDGET`], and has counted no instructions.
     pub const fn new(budget: u64) -> Self {
         debug_assert!(budget <= MAX_BUDGET);
-        Self(budget + 1)
+        Self(budget)
     }
 
-    /// The account of a run a transfer of which found no budget left,
-    /// having counted `retired` instructions.
+    /// The account of a run with no transfer left, having counted
+    /// `retired` instructions.
     pub const fn spent(retired: u64) -> Self {
         Self(retired << ACCOUNT_LANE_BITS)
     }
 
-    /// The transfers still allowed, or `None` once one found none left.
-    pub const fn remaining(self) -> Option<u64> {
-        match self.0 & ACCOUNT_LANE {
-            0 => None,
-            lane => Some(lane - 1),
-        }
-    }
-
-    /// The transfers still allowed, `u64::MAX` once one found none left.
+    /// The transfers still allowed: 0 once the run used its budget, whether
+    /// or not a transfer then found none.
     pub const fn budget(self) -> u64 {
-        match self.remaining() {
-            Some(left) => left,
-            None => u64::MAX,
-        }
+        self.0 & ACCOUNT_LANE
     }
 
     /// The instructions of the blocks transfers left, a signed count: one
@@ -504,7 +557,7 @@ impl Account {
     /// `budget` transfers allowed, the instructions counted kept.
     pub const fn with_budget(self, budget: u64) -> Self {
         debug_assert!(budget <= MAX_BUDGET);
-        Self(self.0 & !ACCOUNT_LANE | (budget + 1))
+        Self(self.0 & !ACCOUNT_LANE | budget)
     }
 
     /// `retired` instructions counted, the budget kept: an exhausted one
@@ -968,8 +1021,8 @@ pub enum StampCount {
     Epoch,
     /// Misses for another context of the target's half.
     Context,
-    /// Misses for an interruption.
-    Interrupted,
+    /// Misses for an interruption or no transfer left.
+    Stopped,
     /// Stamps the stamping cell probe wrote.
     Restamped,
     /// Stamping cell probe transfers through a cell changed since its link,
@@ -2162,7 +2215,11 @@ const HEAT: i32 = core::mem::offset_of!(ChainControl, heat) as i32;
 const SAMPLED: i32 = core::mem::offset_of!(ChainControl, sampled) as i32;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
+/// [`ChainControl::quiet`].
+pub const QUIET_OFFSET: i32 = core::mem::offset_of!(ChainControl, quiet) as i32;
+#[cfg(test)]
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
+#[cfg(test)]
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
 const FRAME_ROOM: i32 = core::mem::offset_of!(ChainControl, frame_room) as i32;
@@ -2171,102 +2228,71 @@ const PAIRS: i32 = core::mem::offset_of!(ChainControl, pairs) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interruption {
-    Epoch,
-    #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-    Flag,
+    /// The quiet word ([`ChainControl::quiet`]).
+    Quiet,
+    /// No gate: the budget alone, for the tests that show the gate is what
+    /// stops a run.
     #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
     Legacy,
 }
 impl Interruption {
-    /// Bytes of a link's gate ([`link_gate`]).
-    fn link_bytes(self) -> usize {
-        match self {
-            Self::Epoch => 18,
+    /// Bytes a polled link's checks ([`link_checks`]) take past an unpolled
+    /// one's.
+    fn link_bytes(self, gate: LinkGate) -> usize {
+        match (self, gate) {
+            (Self::Quiet, LinkGate::Jrcxz) => 4,
+            (Self::Quiet, LinkGate::Pext) => 1,
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-            Self::Flag => 7,
-            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-            Self::Legacy => 0,
+            (Self::Legacy, _) => 0,
         }
     }
 }
-fn interruption_gate(
-    asm: &mut crate::x86_64::asm::Asm,
-    policy: Interruption,
-    scratch: Gpr,
-) -> Option<crate::x86_64::asm::Patch> {
-    gate(asm, policy, scratch, false)
+
+/// How a polled link finds, without the flags, that no interruption is
+/// pending and a transfer is left: a host tier the engine picks from its
+/// target ([`Self::for_target`]). Both fall through when the run goes on,
+/// and use no instruction whose cost differs much between vendors, as
+/// LOOP's (7 uops on Intel's cores) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkGate {
+    /// `mov ecx, [rdx]` and JRCXZ on the quiet word, then `movzx ecx,
+    /// r13w` and JRCXZ on the account: any x86-64 host.
+    Jrcxz,
+    /// `pext ecx, r13d, [rdx]`, the account's transfers part under the
+    /// quiet word as a mask ([`QUIET`] or 0), and one JRCXZ: a host whose
+    /// PEXT runs in hardware ([`crate::TargetCpu::FastPdep`]).
+    Pext,
 }
 
-/// [`interruption_gate`] with a 32-bit branch, for the probes' far exits.
-fn far_interruption_gate(
-    asm: &mut crate::x86_64::asm::Asm,
-    policy: Interruption,
-    scratch: Gpr,
-) -> Option<crate::x86_64::asm::Patch> {
-    gate(asm, policy, scratch, true)
+impl LinkGate {
+    /// The tier `target` runs best.
+    pub const fn for_target(target: crate::TargetCpu) -> Self {
+        if target.supports(crate::TargetCpu::Baseline.with_bmi2().with_fast_pdep()) {
+            Self::Pext
+        } else {
+            Self::Jrcxz
+        }
+    }
 }
 
-/// A tail's or probe's gate, RCX at the control: the jump an interruption
-/// takes. It compares, so it clobbers the flags, as the rest of a tail does.
-fn gate(
+/// A tail's or probe's check before its transfer, RCX at the control, which
+/// clobbers the flags: a transfer left and no interruption pending, in one
+/// `test [rcx], r13w`, as the quiet word is the account's transfers part
+/// while quiet and 0 once an interruption is pending. The jump (8-bit
+/// unless `far`) a run that must stop takes, with nothing spent.
+fn stop_check(
     asm: &mut crate::x86_64::asm::Asm,
     policy: Interruption,
-    scratch: Gpr,
     far: bool,
-) -> Option<crate::x86_64::asm::Patch> {
-    let branch = |asm: &mut crate::x86_64::asm::Asm| match far {
-        true => asm.jcc(Cond::Ne),
-        false => asm.jcc8(Cond::Ne),
-    };
+) -> crate::x86_64::asm::Patch {
     match policy {
-        Interruption::Epoch => {
-            // Aligned MOV is an acquire load on x86. The owner never rewrites
-            // this word; a notifier only advances it after publishing sources.
-            asm.mov_load(Qword, scratch, Mem::base(Rcx, INTERRUPT_EPOCH));
-            asm.alu_load(
-                Alu::Cmp,
-                Qword,
-                scratch,
-                Mem::base(Rcx, OBSERVED_INTERRUPT_EPOCH),
-            );
-            Some(branch(asm))
-        }
+        Interruption::Quiet => asm.test(Size::Word, Mem::base(Rcx, QUIET_OFFSET), ACCOUNT),
         #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::Flag => {
-            asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 0);
-            Some(branch(asm))
-        }
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::Legacy => None,
+        Interruption::Legacy => asm.test(Size::Word, ACCOUNT, ACCOUNT),
     }
-}
-
-/// A link's gate, RDX at the control, without the flags: RCX = the epoch
-/// less the owner's snapshot, plus one (`epoch + !observed + 2` by NOT and
-/// LEA, RAX clobbered), whose LOOP, the 8-bit jump this returns, an
-/// interruption takes: the quiet path falls through. A JRCXZ over a jump,
-/// whose quiet path is taken, cost the scanner (`scanner_time_on_this_host`)
-/// 18% on a Zen 5 host, where LOOP is as cheap as a compare, which would
-/// clobber NZCV.
-fn link_gate(
-    asm: &mut crate::x86_64::asm::Asm,
-    policy: Interruption,
-) -> Option<crate::x86_64::asm::Patch> {
-    match policy {
-        Interruption::Epoch => {
-            asm.mov_load(Qword, Rax, Mem::base(Rdx, OBSERVED_INTERRUPT_EPOCH));
-            asm.unary(crate::x86_64::asm::Unary::Not, Qword, Rax);
-            asm.mov_load(Qword, Rcx, Mem::base(Rdx, INTERRUPT_EPOCH));
-            asm.lea(Qword, Rcx, Mem::indexed(Rcx, Rax, 1, 2));
-            Some(asm.loop_rcx())
-        }
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::Flag => {
-            asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rdx, INTERRUPT_EPOCH), 0);
-            Some(asm.jcc8(Cond::Ne))
-        }
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        Interruption::Legacy => None,
+    match far {
+        true => asm.jcc(Cond::E),
+        false => asm.jcc8(Cond::E),
     }
 }
 
@@ -2277,58 +2303,46 @@ fn transfer_change(ran: u32) -> Option<i32> {
     i32::try_from((i64::from(ran) << ACCOUNT_LANE_BITS) - 1).ok()
 }
 
-/// One transfer from a block of `ran` instructions without the flags, for a
-/// link: `lea r13, [r13 + change]`, `movzx ecx, r13w` and the JRCXZ a
-/// transfer that found no budget left takes, to its [`refund`], which this
-/// returns. Clobbers RCX. `None` as [`transfer_change`].
-fn spend_quietly(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<crate::x86_64::asm::Patch> {
-    let change = transfer_change(ran)?;
-    asm.lea(Qword, ACCOUNT, Mem::base_disp32(ACCOUNT, change));
-    asm.movzx(Dword, Rcx, Size::Word, ACCOUNT);
-    Some(asm.jrcxz())
-}
-
-/// One transfer from a block of `ran` instructions for a tail, which keeps
-/// RCX at the control and may clobber the flags: the LEA of
-/// [`spend_quietly`], `test r13w, r13w` and the jump (8-bit unless `far`) a
-/// transfer that found no budget left takes, to its [`refund`].
-fn spend(
+/// A link's checks, RDX at the control, without the flags: a transfer
+/// left and, `polled`, no interruption pending, by `gate`. The JRCXZs a run
+/// that must stop takes; the run goes on through them. Clobbers RCX.
+fn link_checks(
     asm: &mut crate::x86_64::asm::Asm,
-    ran: u32,
-    far: bool,
-) -> Option<crate::x86_64::asm::Patch> {
-    let change = transfer_change(ran)?;
-    asm.lea(Qword, ACCOUNT, Mem::base_disp32(ACCOUNT, change));
-    asm.test(Size::Word, ACCOUNT, ACCOUNT);
-    Some(match far {
-        true => asm.jcc(Cond::E),
-        false => asm.jcc8(Cond::E),
-    })
-}
-
-/// What a [`spend`] that found no budget left runs: the `ran` instructions
-/// it counted taken off again, the transfers part left 0 for the engine.
-/// No flags.
-fn refund(asm: &mut crate::x86_64::asm::Asm, ran: u32) {
-    if ran != 0 {
-        let ran = -((ran as i32) << ACCOUNT_LANE_BITS);
-        asm.lea(Qword, ACCOUNT, Mem::base_disp32(ACCOUNT, ran));
+    polled: bool,
+    policy: Interruption,
+    gate: LinkGate,
+) -> Vec<crate::x86_64::asm::Patch> {
+    let mut stops = Vec::new();
+    match (polled, policy, gate) {
+        (true, Interruption::Quiet, LinkGate::Pext) => {
+            asm.pext(Rcx, ACCOUNT, Mem::base(Rdx, QUIET_OFFSET));
+            stops.push(asm.jrcxz());
+            return stops;
+        }
+        (true, Interruption::Quiet, LinkGate::Jrcxz) => {
+            asm.mov_load(Dword, Rcx, Mem::base(Rdx, QUIET_OFFSET));
+            stops.push(asm.jrcxz());
+        }
+        _ => {}
     }
+    asm.movzx(Dword, Rcx, Size::Word, ACCOUNT);
+    stops.push(asm.jrcxz());
+    stops
 }
 
-/// One transfer for a probe, then the instructions of its block, which
-/// come in EDX above its word: one transfer taken, then, budget left, the
-/// instructions added. The jump this returns is a transfer that found none
-/// left, the transfers part 0 and EDX whole for the miss. Clobbers EDX on
-/// the way on.
-fn spend_transfer(asm: &mut crate::x86_64::asm::Asm) -> crate::x86_64::asm::Patch {
-    asm.lea(Qword, ACCOUNT, Mem::base(ACCOUNT, -1));
-    asm.test(Size::Word, ACCOUNT, ACCOUNT);
-    let spent = asm.jcc(Cond::E);
+/// `lea r13, [r13 + change]`: one transfer and its block's instructions
+/// ([`transfer_change`]), once a check found a transfer left. No flags.
+fn count(asm: &mut crate::x86_64::asm::Asm, change: i32) {
+    asm.lea(Qword, ACCOUNT, Mem::base_disp32(ACCOUNT, change));
+}
+
+/// A probe's transfer, which its [`stop_check`] at its start allowed:
+/// one transfer and the instructions of its block, which come in EDX above
+/// its word. Clobbers EDX.
+fn spend_transfer(asm: &mut crate::x86_64::asm::Asm) {
     asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
     asm.shift_imm(ShiftOp::Shl, Dword, Rdx, ACCOUNT_LANE_BITS as u8);
-    asm.alu(Alu::Add, Qword, ACCOUNT, Rdx);
-    spent
+    asm.lea(Qword, ACCOUNT, Mem::indexed(ACCOUNT, Rdx, 1, -1));
 }
 // A tail's `ran` shifted into the account fits EDX.
 const _: () = assert!(u32::BITS - ExitWord::RAN_SHIFT + ACCOUNT_LANE_BITS <= 32);
@@ -2338,6 +2352,7 @@ struct ThunkPlan {
     block: u32,
     entry: u64,
     exit: u64,
+    gate: LinkGate,
 }
 
 const _: () = assert!(core::mem::size_of::<LookupEntry>() == 32);
@@ -2703,7 +2718,14 @@ pub fn unlinked(site: u64, slot: usize) -> Option<(u64, [u8; PATCH_BYTES])> {
 /// the slot when the control allows no transfer. `None` when `entry` is out
 /// of a 32-bit jump's reach, an operand exceeds its 32-bit field or `bytes`
 /// is no slot.
-pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Option<SlotLink> {
+pub fn link(
+    at: u64,
+    bytes: usize,
+    retired: u32,
+    block: u32,
+    entry: u64,
+    gate: LinkGate,
+) -> Option<SlotLink> {
     let polled = match bytes {
         LINK_BYTES => false,
         POLLED_LINK_BYTES => true,
@@ -2718,7 +2740,8 @@ pub fn link(at: u64, bytes: usize, retired: u32, block: u32, entry: u64) -> Opti
         block,
         entry,
         Fall::After(exit),
-        Interruption::Epoch,
+        Interruption::Quiet,
+        gate,
     )?;
     debug_assert_eq!(point + code.len() as u64, exit);
     let (first, rest) = code.split_at(PATCH_BYTES);
@@ -2759,7 +2782,14 @@ impl SlotLink {
 /// the exit after the slot. It always looks for an interruption. `None`
 /// when `entry` or `exit` is out of a 32-bit jump's reach or an operand
 /// exceeds its 32-bit field.
-pub fn thunk(at: u64, retired: u32, block: u32, entry: u64, exit: u64) -> Option<Vec<u8>> {
+pub fn thunk(
+    at: u64,
+    retired: u32,
+    block: u32,
+    entry: u64,
+    exit: u64,
+    gate: LinkGate,
+) -> Option<Vec<u8>> {
     thunk_with_policy(
         ThunkPlan {
             at,
@@ -2767,8 +2797,9 @@ pub fn thunk(at: u64, retired: u32, block: u32, entry: u64, exit: u64) -> Option
             block,
             entry,
             exit,
+            gate,
         },
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
@@ -2778,8 +2809,18 @@ fn thunk_with_policy(plan: ThunkPlan, policy: Interruption) -> Option<Vec<u8>> {
         block,
         entry,
         exit,
+        gate,
     } = plan;
-    link_body(at, true, retired, block, entry, Fall::Thunk(exit), policy)
+    link_body(
+        at,
+        true,
+        retired,
+        block,
+        entry,
+        Fall::Thunk(exit),
+        policy,
+        gate,
+    )
 }
 
 /// Where a link's body goes when the control allows no transfer.
@@ -2792,8 +2833,10 @@ enum Fall {
 }
 
 /// The code of a link at host address `at`, which leaves the flags: the
-/// control in RDX, count, name and jump, or `fall`, a spent budget's after
-/// its [`refund`]. Only a `polled` one has the interruption gate.
+/// control in RDX, check ([`link_checks`]), count, name and jump, or `fall`
+/// when the run must stop, nothing spent. Only a `polled` one looks for an
+/// interruption.
+#[allow(clippy::too_many_arguments)]
 fn link_body(
     at: u64,
     polled: bool,
@@ -2802,50 +2845,42 @@ fn link_body(
     entry: u64,
     fall: Fall,
     policy: Interruption,
+    gate: LinkGate,
 ) -> Option<Vec<u8>> {
     let block = i32::try_from(block).ok()?;
+    let change = transfer_change(retired)?;
     let mut code = Code::new();
     let mut asm = code.asm();
     asm.place(Rdx, CONTROL);
-    let interrupted = polled.then(|| link_gate(&mut asm, policy)).flatten();
-    let exhausted = spend_quietly(&mut asm, retired)?;
+    let stops = link_checks(&mut asm, polled, policy, gate);
+    count(&mut asm, change);
     asm.mov_rm_imm32(Qword, Mem::base(Rdx, BLOCK), block);
     let transfer = asm.jmp();
     let distance = relative(at + transfer.end() as u64, entry)?;
     debug_assert_eq!(
         code.len(),
-        LINK_BODY_BYTES + usize::from(polled) * policy.link_bytes()
+        LINK_BODY_BYTES + usize::from(polled) * policy.link_bytes(gate)
     );
-    let mut refunded = Code::new();
-    refund(&mut refunded.asm(), retired);
-    let refunded = refunded.into_bytes();
-    // A spent budget's refund, then where an interruption goes.
-    let (spent, fallen) = match fall {
+    let stop = match fall {
         Fall::Thunk(exit) => {
-            let spent = code.len();
-            code.asm().fixed(&refunded);
-            let fallen = code.len();
+            let stop = code.len();
             let back = code.asm().jmp();
             let back_distance = relative(at + back.end() as u64, exit)?;
             code.patch(back.offset(), back_distance.to_le_bytes());
-            (spent, fallen)
+            stop
         }
-        // The refund ends the slot and falls into the exit after it; the
-        // slot's INT3s up to the refund stay.
+        // The exit after the slot; INT3s up to it, which nothing runs.
         Fall::After(exit) => {
-            let fallen = usize::try_from(exit.checked_sub(at)?).ok()?;
-            let spent = fallen.checked_sub(refunded.len())?;
+            let stop = usize::try_from(exit.checked_sub(at)?).ok()?;
             let mut asm = code.asm();
-            for _ in asm.len()..spent {
+            for _ in asm.len()..stop {
                 asm.int3();
             }
-            asm.fixed(&refunded);
-            (spent, fallen)
+            stop
         }
     };
-    crate::x86_64::asm::resolve(&mut code, exhausted, spent);
-    if let Some(patch) = interrupted {
-        crate::x86_64::asm::resolve(&mut code, patch, fallen);
+    for patch in stops {
+        crate::x86_64::asm::resolve(&mut code, patch, stop);
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
@@ -2949,12 +2984,9 @@ pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Opti
         asm.alu_load(Alu::Cmp, Qword, R8, frame(word));
         misses.push(asm.jcc8(Cond::Ne));
     }
-    misses.extend(interruption_gate(asm, Interruption::Epoch, R8));
-    // Budget left: a transfer at least, the transfers part 2 or more
-    // ([`Account`]). A return spends none, and counts the block's
-    // instructions.
-    asm.alu_imm8(Alu::Cmp, Size::Word, ACCOUNT, 2);
-    misses.push(asm.jcc8(Cond::B));
+    // A transfer left and no interruption pending. A return spends none,
+    // and counts the block's instructions.
+    misses.push(stop_check(asm, Interruption::Quiet, false));
     asm.alu_imm32(Alu::Add, Qword, ACCOUNT, ran);
     // The block's index, entered with BTYPE 0 as a continuation is.
     asm.mov_load(Dword, R8, frame(FrameWord::Block));
@@ -3025,7 +3057,7 @@ pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
 /// and its indirect jump into the found block, are shared: the host's
 /// indirect predictor tells sites apart by the path into it.
 pub fn lookup_dispatcher(btype: u8) -> Option<Vec<u8>> {
-    dispatcher_with_policy(btype, Interruption::Epoch)
+    dispatcher_with_policy(btype, Interruption::Quiet)
 }
 fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     if btype > 3 {
@@ -3043,10 +3075,8 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The table probe.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R9) {
-        misses.push(interrupted);
-    }
+    // A run that must stop leaves before the tables, with EDX whole.
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     translate(&mut asm, &mut misses);
     let table = code.len();
     let mut asm = code.asm();
@@ -3085,7 +3115,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.mov_load(Dword, R8, Mem::base(R10, ENTRY_BLOCK));
     asm.mov_load(Qword, R9, Mem::base(R10, ENTRY_CODE));
     misses.extend(seqlock_check(&mut asm, R10));
-    misses.push(spend_transfer(&mut asm));
+    spend_transfer(&mut asm);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     fill_jump_cache(&mut asm);
     entered_btype(&mut asm, R8, btype);
@@ -3137,10 +3167,7 @@ fn cell_probe(
 ) -> (crate::x86_64::asm::Patch, crate::x86_64::asm::Patch) {
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R8) {
-        misses.push(interrupted);
-    }
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     asm.mov(Qword, R10, R9);
     translate(&mut asm, &mut misses);
     // The cell is the target's with its page's key, or the table decides.
@@ -3163,7 +3190,7 @@ fn cell_probe(
     let unsampled = asm.jcc8(Cond::Ne);
     asm.mov_store(Qword, Mem::base(Rcx, SAMPLED), R10);
     asm.bind(unsampled);
-    misses.push(spend_transfer(&mut asm));
+    spend_transfer(&mut asm);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     if stamping {
@@ -3248,7 +3275,7 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(kept);
 }
 
-/// Bytes in a [`stamped_tail`]: 173 at most, with a 32-bit displacement
+/// Bytes in a [`stamped_tail`]: 132 at most, with a 32-bit displacement
 /// for the stamp of a cell numbered 8 or above.
 pub const STAMPED_TAIL_BYTES: usize = 176;
 
@@ -3257,9 +3284,9 @@ pub const STAMPED_TAIL_BYTES: usize = 176;
 /// `entry`, when it was linked: while this PE's stamp of the cell names the
 /// context it runs in and its ITLB's drop epoch of the target's half, the
 /// transfer is counted, `block` named and `entry` entered by a direct jump,
-/// without a translation or a probe; else, as for an interruption, it is
-/// the [`cell_tail`] after it, whose cell probe stamps the cell when it
-/// enters its block. A budget spent returns with `word`, as a probe would.
+/// without a translation or a probe; else, as for an interruption or no
+/// transfer left, it is the [`cell_tail`] after it, whose cell probe stamps
+/// the cell when it enters its block, or stops the run.
 ///
 /// A stamp exists only while the cell holds what it held at the link
 /// (`live`, [`put_cell`] clears it and zeroes every PE's stamps first), and
@@ -3291,7 +3318,7 @@ pub fn stamped_tail(
         entry,
         probe,
         0,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 
@@ -3329,7 +3356,7 @@ pub fn stamped_branch_tail(
         entry,
         probe,
         btype,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )
 }
 
@@ -3365,14 +3392,14 @@ fn stamped_with_policy(
     asm.mov_load(Qword, R9, Mem::base(Rcx, CONTEXTS + 8 * half));
     asm.alu_load(Alu::Cmp, Qword, R9, Mem::base(R10, stamp));
     let context = asm.jcc8(Cond::Ne);
-    let interrupted = gate(&mut asm, policy, R8, false);
+    let stopped = stop_check(&mut asm, policy, false);
     asm.alu_imm8(
         Alu::Add,
         Qword,
         Mem::base(R10, StampCount::Hits.offset()),
         1,
     );
-    let exhausted = spend(&mut asm, ran, false)?;
+    count(&mut asm, transfer_change(ran)?);
     if btype == 0 {
         asm.mov_rm_imm32(Qword, Mem::base(Rcx, BLOCK), block);
     } else {
@@ -3384,21 +3411,14 @@ fn stamped_with_policy(
     let distance = relative(at + transfer.end() as u64, entry)?;
     code.patch(transfer.offset(), distance.to_le_bytes());
     let mut asm = code.asm();
-    asm.bind(exhausted);
-    refund(&mut asm, ran);
-    asm.mov_imm64(Rax, target);
-    asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    exit_return(&mut asm);
-    // A miss counts its cause and takes the cell tail.
+    // A miss counts its cause and takes the cell tail, whose probe stops a
+    // run that must stop as it would.
     let mut to_tail = Vec::new();
     for (miss, count) in [
-        (Some(epoch), StampCount::Epoch),
-        (Some(context), StampCount::Context),
-        (interrupted, StampCount::Interrupted),
+        (epoch, StampCount::Epoch),
+        (context, StampCount::Context),
+        (stopped, StampCount::Stopped),
     ] {
-        let Some(miss) = miss else {
-            continue;
-        };
         asm.bind(miss);
         asm.alu_imm8(Alu::Add, Qword, Mem::base(R10, count.offset()), 1);
         to_tail.push(asm.jmp8());
@@ -3528,8 +3548,8 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
     exit_return(asm);
 }
 
-/// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
-/// budget's return, and the plain tail ([`TAIL_BYTES`]) of a miss.
+/// Bytes in a [`lookup_tail`]: the jump cache's hit and the plain tail
+/// ([`TAIL_BYTES`]) of a miss.
 pub const LOOKUP_TAIL_BYTES: usize = 224;
 
 /// The tail at host address `at` that an exit's patch point jumps to once
@@ -3540,7 +3560,8 @@ pub const LOOKUP_TAIL_BYTES: usize = 224;
 /// the exit's `word` with the `ran` instructions of the block it leaves,
 /// which only a probe reads, then a jump to the table probe at `probe`,
 /// which enters the block it finds, filling the cache, or returns to the
-/// engine. An interruption or a spent budget leaves as the probe would.
+/// engine. An interruption or no transfer left takes the plain tail too,
+/// whose probe stops the run.
 /// `None` when `ran` exceeds its field, `btype` is no BTYPE or `probe` is
 /// out of a 32-bit jump's reach.
 ///
@@ -3561,7 +3582,7 @@ pub fn lookup_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
-    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Epoch)
+    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Quiet)
 }
 
 fn lookup_tail_with_policy(
@@ -3621,7 +3642,7 @@ pub fn paired_tail(
         ran,
         probe,
         0,
-        Interruption::Epoch,
+        Interruption::Quiet,
     )?;
     let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
@@ -3646,7 +3667,7 @@ fn lookup_tail_code(
     let entry = |field: i32| Mem::indexed(R10, R9, 1, JUMP_CACHE + field);
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses: Vec<_> = gate(&mut asm, policy, R8, true).into_iter().collect();
+    let mut misses = Vec::new();
     // R10 = this PE's stamps, R9 = the entry's offset.
     asm.mov_load(Qword, R10, Mem::base(Rcx, STAMPS));
     asm.mov(Dword, R9, Rax);
@@ -3670,17 +3691,14 @@ fn lookup_tail_code(
         asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
         misses.push(asm.jcc(Cond::E));
     }
-    let exhausted = spend(&mut asm, ran, false)?;
+    // A run that must stop takes the plain tail, whose probe stops it.
+    misses.push(stop_check(&mut asm, policy, true));
+    count(&mut asm, transfer_change(ran)?);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     asm.jmp_rm(entry(JUMP_CODE));
-    // A spent budget returns as the probe's would, its word in EDX whole.
-    asm.bind(exhausted);
-    refund(&mut asm, ran);
-    asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    missed(&mut asm);
     for miss in misses {
         asm.bind(miss);
     }
@@ -3886,7 +3904,7 @@ fn lookup_thunk(
     kind: impl Into<ExitWord>,
     btype: u8,
 ) -> Option<Vec<u8>> {
-    lookup_with_policy(ran, target, kind, btype, None, Interruption::Epoch)
+    lookup_with_policy(ran, target, kind, btype, None, Interruption::Quiet)
 }
 /// [`lookup_thunk`] through the cell at `cell` for `target`.
 #[cfg(test)]
@@ -3896,7 +3914,7 @@ fn lookup_thunk_with_cell(
     kind: impl Into<ExitWord>,
     cell: u64,
 ) -> Option<Vec<u8>> {
-    lookup_with_policy(ran, Some(target), kind, 0, Some(cell), Interruption::Epoch)
+    lookup_with_policy(ran, Some(target), kind, 0, Some(cell), Interruption::Quiet)
 }
 #[cfg(test)]
 fn lookup_with_policy(
@@ -3990,6 +4008,59 @@ mod tests {
     pub(super) unsafe fn set_account(frame: u64, account: Account) {
         // SAFETY: the caller's contract.
         unsafe { (*(frame as *mut crate::GuestState)).account = account.0 };
+    }
+
+    /// The link tier of this host ([`LinkGate::for_target`]).
+    pub(super) fn gate() -> LinkGate {
+        LinkGate::for_target(crate::TargetCpu::detect())
+    }
+
+    /// A control with the account of the runs that use it, which native
+    /// code keeps in [`ACCOUNT`] and the engine apart: comparing two
+    /// compares both.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct Controlled {
+        pub control: ChainControl,
+        pub account: Account,
+    }
+
+    impl core::ops::Deref for Controlled {
+        type Target = ChainControl;
+        fn deref(&self) -> &ChainControl {
+            &self.control
+        }
+    }
+
+    impl core::ops::DerefMut for Controlled {
+        fn deref_mut(&mut self) -> &mut ChainControl {
+            &mut self.control
+        }
+    }
+
+    impl Controlled {
+        /// Run `run` with a frame that finds the control and holds the
+        /// account, then keep the account it left.
+        pub(super) fn run<T>(&mut self, run: impl FnOnce(&mut crate::GuestState) -> T) -> T {
+            let mut frame = alloc::boxed::Box::new(crate::GuestState::default());
+            frame.anchors[Anchor::Control] = &mut self.control as *mut ChainControl as u64;
+            frame.account = self.account.0;
+            let result = run(&mut frame);
+            self.account = Account(frame.account);
+            result
+        }
+
+        /// Post an interruption ([`interrupt`]).
+        pub(super) fn interrupt(&mut self) {
+            // SAFETY: the control is this one's, which no native code runs on.
+            unsafe { interrupt(&mut self.control) };
+        }
+
+        /// Acknowledge the epoch the control holds ([`acknowledge`]).
+        pub(super) fn acknowledge(&mut self) {
+            let epoch = self.control.interrupt_epoch;
+            // SAFETY: as for `interrupt`.
+            unsafe { acknowledge(&mut self.control, epoch) };
+        }
     }
 
     fn lookup_slot(pc: u64, key: u64) -> usize {
@@ -4351,7 +4422,7 @@ mod tests {
                 let (undone, jump_back) = unlinked(site, slot).unwrap();
                 assert_eq!(undone, point);
                 assert_eq!(code[offset..offset + PATCH_BYTES], jump_back);
-                let linking = link(at, slot, 3, 7, 0x10_8000).unwrap();
+                let linking = link(at, slot, 3, 7, 0x10_8000, LinkGate::Jrcxz).unwrap();
                 assert_eq!(linking.rest_at, point + PATCH_BYTES as u64);
                 let start = (linking.rest_at - at) as usize;
                 // The body fills the slot from its point to the exit.
@@ -4377,77 +4448,96 @@ mod tests {
                 assert_eq!(code[exit..exit + PATCH_BYTES], ret);
             }
         }
-        assert!(link(0, LINK_BYTES + 1, 3, 7, 0).is_none());
+        assert!(link(0, LINK_BYTES + 1, 3, 7, 0, LinkGate::Jrcxz).is_none());
         let word = 0x1122_3344_5566_7788;
         assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_441f_0f66_7788);
     }
 
     #[test]
     fn thunks_count_name_and_jump_or_fall_back() {
-        let word = ExitWord::from(ExitKind::Fallthrough);
-        let _ = word;
-        let code = thunk(0x1000, 7, 3, 0x2000, 0x800).unwrap();
+        let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Jrcxz).unwrap();
         // mov rdx, [rdi + control]
         let mut expected = vec![0x48, 0x8b, 0x97];
         expected.extend(824u32.to_le_bytes());
-        // The gate without the flags: RCX = epoch - observed + 1, whose
-        // LOOP goes to the jump back past the refund.
-        expected.extend([0x48, 0x8b, 0x42, 0x48, 0x48, 0xf7, 0xd0]);
-        expected.extend([0x48, 0x8b, 0x4a, 0x40, 0x48, 0x8d, 0x4c, 0x01, 0x02]);
-        expected.extend([0xe2, 33]);
-        // lea r13, [r13 + (7 << 16) - 1]: one transfer and 7 instructions;
-        // movzx ecx, r13w; JRCXZ to the refund when none was left.
+        // The gate without the flags: mov ecx, [rdx], the quiet word, whose
+        // JRCXZ goes to the jump back.
+        expected.extend([0x8b, 0x0a, 0xe3, 26]);
+        // movzx ecx, r13w; JRCXZ there too when no transfer is left; then
+        // lea r13, [r13 + (7 << 16) - 1]: one transfer and 7 instructions.
+        expected.extend([0x41, 0x0f, 0xb7, 0xcd, 0xe3, 20]);
         expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
-        expected.extend([0x41, 0x0f, 0xb7, 0xcd, 0xe3, 13]);
         expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0]);
-        // The jump ends 0x33 bytes into the thunk.
+        // The jump ends 0x25 bytes into the thunk.
         expected.extend([0xe9]);
-        expected.extend((0x2000i32 - 0x1033).to_le_bytes());
+        expected.extend((0x2000i32 - 0x1025).to_le_bytes());
         assert_eq!(code.len(), THUNK_BYTES);
         assert_eq!(code[..POLLED_LINK_BODY_BYTES], expected);
-        // lea r13, [r13 - (7 << 16)], then the jump back.
+        // The jump back, nothing spent.
+        assert_eq!(code[POLLED_LINK_BODY_BYTES], 0xe9);
         assert_eq!(
-            code[POLLED_LINK_BODY_BYTES..][..REFUND_BYTES],
-            [0x4d, 0x8d, 0xad, 0, 0, 0xf9, 0xff]
-        );
-        assert_eq!(code[POLLED_LINK_BODY_BYTES + REFUND_BYTES], 0xe9);
-        assert_eq!(
-            code[POLLED_LINK_BODY_BYTES + REFUND_BYTES + 1..],
+            code[POLLED_LINK_BODY_BYTES + 1..],
             (0x800i32 - 0x1000 - code.len() as i32).to_le_bytes()
         );
-        // A block of more instructions than an 8-bit refund holds.
-        let long = thunk(0x1000, 200, 3, 0x2000, 0x800).unwrap();
+        // The thunk of a memory account took 51 bytes, 39 of them run.
+        const _: () = assert!(THUNK_BYTES <= 46);
+        // A block of more instructions than an 8-bit displacement holds.
+        let long = thunk(0x1000, 200, 3, 0x2000, 0x800, LinkGate::Jrcxz).unwrap();
         assert_eq!(long.len(), THUNK_BYTES);
-        assert!(thunk(0, 0, 0, 1 << 40, 0x800).is_none());
+        assert!(thunk(0, 0, 0, 1 << 40, 0x800, LinkGate::Jrcxz).is_none());
+        // The PEXT tier: pext ecx, r13d, [rdx], the transfers part under the
+        // quiet word, and one JRCXZ to the jump back; the rest as above.
+        let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Pext).unwrap();
+        let body = LINK_BODY_BYTES + 1;
+        let mut expected = vec![0x48, 0x8b, 0x97];
+        expected.extend(824u32.to_le_bytes());
+        expected.extend([0xc4, 0xe2, 0x12, 0xf5, 0x0a, 0xe3, 20]);
+        expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
+        expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0, 0xe9]);
+        expected.extend((0x2000i32 - 0x1000 - body as i32).to_le_bytes());
+        assert_eq!(code[..body], expected);
+        assert_eq!(code.len(), body + JUMP_BYTES);
+        // Either tier's slot body fits the slot.
+        for gate in [LinkGate::Jrcxz, LinkGate::Pext] {
+            let linking = link(0x1000, POLLED_LINK_BYTES, 7, 3, 0x2000, gate).unwrap();
+            assert_eq!(linking.body().len(), POLLED_LINK_BYTES - patch_pad(0x1000));
+        }
     }
 
-    /// An account's transfers and instructions are apart: a transfer's LEA
-    /// adds its block's instructions less one transfer, a settle below zero
-    /// leaves the transfers as they were, and one that finds none left
-    /// leaves the transfers part 0 once its refund takes its instructions
-    /// off again.
+    /// The PEXT tier is a fast-PDEP host's: Zen 1 and 2 microcode PEXT.
+    #[test]
+    fn link_gates_follow_the_target() {
+        use crate::TargetCpu;
+        assert_eq!(LinkGate::for_target(TargetCpu::Baseline), LinkGate::Jrcxz);
+        assert_eq!(
+            LinkGate::for_target(TargetCpu::X86_64_V2.with_bmi2()),
+            LinkGate::Jrcxz
+        );
+        assert_eq!(
+            LinkGate::for_target(TargetCpu::X86_64_V2.with_bmi2().with_fast_pdep()),
+            LinkGate::Pext
+        );
+    }
+
+    /// An account's transfers and instructions are apart: a transfer's LEA,
+    /// which runs only with a transfer left, adds its block's instructions
+    /// less one transfer, and a settle below zero leaves the transfers as
+    /// they were.
     #[test]
     fn accounts_keep_transfers_apart_from_instructions() {
         let transfer = |account: Account, ran: u32| {
+            assert_ne!(account.budget(), 0, "a check stops a run with none left");
             Account(
                 account
                     .0
                     .wrapping_add(transfer_change(ran).unwrap() as i64 as u64),
             )
         };
-        let refund =
-            |account: Account, ran: u32| Account(account.0.wrapping_sub(u64::from(ran) << 16));
         let full = Account::new(MAX_BUDGET);
         assert_eq!((full.budget(), full.retired()), (MAX_BUDGET, 0));
-        let one = transfer(Account::new(1), 7);
-        assert_eq!((one.budget(), one.retired()), (0, 7));
-        // The last unit spent, the next transfer finds none and refunds.
-        let spent = transfer(one, 9);
-        assert_eq!(spent.remaining(), None);
-        let spent = refund(spent, 9);
+        let spent = transfer(Account::new(1), 7);
         assert_eq!(
             (spent, spent.budget(), spent.retired()),
-            (Account::spent(7), u64::MAX, 7)
+            (Account::spent(7), 0, 7)
         );
         // A settle 5 below zero, then a transfer of 9: the transfers part
         // never borrowed.
@@ -4465,7 +4555,7 @@ mod tests {
         );
         assert_eq!(
             Account::new(3).with_budget(0).with_retired(11),
-            Account::new(0).with_retired(11)
+            Account::spent(11)
         );
     }
 
@@ -4651,15 +4741,12 @@ mod tests {
                 ),
                 (0, 12, 2)
             );
-            // No budget left: the account turns negative and the exit is taken.
+            // No budget left: the exit is taken, nothing spent.
             assert_eq!(
                 exit(dynamic(frame, TARGET)),
                 (TARGET, ExitKind::Return as u64)
             );
-            assert_eq!(
-                (account(frame).budget(), account(frame).retired()),
-                (u64::MAX, 12)
-            );
+            assert_eq!((account(frame).budget(), account(frame).retired()), (0, 12));
             // A settle before the exit left the count 5 below zero: the
             // probe's 9 instructions repay it, and the one transfer left,
             // which the settle never touched, is taken.
@@ -4681,7 +4768,7 @@ mod tests {
             );
             assert_eq!(
                 (account(frame).budget(), account(frame).retired()),
-                (u64::MAX, (-5i64) as u64)
+                (0, (-5i64) as u64)
             );
             set_account(frame, account(frame).with_retired(12));
             set_account(frame, account(frame).with_budget(5));
@@ -4784,8 +4871,7 @@ mod tests {
                 (2, 35, 5, 3 << BLOCK_BTYPE_SHIFT | 42)
             );
             set_account(frame, account(frame).with_budget(5));
-            control.interrupt_epoch = 1;
-            control.observed_interrupt_epoch = 0;
+            interrupt(&mut control);
             let prior = (
                 account(frame).budget(),
                 account(frame).retired(),
@@ -4812,7 +4898,7 @@ mod tests {
                 ),
                 prior
             );
-            control.observed_interrupt_epoch = 1;
+            acknowledge(&mut control, 1);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!((account(frame).budget(), control.block), (4, 42));
             assert_eq!(munmap(page, PAGE), 0);
@@ -5063,9 +5149,7 @@ mod tests {
                 assert_eq!(&probes[at..at + 3], &[0x48, 0x8b, 0x8f]);
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            for policy in [Interruption::Legacy, Interruption::Flag] {
-                assert!(dispatcher_with_policy(btype, policy).is_some());
-            }
+            assert!(dispatcher_with_policy(btype, Interruption::Legacy).is_some());
         }
     }
 
@@ -5207,14 +5291,10 @@ mod tests {
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
                 assert_eq!((account(frame).budget(), control.hits), (0, 2));
-                // No budget: one spend turns the account negative, and the
-                // exit returns.
+                // No budget: the exit returns, nothing spent.
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!(
-                    (account(frame).budget(), account(frame).retired()),
-                    (u64::MAX, 15)
-                );
+                assert_eq!((account(frame).budget(), account(frame).retired()), (0, 15));
                 // Another context of the same salt: the page translates
                 // anew, whatever the cell holds.
                 set_account(frame, account(frame).with_budget(5));
@@ -5237,7 +5317,7 @@ mod tests {
                 *(cell as *mut LookupEntry) = cell_entry;
                 set_account(frame, account(frame).with_budget(5));
                 // A pending interruption: nothing spent or counted.
-                control.interrupt_epoch = 1;
+                interrupt(&mut control);
                 let prior = (
                     account(frame).budget(),
                     account(frame).retired(),
@@ -5259,7 +5339,7 @@ mod tests {
                     ),
                     prior
                 );
-                control.observed_interrupt_epoch = 1;
+                acknowledge(&mut control, 1);
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (0x5111, 99));
                 assert_eq!((account(frame).budget(), control.block), (4, 42));

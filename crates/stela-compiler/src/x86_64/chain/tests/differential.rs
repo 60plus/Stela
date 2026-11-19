@@ -6,8 +6,8 @@
 //! BTYPE takes the transfer into the block the reference enters or the
 //! exit it takes, and leaves the control as the reference would.
 use super::super::*;
-use crate::GuestState;
-use alloc::{boxed::Box, format, vec::Vec};
+use super::Controlled;
+use alloc::{format, vec::Vec};
 use core::ffi::c_void;
 unsafe extern "C" {
     fn mmap(
@@ -60,10 +60,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The cell probe, R9 at the cell.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R8) {
-        misses.push(interrupted);
-    }
+    let misses = vec![stop_check(&mut asm, policy, true)];
     asm.push(R9);
     let mut untranslated = Vec::new();
     translate(&mut asm, &mut untranslated);
@@ -82,7 +79,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.pop(R8);
     asm.mov(Dword, R8, R8);
     asm.place(Rcx, CONTROL);
-    misses.push(spend_transfer(&mut asm));
+    spend_transfer(&mut asm);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
     for miss in misses {
@@ -114,10 +111,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     // The table probe.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
-    let mut misses = Vec::new();
-    if let Some(interrupted) = far_interruption_gate(&mut asm, policy, R9) {
-        misses.push(interrupted);
-    }
+    let mut misses = vec![stop_check(&mut asm, policy, true)];
     translate(&mut asm, &mut misses);
     let table = code.len();
     let mut asm = code.asm();
@@ -158,7 +152,7 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let torn = legacy_seqlock_check(&mut asm);
     asm.pop(R9);
     asm.place(Rcx, CONTROL);
-    misses.push(spend_transfer(&mut asm));
+    spend_transfer(&mut asm);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     for bit in 0..2 {
         if btype & 1 << bit != 0 {
@@ -277,20 +271,14 @@ fn put(pages: &Pages, offset: usize, bytes: &[u8]) {
 }
 
 /// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`
-/// and the account in its `spare` word, which native code never reads, so
-/// comparing controls compares accounts too: what it returned, the account
-/// it left put back there.
-fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    let mut frame = Box::new(GuestState::default());
-    frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
-    frame.account = control.spare;
+/// and its account: what it returned.
+fn run(region: &Pages, control: &mut Controlled, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result = unsafe {
-        crate::x86_64::native::enter_counted(region.0 as *const u8, &mut *frame, target, 0)
-    };
-    control.spare = frame.account;
+    let result = control.run(|frame| unsafe {
+        crate::x86_64::native::enter_counted(region.0 as *const u8, frame, target, 0)
+    });
     (result as u64, (result >> 64) as u64)
 }
 
@@ -323,7 +311,7 @@ const PATHS: [Path; 5] = [
 /// block's first instruction, through the entry's targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reference {
-    /// An interruption pending.
+    /// No transfer left, or an interruption pending.
     Stopped,
     /// No translation of the target's page in the contexts the control
     /// names.
@@ -332,9 +320,6 @@ enum Reference {
     Absent,
     /// The block refuses the BTYPE: the engine takes the exception.
     Refused(LookupEntry),
-    /// The block accepts it, but no transfer is left: the account takes
-    /// the transfer it found none for.
-    Spent(LookupEntry),
     Entered(LookupEntry),
 }
 
@@ -361,11 +346,11 @@ fn reference(
     itlb: &LookupTable,
     table: &LookupTable,
     cell: Option<LookupEntry>,
-    control: &ChainControl,
+    control: &Controlled,
     target: u64,
     btype: u8,
 ) -> Reference {
-    if control.interrupt_epoch != control.observed_interrupt_epoch {
+    if control.quiet.0 & control.account.budget() == 0 {
         return Reference::Stopped;
     }
     let Some(key) = translated(itlb, control.contexts, target) else {
@@ -378,8 +363,6 @@ fn reference(
         Reference::Absent
     } else if entry.targets & 1 << btype == 0 {
         Reference::Refused(entry)
-    } else if Account(control.spare).budget() == 0 {
-        Reference::Spent(entry)
     } else {
         Reference::Entered(entry)
     }
@@ -429,8 +412,8 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
     }
     for btype in 0..4u8 {
         let offset = PROBES + DISPATCHER_BYTES * btype as usize;
-        let fresh = dispatcher_with_policy(btype, Interruption::Epoch).unwrap();
-        let before = legacy_dispatcher(btype, Interruption::Epoch).unwrap();
+        let fresh = dispatcher_with_policy(btype, Interruption::Quiet).unwrap();
+        let before = legacy_dispatcher(btype, Interruption::Quiet).unwrap();
         assert!(fresh.len() <= DISPATCHER_BYTES && before.len() <= DISPATCHER_BYTES);
         put(&new, offset, &fresh);
         put(&old, offset, &before);
@@ -463,13 +446,13 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         };
         table.insert(table.slot(pc, KEYS[0]), entry);
     }
-    // Hot exits' stamped cells, each linked to an entry the table holds,
-    // with the entry its stamped tail was made for.
-    let mut sites: Vec<(u64, u64, Option<LookupEntry>)> = Vec::new();
-    for (site, &pc) in (0x1000..).zip(&pcs[..4]) {
+    // Hot exits' stamped cells, each linked to an entry the table holds.
+    let mut sites: Vec<(u64, u64)> = (0..4)
+        .map(|site| (0x1000 + site, pcs[site as usize]))
+        .collect();
+    for &(site, pc) in &sites {
         let held = table.find(table.slot(pc, KEYS[0]), pc, KEYS[0]);
         table.link_hot_cell(site, pc, Some(held)).unwrap();
-        sites.push((site, pc, Some(held)));
     }
     for trial in 0..TRIALS {
         // Change the tables as the engine does between transfers.
@@ -526,7 +509,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 let current =
                     (held.pc == pc && held.key == key && rng.below(4) != 0).then_some(held);
                 table.link_hot_cell(sites[index].0, pc, current).unwrap();
-                sites[index] = (sites[index].0, pc, current);
+                sites[index].1 = pc;
             }
             _ => {
                 if rng.below(50) == 0 {
@@ -539,7 +522,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         let path_index = PATHS.iter().position(|&each| each == path).unwrap();
         let btype = (trial % 4) as u8;
         let through_cell = matches!(path, Path::Cell | Path::Stamping | Path::Stamped);
-        let (site, cell_pc, linked) = sites[rng.below(sites.len() as u64) as usize];
+        let (site, cell_pc) = sites[rng.below(sites.len() as u64) as usize];
         let target = match rng.below(8) {
             _ if path == Path::Stamped => cell_pc,
             0 => pcs[rng.below(8) as usize] + 4,
@@ -576,12 +559,13 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 dispatcher + STAMPING_PROBE_ENTRY as u64,
             )
             .unwrap(),
-            // As the engine links a hot exit: a stamped tail of the entry
-            // its cell held at the link, where the entry accepts the BTYPE.
+            // As the engine relinks a hot exit: a stamped tail of the entry
+            // its cell holds, live again, where the entry accepts the BTYPE.
             Path::Stamped
-                if let Some(linked) = linked
-                    && linked.targets & 1 << btype != 0 =>
+                if held.key != 0 && held.pc == cell_pc && held.targets & 1 << btype != 0 =>
             {
+                table.note_stamped(number);
+                assert!(table.revive_stamped(number, held));
                 stamped_branch_tail(
                     at,
                     cell,
@@ -589,8 +573,8 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                     cell_pc,
                     kind,
                     RAN,
-                    linked.block,
-                    linked.entry,
+                    held.block,
+                    held.entry,
                     dispatcher + STAMPING_PROBE_ENTRY as u64,
                     btype,
                 )
@@ -611,9 +595,8 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         let stub = [0x48, 0x89, 0xf0]; // mov rax,rsi
         put(&new, 0, &stub);
         put(&new, 3, &fresh);
-        let budget = [0, 1, 2, 5][rng.below(4) as usize];
-        let mut base = ChainControl {
-            spare: Account::new(budget).with_retired(100).0,
+        let budget = rng.below(4) as usize;
+        let base = ChainControl {
             block: 7,
             contexts: match rng.below(4) {
                 0 => [
@@ -624,7 +607,6 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
             },
             table: table.address(),
             hits: 3,
-            interrupt_epoch: u64::from(rng.below(10) == 0),
             salts: [0; 2],
             itlb: itlb.address(),
             masks: [table.mask(), itlb.mask()],
@@ -632,7 +614,14 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
             cells,
             ..ChainControl::default()
         };
+        let mut base = Controlled {
+            control: base,
+            account: Account::new([0, 1, 2, 5][budget]).with_retired(100),
+        };
         base.salts = base.contexts.map(|context| itlb.salt(context));
+        if rng.below(10) == 0 {
+            base.interrupt();
+        }
         let expected = reference(
             &itlb,
             &table,
@@ -675,15 +664,10 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
             )
         };
         let named = |block: u32| u64::from(block) | u64::from(btype) << BLOCK_BTYPE_SHIFT;
-        // A transfer takes one of the budget and adds its block's
-        // instructions; one that found none left takes it all the same.
-        let spent = Account::new(budget.saturating_sub(1))
-            .with_retired(100 + u64::from(RAN))
-            .0;
-        let unspent = match expected {
-            Reference::Spent(_) => Account::spent(100).0,
-            _ => base.spare,
-        };
+        let spent = base
+            .account
+            .with_budget(base.account.budget().saturating_sub(1))
+            .with_retired(base.account.retired() + u64::from(RAN));
         // The table probe counts its transfers apart; a cell of the target
         // with its page's key spares it.
         let cell_holds = translated(&itlb, base.contexts, target)
@@ -692,7 +676,7 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
         match expected {
             Reference::Entered(entry) if ra.1 == 99 && ra.0 == marker(entry.block as usize) => {
                 assert_eq!(a.block, named(entry.block), "{}", context());
-                assert_eq!(a.spare, spent, "{}", context());
+                assert_eq!(a.account, spent, "{}", context());
                 assert_eq!(a.hits, hits, "{}", context());
                 entered += 1;
             }
@@ -705,8 +689,8 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 );
                 assert_eq!(ra, (target, u64::from(word)), "{}", context());
                 assert_eq!(
-                    (a.block, a.spare, a.hits),
-                    (base.block, unspent, base.hits),
+                    (a.block, a.account, a.hits),
+                    (base.block, base.account, base.hits),
                     "{}",
                     context()
                 );
@@ -737,13 +721,12 @@ fn differential(seed: u64, seen: &mut alloc::collections::BTreeSet<(usize, u8, u
                 assert!(
                     matches!(path, Path::Lookup | Path::Stamped)
                         && !matches!(expected, Reference::Stopped)
-                        && budget > 0
                         && KEYS.into_iter().any(named_here),
                     "{}: entered block {block}",
                     context()
                 );
                 assert_eq!(a.block, named(block), "{}", context());
-                assert_eq!(a.spare, spent, "{}", context());
+                assert_eq!(a.account, spent, "{}", context());
                 cached += 1;
             }
         }
@@ -788,7 +771,7 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
     code.extend(marker(0).to_le_bytes());
     code.extend([0xba, 99, 0, 0, 0, 0xc3]);
     put(&blocks, 0, &code);
-    let dispatcher = dispatcher_with_policy(0, Interruption::Epoch).unwrap();
+    let dispatcher = dispatcher_with_policy(0, Interruption::Quiet).unwrap();
     assert!(dispatcher.len() <= DISPATCHER_BYTES);
     put(&region, PROBES, &dispatcher);
     let tail = lookup_tail(
@@ -821,14 +804,16 @@ fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
     let control = |itlb: &LookupTable| {
         let stamps = fresh[next.get()];
         next.set(next.get() + 1);
-        let mut control = ChainControl {
-            spare: Account::new(5).0,
-            contexts: [CONTEXTS[0], CONTEXTS[1]],
-            table: table.address(),
-            itlb: itlb.address(),
-            masks: [table.mask(), itlb.mask()],
-            stamps,
-            ..ChainControl::default()
+        let mut control = Controlled {
+            control: ChainControl {
+                contexts: [CONTEXTS[0], CONTEXTS[1]],
+                table: table.address(),
+                itlb: itlb.address(),
+                masks: [table.mask(), itlb.mask()],
+                stamps,
+                ..ChainControl::default()
+            },
+            account: Account::new(5),
         };
         control.salts = control.contexts.map(|context| itlb.salt(context));
         control

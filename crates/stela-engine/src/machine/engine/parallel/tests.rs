@@ -134,6 +134,7 @@ fn duplicate_safe_attachment_refuses_without_replacing_the_live_owner() {
     assert_eq!(first.chain.account().0, 17);
     let pending = first.chain.snapshot();
     assert_ne!(pending.interrupt_epoch, pending.observed_interrupt_epoch);
+    assert_eq!(pending.quiet, stela_compiler::x86_64::chain::Quiet(0));
     drop(first);
     second.enter_parallel(Arc::clone(&hub)).unwrap();
     assert!(second.attached.as_ref().unwrap().epoch > epoch);
@@ -152,10 +153,10 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     let (resume_tx, resume_rx) = mpsc::channel();
     let foreign = Arc::clone(&hub);
     let reader = std::thread::spawn(move || {
-        let epoch = foreign.inboxes[0].chain.interrupt_epoch();
+        let chain = &foreign.inboxes[0].chain;
         ready_tx.send(()).unwrap();
         resume_rx.recv().unwrap();
-        epoch.fetch_add(1, Ordering::Release);
+        chain.notify();
     });
     ready_rx.recv().unwrap();
     drop(attached);
@@ -190,6 +191,7 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
         (2, 21, [22, 23])
     );
     assert_ne!(snapshot.interrupt_epoch, snapshot.observed_interrupt_epoch);
+    assert_eq!(snapshot.quiet, stela_compiler::x86_64::chain::Quiet(0));
     assert_eq!(hub.inboxes[0].owner.load(Ordering::Acquire), next.epoch);
     drop(control);
     drop(next);
@@ -1002,6 +1004,10 @@ fn notification_after_drain_survives_native_budget_reset() {
     machine.read_mail().unwrap();
     let drained = machine.chain.snapshot();
     assert_eq!(drained.interrupt_epoch, drained.observed_interrupt_epoch);
+    assert_eq!(
+        drained.quiet,
+        stela_compiler::x86_64::chain::Quiet::default()
+    );
     // This is the old lost-notification window: the owner has drained,
     // then a peer posts before the owner initializes its next budget.
     hub.post(0, |mail| mail.event = true);
@@ -1010,9 +1016,11 @@ fn notification_after_drain_survives_native_budget_reset() {
     assert_eq!(machine.chain.account().budget(), 4096);
     assert_ne!(entered.interrupt_epoch, entered.observed_interrupt_epoch);
     assert_eq!(entered.observed_interrupt_epoch, drained.interrupt_epoch);
+    assert_eq!(entered.quiet, stela_compiler::x86_64::chain::Quiet(0));
     machine.read_mail().unwrap();
     let next = machine.chain.snapshot();
     assert_eq!(next.interrupt_epoch, next.observed_interrupt_epoch);
+    assert_eq!(next.quiet, stela_compiler::x86_64::chain::Quiet::default());
 }
 
 #[test]
@@ -1031,6 +1039,7 @@ fn epoch_exhaustion_is_sticky_across_drain_detach_and_reuse() {
     let exhausted = machine.chain.snapshot();
     assert_eq!(exhausted.interrupt_epoch, u64::MAX);
     assert_eq!(exhausted.observed_interrupt_epoch, u64::MAX - 1);
+    assert_eq!(exhausted.quiet, stela_compiler::x86_64::chain::Quiet(0));
     drop(machine);
     let (_, mut next) = Attached::new(&hub, 0, false).unwrap();
     next.initialize(11, 14, [12, 13], [0xffff, 0xfff]);
@@ -1039,6 +1048,7 @@ fn epoch_exhaustion_is_sticky_across_drain_detach_and_reuse() {
     let reused = next.snapshot();
     assert_eq!(reused.interrupt_epoch, u64::MAX);
     assert_eq!(reused.observed_interrupt_epoch, u64::MAX - 1);
+    assert_eq!(reused.quiet, stela_compiler::x86_64::chain::Quiet(0));
 }
 
 #[test]
@@ -1746,10 +1756,7 @@ fn the_fast_ipi_table_completes_a_request_through_the_hubs_words() {
     let entry = *table.target(0, 1).unwrap();
     assert_eq!(entry.lines, hub.inboxes[1].lines.as_ptr() as u64);
     assert_eq!(entry.sleeping, hub.inboxes[1].sleeping.as_ptr() as u64);
-    assert_eq!(
-        entry.interrupt,
-        hub.inboxes[1].chain.interrupt_epoch().as_ptr() as u64
-    );
+    assert_eq!(entry.interrupt, hub.inboxes[1].chain.control());
     assert_eq!(entry.pe, 1);
     let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
     let interrupt = hub.inboxes[1]

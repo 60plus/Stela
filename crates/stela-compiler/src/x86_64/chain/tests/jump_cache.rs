@@ -4,7 +4,7 @@
 //! replacement, a context switch, a native transition's new contexts) takes
 //! the entry with it. Random runs against the plain tail.
 use super::super::*;
-use crate::GuestState;
+use super::Controlled;
 use alloc::{boxed::Box, vec::Vec};
 use core::ffi::c_void;
 unsafe extern "C" {
@@ -94,27 +94,22 @@ fn region() -> Pages {
     region
 }
 
-/// Run the stub at `stub` with the target in RSI and the account in the
-/// control's `spare` word, which native code never reads, so comparing
-/// controls compares accounts too: RAX and RDX it returns, the account it
-/// left put back there.
-fn run(region: &Pages, stub: usize, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    let mut frame = Box::new(GuestState::default());
-    frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
-    frame.account = control.spare;
+/// Run the stub at `stub` with the target in RSI, the control and its
+/// account: RAX and RDX it returns.
+fn run(region: &Pages, stub: usize, control: &mut Controlled, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stubs, tails and probes with the block
     // ABI; they touch the frame's control, the tables, the stamps and the
     // blocks, which outlive the call.
-    let result =
-        unsafe { crate::x86_64::native::enter_counted(region.0.add(stub), &mut *frame, target, 0) };
-    control.spare = frame.account;
+    let result = control.run(|frame| unsafe {
+        crate::x86_64::native::enter_counted(region.0.add(stub), frame, target, 0)
+    });
     (result as u64, (result >> 64) as u64)
 }
 
 struct World {
     table: LookupTable,
     itlb: LookupTable,
-    control: Box<ChainControl>,
+    control: Box<Controlled>,
     blocks: Pages,
     region: Pages,
 }
@@ -124,15 +119,17 @@ impl World {
         let mut table = LookupTable::new();
         let itlb = LookupTable::itlb();
         let stamps = table.new_stamps();
-        let control = Box::new(ChainControl {
-            spare: Account::new(MAX_BUDGET).0,
-            table: table.address(),
-            itlb: itlb.address(),
-            contexts: CONTEXTS,
-            salts: CONTEXTS.map(|context| itlb.salt(context)),
-            masks: [table.mask(), itlb.mask()],
-            stamps,
-            ..ChainControl::default()
+        let control = Box::new(Controlled {
+            control: ChainControl {
+                table: table.address(),
+                itlb: itlb.address(),
+                contexts: CONTEXTS,
+                salts: CONTEXTS.map(|context| itlb.salt(context)),
+                masks: [table.mask(), itlb.mask()],
+                stamps,
+                ..ChainControl::default()
+            },
+            account: Account::new(MAX_BUDGET),
         });
         World {
             table,
@@ -190,7 +187,7 @@ fn a_filled_entry_holds_until_its_page_goes() {
     assert_eq!(
         (
             world.control.hits,
-            Account(world.control.spare).retired(),
+            world.control.account.retired(),
             world.control.block
         ),
         (1, u64::from(RAN), 3)
@@ -270,14 +267,19 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     assert_eq!(world.control.hits, hits + 1);
     let branch = (REFUSING, ExitKind::Indirect as u64 | (RAN as u64) << 20);
     assert_eq!(world.run(32, REFUSING), branch);
-    // A spent budget returns with the word and the instructions run.
-    world.control.spare = Account(world.control.spare).with_budget(0).0;
+    // A spent budget returns with the word and the instructions run, the
+    // account unchanged.
+    world.control.account = world.control.account.with_budget(0);
+    let account = world.control.account;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.spare = Account(world.control.spare).with_budget(100).0;
-    // An interruption posted: the probe's gate exits.
-    world.control.interrupt_epoch = 1;
+    assert_eq!(world.control.account, account);
+    world.control.account = world.control.account.with_budget(100);
+    // An interruption posted: the probe's check exits.
+    world.control.interrupt();
+    let account = world.control.account;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.interrupt_epoch = 0;
+    assert_eq!(world.control.account, account);
+    world.control.acknowledge();
     assert_eq!(world.run(0, PC), (0x7705, 99));
 }
 
@@ -330,7 +332,7 @@ fn cached_tails_run_as_plain_tails() {
             _ => {
                 // The cached tail first: an entry of an earlier change
                 // must miss.
-                let mut plain = ChainControl { ..*world.control };
+                let mut plain = *world.control;
                 let got = world.run(0, pc);
                 let expected = run(&world.region, 16, &mut plain, pc);
                 assert_eq!(got, expected, "{pc:#x}");
@@ -338,10 +340,10 @@ fn cached_tails_run_as_plain_tails() {
                 assert_eq!(
                     (
                         world.control.block,
-                        Account(world.control.spare).retired(),
+                        world.control.account.retired(),
                         world.control.hits
                     ),
-                    (plain.block, Account(plain.spare).retired(), plain.hits),
+                    (plain.block, plain.account.retired(), plain.hits),
                     "{pc:#x}"
                 );
                 compared += 1;

@@ -127,7 +127,7 @@ fn call_and_return(callee: Callee) -> Vec<u8> {
         }
         Callee::Interrupted => {
             asm.place(Rcx, CONTROL);
-            asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+            post(&mut asm);
         }
         Callee::Exit => {
             asm.mov_imm32(Rdx, EXITED as u32);
@@ -147,6 +147,12 @@ fn call_and_return(callee: Callee) -> Vec<u8> {
     }
     returning(&mut asm);
     code.into_bytes()
+}
+
+/// An interruption posted to the control at RCX, as [`interrupt`] does.
+fn post(asm: &mut crate::x86_64::asm::Asm) {
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+    asm.mov_rm_imm32(Qword, Mem::base(Rcx, QUIET_OFFSET), 0);
 }
 
 struct Run {
@@ -269,7 +275,9 @@ fn what_runs_between_call_and_return_decides_the_frame() {
     // Acknowledged: the next run's frame matches.
     let code = pages(&call_and_return(Callee::Interrupted));
     run.enter(&code, 0, RETURN);
-    run.control.observed_interrupt_epoch = run.control.interrupt_epoch;
+    let epoch = run.control.interrupt_epoch;
+    // SAFETY: the run's control, which nothing runs on now.
+    unsafe { acknowledge(&mut *run.control, epoch) };
     let code = pages(&call_and_return(Callee::Return));
     assert_eq!(run.enter(&code, 0, RETURN), CONTINUED);
 }
@@ -410,7 +418,7 @@ fn recursion_ending(interrupt: bool) -> Vec<u8> {
     asm.bind(base);
     if interrupt {
         asm.place(Rcx, CONTROL);
-        asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, INTERRUPT_EPOCH), 1);
+        post(&mut asm);
     } else {
         asm.mov_imm32(Rax, 0x5e);
         asm.mov_imm32(Rdx, EXITED as u32);

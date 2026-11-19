@@ -249,7 +249,8 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     let at = exit.offset - chain::POLLED_LINK_BYTES;
     // The link at offset 0 as the code's own would be at its offset: the
     // pad and point alike once the code lands at an aligned address.
-    let link = chain::link(at as u64, chain::POLLED_LINK_BYTES, 3, 1, 0)
+    let gate = chain::LinkGate::for_target(crate::TargetCpu::detect());
+    let link = chain::link(at as u64, chain::POLLED_LINK_BYTES, 3, 1, 0, gate)
         .unwrap()
         .body();
     let mut code = block.native.x86_64_code;
@@ -259,6 +260,7 @@ fn pinned_divide_remainder_commits_before_a_polled_exit() {
     let mut control = chain::ChainControl {
         interrupt_epoch: 2,
         observed_interrupt_epoch: 1,
+        quiet: chain::Quiet(0),
         ..Default::default()
     };
     let mut state = GuestState {
