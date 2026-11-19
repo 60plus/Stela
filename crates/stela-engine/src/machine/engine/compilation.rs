@@ -891,7 +891,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .rebases
                 .look(key, offset as u16, context, pc, again)
             {
-                super::rebase::Found::Entry(entry) => {
+                super::rebase::Found::Entry(entry, origin) => {
                     if entry.input.len() > available && !whole {
                         return Ok(None);
                     }
@@ -903,13 +903,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         }
                         self.code.rebases.hit();
                         self.count_store_source(StoreSource::Rebased);
-                        let origin = Arc::new(recovery::StoredOrigin {
-                            key: *key,
-                            context: *context,
-                            page,
-                            preparation: preparation.clone(),
-                            kept: Some(entry.clone()),
-                        });
+                        // The origin its last install at this page made,
+                        // else a new one the slot keeps for the next.
+                        let origin = match origin.filter(|origin| {
+                            origin.page == page && Arc::ptr_eq(&origin.preparation, &preparation)
+                        }) {
+                            Some(origin) => origin,
+                            None => {
+                                let origin = Arc::new(recovery::StoredOrigin {
+                                    key: *key,
+                                    context: *context,
+                                    page,
+                                    preparation: preparation.clone(),
+                                    kept: Some(entry.clone()),
+                                });
+                                self.code
+                                    .rebases
+                                    .originate(key, offset as u16, context, &origin);
+                                origin
+                            }
+                        };
                         let installed = self
                             .install(
                                 pc,

@@ -10137,6 +10137,7 @@ mod permission_kept;
 mod process_switching;
 mod pstate_features;
 mod recovery;
+mod reinstall_cost;
 mod retire_cost;
 mod shared_code;
 mod sharing;
