@@ -426,18 +426,18 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     // Golden encodings identify the exact post-guard native window. The
     // first entry has already admitted a transfer with the old epoch; its
     // backedge re-enters the full, unchanged production thunk.
-    const AFTER_GUARD: usize = 27;
+    const AFTER_GUARD: usize = 25;
     assert_eq!(
         &body[7..23],
         &[
             0x48, 0x8b, 0x42, 0x48, // mov rax,[rdx+observed]
             0x48, 0xf7, 0xd0, // not rax
             0x48, 0x8b, 0x4a, 0x40, // mov rcx,[rdx+epoch]
-            0x48, 0x8d, 0x4c, 0x01, 0x01, // lea rcx,[rcx+rax+1]
+            0x48, 0x8d, 0x4c, 0x01, 0x02, // lea rcx,[rcx+rax+2]
         ]
     );
-    assert_eq!(body[23..26], [0xe3, 0x02, 0xeb]);
-    assert_eq!(AFTER_GUARD + usize::from(body[26]), body.len() - JUMP_BYTES);
+    assert_eq!(body[23], 0xe2);
+    assert_eq!(AFTER_GUARD + usize::from(body[24]), body.len() - JUMP_BYTES);
     // lea r13,[r13 + (7 << 16) - 1]: one transfer and seven instructions.
     assert_eq!(
         &body[AFTER_GUARD..AFTER_GUARD + 7],

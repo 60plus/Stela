@@ -111,7 +111,7 @@ pub const PATCH_BYTES: usize = JUMP_BYTES;
 const MAX_PAD: usize = 4;
 /// Bytes of a [`link`]'s body, without and with the interruption gate.
 pub const LINK_BODY_BYTES: usize = 33;
-pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 20;
+pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 18;
 /// Bytes of the largest [`refund`] of a link that found no budget left.
 const REFUND_BYTES: usize = 7;
 /// Bytes in the largest [`thunk`]: the body, the refund and the jump to
@@ -2181,7 +2181,7 @@ impl Interruption {
     /// Bytes of a link's gate ([`link_gate`]).
     fn link_bytes(self) -> usize {
         match self {
-            Self::Epoch => 20,
+            Self::Epoch => 18,
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
             Self::Flag => 7,
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
@@ -2242,10 +2242,12 @@ fn gate(
 }
 
 /// A link's gate, RDX at the control, without the flags: RCX = the epoch
-/// less the owner's snapshot (`epoch + !observed + 1` by NOT and LEA, RAX
-/// clobbered), whose JRCXZ skips the 8-bit jump an interruption takes,
-/// which this returns. A compare would be 0.4 to 1.9 TSC ticks cheaper per
-/// polled link (`spread_transfer_costs`), but would clobber NZCV.
+/// less the owner's snapshot, plus one (`epoch + !observed + 2` by NOT and
+/// LEA, RAX clobbered), whose LOOP, the 8-bit jump this returns, an
+/// interruption takes: the quiet path falls through. A JRCXZ over a jump,
+/// whose quiet path is taken, cost the scanner (`scanner_time_on_this_host`)
+/// 18% on a Zen 5 host, where LOOP is as cheap as a compare, which would
+/// clobber NZCV.
 fn link_gate(
     asm: &mut crate::x86_64::asm::Asm,
     policy: Interruption,
@@ -2255,11 +2257,8 @@ fn link_gate(
             asm.mov_load(Qword, Rax, Mem::base(Rdx, OBSERVED_INTERRUPT_EPOCH));
             asm.unary(crate::x86_64::asm::Unary::Not, Qword, Rax);
             asm.mov_load(Qword, Rcx, Mem::base(Rdx, INTERRUPT_EPOCH));
-            asm.lea(Qword, Rcx, Mem::indexed(Rcx, Rax, 1, 1));
-            let quiet = asm.jrcxz();
-            let interrupted = asm.jmp8();
-            asm.bind(quiet);
-            Some(interrupted)
+            asm.lea(Qword, Rcx, Mem::indexed(Rcx, Rax, 1, 2));
+            Some(asm.loop_rcx())
         }
         #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
         Interruption::Flag => {
@@ -4391,19 +4390,19 @@ mod tests {
         // mov rdx, [rdi + control]
         let mut expected = vec![0x48, 0x8b, 0x97];
         expected.extend(824u32.to_le_bytes());
-        // The gate without the flags: RCX = epoch - observed, whose JRCXZ
-        // skips the jump to the jump back past the refund.
+        // The gate without the flags: RCX = epoch - observed + 1, whose
+        // LOOP goes to the jump back past the refund.
         expected.extend([0x48, 0x8b, 0x42, 0x48, 0x48, 0xf7, 0xd0]);
-        expected.extend([0x48, 0x8b, 0x4a, 0x40, 0x48, 0x8d, 0x4c, 0x01, 0x01]);
-        expected.extend([0xe3, 0x02, 0xeb, 33]);
+        expected.extend([0x48, 0x8b, 0x4a, 0x40, 0x48, 0x8d, 0x4c, 0x01, 0x02]);
+        expected.extend([0xe2, 33]);
         // lea r13, [r13 + (7 << 16) - 1]: one transfer and 7 instructions;
         // movzx ecx, r13w; JRCXZ to the refund when none was left.
         expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
         expected.extend([0x41, 0x0f, 0xb7, 0xcd, 0xe3, 13]);
         expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0]);
-        // The jump ends 0x35 bytes into the thunk.
+        // The jump ends 0x33 bytes into the thunk.
         expected.extend([0xe9]);
-        expected.extend((0x2000i32 - 0x1035).to_le_bytes());
+        expected.extend((0x2000i32 - 0x1033).to_le_bytes());
         assert_eq!(code.len(), THUNK_BYTES);
         assert_eq!(code[..POLLED_LINK_BODY_BYTES], expected);
         // lea r13, [r13 - (7 << 16)], then the jump back.

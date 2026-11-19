@@ -45,6 +45,15 @@ impl Asm<'_> {
         self.code.push(0xe3);
         self.short_patch()
     }
+    /// `loop rel8` (E2 cb): RCX less one, then a branch while it is not
+    /// zero, without reading or writing flags; resolved later by
+    /// [`Self::bind`] or [`resolve`].
+    ///
+    /// [`resolve`]: super::resolve
+    pub(crate) fn loop_rcx(&mut self) -> Patch {
+        self.code.push(0xe2);
+        self.short_patch()
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +104,15 @@ mod tests {
         asm.nop();
         asm.bind(skip);
         assert_eq!((code.instructions(), &code[..]), (2, &[0xe3, 1, 0x90][..]));
+    }
+
+    #[test]
+    fn loop_resolves_relative_to_the_next_instruction() {
+        let mut code = Code::new();
+        let mut asm = code.asm();
+        let skip = asm.loop_rcx();
+        asm.nop();
+        asm.bind(skip);
+        assert_eq!((code.instructions(), &code[..]), (2, &[0xe2, 1, 0x90][..]));
     }
 }
