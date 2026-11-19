@@ -227,7 +227,7 @@ fn entry(offset: u16, fill: u8, bytes: usize) -> crate::translations::Entry {
         // A merge decodes what two segments hold with every check.
         source_map: vec![(offset, 0)],
         exits: Vec::new(),
-        recovery: Vec::new(),
+        recovery: Default::default(),
     }
 }
 

@@ -201,27 +201,28 @@ impl<'a> Template<'a> {
     /// of tags never grants private/APX admission: that must be derived from an
     /// compiler/profile ABI permit before future eager invocation.
     pub(super) fn portable_requires_unavailable_capture(&self) -> bool {
-        use stela_compiler::block::{
-            RecoveryBinding, RecoverySource, RetirementPhase, RetirementPoint,
-        };
-        let requires = |retirement: RetirementPoint, bindings: &[RecoveryBinding]| {
-            retirement.phase() != RetirementPhase::Before
-                || bindings.iter().any(|binding| match binding.source {
+        use stela_compiler::block::{RecoveryBinding, RecoverySource, RetirementPhase};
+        fn requires(
+            phase: RetirementPhase,
+            mut bindings: impl Iterator<Item = RecoveryBinding>,
+        ) -> bool {
+            phase != RetirementPhase::Before
+                || bindings.any(|binding| match binding.source {
                     RecoverySource::HostRegister(register) => register >= 16,
                     RecoverySource::NativeSpill(_) => true,
                 })
-        };
+        }
         // Rebasing a row moves its PC alone, not its phase or bindings.
         match self {
             Self::Stored { entry, .. } => entry
                 .recovery
                 .iter()
-                .any(|row| requires(row.retirement, &row.bindings)),
+                .any(|row| requires(row.phase, row.bindings())),
             Self::Compiled(emission) => emission
                 .block
                 .fault_recovery
                 .iter()
-                .any(|row| requires(row.retirement, &row.bindings)),
+                .any(|row| requires(row.retirement.phase(), row.bindings.iter().copied())),
         }
     }
     pub(super) fn matches_source(&self, source: &[u8]) -> bool {

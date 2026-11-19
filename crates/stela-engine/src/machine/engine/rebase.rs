@@ -282,7 +282,7 @@ mod tests {
             relocations: alloc::vec![],
             source_map: alloc::vec![(offset, 0)],
             exits: alloc::vec![],
-            recovery: alloc::vec![],
+            recovery: Default::default(),
         }
     }
 
