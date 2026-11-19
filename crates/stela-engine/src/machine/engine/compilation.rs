@@ -354,11 +354,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         let held_page = held.pc == page && held.key == context;
-        if !held_page {
+        // A leaf's other pages come back with the page whose take brought
+        // them (`refill_pages` takes its leaf's pages again), which the
+        // log holds: they would only lengthen it, and every TLBI of
+        // everything goes through it.
+        if !held_page && !matches!(taken, Taken::Leaf) {
             self.log_fill(page, context);
-            if shared && half == 0 {
-                self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
-            }
+        }
+        if !held_page && shared && half == 0 {
+            self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
         }
         match taken {
             Taken::Refill if !held_page => {
