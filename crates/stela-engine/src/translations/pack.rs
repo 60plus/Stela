@@ -39,14 +39,23 @@ use stela_formats::journal;
 pub const MAGIC: [u8; 8] = *b"STLTPACK";
 pub const SCHEMA: u32 = 1;
 const MIXED_SCHEMA: u32 = 2;
+/// The schemas of packs whose index counts each record's uses
+/// ([`USES_SHIFT`]): [`SCHEMA`] and [`MIXED_SCHEMA`] this much higher. A
+/// pack of the first two loads, its records counted as unused.
+const COUNTED: u32 = 2;
+const COUNTED_SCHEMA: u32 = SCHEMA + COUNTED;
+const COUNTED_MIXED_SCHEMA: u32 = MIXED_SCHEMA + COUNTED;
 /// Magic, schema, record count and translator id.
 pub const HEADER_BYTES: usize = MAGIC.len() + 4 + 4 + DIGEST_BYTES;
 const DIGEST_BYTES: usize = 32;
 /// Page key, offset and length. The length field's top byte holds the
-/// record's age ([`MAX_UNUSED_BOOTS`]), the rest its length.
+/// record's age ([`MAX_UNUSED_BOOTS`]), the byte below it, in a counted
+/// pack, the most uses a boot made of it ([`Merge::by_use`], saturating),
+/// the rest its length.
 const INDEX_ENTRY_BYTES: usize = DIGEST_BYTES + 8 + 8;
 const AGE_SHIFT: u32 = 56;
-pub const LENGTH_MASK: u64 = (1 << AGE_SHIFT) - 1;
+const USES_SHIFT: u32 = 48;
+pub const LENGTH_MASK: u64 = (1 << USES_SHIFT) - 1;
 /// A record no boot looked up for more boots in a row than this leaves the
 /// next pack: the pack keeps what boots use, and what they stopped using
 /// costs no read time for long. Every boot reads the whole pack.
@@ -109,11 +118,25 @@ impl PackFormat {
                 .try_into()
                 .expect("a schema word"),
         ) {
-            SCHEMA => Ok(Self::Raw),
-            MIXED_SCHEMA => Ok(Self::Mixed),
+            SCHEMA | COUNTED_SCHEMA => Ok(Self::Raw),
+            MIXED_SCHEMA | COUNTED_MIXED_SCHEMA => Ok(Self::Mixed),
             _ => Err(PackError::Schema),
         }
     }
+
+    /// The schema a pack of this format is written with: counted.
+    fn schema(self) -> u32 {
+        self as u32 + COUNTED
+    }
+}
+
+/// Whether the pack whose header starts `header` counts its records' uses.
+fn counted(header: &[u8]) -> bool {
+    u32::from_le_bytes(
+        header[MAGIC.len()..][..4]
+            .try_into()
+            .expect("a schema word"),
+    ) > MIXED_SCHEMA
 }
 
 /// The bytes of the header, index and index checksum of the pack whose
@@ -445,6 +468,17 @@ fn entry_age(bytes: &[u8], index: usize) -> u8 {
     (index_field(bytes, at) >> AGE_SHIFT) as u8
 }
 
+/// Index entry `index`'s uses: the byte below its age in a counted pack,
+/// none in an older one.
+fn entry_uses(bytes: &[u8], index: usize) -> u8 {
+    let at = HEADER_BYTES + index * INDEX_ENTRY_BYTES + DIGEST_BYTES + 8;
+    if counted(bytes) {
+        (index_field(bytes, at) >> USES_SHIFT) as u8
+    } else {
+        0
+    }
+}
+
 fn index_field(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a field"))
 }
@@ -490,6 +524,10 @@ impl<'a> Segment<'a> {
 
     fn age(&self, index: usize) -> u8 {
         entry_age(self.index(), index)
+    }
+
+    fn uses(&self, index: usize) -> u8 {
+        entry_uses(self.index(), index)
     }
 
     /// The record of index entry `index`, to decode.
@@ -737,7 +775,7 @@ impl<'a> Layout<'a> {
         let count = records.len();
         let mut prefix = Vec::with_capacity(prefix_length(count));
         prefix.extend(MAGIC);
-        prefix.extend((format as u32).to_le_bytes());
+        prefix.extend(format.schema().to_le_bytes());
         prefix.extend((count as u32).to_le_bytes());
         prefix.extend(translator.0);
         for (key, offset, piece) in &records {
@@ -1055,6 +1093,8 @@ pub struct Merge<'a> {
     /// used most, until the bound is full.
     uses: BTreeMap<Digest, u32>,
     chosen: Vec<bool>,
+    /// Per record taken, the most uses its segments counted.
+    counted: Vec<u8>,
     phase: Phase<'a>,
     evicted: u64,
     expired: u64,
@@ -1135,6 +1175,7 @@ impl<'a> Merge<'a> {
             by_age: [(0, 0); RANKS],
             uses: BTreeMap::new(),
             chosen: Vec::new(),
+            counted: Vec::new(),
             phase: Phase::Taking,
             evicted: 0,
             expired: 0,
@@ -1169,16 +1210,24 @@ impl<'a> Merge<'a> {
         let Some(oldest) = oldest else {
             return Vec::new();
         };
-        let mut order: Vec<(u32, usize)> = self
+        let mut order: Vec<(u32, u8, usize)> = self
             .records
             .iter()
             .enumerate()
             .filter(|(_, (_, _, rank))| usize::from(*rank) == oldest)
-            .map(|(at, (key, _, _))| (self.uses.get(key).copied().unwrap_or(0), at))
+            .map(|(at, (key, _, _))| {
+                (
+                    self.uses.get(key).copied().unwrap_or(0),
+                    self.counted[at],
+                    at,
+                )
+            })
             .collect();
-        order.sort_by_key(|&(uses, at)| (core::cmp::Reverse(uses), at));
+        order.sort_by_key(|&(uses, counted, at)| {
+            (core::cmp::Reverse(uses), core::cmp::Reverse(counted), at)
+        });
         let mut chosen = alloc::vec![false; self.records.len()];
-        for (_, at) in order {
+        for (_, _, at) in order {
             let more = self.records[at].1.bytes().len() as u64;
             if count < MAX_RECORDS && layout_bytes(count + 1, bytes + more) <= self.bound {
                 chosen[at] = true;
@@ -1195,6 +1244,7 @@ impl<'a> Merge<'a> {
         self.by_age[0].0 += piece.bytes().len() as u64;
         self.by_age[0].1 += 1;
         self.records.push((key, piece, 0));
+        self.counted.push(0);
     }
 
     /// The rank a record of `age` is kept by: its age, one more when the
@@ -1287,6 +1337,12 @@ impl<'a> Merge<'a> {
         slot.0 += piece.bytes().len() as u64;
         slot.1 += 1;
         self.records.push((key, piece, rank));
+        let counted = holders
+            .iter()
+            .map(|&(index, at)| self.segments[index].uses(at))
+            .max()
+            .unwrap_or(0);
+        self.counted.push(counted);
         true
     }
 
@@ -1333,7 +1389,7 @@ impl<'a> Merge<'a> {
                         let count = *count;
                         let mut prefix = Vec::with_capacity(prefix_length(count));
                         prefix.extend(MAGIC);
-                        prefix.extend((self.format as u32).to_le_bytes());
+                        prefix.extend(self.format.schema().to_le_bytes());
                         prefix.extend((count as u32).to_le_bytes());
                         prefix.extend(self.translator.0);
                         self.phase = Phase::Indexing {
@@ -1385,12 +1441,17 @@ impl<'a> Merge<'a> {
                         self.records = Vec::new();
                         return true;
                     };
+                    let index = *at;
                     *at += 1;
                     if *age == DROPPED {
                         *piece = Piece::Kept(&[]);
                         continue;
                     }
                     let length = piece.bytes().len() as u64;
+                    // The most uses a boot made of it: this boot's, or an
+                    // earlier one's.
+                    let boot = self.uses.get(key).copied().unwrap_or(0);
+                    let uses = u64::from(self.counted[index].max(boot.min(255) as u8));
                     // The rank less the step for records the running boot
                     // did not use ([`Merge::rank`]).
                     let unused = self
@@ -1400,7 +1461,9 @@ impl<'a> Merge<'a> {
                     let age = *age - u8::from(unused);
                     prefix.extend(key.0);
                     prefix.extend(offset.to_le_bytes());
-                    prefix.extend((length | u64::from(age) << AGE_SHIFT).to_le_bytes());
+                    prefix.extend(
+                        (length | uses << USES_SHIFT | u64::from(age) << AGE_SHIFT).to_le_bytes(),
+                    );
                     // Hash the index in pieces, so the checksum costs no
                     // step more than its share.
                     if prefix.len() - *hashed >= INDEX_HASH_BYTES {
@@ -2876,6 +2939,80 @@ mod tests {
         };
         assert_eq!(merged(false), [true, true, false, false, false, false]);
         assert_eq!(merged(true), [false, false, false, false, true, true]);
+    }
+
+    /// A pack's index keeps the most uses a boot made of each record, so a
+    /// boot short of room keeps what earlier sessions ran most before it
+    /// used them itself; a pack of the schema before loads, its records
+    /// unused.
+    #[test]
+    fn a_pack_counts_uses_across_boots_and_an_older_pack_loads() {
+        let translator = translator_id();
+        let pages: Vec<Digest> = (0u8..6).map(|page| Digest::of(&[page])).collect();
+        let mut store = Store::new(translator, None).0;
+        for (at, &key) in pages.iter().enumerate() {
+            store.offer(offer(0x1_0000_4008 + 0x4000 * at as u64, key));
+        }
+        let first = Delta::new(translator, store.take_added())
+            .finish()
+            .unwrap()
+            .to_vec();
+        let mut keys = pages.clone();
+        keys.sort();
+        // A boot uses the two last in key order, and merges in full.
+        let mut boot = Store::new(translator, Some(&first)).0;
+        for (key, uses) in [(keys[5], 3), (keys[4], 2)] {
+            for _ in 0..uses {
+                assert!(boot.record(&key).is_some());
+            }
+        }
+        let segments = boot.segments().iter().cloned().map(Segment::from).collect();
+        let counted = Merge::new(translator, segments, Vec::new(), u64::MAX)
+            .by_use(boot.uses().clone())
+            .finish()
+            .layout
+            .to_vec();
+        let record = boot.segments()[0].get(&keys[0]).unwrap().len() as u64;
+        let bound = layout_bytes(2, 2 * record);
+        let kept = |bytes: &[u8]| {
+            let pack = Pack::parse(bytes, &translator).unwrap();
+            keys.iter()
+                .map(|key| pack.get(key).is_some())
+                .collect::<Vec<_>>()
+        };
+        let merged = |store: &Store| {
+            let segments = store
+                .segments()
+                .iter()
+                .cloned()
+                .map(Segment::from)
+                .collect();
+            Merge::new(translator, segments, Vec::new(), bound)
+                .by_use(store.uses().clone())
+                .finish()
+                .layout
+                .to_vec()
+        };
+        // The next boot has used nothing yet: it keeps the two used most.
+        let (next, error) = Store::new(translator, Some(&counted));
+        assert_eq!(error, None);
+        assert_eq!(
+            kept(&merged(&next)),
+            [false, false, false, false, true, true]
+        );
+        // The same pack in the schema before: it loads, and with no uses
+        // counted the first in key order stay, as before.
+        let mut old = counted.clone();
+        old[MAGIC.len()..][..4].copy_from_slice(&SCHEMA.to_le_bytes());
+        let end = prefix_length(keys.len()) - CHECKSUM_BYTES;
+        let checksum = Sha256::digest(&old[..end]);
+        old[end..end + CHECKSUM_BYTES].copy_from_slice(&checksum);
+        let (older, error) = Store::new(translator, Some(&old));
+        assert_eq!(error, None);
+        assert_eq!(
+            kept(&merged(&older)),
+            [true, true, false, false, false, false]
+        );
     }
 
     /// A key several segments hold reads as their records merged, and a
