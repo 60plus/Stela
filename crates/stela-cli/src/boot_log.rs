@@ -975,6 +975,13 @@ pub(crate) mod tests {
 
     /// A log region with one boot per entry of `boots`, each printing it.
     pub(crate) fn region(boots: &[&str]) -> Vec<u8> {
+        let boots: Vec<Vec<u8>> = boots.iter().map(|line| line.as_bytes().to_vec()).collect();
+        written(&boots)
+    }
+
+    /// A 4 MiB log region as this tree's writer leaves it, with one boot per
+    /// entry of `boots`, each printing it and storing every 64 KiB.
+    pub(crate) fn written(boots: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
         let mut region = Bytes {
             bytes: &mut bytes,
@@ -989,12 +996,75 @@ pub(crate) mod tests {
                 features: Default::default(),
             },
         };
-        for line in boots {
+        for lines in boots {
             let mut writer = Writer::open(&mut region).unwrap();
-            writer.append(line.as_bytes());
-            writer.flush(&mut region).unwrap();
+            for part in lines.chunks(64 << 10) {
+                writer.append(part);
+                writer.flush(&mut region).unwrap();
+            }
         }
         bytes
+    }
+
+    /// `boots` boots of `lines` numbered lines each (`boot B line L`), from
+    /// `first` on: a boot's own lines, without its marker.
+    pub(crate) fn boot_lines(first: usize, boots: usize, lines: usize) -> Vec<Vec<u8>> {
+        (first..first + boots)
+            .map(|boot| {
+                (0..lines)
+                    .flat_map(|line| {
+                        format!("[{line:5}.000] boot {boot} line {line:06}\n").into_bytes()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A 4 MiB log region as every released `stela.efi` (0.5.0 and older)
+    /// left it: a version 1 header of 40 bytes and its SHA-256, and a ring
+    /// that fills the region, holding the newest bytes of `boots`, each
+    /// after its `=== STELA BOOT n ===` marker.
+    pub(crate) fn released_region(boots: &[Vec<u8>]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut stream = Vec::new();
+        for (boot, lines) in boots.iter().enumerate() {
+            stream.extend_from_slice(format!("=== STELA BOOT {} ===\n", boot + 1).as_bytes());
+            stream.extend_from_slice(lines);
+        }
+        let mut bytes = vec![0u8; boot_log::LOG_BYTES as usize];
+        let ring = boot_log::LOG_BYTES - boot_log::HEADER_BYTES;
+        let head = stream.len() as u64;
+        bytes[..8].copy_from_slice(boot_log::MAGIC);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&head.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(boots.len() as u64).to_le_bytes());
+        bytes[32..40].copy_from_slice(&ring.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..40]);
+        bytes[40..72].copy_from_slice(&digest);
+        for at in head.saturating_sub(ring)..head {
+            bytes[(boot_log::HEADER_BYTES + at % ring) as usize] = stream[at as usize];
+        }
+        bytes
+    }
+
+    /// What `stela log IMAGE` saves for the image of a stick whose EFI
+    /// partition holds `log` as its log file: the command's own path, from
+    /// the disk's GPT through the FAT32 volume to the file's clusters.
+    pub(crate) fn stick_log_text(log: &[u8]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("stick.img");
+        disk_image(&image, &[(ESP, &fat_volume(Some(log)))]);
+        let output = dir.path().join("log.txt");
+        BootLog {
+            file: Some(image),
+            output: Some(output.clone()),
+            partition: None,
+            offset: None,
+            in_target: false,
+        }
+        .run()
+        .unwrap();
+        String::from_utf8(std::fs::read(output).unwrap()).unwrap()
     }
 
     const GUID: &str = "5E1A0000-0000-4000-8000-0000000000C0";
@@ -1282,7 +1352,7 @@ pub(crate) mod tests {
 
     /// A whole-disk image of `partitions`, each a type and its bytes, laid
     /// out from 1 MiB.
-    fn disk_image(path: &Path, partitions: &[(&str, &[u8])]) {
+    pub(crate) fn disk_image(path: &Path, partitions: &[(&str, &[u8])]) {
         let mut first = 2048u64;
         let mut table = Table {
             disk_guid: Guid([9; 16]),
@@ -1320,7 +1390,7 @@ pub(crate) mod tests {
         std::fs::write(path, image).unwrap();
     }
 
-    const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+    pub(crate) const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
     const LINUX: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
 
     #[test]
