@@ -218,6 +218,61 @@ fn compression_report(compression: &[step_timing::Compression; 2], tsc_hz: u64) 
     ));
 }
 
+/// The keys `PES SYSTEM TOTAL` names.
+const SYSTEM_TOTAL_SHOWN: usize = 48;
+
+/// Add the beat's System exits (`exits`) to `total`, by key; at `due`, the
+/// end of a [`HOT_TOTAL_BEATS`] stretch, write `PES SYSTEM TOTAL
+/// count/ns_each/ms`: the [`SYSTEM_TOTAL_SHOWN`] keys that took the most
+/// exit time over the stretch, each with its class
+/// (`step_timing::SystemClass`), then the rest summed, and start over. The
+/// beat's line names only its sixteen costliest keys, and a kernel spreads
+/// many exits over keys that each stay under that cut in every beat.
+fn system_total_report(
+    total: &mut BTreeMap<u32, step_timing::SystemExit>,
+    exits: &step_timing::SystemExits,
+    due: bool,
+    tsc_hz: u64,
+) {
+    for exit in exits.counted() {
+        let entry = total.entry(exit.key).or_insert(step_timing::SystemExit {
+            key: exit.key,
+            ..Default::default()
+        });
+        entry.count += exit.count;
+        entry.ticks += exit.ticks;
+        entry.closes += exit.closes;
+    }
+    if !due || total.is_empty() {
+        return;
+    }
+    let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+    let mut keys: Vec<step_timing::SystemExit> = total.values().copied().collect();
+    keys.sort_unstable_by_key(|exit| core::cmp::Reverse(exit.ticks));
+    let mut line = format!("PES SYSTEM TOTAL beats={HOT_TOTAL_BEATS} count/ns_each/ms");
+    for exit in keys.iter().take(SYSTEM_TOTAL_SHOWN) {
+        let class =
+            step_timing::SystemClass::NAMES[step_timing::SystemClass::of(exit.key) as usize];
+        line.push_str(&format!(
+            " {}[{class}]={}/{}/{}",
+            step_timing::system_key_name(exit.key),
+            exit.count,
+            nanos(exit.ticks) / u128::from(exit.count.max(1)),
+            nanos(exit.ticks) / 1_000_000
+        ));
+    }
+    if let Some(rest) = rest(&keys, SYSTEM_TOTAL_SHOWN) {
+        line.push_str(&format!(
+            " rest={}/{}/{}",
+            rest.count,
+            nanos(rest.ticks) / u128::from(rest.count.max(1)),
+            nanos(rest.ticks) / 1_000_000
+        ));
+    }
+    output::arguments(format_args!("{line}\n"));
+    total.clear();
+}
+
 /// The exits of `exits` past the first `shown`, summed, if any.
 fn rest(exits: &[step_timing::SystemExit], shown: usize) -> Option<step_timing::SystemExit> {
     let rest = exits.get(shown..).filter(|rest| !rest.is_empty())?;
@@ -1481,6 +1536,9 @@ pub(super) struct Heartbeat {
     pub(super) dynamic: step_timing::DynamicSites,
     /// The hot blocks sampled since the first beat (`hot_total_report`).
     pub(super) hot_total: step_timing::HotBlocks,
+    /// Every System exit key's exits since the last `PES SYSTEM TOTAL`
+    /// line (`system_total_report`).
+    pub(super) system_total: BTreeMap<u32, step_timing::SystemExit>,
 }
 
 /// The heartbeat's reports after its first part ([`Heartbeat::beat`]), in
@@ -1551,6 +1609,7 @@ impl Heartbeat {
             pmu: host::pmu::Seen::new(),
             dynamic: Default::default(),
             hot_total: Default::default(),
+            system_total: BTreeMap::new(),
         }
     }
 
@@ -1872,6 +1931,12 @@ impl Heartbeat {
             0 if profiling => {
                 let exits = parallel::system_exits(machine);
                 system_exits_report(&exits, tsc_hz);
+                system_total_report(
+                    &mut self.system_total,
+                    &exits,
+                    self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    tsc_hz,
+                );
                 barrier_waits_report(&exits.barriers, tsc_hz);
                 regime_syncs_report(&exits.regimes, tsc_hz);
                 device_exits_report(machine, &exits.devices, tsc_hz);
