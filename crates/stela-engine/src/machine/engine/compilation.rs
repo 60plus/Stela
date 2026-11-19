@@ -1496,11 +1496,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let window = 10 * self.profile.counter_frequency;
         let shared = self.code_hub.is_some();
         let census = if shared {
-            &mut cache.census
+            cache
+                .census
+                .get_or_insert_with(|| Box::new(install_census::Census::board()))
         } else {
-            &mut self.census
-        }
-        .get_or_insert_with(|| Box::new(install_census::Census::new()));
+            self.census
+                .get_or_insert_with(|| Box::new(install_census::Census::new()))
+        };
         let (thrash, first) = census.installed(identity, now, window);
         let elsewhere = !shared
             && self
