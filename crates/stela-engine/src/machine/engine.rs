@@ -1559,4 +1559,6 @@ impl<H: Host> mmu::TableMemory for RamTables<'_, H> {
 #[cfg(test)]
 mod density;
 #[cfg(test)]
+mod fetch_costs;
+#[cfg(test)]
 mod tests;
