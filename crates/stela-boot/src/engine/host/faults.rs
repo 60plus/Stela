@@ -167,18 +167,21 @@ pub(super) fn resolve(
     write: bool,
     unprivileged: bool,
 ) -> Result<(mmu::Translation, u64), FaultCause> {
-    resolve_recording(state, address, write, unprivileged, true)
+    resolve_recording(state, address, write, unprivileged, true, &mut None)
 }
 
 /// [`resolve`], caching a device translation in the helper's software TLB
 /// only with `record_device`: a fault-around walk ([`map_around`]) leaves
-/// the TLB as no access touched it.
+/// the TLB as no access touched it. A walk starts at `table` when it holds
+/// one ([`mmu::translate_from`]), else it notes there the table it read
+/// its last descriptor from, for the walks of the same fault after it.
 fn resolve_recording(
     state: &mut State,
     address: u64,
     write: bool,
     unprivileged: bool,
     record_device: bool,
+    table: &mut Option<mmu::WalkTable>,
 ) -> Result<(mmu::Translation, u64), FaultCause> {
     let regime = state.regime.as_ref().ok_or(FaultCause::NonCanonical)?;
     let access = if write { Access::Write } else { Access::Read };
@@ -196,13 +199,28 @@ fn resolve_recording(
             FaultCause::Device { physical }
         });
     }
-    let translation = match mmu::translate(
-        &regime.controls,
-        address,
-        access,
-        requester,
-        &mut GuestTables::new(state),
-    ) {
+    let outcome = match *table {
+        Some(start) => mmu::translate_from(
+            &regime.controls,
+            &start,
+            address,
+            access,
+            requester,
+            &mut GuestTables::new(state),
+        ),
+        None => {
+            let (outcome, noted) = mmu::translate_noting(
+                &regime.controls,
+                address,
+                access,
+                requester,
+                &mut GuestTables::new(state),
+            );
+            *table = noted;
+            outcome
+        }
+    };
+    let translation = match outcome {
         Outcome::Mapped(translation) => translation,
         Outcome::Fault(fault) => return Err(FaultCause::Guest(fault)),
         Outcome::Unsupported(unsupported) => return Err(FaultCause::Translation(unsupported)),
@@ -270,10 +288,14 @@ pub(crate) fn page_fault(
             saved,
         );
     }
-    let (translation, host) = match resolve(state, address, write, false) {
-        Ok(resolved) => resolved,
-        Err(cause) => return abandon(state, frame, address, write, cause, saved),
-    };
+    // The fault's own walk notes its leaf table; fault-around's walks of
+    // the same window start there.
+    let mut walk_table = None;
+    let (translation, host) =
+        match resolve_recording(state, address, write, false, true, &mut walk_table) {
+            Ok(resolved) => resolved,
+            Err(cause) => return abandon(state, frame, address, write, cause, saved),
+        };
     let rights = shadow_rights(state, &translation);
     let root = state.roots[state.root_of(state.current)];
     let virtual_page = address & !(PAGE - 1);
@@ -385,7 +407,7 @@ pub(crate) fn page_fault(
     if frame.error & 1 == 0 {
         let table = slot.wrapping_sub(tables::index(virtual_page, 0));
         for beside in shadow::around(address, translation.size, FILL_WINDOW) {
-            map_around(state, table, half, beside);
+            map_around(state, table, half, beside, &mut walk_table);
         }
     }
     state.fills += 1;
@@ -408,8 +430,11 @@ fn shadow_rights(state: &State, translation: &mmu::Translation) -> u64 {
 /// Fault-around: map the leaf at `address` in the window of a fault just
 /// filled through `table` (the live leaf table that holds the whole
 /// window) exactly as a read fault at `address` would fill it, from its own
-/// walk in the current regime and view. Arm lets a TLB walk and cache any
-/// valid translation before an access needs it, and a fault-around entry
+/// walk in the current regime and view. The walk starts at the guest table
+/// the fault's walk read its leaf from (`walk_table`, [`mmu::translate_from`]),
+/// which holds the window's other leaves when they share it, as a walk
+/// cache's entry would. Arm lets a TLB walk and cache any valid
+/// translation before an access needs it, and a fault-around entry
 /// is recorded in the half's extents like a demand fill's, so the same
 /// TLBIs, context switches and resets remove it. Every walk outcome a read
 /// fill would not map is left to the leaf's own fault: translation, Access
@@ -418,11 +443,18 @@ fn shadow_rights(state: &State, translation: &mmu::Translation) -> u64 {
 /// cached either. Lower-half global leaves are left to their fault too (the
 /// shared span widens there), and pages already present are kept, so every
 /// entry written was absent and needs no flush.
-fn map_around(state: &mut State, table: *mut u64, half: usize, address: u64) {
+fn map_around(
+    state: &mut State,
+    table: *mut u64,
+    half: usize,
+    address: u64,
+    walk_table: &mut Option<mmu::WalkTable>,
+) {
     if !state.placement.native(address) {
         return;
     }
-    let Ok((translation, _)) = resolve_recording(state, address, false, false, false) else {
+    let Ok((translation, _)) = resolve_recording(state, address, false, false, false, walk_table)
+    else {
         return;
     };
     let tag_checks = state

@@ -609,7 +609,8 @@ pub struct State {
     /// Pages mapped beside a fault's from the same leaf.
     pub prefills: u64,
     /// Pages mapped beside a fault's from the window's other leaves
-    /// (fault-around), each from its own walk.
+    /// (fault-around), each from its own walk, which starts at the fault's
+    /// leaf table when that holds it.
     pub around: u64,
     /// TSC ticks from a filled #PF's handler entry to its return.
     pub fill_ticks: u64,
