@@ -1196,6 +1196,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The footprint from a finished walk: the parts its walk summed and the
     /// index and table sizes, which take the board's lock once.
     pub fn footprint_finish(&self, walk: &FootprintWalk) -> Footprint {
+        let index = self
+            .code
+            .every_page(super::board::LockSite::Report)
+            .heap_bytes();
         let cache = self.code.cache_at(super::board::LockSite::Report);
         Footprint {
             blocks: self.code.blocks.heap_bytes(),
@@ -1203,7 +1207,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             owners: 0,
             successors: walk.successors,
             rows: walk.rows,
-            index: cache.index.heap_bytes(),
+            index,
             lookup: cache.targets.index_bytes() + self.itlb.index_bytes(),
             pages: (self.pages.len() + self.spare_pages.len()) * crate::translations::PAGE_BYTES,
         }

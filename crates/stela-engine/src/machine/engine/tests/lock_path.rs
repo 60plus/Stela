@@ -218,7 +218,7 @@ fn walk(
     // Every PE runs the first `hot` blocks; each its own share of the rest.
     let cold = (blocks.len() - hot) / pes;
     let own = hot + pe * cold..hot + (pe + 1) * cold;
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (pe as u64 + 1) * 0x1234_5678);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ ((pe as u64 + 1) * 0x1234_5678));
     let grace = &hub.board.grace;
     let section = Section::enter(grace, pe);
     let mut tallies = Tallies::default();
@@ -384,9 +384,9 @@ fn lock_path_costs() {
     if profile.is_some() {
         super::super::fetch_costs::sampler::start();
     }
-    let before = code.cache().lock;
+    let before = code.lock_counts();
     let (all, wall) = run(steps);
-    let after = code.cache().lock;
+    let after = code.lock_counts();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(path) = &profile {
         super::super::fetch_costs::sampler::stop(path);

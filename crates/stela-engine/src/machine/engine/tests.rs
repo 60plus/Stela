@@ -2472,7 +2472,7 @@ fn check_code_arena_reclamation(indexed: bool) {
     // The parts held pages 0 and 1, then page 0 again and page 2; page
     // 3 needed the first part back, whose reclaim forgot its two blocks
     // alone, and whose slots took the next blocks.
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [page(0) + 4, page(1) + 8, page(2), page(3)]);
@@ -2482,7 +2482,7 @@ fn check_code_arena_reclamation(indexed: bool) {
     assert_eq!(&slots[4..], [1, 0]);
     assert_eq!(
         matches!(
-            machine.code.cache().code_slots,
+            *machine.code.code_slots.lock().unwrap(),
             code_slots::CodeSlots::Partitioned { .. }
         ),
         indexed
@@ -2523,7 +2523,7 @@ fn an_evicted_blocks_successor_box_and_index_list_serve_the_next_block() {
         machine.code.blocks[next].successors[0].target.0,
         base + 2 * FETCH_PAGE + 4
     );
-    assert!(machine.code.cache().index.page(base).next().is_none());
+    assert!(machine.code.index().page(base).next().is_none());
     assert!(machine.fetch_block(base + 3 * FETCH_PAGE, false).is_ok());
     // The first page's block is installed again within the window: thrash.
     assert!(machine.fetch_block(base, false).is_ok());
@@ -2653,16 +2653,14 @@ fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
     assert_eq!(
         machine
             .code
-            .cache()
-            .index
+            .index()
             .get(&machine.code.blocks, base + 12, physical, variant),
         Some(1)
     );
     assert_eq!(
         machine
             .code
-            .cache()
-            .index
+            .index()
             .get(&machine.code.blocks, base, first_physical, variant),
         None
     );
@@ -2755,8 +2753,11 @@ fn pressure_reclaims_metadata_when_the_next_arena_part_is_empty() {
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
     assert_eq!(machine.code.blocks.recovery().len(), 1);
     assert!(
-        !(machine.code.cache().index.sweep(None))
-            .any(|(_, slot)| machine.code.blocks[slot].pc == base)
+        !(machine.code.index().sweep(None, usize::MAX).into_iter()).any(|(_, slot)| machine
+            .code
+            .blocks[slot]
+            .pc
+            == base)
     );
     assert_ne!(machine.code_generation, old_generation);
     // A cached hit adds no compilation scratch and keeps its owner.
@@ -2769,7 +2770,7 @@ fn pressure_reclaims_metadata_when_the_next_arena_part_is_empty() {
     // Continued foreign pressure must not permit unbounded local growth.
     assert!(machine.fetch_block(base + 2 * FETCH_PAGE, false).is_ok());
     assert_eq!(machine.code.blocks.recovery().len(), 1);
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
 }
 
 #[test]
@@ -2782,7 +2783,7 @@ fn a_machine_with_few_blocks_keeps_them_under_memory_pressure() {
     machine.host.memory_low = true;
     // One block frees too little to relieve the heap: it stays.
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 0);
 }
 
@@ -2799,7 +2800,7 @@ fn pressure_releases_the_oldest_arena_part_and_keeps_newer_code() {
     }
     machine.host.memory_low = true;
     assert!(machine.fetch_block(page(3), false).is_ok());
-    let mut left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let mut left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     left.sort_unstable();
@@ -2816,7 +2817,7 @@ fn a_block_installed_while_memory_runs_low_discards_the_others_first() {
     assert!(machine.fetch_block(base, false).is_ok());
     machine.host.memory_low = true;
     assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [base + FETCH_PAGE]);
@@ -2834,7 +2835,7 @@ fn memory_pressure_reclaims_before_each_new_compilation() {
     // Still low, as another machine's data may keep it: a new compile
     // releases this machine's old owners before allocating more.
     assert!(machine.fetch_block(base + 2 * FETCH_PAGE, false).is_ok());
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 2);
 }
 
@@ -2854,11 +2855,11 @@ fn pressure_this_machine_cannot_relieve_waits_for_it_to_regrow() {
     // One block held: it installs the next without discarding again.
     assert!(machine.fetch_block(page(3), false).is_ok());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     // Two again, as many as at the last reclaim: the next one reclaims.
     assert!(machine.fetch_block(page(4), false).is_ok());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 2);
-    assert_eq!(machine.code.cache().index.len(), 1);
+    assert_eq!(machine.code.index().len(), 1);
     // Once memory recovers, the next stretch of pressure reclaims at once.
     machine.host.memory_low = false;
     assert!(machine.fetch_block(page(0), false).is_ok());
@@ -2910,17 +2911,17 @@ fn ic_ivau_forgets_its_pages_blocks_and_ic_iallu_every_block() {
             Ok(Fetched::Block(_))
         ));
     }
-    assert_eq!(machine.code.cache().index.len(), 2);
+    assert_eq!(machine.code.index().len(), 2);
     machine.cpu.state.x[0] = base + 0x40;
     machine.system_instruction(IC_IVAU_X0).unwrap();
-    let left: Vec<u64> = (machine.code.cache().index.sweep(None))
+    let left: Vec<u64> = (machine.code.index().sweep(None, usize::MAX).into_iter())
         .map(|(_, slot)| machine.code.blocks[slot].pc)
         .collect();
     assert_eq!(left, [base + FETCH_PAGE]);
     assert_eq!(machine.statistics.code_invalidations, 1);
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 0);
     machine.system_instruction(IC_IALLU).unwrap();
-    assert!(machine.code.cache().index.is_empty());
+    assert!(machine.code.index().is_empty());
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
 }
 

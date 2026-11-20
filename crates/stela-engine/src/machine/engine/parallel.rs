@@ -1259,7 +1259,7 @@ impl Hub {
     /// there to note them ([`Self::compiling`]): an IC IVAU of one must
     /// reach every PE that may run them.
     pub(super) fn note_code(&self, code: &super::board::Code) {
-        for frame in code.cache_at(super::board::LockSite::Other).index.frames() {
+        for frame in code.every_page(super::board::LockSite::Other).frames() {
             self.compiling(frame);
         }
     }
