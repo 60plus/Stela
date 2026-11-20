@@ -35,6 +35,7 @@ use core::{
 use stela_boot_core::host_memory::PACK_FLOOR;
 use stela_crypto::{Sha256, digest::Digest as _};
 use stela_drivers::block::BlockDevice;
+use stela_engine::machine::Looked;
 use stela_engine::machine::Offer;
 use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
@@ -850,15 +851,23 @@ impl Shared {
 }
 
 impl Translations for Shared {
+    fn record(&mut self, key: &Digest) -> Option<alloc::sync::Arc<StoredRecord>> {
+        match self.lookup(key) {
+            Looked::Found(record) => Some(record),
+            Looked::Absent | Looked::Awaited => None,
+        }
+    }
+
     /// The pack bytes outlive the lock, so other PEs can reach the store
     /// while a record is decoded. A writer also tracks absent keys.
-    fn record(&mut self, key: &Digest) -> Option<alloc::sync::Arc<StoredRecord>> {
+    fn lookup(&mut self, key: &Digest) -> Looked {
         if !available(READ_PACK | WRITE_PACK) {
-            return None;
+            return Looked::Absent;
         }
         let started = output::now();
         COSTS.lookups.fetch_add(1, Ordering::Relaxed);
         let lock = part(key);
+        let mut awaited = false;
         let lookup = lock.with(|store| {
             let store = store.as_mut()?;
             if let Some(record) = store.cached_record(key) {
@@ -872,8 +881,9 @@ impl Translations for Shared {
                 ))),
                 None => {
                     // A record left in the file is asked for: the block
-                    // compiles meanwhile.
-                    if !store.want(key) {
+                    // compiles meanwhile, and a later fetch asks again.
+                    awaited = store.want(key);
+                    if !awaited {
                         store.looked_up(key, false, false);
                     }
                     None
@@ -885,14 +895,17 @@ impl Translations for Shared {
                 COSTS
                     .lookup_ticks
                     .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-                return Some(record);
+                return Looked::Found(record);
             }
             Some(Err(source)) => source,
             None => {
                 COSTS
                     .lookup_ticks
                     .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-                return None;
+                return match awaited {
+                    true => Looked::Awaited,
+                    false => Looked::Absent,
+                };
             }
         };
         let decoding = output::now();
@@ -908,7 +921,9 @@ impl Translations for Shared {
         COSTS
             .lookup_ticks
             .fetch_add(output::now().wrapping_sub(started), Ordering::Relaxed);
-        decoded.ok().map(DecodedRecord::into_record)
+        decoded.ok().map_or(Looked::Absent, |decoded| {
+            Looked::Found(decoded.into_record())
+        })
     }
 
     fn prepared(

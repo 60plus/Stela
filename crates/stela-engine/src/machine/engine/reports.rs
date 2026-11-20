@@ -667,6 +667,10 @@ pub struct Statistics {
     /// Fetch pages read again whose known key the store held no record
     /// for: not looked up again.
     pub known_absent: u64,
+    /// Fetch pages whose record the store was reading at their lookup,
+    /// and the lookups again of such pages at later fetches in them.
+    pub awaited_pages: u64,
+    pub awaited_lookups: u64,
     /// Blocks offered to the store while memory was low.
     pub offered_low: u64,
     /// Fetches whose page the store held a record for that gave no block:
@@ -859,6 +863,8 @@ impl core::ops::AddAssign for Statistics {
             page_ticks,
             known_keys,
             known_absent,
+            awaited_pages,
+            awaited_lookups,
             offered_low,
             record_misses,
             shared_ticks,
@@ -1039,6 +1045,8 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.page_ticks, page_ticks),
             (&mut self.known_keys, known_keys),
             (&mut self.known_absent, known_absent),
+            (&mut self.awaited_pages, awaited_pages),
+            (&mut self.awaited_lookups, awaited_lookups),
             (&mut self.offered_low, offered_low),
             (&mut self.shared_ticks, shared_ticks),
             (&mut self.install_ticks, install_ticks),

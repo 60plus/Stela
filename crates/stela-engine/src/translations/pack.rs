@@ -24,7 +24,7 @@ mod codec;
 
 use super::{Digest, Entry, FormatError, Record, StoredRecord};
 use crate::machine::engine::SharedTranslation;
-use crate::machine::{Offer, Translations};
+use crate::machine::{Looked, Offer, Translations};
 use crate::platform::sync::Mutex;
 use alloc::{
     borrow::Cow,
@@ -3297,19 +3297,29 @@ impl<'a> Store<'a> {
 
 impl Translations for Store<'_> {
     fn record(&mut self, key: &Digest) -> Option<Arc<StoredRecord>> {
+        match self.lookup(key) {
+            Looked::Found(record) => Some(record),
+            Looked::Absent | Looked::Awaited => None,
+        }
+    }
+
+    fn lookup(&mut self, key: &Digest) -> Looked {
         if let Some(record) = self.cached_record(key) {
-            return Some(record);
+            return Looked::Found(record);
         }
         let Some(stored) = self.stored(key) else {
-            if !self.want(key) {
-                self.looked_up(key, false, false);
+            if self.want(key) {
+                return Looked::Awaited;
             }
-            return None;
+            self.looked_up(key, false, false);
+            return Looked::Absent;
         };
         let mut scratch = self.take_decode_scratch(stored);
         let decoded = DecodedRecord::decode(stored, &self.translator, key, &mut scratch);
         drop(self.finish_decode(key, stored, &decoded, &mut scratch));
-        decoded.ok().map(DecodedRecord::into_record)
+        decoded.ok().map_or(Looked::Absent, |decoded| {
+            Looked::Found(decoded.into_record())
+        })
     }
 
     fn prepared(

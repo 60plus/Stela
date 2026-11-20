@@ -161,7 +161,9 @@ use stela_compiler::{
 pub use stela_contracts::bus::Transition;
 pub use stela_contracts::dma::Memory;
 pub use stela_contracts::gate::{CallerFault, CallerMemory, GateCall, GateOutcome};
-pub use stored::{EntryChecks, Offer, SharedTranslation, StoreEvent, Translations, entry_checks};
+pub use stored::{
+    EntryChecks, Looked, Offer, SharedTranslation, StoreEvent, Translations, entry_checks,
+};
 pub use system::FP_TRAPS_WRITABLE;
 use {
     super::cpu::Cpu, super::cpu::Exception, super::cpu::HCR_AMO, super::cpu::HCR_API,

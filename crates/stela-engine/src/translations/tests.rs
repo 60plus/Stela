@@ -850,6 +850,7 @@ fn the_translator_id_covers_every_engine_item_its_inputs_name() {
                 "super::StoredRecord",
                 "super::*",
                 "crate::machine::engine::SharedTranslation",
+                "crate::machine::Looked",
                 "crate::machine::Offer",
                 "crate::machine::Preparation",
                 "crate::machine::Translations",
