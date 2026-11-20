@@ -183,6 +183,69 @@ fn switch_thunk_of(machine: &mut Machine<FakeHost, NoDevices>) -> Vec<u8> {
     table_switch::switch_thunk(GuestAddress(UPPER_PC), 3, cell, written, &places).code
 }
 
+/// What leaves every lookup context keeps the entries: a TLBI by VA of one
+/// ASID or of all, and a change of SPRR permissions; the next native write
+/// of a kept value completes as the engine path's does. Engine-path
+/// changes count why their thunk would have missed: no entry, then a
+/// forgotten one.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn native_table_switches_survive_what_keeps_contexts() {
+    use super::super::table_switches::miss;
+    use mmu::tlbi::{Everywhere, Reach};
+    const FIRST: u64 = 1 << 48 | 0x8000;
+    const OTHER: u64 = 2 << 48 | 0xc000;
+    type Change = fn(&mut Machine<FakeHost, NoDevices>);
+    let changes: [Change; 3] = [
+        |machine| {
+            let reach = Reach::Containing(0x4000);
+            machine.tlb_maintained(reach, Everywhere::AsidAddresses(reach, 1), Some(1));
+        },
+        |machine| {
+            let reach = Reach::Overlapping {
+                first: 0,
+                last: 1 << 40,
+            };
+            machine.tlb_maintained(reach, Everywhere::Addresses(reach), None);
+        },
+        |machine| machine.permissions_changed(),
+    ];
+    for sets in [false, true] {
+        for (index, change) in changes.into_iter().enumerate() {
+            let (mut engine, mut native) = (switching(1, FIRST, sets), switching(1, FIRST, sets));
+            let thunk = switch_thunk_of(&mut native);
+            // The first write, from the closed cell.
+            assert_eq!(native.statistics.switch_misses[miss::CLOSED], 1);
+            native.statistics.switch_misses = [0; miss::REASONS];
+            assert!(!write_both(&mut engine, &mut native, &thunk, OTHER));
+            assert!(write_both(&mut engine, &mut native, &thunk, FIRST));
+            change(&mut engine);
+            change(&mut native);
+            assert_eq!(
+                switched(&mut engine),
+                switched(&mut native),
+                "change {index}"
+            );
+            assert!(
+                write_both(&mut engine, &mut native, &thunk, OTHER),
+                "change {index} sets={sets}"
+            );
+            assert_eq!(
+                switched(&mut engine),
+                switched(&mut native),
+                "change {index}"
+            );
+            let mut expected = [0; miss::REASONS];
+            expected[miss::NEVER] = 1;
+            assert_eq!(native.statistics.switch_misses, expected, "change {index}");
+            native.mirrors.table_switch.forget();
+            assert!(!write_both(&mut engine, &mut native, &thunk, FIRST));
+            expected[miss::FORGOTTEN] = 1;
+            assert_eq!(native.statistics.switch_misses, expected, "change {index}");
+        }
+    }
+}
+
 /// A process switch and a domain switch and back, through native TTBR0
 /// writes, against the engine's: a write to a value the engine wrote or
 /// left before completes natively and leaves the register, the lookup

@@ -183,6 +183,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// An architectural cache epoch must never wrap back to an old permission.
     pub(super) fn advance_translation_generation(&mut self) {
         self.mirrors.table_switch.forget();
+        self.refresh_translations();
+    }
+
+    /// [`Self::advance_translation_generation`] keeping the native TTBR0
+    /// switch entries (`x86_64::table_switch`), for a TLBI that leaves
+    /// every lookup context and a permissions change. An entry names
+    /// nothing a translation holds: its lower context is the one of its
+    /// TTBR0 under the controls its upper context was made with (the two
+    /// halves' contexts are keyed by the same controls but TTBR0, and a
+    /// context's number is never given again), which the thunk checks, and
+    /// its host set, whose generation and class (the rights and the lower
+    /// half's TCR fields) the thunk checks too. What lookup contexts go
+    /// forgets them ([`Self::forget_contexts`]).
+    pub(super) fn refresh_translations(&mut self) {
         self.mirrors.close_code_page();
         self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
@@ -376,7 +390,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn forget_fetches(&mut self, reach: mmu::tlbi::Reach) {
         let (first, last) = match reach {
             mmu::tlbi::Reach::Nothing => return,
-            mmu::tlbi::Reach::All => return self.advance_translation_generation(),
+            mmu::tlbi::Reach::All => return self.refresh_translations(),
             mmu::tlbi::Reach::Containing(address) => (address, address),
             mmu::tlbi::Reach::Overlapping { first, last } => (first, last),
         };
@@ -385,7 +399,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             };
             if (last - first) / FETCH_PAGE >= FETCH_CACHE as u64 {
-                return self.advance_translation_generation();
+                return self.refresh_translations();
             }
             for page in (first..=last).step_by(FETCH_PAGE as usize) {
                 let slot = (page / FETCH_PAGE) as usize % FETCH_CACHE;
@@ -481,6 +495,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// again.
     pub(super) fn controls_changed(&mut self) {
         self.derived_changed();
+        self.mirrors.table_switch.forget();
         self.permissions_changed();
     }
 
@@ -499,7 +514,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// data and at thread switches, thousands of times a second.
     pub(super) fn permissions_changed(&mut self) {
         self.mirrors.close(SPRR_PERM_MIRROR);
-        self.advance_translation_generation();
+        self.refresh_translations();
         self.statistics.translation_changes += 1;
         self.sync_host_regime(step_timing::SyncSource::Translation);
     }
@@ -539,7 +554,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             | mmu::tlbi::Everywhere::AsidAddresses(addresses, _) => {
                 // Canonical memory's kept TLBs refresh on the generation.
                 if self.canonical_memory_serves() {
-                    self.advance_translation_generation();
+                    self.refresh_translations();
                 } else {
                     self.forget_fetches(reach);
                 }
