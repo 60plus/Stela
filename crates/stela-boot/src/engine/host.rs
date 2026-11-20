@@ -956,6 +956,8 @@ pub struct Statistics {
     pub lower_found: u64,
     pub native_switches: u64,
     pub kept_dropped: u64,
+    /// CR3 loads that flushed a stale view ([`table_switch::Sets::flushes`]).
+    pub flushed_loads: u64,
     /// Whole resets by cause: exhausted frames, SPRR, TTBR0 and other
     /// controls, tag checks, invalidations and TLBIs of everything.
     pub reset_causes: [u64; CAUSES],
@@ -1019,6 +1021,7 @@ pub fn statistics() -> Statistics {
         lower_switches: state.lower_switches,
         lower_found: state.lower_found,
         native_switches: state.native_switches,
+        flushed_loads: state.native_sets.flushes,
         kept_dropped: state.kept_dropped,
         reset_causes: state.reset_causes,
         control_fields: state.control_fields,
@@ -1723,6 +1726,7 @@ impl State {
         let index = self.set * ROOTS + root_view;
         let stale = core::mem::replace(&mut self.native_sets.stale[index], 0) != 0;
         let keep = if stale {
+            self.native_sets.flushes += 1;
             0
         } else {
             super::storage::KEEP_ENTRIES

@@ -90,7 +90,7 @@ impl TranslatedSeen {
 /// The host's shadow counters at the last heartbeat.
 #[derive(Default)]
 pub(super) struct ShadowSeen {
-    pub(super) counts: [u64; 30],
+    pub(super) counts: [u64; 31],
     pub(super) gate: [u64; 7],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
@@ -134,6 +134,7 @@ impl ShadowSeen {
             host.lower_found,
             host.kept_dropped,
             host.native_switches,
+            host.flushed_loads,
             host.bank_switches,
             host.bank_misses,
             host.scoped,
@@ -175,6 +176,7 @@ impl ShadowSeen {
             lower_found,
             kept_dropped,
             native_switches,
+            flushed_loads,
             bank_switches,
             bank_misses,
             scoped,
@@ -235,7 +237,7 @@ impl ShadowSeen {
              invalidated={invalidated} maintained={maintained} \
              lower_resets={lower_resets} lower_switches={lower_switches} \
              lower_found={lower_found} kept_dropped={kept_dropped} \
-             native_switches={native_switches} \
+             native_switches={native_switches} flushed_loads={flushed_loads} \
              bank_switches={bank_switches} bank_misses={bank_misses} scoped={scoped} \
              view_switches={view_switches} fill_ns_each={fill_ns_each} around={around} \
              faults={faults} fault_ns_each={fault_ns_each} guest_faults={guest_faults} \

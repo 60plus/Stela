@@ -1073,6 +1073,7 @@ pub(super) mod tests {
                 }
             }
             assert_eq!(native.statistics.native_transitions, [0, 0, 2, 2]);
+            assert_eq!(native.host.sets.as_ref().unwrap().sets.flushes, 2);
             // A set of another class: the engine's.
             native.host.sets.as_mut().unwrap().sets.classes[1] = 2;
             let before = observed(&native);

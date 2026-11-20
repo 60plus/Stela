@@ -417,7 +417,8 @@ fn check_host(asm: &mut Asm<'_>, misses: &mut Vec<Patch>) {
 /// Load CR3 for the current set's root of the record's view (RDX at the
 /// record, RCX at its sets): in the root's PCID where the sets are
 /// tagged, keeping its entries unless its stale byte is set, which it
-/// clears. It keeps RDX, saving it and R8 on the stack.
+/// clears, counting the flush ([`Sets::flushes`]). It keeps RDX, saving it
+/// and R8 on the stack.
 fn load_view(asm: &mut Asm<'_>, cr3: Cr3) {
     use Gpr::{R8, Rax, Rcx, Rdx};
     use Size::{Byte, Dword, Qword};
@@ -444,6 +445,7 @@ fn load_view(asm: &mut Asm<'_>, cr3: Cr3) {
     asm.alu(Alu::Or, Qword, Rdx, R8);
     let load = asm.jmp8();
     asm.bind(flush);
+    asm.alu_imm8(Alu::Add, Qword, sets(offset_of!(Sets, flushes)), 1);
     asm.alu(Alu::Xor, Dword, R8, R8);
     asm.mov_store(Byte, stale, R8);
     asm.bind(load);

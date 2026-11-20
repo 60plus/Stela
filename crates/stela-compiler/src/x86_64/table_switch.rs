@@ -23,7 +23,7 @@
 //! the switch for the engine, which settles the rest at its next exit, and
 //! loads CR3 with the target set's root of the view the current CR3 is of:
 //! in that view's PCID, without the no-flush bit while the view's stale
-//! byte is set, which it clears. Where the host isolates predictions
+//! byte is set, which it clears and counts. Where the host isolates predictions
 //! between contexts it issues IBPB and refills the return stack, as the
 //! engine's exit would. It clobbers RAX, RCX, RDX, R8, R9 and flags, which
 //! no exit keeps live.
@@ -61,6 +61,9 @@ pub struct Sets {
     pub switched: u64,
     /// The current set's first root, which transition records check.
     pub current: u64,
+    /// CR3 loads that flushed a stale view's PCID, the host's and native
+    /// code's.
+    pub flushes: u64,
     /// Each set's generation, which moves whenever it is given to another
     /// context, and class: sets of one class differ in TTBR0 alone.
     pub generations: [u64; SETS],
@@ -77,6 +80,7 @@ impl Default for Sets {
             tagged: 0,
             switched: 0,
             current: 0,
+            flushes: 0,
             generations: [0; SETS],
             classes: [0; SETS],
             stale: [1; SETS * SET_ROOTS],
@@ -393,9 +397,12 @@ pub fn switch_thunk(
         let flush = asm.jcc8(Cond::Ne);
         asm.mov_imm64(R9, KEEP_ENTRIES);
         asm.alu(Alu::Or, Qword, Rax, R9);
+        let kept = asm.jmp8();
         asm.bind(flush);
+        asm.alu_imm8(Alu::Add, Qword, sets(offset_of!(Sets, flushes)), 1);
         asm.alu(Alu::Xor, Dword, R9, R9);
         asm.mov_store(Byte, stale, R9);
+        asm.bind(kept);
         asm.bind(untagged);
         load_cr3(&mut asm, cr3);
     }

@@ -269,12 +269,14 @@ fn a_set_loads_the_same_view_of_its_root_in_its_context() {
     );
     assert_eq!((world.sets.switched, world.sets.current), (6, root(5, 0)));
     assert_eq!(world.register, NEW);
-    // A stale view flushes as it loads and is fresh after.
+    assert_eq!(world.sets.flushes, 0);
+    // A stale view flushes as it loads, counted, and is fresh after.
     let mut stale = self::world(true);
     stale.sets.stale[index as usize] = 1;
     assert_eq!(run(&thunk(true, &stale), &mut stale, NEW), NEXT);
     assert_eq!(stale.cr3, root(5, 3) | (FIRST_CONTEXT + index));
     assert_eq!(stale.sets.stale[index as usize], 0);
+    assert_eq!(stale.sets.flushes, 1);
     // Untagged roots load bare.
     let mut untagged = self::world(true);
     untagged.sets.tagged = 0;
