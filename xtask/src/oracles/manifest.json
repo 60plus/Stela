@@ -3284,6 +3284,14 @@
     "reason": "races two host cores on one 16-byte pair (FEAT_LSE2); run explicitly after changing pair lowering"
   },
   {
+    "package": "stela-engine",
+    "test": "regions_time_their_programs",
+    "source": "crates/stela-engine/tests/regions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "native timing of each region program against blocks; run explicitly in a release build on a quiet host"
+  },
+  {
     "package": "stela-soc",
     "test": "original_j314s_display_ptd_view_is_the_pmgr_pmp_update_bank",
     "source": "crates/stela-soc/src/machine/display_resources/tests.rs",

@@ -540,7 +540,7 @@ fn a_rewritten_region_runs_its_new_body() -> Result<()> {
 /// each, the first round compiling. Opt-in: `--ignored --nocapture`, in a
 /// release build on a quiet host.
 #[test]
-#[ignore = "manual: timing"]
+#[ignore = "manual: opt-in"]
 fn regions_time_their_programs() -> Result<()> {
     let data = Mapping::new()?;
     let code = Mapping::new()?;
