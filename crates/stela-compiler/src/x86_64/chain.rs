@@ -2575,9 +2575,9 @@ const SAMPLED: i32 = core::mem::offset_of!(ChainControl, sampled) as i32;
 const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 /// [`ChainControl::quiet`].
 pub const QUIET_OFFSET: i32 = core::mem::offset_of!(ChainControl, quiet) as i32;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
 const FRAME_ROOM: i32 = core::mem::offset_of!(ChainControl, frame_room) as i32;
@@ -4368,11 +4368,13 @@ mod tests {
         unsafe { (*(frame as *mut crate::GuestState)).account = account.0 };
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     /// The link tier of this host ([`LinkGate::for_target`]).
     pub(super) fn gate() -> LinkGate {
         LinkGate::for_target(crate::TargetCpu::detect())
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     /// A control with the account of the runs that use it, which native
     /// code keeps in [`ACCOUNT`] and the engine apart: comparing two
     /// compares both.
@@ -4382,6 +4384,7 @@ mod tests {
         pub account: Account,
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     impl core::ops::Deref for Controlled {
         type Target = ChainControl;
         fn deref(&self) -> &ChainControl {
@@ -4389,12 +4392,14 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     impl core::ops::DerefMut for Controlled {
         fn deref_mut(&mut self) -> &mut ChainControl {
             &mut self.control
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     impl Controlled {
         /// Run `run` with a frame that finds the control and holds the
         /// account, then keep the account it left.
