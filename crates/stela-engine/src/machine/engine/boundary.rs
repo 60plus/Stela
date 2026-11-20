@@ -1190,16 +1190,18 @@ impl Devices for NoDevices {
 }
 
 /// What native code does to move a host to another view of one regime
-/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: load
-/// `cr3` while the word at `root_at` is still `root` and the byte at
-/// `stale_at` clear, write `view` to the word at `view_at`, and leave
-/// RFLAGS.AC as `ac` says.
+/// ([`Host::native_view`]), as `x86_64::transition::Record` keeps it: while
+/// the current set of the host's root sets at `sets`
+/// (`x86_64::table_switch::Sets`) is of class `class`, load CR3 for that
+/// set's root of view `root` (in its PCID, flushing it if stale), write
+/// `view` to the word at `view_at`, and leave RFLAGS.AC as `ac` says.
+/// Sets of one class differ in TTBR0 alone, so a record made in one set
+/// holds after the PE switched to another of its class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeView {
-    pub cr3: u64,
-    pub root_at: u64,
+    pub sets: u64,
     pub root: u64,
-    pub stale_at: u64,
+    pub class: u64,
     pub view_at: u64,
     pub view: u64,
     pub ac: u64,

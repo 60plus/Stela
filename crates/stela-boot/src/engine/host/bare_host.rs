@@ -563,10 +563,11 @@ impl Host for BareHost<'_> {
         state().contexts.pan_flag
     }
 
-    /// A view of one regime's controls, watchpoints and tag checks whose
-    /// root exists: CR3 in its PCID with the no-flush bit while the context
-    /// holds nothing stale (the record checks the flag), plain CR3 (which
-    /// flushes) without PCIDE; RFLAGS.AC for PAN where SMAP stands for it.
+    /// A view of one regime's controls, watchpoints and tag checks: the
+    /// current set's root of it, in any set of the current one's class,
+    /// whose views mean the same but for TTBR0 (the thunk checks the class
+    /// and loads the view's PCID, flushing a stale one); RFLAGS.AC for PAN
+    /// where SMAP stands for it.
     fn native_view(&mut self, from: &Regime, to: &Regime) -> Option<NativeView> {
         use stela_compiler::x86_64::transition::{AC_CLEAR, AC_KEEP, AC_SET};
         let state = state();
@@ -574,18 +575,15 @@ impl Host for BareHost<'_> {
             || from.watch != to.watch
             || from.tag_checks != to.tag_checks
             || state.regime != Some(*to)
+            || state.native_sets.current != state.roots[0]
         {
             return None;
         }
+        let class = state.native_sets.classes[state.set];
+        if class == 0 {
+            return None;
+        }
         let view = view_of(to);
-        let root = state.root_of(view);
-        let base = *state.roots.get(root)?;
-        let index = state.set * ROOTS + root;
-        let cr3 = if state.contexts.tagged {
-            base | root_context(index) | crate::engine::storage::KEEP_ENTRIES
-        } else {
-            base
-        };
         let ac = if !state.contexts.pan_flag {
             AC_KEEP
         } else if view % VIEWS == PAN_VIEW {
@@ -594,11 +592,9 @@ impl Host for BareHost<'_> {
             AC_SET
         };
         Some(NativeView {
-            cr3,
-            // The record holds in the current set alone.
-            root_at: &state.native_sets.current as *const u64 as u64,
-            root: state.native_sets.current,
-            stale_at: &state.native_sets.stale[index] as *const u8 as u64,
+            sets: &state.native_sets as *const table_switch::Sets as u64,
+            root: state.root_of(view) as u64,
+            class,
             view_at: &state.native_view as *const u64 as u64,
             view: native_view_word(view, to.requester),
             ac,

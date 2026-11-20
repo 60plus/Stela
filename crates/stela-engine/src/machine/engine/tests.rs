@@ -187,13 +187,19 @@ pub(super) struct FakeHost {
 
 /// A host's root sets as `x86_64::table_switch` reads them, one per TTBR0
 /// value, all of one class, and the word that stands for CR3: what
-/// [`Host::set_regime`] selects and native switches load.
+/// [`Host::set_regime`] selects and native switches and transitions load,
+/// the root of the regime's view ([`FakeSets::view_of`]) in the current
+/// set.
 pub(super) struct FakeSets {
     pub(super) sets: table_switch::Sets,
     pub(super) cr3: u64,
     /// The TTBR0 of each set made so far, and the current one.
     pub(super) keys: Vec<u64>,
     pub(super) current: usize,
+    /// The current view, and the view word native transitions write
+    /// ([`Host::native_view`]).
+    pub(super) view: usize,
+    pub(super) view_word: u64,
     /// Native switches the host followed.
     pub(super) followed: usize,
 }
@@ -215,8 +221,27 @@ impl FakeSets {
             cr3: FAKE_SETS_BASE | table_switch::FIRST_CONTEXT,
             keys: Vec::new(),
             current: 0,
+            view: 0,
+            view_word: 0,
             followed: 0,
         })
+    }
+
+    /// The view of `requester`: EL0, EL1, EL1 with PAN, or the guarded
+    /// level, as the bare host numbers them.
+    pub(super) fn view_of(requester: mmu::Requester) -> usize {
+        match (requester.el, requester.pan, requester.guarded) {
+            (0, _, _) => 0,
+            (_, _, true) => 3,
+            (_, false, false) => 1,
+            (_, true, false) => 2,
+        }
+    }
+
+    /// CR3 for set `set`'s root of `view`, without the no-flush bit.
+    pub(super) fn cr3_of(set: usize, view: usize) -> u64 {
+        let index = (set * table_switch::SET_ROOTS + view) as u64;
+        (FAKE_SETS_BASE + index * 4096) | (table_switch::FIRST_CONTEXT + index)
     }
 
     /// The root of set `set`'s first view.
@@ -224,12 +249,18 @@ impl FakeSets {
         FAKE_SETS_BASE + (set * table_switch::SET_ROOTS) as u64 * 4096
     }
 
-    /// Follow a native switch, then select the set of `ttbr0`.
-    fn select(&mut self, ttbr0: u64) {
+    /// Follow a native switch, then select the set of `ttbr0` and load its
+    /// root of `view`.
+    fn select(&mut self, ttbr0: u64, view: usize) {
         let switched = core::mem::take(&mut self.sets.switched);
         if switched != 0 {
             self.current = switched as usize - 1;
             self.followed += 1;
+        }
+        // The view a native transition loaded.
+        let word = core::mem::take(&mut self.view_word);
+        if word != 0 {
+            self.view = (word & 0xff) as usize;
         }
         let set = match self.keys.iter().position(|&key| key == ttbr0) {
             Some(set) => set,
@@ -241,12 +272,11 @@ impl FakeSets {
                 set
             }
         };
-        if self.keys.len() == 1 || set != self.current {
+        if self.keys.len() == 1 || set != self.current || view != self.view {
             self.current = set;
-            let root = Self::root(set);
-            let context = table_switch::FIRST_CONTEXT + (set * table_switch::SET_ROOTS) as u64;
-            self.sets.current = root;
-            self.cr3 = root | context;
+            self.view = view;
+            self.sets.current = Self::root(set);
+            self.cr3 = Self::cr3_of(set, view);
         }
     }
 }
@@ -413,8 +443,27 @@ impl Host for FakeHost {
     fn set_regime(&mut self, regime: &Regime) {
         self.regimes.push(*regime);
         if let Some(sets) = &mut self.sets {
-            sets.select(regime.controls.ttbr0);
+            sets.select(regime.controls.ttbr0, FakeSets::view_of(regime.requester));
         }
+    }
+    fn native_view(&mut self, from: &Regime, to: &Regime) -> Option<NativeView> {
+        let sets = self.sets.as_mut()?;
+        if from.controls != to.controls
+            || from.watch != to.watch
+            || from.tag_checks != to.tag_checks
+            || self.regimes.last() != Some(to)
+        {
+            return None;
+        }
+        let view = FakeSets::view_of(to.requester);
+        Some(NativeView {
+            sets: &sets.sets as *const table_switch::Sets as u64,
+            root: view as u64,
+            class: sets.sets.classes[sets.current],
+            view_at: &sets.view_word as *const u64 as u64,
+            view: 0x100 | view as u64,
+            ac: stela_compiler::x86_64::transition::AC_KEEP,
+        })
     }
     fn native_sets(&mut self) -> Option<(u64, table_switch::Cr3)> {
         let sets = self.sets.as_ref()?;

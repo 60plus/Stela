@@ -504,6 +504,7 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     ),
     cycles: CYCLES,
     instructions: INSTRUCTION_COUNTER,
+    cr3: stela_compiler::x86_64::table_switch::Cr3::Register,
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
 
