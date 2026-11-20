@@ -593,6 +593,108 @@ fn regions_time_their_programs() -> Result<()> {
     Ok(())
 }
 
+/// Regions whose last loop runs to their end, as real code has them, end
+/// where their linked blocks do. An inline memcpy (64-byte, 8-byte and byte
+/// loops, from a shared cache function): the byte loop's last branch is the
+/// body's last row and falls out into the return, which the count tests
+/// before the loops reach too, so the loop's run ends before the return.
+/// Its run stayed open there, and the return stored the loop's locals from
+/// hosts the paths from before the loop never loaded: X9 and X10 took
+/// whatever those hosts held, a host address among them.
+#[test]
+fn regions_whose_last_loop_runs_to_their_end_run_as_their_blocks() -> Result<()> {
+    let data = Mapping::new()?;
+    let code = Mapping::new()?;
+    let programs: [&[u32]; 1] = [&[
+        0xb400_0562, //    cbz x2, 9f
+        0xd280_0008, //    mov x8, #0
+        0xf100_205f, //    cmp x2, #8
+        0x5400_0443, //    b.lo 7f
+        0xcb01_0009, //    sub x9, x0, x1
+        0xf100_fd3f, //    cmp x9, #63
+        0x5400_03e9, //    b.ls 7f
+        0xf101_005f, //    cmp x2, #64
+        0x5400_0062, //    b.hs 1f
+        0xd280_0008, //    mov x8, #0
+        0x1400_0011, //    b 5f
+        0xd280_0009, // 1: mov x9, #0
+        0x927a_e448, //    and x8, x2, #0xffffffffffffffc0
+        0xaa08_03ea, //    mov x10, x8
+        0x8b09_002b, // 2: add x11, x1, x9
+        0xad40_0560, //    ldp q0, q1, [x11]
+        0xad41_0d62, //    ldp q2, q3, [x11, #32]
+        0x8b09_000b, //    add x11, x0, x9
+        0xad00_0560, //    stp q0, q1, [x11]
+        0xad01_0d62, //    stp q2, q3, [x11, #32]
+        0x9101_0129, //    add x9, x9, #64
+        0xf101_014a, //    subs x10, x10, #64
+        0x54ff_ff01, //    b.ne 2b
+        0xeb08_005f, //    cmp x2, x8
+        0x5400_0260, //    b.eq 9f
+        0xf27d_085f, //    tst x2, #0x38
+        0x5400_0160, //    b.eq 7f
+        0xaa08_03e9, // 5: mov x9, x8
+        0x927d_f048, //    and x8, x2, #0xfffffffffffffff8
+        0xcb08_012a, //    sub x10, x9, x8
+        0xfc69_6820, // 6: ldr d0, [x1, x9]
+        0xfc29_6800, //    str d0, [x0, x9]
+        0x9100_2129, //    add x9, x9, #8
+        0xb100_214a, //    adds x10, x10, #8
+        0x54ff_ff81, //    b.ne 6b
+        0xeb08_005f, //    cmp x2, x8
+        0x5400_00e0, //    b.eq 9f
+        0xcb08_0049, // 7: sub x9, x2, x8
+        0x3868_682a, // 8: ldrb w10, [x1, x8]
+        0x3828_680a, //    strb w10, [x0, x8]
+        0x9100_0508, //    add x8, x8, #1
+        0xf100_0529, //    subs x9, x9, #1
+        0x54ff_ff81, //    b.ne 8b
+        0xd65f_03c0, // 9: ret
+        SUFFIX,
+    ]];
+    let mut rng = Rng(0x1319_8a2e_0370_7344);
+    for (index, words) in programs.iter().enumerate() {
+        let mut aborts = 0;
+        for case in 0..40 {
+            let mut initial = GuestState {
+                x: std::array::from_fn(|_| rng.next()),
+                nzcv: (rng.next() as u32) & 0xf000_0000,
+                ..GuestState::default()
+            };
+            for register in [0, 1] {
+                initial.x[register] = data.0 + rng.below(2 * PAGE);
+            }
+            // Counts that are zero now and then, and that run past the
+            // data at times.
+            initial.x[2] = rng.below(4) * rng.below(PAGE);
+            // The memcpy returns to its suffix.
+            initial.x[30] = code.0 + 4 * (words.len() as u64 - 1);
+            let contents: Vec<u8> = (0..BYTES).map(|_| rng.next() as u8).collect();
+            let start = Case {
+                initial: &initial,
+                contents: &contents,
+                protected: (case % 3 == 2).then(|| 1 + rng.below(3)),
+                masked: case % 2 == 1,
+            };
+            let (linked, _, _) = run(words, &code, &data, false, &start)?;
+            let (region, _, _) = run(words, &code, &data, true, &start)?;
+            assert_eq!(
+                (region.stop, region.pc, region.retired, region.abort),
+                (linked.stop, linked.pc, linked.retired, linked.abort),
+                "program {index} case {case}"
+            );
+            assert_eq!(region.state, linked.state, "program {index} case {case}");
+            assert!(
+                region.memory == linked.memory,
+                "program {index} case {case}: memory"
+            );
+            aborts += usize::from(linked.abort.is_some());
+        }
+        assert!(aborts > 2, "program {index}: {aborts} of 40 aborted");
+    }
+    Ok(())
+}
+
 /// The executable ranges of an image: a 64-bit Mach-O's executable
 /// segments (a kernelcache, TXM), or a dyld shared cache file's executable
 /// mappings, each with its unslid address.
