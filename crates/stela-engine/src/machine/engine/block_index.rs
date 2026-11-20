@@ -376,7 +376,7 @@ impl BlockIndex {
         self.pages.keys().copied()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "std", feature = "native-profile")))]
     pub(super) fn len(&self) -> usize {
         self.entries.iter().map(Vec::len).sum()
     }

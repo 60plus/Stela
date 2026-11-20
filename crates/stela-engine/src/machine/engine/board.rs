@@ -1006,7 +1006,7 @@ impl EveryPage<'_> {
     }
 
     /// The indexed blocks.
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "std", feature = "native-profile")))]
     pub(super) fn len(&self) -> usize {
         self.0.iter().map(|shard| shard.index.len()).sum()
     }
