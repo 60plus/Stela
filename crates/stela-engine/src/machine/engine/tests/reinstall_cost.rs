@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const ADD: u32 = 0x9100_0400; // add x0, x0, #1
 const B8: u32 = 0x1400_0002; // b .+8
 
-fn number(name: &str, default: usize) -> usize {
+pub(super) fn number(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|value| {
@@ -32,7 +32,7 @@ fn number(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn image() -> Vec<u8> {
+pub(super) fn image() -> Vec<u8> {
     let bytes = number("FETCH_BYTES", 1 << 20);
     match std::env::var("FETCH_IMAGE") {
         Ok(path) => {

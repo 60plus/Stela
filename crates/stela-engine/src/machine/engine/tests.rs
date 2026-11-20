@@ -152,6 +152,8 @@ pub(super) struct FakeHost {
     serializes: usize,
     /// Counts the counter moves on after each read.
     pub(super) counter_step: u64,
+    /// The counter is the TSC, for host timing benches.
+    pub(super) real_counter: bool,
     pub(super) execute_ticks: u64,
     pub(super) timers: Vec<Option<u64>>,
     /// What [`Host::tsc_counter`] answers.
@@ -388,6 +390,9 @@ impl Host for FakeHost {
     }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
+        if self.real_counter {
+            return super::board::timestamp();
+        }
         let now = self.now;
         self.now += self.counter_step;
         now
@@ -599,6 +604,7 @@ pub(super) fn board_on<D: Devices>(
         on_serialize: None,
         serializes: 0,
         counter_step: 0,
+        real_counter: false,
         execute_ticks: 0,
         timers: Vec::new(),
         tsc_counter: None,
@@ -10131,6 +10137,7 @@ mod exits;
 mod fast_ipi_native;
 mod floating_point_traps;
 mod instructions_native;
+mod lock_path;
 mod native_exceptions;
 mod one_sided;
 mod permission_kept;
