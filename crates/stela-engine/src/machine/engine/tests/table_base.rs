@@ -403,7 +403,7 @@ fn native_table_switches_follow_the_hosts_sets() {
 /// --ignored --nocapture`
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-#[ignore]
+#[ignore = "manual: opt-in"]
 fn table_switch_benchmark() {
     use core::ffi::c_void;
     unsafe extern "C" {

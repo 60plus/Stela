@@ -1121,7 +1121,7 @@ pub(super) mod tests {
     /// native thunks (CR3 a word), each pair. Run with `--release --lib
     /// guarded_set_benchmark -- --ignored --nocapture`.
     #[test]
-    #[ignore = "benchmark"]
+    #[ignore = "manual: opt-in"]
     fn guarded_set_benchmark() {
         use super::super::tests::FakeSets;
         use core::ffi::c_void;

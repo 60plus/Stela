@@ -347,7 +347,7 @@ pub(super) fn replay(held: f64, disk: Disk, reader: Reader, cache: usize) -> Out
 
 /// The table: disks, readers and pack contents.
 #[test]
-#[ignore = "manual: the table"]
+#[ignore = "manual: opt-in"]
 fn demand_read_pack_replay() {
     let whole = PAGES as u64 * RECORD_BYTES;
     std::println!(
@@ -413,7 +413,7 @@ fn demand_read_pack_replay() {
 /// (merges before) and in the order of first use (a merge's now), and the
 /// reader of a disk whose reads seek, which reads ahead only.
 #[test]
-#[ignore = "manual: the table"]
+#[ignore = "manual: opt-in"]
 fn demand_read_layout_replay() {
     for disk in DISKS {
         for cache in [8_192, 32_768] {
@@ -452,7 +452,7 @@ fn demand_read_layout_replay() {
 /// with the memory its indexes take on that host. The pack holds pages
 /// chosen at random, not by use: a lower bound on its hits.
 #[test]
-#[ignore = "manual: the table"]
+#[ignore = "manual: opt-in"]
 fn demand_read_limit_replay() {
     use super::writer::{KEPT_EIGHTHS, LEFT_EIGHTHS, demand_limit, resident_records};
     let footprint = PAGES as u64 * RECORD_BYTES;

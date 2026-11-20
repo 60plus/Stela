@@ -1632,7 +1632,7 @@ fn a_second_boot_over_a_full_pack_keeps_the_code_it_uses() {
 /// step [`STEP_WORK`] units with the reads served between steps.
 /// `cargo test -p stela-engine --lib --release merge_from_the_file_step_costs -- --ignored --nocapture`
 #[test]
-#[ignore = "manual: the numbers"]
+#[ignore = "manual: opt-in"]
 fn merge_from_the_file_step_costs() {
     let (file, segments) = filed(&[
         layout_of(0, 15_000, 0, 4096),
