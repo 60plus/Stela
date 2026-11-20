@@ -71,6 +71,8 @@ pub use parallel::{
     SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
+/// The reasons [`Statistics::switch_misses`] counts.
+pub const SWITCH_MISS_REASONS: usize = table_switches::miss::REASONS;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;

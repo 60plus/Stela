@@ -21,6 +21,27 @@
 //! regime, which the host already follows from its own sets.
 use super::*;
 
+/// Why a TTBR0 write that changes the register took the engine path, as
+/// its thunk would have decided ([`Machine::note_switch_miss`]): no thunk
+/// could serve it (the table-base cell closed, or code of the lower half
+/// or of a non-global upper half); no entry for the value was ever kept;
+/// one was, but the table forgot it since; it was kept under another upper
+/// lookup context; the host's sets were closed or the entry's set was
+/// given to another context since; the entry's set is of another class
+/// than the current one (other rights or lower TCR fields); or the entry
+/// held, so no thunk ran (none installed yet, or the block ran in the
+/// engine) or mail was pending.
+pub mod miss {
+    pub const CLOSED: usize = 0;
+    pub const NEVER: usize = 1;
+    pub const FORGOTTEN: usize = 2;
+    pub const CONTEXT: usize = 3;
+    pub const SET: usize = 4;
+    pub const CLASS: usize = 5;
+    pub const OTHER: usize = 6;
+    pub const REASONS: usize = 7;
+}
+
 /// What a TTBR0 write leaves of the state before it, for its entry back.
 pub(super) struct SwitchPoint {
     controls: mmu::Controls,
@@ -54,6 +75,63 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let variant = self.current_variant(false, false);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         self.contexts(el, variant)
+    }
+
+    /// The engine is about to complete `MSR TTBR0, Xt` (`word`) from the
+    /// state `from` ([`Self::switch_point`]): count why its thunk would not
+    /// have, when the write changes the register ([`miss`]).
+    pub(super) fn note_switch_miss(&mut self, word: u32, from: Option<&SwitchPoint>) {
+        let rt = (word & 0x1f) as usize;
+        let value = self.cpu.state.x.get(rt).copied().unwrap_or(0);
+        let reason = match from {
+            None => {
+                let current = self.cpu.translating_controls(self.cpu.regime()).ttbr0;
+                if value == current {
+                    return;
+                }
+                miss::CLOSED
+            }
+            Some(from) if from.value == value => return,
+            Some(from) => self.switch_miss_reason(value, from.contexts[1]),
+        };
+        self.statistics.switch_misses[reason] += 1;
+    }
+
+    fn switch_miss_reason(&self, value: u64, upper: u64) -> usize {
+        let table = &self.mirrors.table_switch;
+        let mut kept = table.entries.iter().filter(|entry| entry.value == value);
+        let Some(entry) = kept
+            .clone()
+            .find(|entry| entry.generation == table.generation)
+        else {
+            return if kept.next().is_some() {
+                miss::FORGOTTEN
+            } else {
+                miss::NEVER
+            };
+        };
+        if entry.upper != upper {
+            return miss::CONTEXT;
+        }
+        if table.sets == 0 {
+            return miss::OTHER;
+        }
+        // SAFETY: the host's sets live as long as the machine runs on it
+        // (`Host::native_sets`); only this PE writes them, and not now.
+        let sets = unsafe { &*(table.sets as *const table_switch::Sets) };
+        let set = entry.set as usize;
+        if sets.open == 0
+            || set >= table_switch::SETS
+            || sets.generations[set] != entry.set_generation
+        {
+            return miss::SET;
+        }
+        let current =
+            (sets.current.wrapping_sub(sets.base) >> 12) as usize / table_switch::SET_ROOTS;
+        match sets.classes.get(current) {
+            Some(&class) if class == sets.classes[set] => miss::OTHER,
+            _ => miss::CLASS,
+        }
     }
 
     /// An engine-path write of the register at `storage` that left the

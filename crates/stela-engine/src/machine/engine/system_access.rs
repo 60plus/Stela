@@ -752,6 +752,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn table_base_write(&mut self, word: u32, access: RegisterAccess) -> Step {
         let before = self.completion_point();
         let from = self.switch_point();
+        self.note_switch_miss(word, from.as_ref());
         self.plain_read = None;
         let step = self.register_access(word, access);
         let value = self

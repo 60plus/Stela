@@ -697,6 +697,9 @@ pub struct Statistics {
     /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
     /// (`x86_64::transition`) and `transitions::miss` reason.
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
+    /// Why TTBR0 writes that change the register took the engine path, by
+    /// `table_switches::miss` reason.
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why runs ended at a branch-kind exit, by kind (fallthrough, direct,
     /// indirect, call, return) and [`BranchMiss`] reason; the last slot
     /// counts those of each kind whose run made a native transition.
@@ -878,6 +881,7 @@ impl core::ops::AddAssign for Statistics {
             native_transitions,
             engine_transitions,
             transition_misses,
+            switch_misses,
             branch_misses,
             line_queries,
             line_ticks,
@@ -967,6 +971,9 @@ impl core::ops::AddAssign for Statistics {
             .iter_mut()
             .zip(transition_misses.as_flattened())
         {
+            *total += count;
+        }
+        for (total, count) in self.switch_misses.iter_mut().zip(switch_misses) {
             *total += count;
         }
         for (total, count) in self

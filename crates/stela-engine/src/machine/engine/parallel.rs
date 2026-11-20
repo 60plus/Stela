@@ -599,6 +599,9 @@ pub struct Counts {
     /// Why SVC, ERET, GENTER and GEXIT took the engine path, in kind order
     /// ([`super::Statistics::transition_misses`]).
     pub transition_misses: [[u64; super::transitions::miss::REASONS]; 4],
+    /// Why its TTBR0 changes took the engine path
+    /// ([`super::Statistics::switch_misses`]).
+    pub switch_misses: [u64; super::table_switches::miss::REASONS],
     /// Why its runs ended at branch-kind exits, in kind order
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
@@ -2733,6 +2736,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 statistics.engine_transitions[stela_compiler::x86_64::transition::EXCEPTION_RETURN],
             ],
             transition_misses: statistics.transition_misses,
+            switch_misses: statistics.switch_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
                 let mut stamped = [0; chain::STAMP_COUNTS + 11];
