@@ -293,6 +293,12 @@ pub enum StoreEvent {
     /// A shared block was found but not installed: its admitted bytes or
     /// source extent differ from the fetch's.
     SharedRejected,
+    /// A fetch page's record was being read at its lookup
+    /// ([`Looked::Awaited`]).
+    AwaitedPage,
+    /// Such a page was looked up again at a later fetch in it, and whether
+    /// its record was there then.
+    LookedAgain { found: bool },
 }
 
 /// A block compiled anew, and how it was compiled. Emission fields are private;
@@ -549,6 +555,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             Looked::Awaited => {
                 self.statistics.awaited_pages += 1;
+                if let Some(translations) = self.host.translations() {
+                    translations.note(StoreEvent::AwaitedPage);
+                }
                 (None, true)
             }
         };
@@ -585,6 +594,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         };
         let looked = translations.lookup(&key);
+        let found = matches!(looked, Looked::Found(_));
+        translations.note(StoreEvent::LookedAgain { found });
         self.statistics.awaited_lookups += 1;
         let Some(stored) = self.pages.get_mut(&frame) else {
             return;

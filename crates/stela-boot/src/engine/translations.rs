@@ -752,6 +752,11 @@ struct Costs {
     page_reads: AtomicU64,
     page_ticks: AtomicU64,
     shared_rejected: AtomicU64,
+    /// Fetch pages whose record was being read at their lookup, their
+    /// lookups again at later fetches, and those that found it.
+    awaited_pages: AtomicU64,
+    awaited_lookups: AtomicU64,
+    awaited_found: AtomicU64,
     lookups: AtomicU64,
     lookup_ticks: AtomicU64,
     decode_ticks: AtomicU64,
@@ -761,6 +766,9 @@ static COSTS: Costs = Costs {
     page_reads: AtomicU64::new(0),
     page_ticks: AtomicU64::new(0),
     shared_rejected: AtomicU64::new(0),
+    awaited_pages: AtomicU64::new(0),
+    awaited_lookups: AtomicU64::new(0),
+    awaited_found: AtomicU64::new(0),
     lookups: AtomicU64::new(0),
     lookup_ticks: AtomicU64::new(0),
     decode_ticks: AtomicU64::new(0),
@@ -975,6 +983,15 @@ impl Translations for Shared {
             }
             StoreEvent::SharedRejected => {
                 COSTS.shared_rejected.fetch_add(1, Ordering::Relaxed);
+            }
+            StoreEvent::AwaitedPage => {
+                COSTS.awaited_pages.fetch_add(1, Ordering::Relaxed);
+            }
+            StoreEvent::LookedAgain { found } => {
+                COSTS.awaited_lookups.fetch_add(1, Ordering::Relaxed);
+                if found {
+                    COSTS.awaited_found.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -2061,13 +2078,17 @@ fn report_reader(counters: &pack::Counters) {
     let micros = |ticks: u64| ticks * 1_000_000 / super::host::COUNTER_HZ;
     output::arguments(format_args!(
         "TRANSLATIONS reader awaited={} read={} read_mb={} ahead={} launched={launched} \
-         dropped={dropped} mean_us={} longest_us={} slow={slow} failed={failed}\n",
+         dropped={dropped} mean_us={} longest_us={} slow={slow} failed={failed} \
+         awaited_pages={} awaited_lookups={} awaited_found={}\n",
         counters.awaited,
         counters.read,
         counters.read_bytes >> 20,
         counters.read_ahead,
         micros(latency),
         micros(longest),
+        COSTS.awaited_pages.load(Ordering::Relaxed),
+        COSTS.awaited_lookups.load(Ordering::Relaxed),
+        COSTS.awaited_found.load(Ordering::Relaxed),
     ));
 }
 
